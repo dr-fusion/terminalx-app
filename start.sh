@@ -5,8 +5,7 @@
 set -e
 
 # ── cd to project root (where this script lives) ───────────────────────────
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+cd "$(dirname "$0")"
 
 # ── Defaults ────────────────────────────────────────────────────────────────
 PORT="${PORT:-3456}"
