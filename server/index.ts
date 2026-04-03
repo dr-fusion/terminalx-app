@@ -286,17 +286,10 @@ app.prepare().then(() => {
   const server = createServer((req, res) => {
     const parsedUrl = parseUrl(req.url || "", true);
 
-    // Health endpoint
+    // Health endpoint — minimal public info only
     if (parsedUrl.pathname === "/health") {
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(
-        JSON.stringify({
-          status: "ok",
-          uptime: process.uptime(),
-          activePtys: getActivePtyCount(),
-          timestamp: new Date().toISOString(),
-        })
-      );
+      res.end(JSON.stringify({ status: "ok" }));
       return;
     }
 
