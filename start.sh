@@ -4,6 +4,10 @@
 
 set -e
 
+# ── cd to project root (where this script lives) ───────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
 # ── Defaults ────────────────────────────────────────────────────────────────
 PORT="${PORT:-3456}"
 TERMINUS_HOST="${TERMINUS_HOST:-0.0.0.0}"
@@ -12,7 +16,7 @@ TERMINUS_SHELL="${TERMINUS_SHELL:-$SHELL}"
 TERMINUS_MAX_SESSIONS="${TERMINUS_MAX_SESSIONS:-20}"
 TERMINUS_READ_ONLY="${TERMINUS_READ_ONLY:-false}"
 TERMINUS_LOG_PATHS="${TERMINUS_LOG_PATHS:-/var/log,~/.pm2/logs}"
-
+TERMINALX_ADMIN_PASSWORD="REDACTED"
 # ── Auth Mode ───────────────────────────────────────────────────────────────
 AUTH_MODE="${TERMINALX_AUTH_MODE:-local}"
 
@@ -71,7 +75,7 @@ export NODE_ENV=production
 # ── Build if needed ─────────────────────────────────────────────────────────
 if [ ! -d ".next" ] || [ "$1" = "--build" ]; then
   echo "Building TerminalX..."
-  npx next build
+  npm run build
 fi
 
 # ── Print config ────────────────────────────────────────────────────────────
