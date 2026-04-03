@@ -1,36 +1,73 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# TerminalX
 
-## Getting Started
+A self-hosted terminal IDE for the browser. Manage tmux sessions, browse files, and tail logs — all from a beautiful web UI built with shadcn/ui.
 
-First, run the development server:
+## Features
+
+- **Tabbed Terminals** — Open multiple tmux sessions in browser tabs
+- **Session Management** — Create, attach, and kill tmux sessions from the sidebar
+- **File Browser** — Navigate your server's filesystem with a tree view
+- **Log Viewer** — Tail log files in real-time with color-coded levels
+- **Resizable Panels** — Drag to arrange your workspace
+- **Mobile Responsive** — Manage your server from your phone
+- **Tailscale Ready** — Zero-config auth when used behind Tailscale
+
+## Quick Start
+
+```bash
+# Clone and install
+git clone https://github.com/dr-fusion/terminalx-app.git
+cd terminalx-app
+npm install
+
+# Build and run
+npm run build
+npm run start
+```
+
+Open http://localhost:3000
+
+### With Tailscale
+
+```bash
+npm run start &
+tailscale serve --bg 3000
+```
+
+Now accessible at `https://your-machine.tailnet.ts.net`
+
+## Development
 
 ```bash
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+## Configuration
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+All settings via environment variables:
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PORT` | `3000` | Server port |
+| `TERMINUS_ROOT` | `$HOME` | File browser root |
+| `TERMINUS_SHELL` | `$SHELL` | Default shell |
+| `TERMINUS_READ_ONLY` | `false` | Read-only mode |
+| `TERMINUS_MAX_SESSIONS` | `20` | Max terminal sessions |
+| `TERMINUS_LOG_PATHS` | `/var/log,~/.pm2/logs` | Log directories to scan |
 
-## Learn More
+## Tech Stack
 
-To learn more about Next.js, take a look at the following resources:
+- [Next.js](https://nextjs.org) 16 + custom WebSocket server
+- [shadcn/ui](https://ui.shadcn.com) + [Tailwind CSS](https://tailwindcss.com) 4
+- [xterm.js](https://xtermjs.org) + [node-pty](https://github.com/nicedudeng/node-pty)
+- [react-resizable-panels](https://github.com/bvaughn/react-resizable-panels)
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## Requirements
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+- Node.js 20+
+- tmux installed on the server
+- Build tools for node-pty (`build-essential` on Debian/Ubuntu)
 
-## Deploy on Vercel
+## License
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+MIT
