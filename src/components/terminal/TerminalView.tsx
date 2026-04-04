@@ -1,10 +1,11 @@
 "use client";
 
-import { useEffect, useRef, useCallback } from "react";
+import { useEffect, useRef, useCallback, useState } from "react";
 import { Terminal } from "xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { SearchAddon } from "@xterm/addon-search";
+import { Upload } from "lucide-react";
 import "xterm/css/xterm.css";
 
 interface TerminalViewProps {
@@ -19,12 +20,16 @@ export function TerminalView({
   onReconnect,
 }: TerminalViewProps) {
   const containerRef = useRef<HTMLDivElement>(null);
+  const wrapperRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectAttemptRef = useRef(0);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const intentionalCloseRef = useRef(false);
+  const [isDragging, setIsDragging] = useState(false);
+  const [uploadStatus, setUploadStatus] = useState<string | null>(null);
+  const dragCounterRef = useRef(0);
 
   const connectWs = useCallback(() => {
     if (!terminalRef.current) return;
@@ -205,11 +210,105 @@ export function TerminalView({
     };
   }, [connectWs]);
 
+  const uploadFile = useCallback(async (file: File) => {
+    setUploadStatus(`Uploading ${file.name}...`);
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      const res = await fetch("/api/upload", { method: "POST", body: formData });
+      if (!res.ok) {
+        const err = await res.json();
+        setUploadStatus(`Failed: ${err.error}`);
+        setTimeout(() => setUploadStatus(null), 3000);
+        return;
+      }
+      const data = await res.json();
+      // Paste the file path into the terminal
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        wsRef.current.send(data.path + " ");
+      }
+      setUploadStatus(`Uploaded: ${data.filename}`);
+      setTimeout(() => setUploadStatus(null), 2000);
+    } catch {
+      setUploadStatus("Upload failed");
+      setTimeout(() => setUploadStatus(null), 3000);
+    }
+  }, []);
+
+  const handleDragEnter = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dragCounterRef.current++;
+    if (e.dataTransfer.types.includes("Files")) {
+      setIsDragging(true);
+    }
+  }, []);
+
+  const handleDragLeave = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dragCounterRef.current--;
+    if (dragCounterRef.current === 0) {
+      setIsDragging(false);
+    }
+  }, []);
+
+  const handleDragOver = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+  }, []);
+
+  const handleDrop = useCallback(
+    async (e: React.DragEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      setIsDragging(false);
+      dragCounterRef.current = 0;
+
+      const files = Array.from(e.dataTransfer.files);
+      for (const file of files) {
+        await uploadFile(file);
+      }
+    },
+    [uploadFile]
+  );
+
   return (
     <div
-      ref={containerRef}
-      className="h-full w-full"
-      style={{ backgroundColor: "#0D0F12" }}
-    />
+      ref={wrapperRef}
+      className="h-full w-full relative"
+      onDragEnter={handleDragEnter}
+      onDragLeave={handleDragLeave}
+      onDragOver={handleDragOver}
+      onDrop={handleDrop}
+    >
+      <div
+        ref={containerRef}
+        className="h-full w-full"
+        style={{ backgroundColor: "#0D0F12" }}
+      />
+
+      {/* Drag overlay */}
+      {isDragging && (
+        <div className="absolute inset-0 bg-[#3B82F6]/10 border-2 border-dashed border-[#3B82F6] rounded flex items-center justify-center z-50 pointer-events-none">
+          <div className="flex flex-col items-center gap-2 text-[#3B82F6]">
+            <Upload size={32} />
+            <span className="text-[14px] font-medium">
+              Drop files to upload
+            </span>
+            <span className="text-[12px] text-[#6B7280]">
+              File path will be pasted into terminal
+            </span>
+          </div>
+        </div>
+      )}
+
+      {/* Upload status toast */}
+      {uploadStatus && (
+        <div className="absolute bottom-4 left-1/2 -translate-x-1/2 px-3 py-1.5 rounded bg-[#1C1F2B] border border-[#2A2D3A] text-[12px] text-[#E4E4E7] shadow-lg z-50">
+          {uploadStatus}
+        </div>
+      )}
+    </div>
   );
 }
