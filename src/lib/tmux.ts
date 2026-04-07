@@ -50,7 +50,12 @@ export function listSessions(): TmuxSession[] {
   } catch (err: unknown) {
     // tmux returns error when no server is running
     const message = err instanceof Error ? err.message : String(err);
-    if (message.includes("no server running") || message.includes("no sessions")) {
+    if (
+      message.includes("no server running") ||
+      message.includes("no sessions") ||
+      message.includes("No such file or directory") ||
+      message.includes("error connecting")
+    ) {
       return [];
     }
     throw err;
