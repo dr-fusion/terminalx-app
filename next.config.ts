@@ -3,8 +3,10 @@ import type { NextConfig } from "next";
 const nextConfig: NextConfig = {
   // Expose auth mode to middleware runtime (NOT secrets — never put secrets here,
   // the env block is inlined into client-side JavaScript bundles)
+  // Force-inline env vars into edge middleware at build time.
   env: {
-    TERMINALX_AUTH_MODE: process.env.TERMINALX_AUTH_MODE || "none",
+    TERMINALX_AUTH_MODE: process.env.TERMINALX_AUTH_MODE ?? "none",
+    TERMINALX_JWT_SECRET: process.env.TERMINALX_JWT_SECRET ?? "",
   },
   async headers() {
     return [

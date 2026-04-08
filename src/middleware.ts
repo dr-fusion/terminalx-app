@@ -10,15 +10,15 @@ function getJwtSecretEdge(): Uint8Array | null {
   return new TextEncoder().encode(secret);
 }
 
-function getAuthModeEdge(): "none" | "password" | "local" {
+function getAuthModeEdge(): "none" | "password" | "local" | "google" {
   const mode = process.env.TERMINALX_AUTH_MODE || "none";
-  if (mode === "password" || mode === "local") {
+  if (mode === "password" || mode === "local" || mode === "google") {
     return mode;
   }
   return "none";
 }
 
-const PUBLIC_PATHS = ["/login", "/api/auth/", "/_next/", "/favicon.ico"];
+const PUBLIC_PATHS = ["/login", "/api/auth/", "/api/auth/google", "/api/auth/google/callback", "/_next/", "/favicon.ico"];
 
 /**
  * Strip user identity headers to prevent spoofing from untrusted clients.
@@ -48,18 +48,20 @@ export async function middleware(req: NextRequest) {
     }
   }
 
+  // Build external-facing base URL for redirects (behind reverse proxy)
+  const proto = req.headers.get("x-forwarded-proto") || req.nextUrl.protocol.replace(":", "");
+  const host = req.headers.get("x-forwarded-host") || req.headers.get("host") || req.nextUrl.host;
+  const base = `${proto}://${host}`;
+
   // Parse JWT from cookie
   const token = req.cookies.get("terminalx-session")?.value;
   if (!token) {
-    return stripUserHeaders(NextResponse.redirect(new URL("/login", req.url)));
+    return stripUserHeaders(NextResponse.redirect(new URL("/login", base)));
   }
 
   const secret = getJwtSecretEdge();
   if (!secret) {
-    // No secret configured — cannot verify tokens.
-    // Redirect to login rather than passing through unauthenticated,
-    // to prevent auth bypass when TERMINALX_JWT_SECRET env var is not set.
-    return stripUserHeaders(NextResponse.redirect(new URL("/login", req.url)));
+    return stripUserHeaders(NextResponse.redirect(new URL("/login", base)));
   }
 
   try {
@@ -71,7 +73,7 @@ export async function middleware(req: NextRequest) {
     return response;
   } catch {
     // Invalid or expired token
-    const response = NextResponse.redirect(new URL("/login", req.url));
+    const response = NextResponse.redirect(new URL("/login", base));
     response.cookies.delete("terminalx-session");
     return stripUserHeaders(response);
   }

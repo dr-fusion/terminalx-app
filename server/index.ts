@@ -59,6 +59,7 @@ async function authenticateWebSocket(
   req: IncomingMessage,
   socket: Socket
 ): Promise<boolean> {
+  // Only skip auth when explicitly in "none" mode
   if (AUTH_MODE === "none") return true;
 
   const cookies = parseCookies(req.headers.cookie);

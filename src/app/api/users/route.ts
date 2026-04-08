@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getUsers, createUser, deleteUser, getUserById } from "@/lib/users";
+import { getUsers, createUser, deleteUser, getUserById, getUserByUsername, updateUserRole } from "@/lib/users";
 import { getAuthMode } from "@/lib/auth-config";
 import { audit } from "@/lib/audit-log";
 
@@ -99,16 +99,21 @@ export async function DELETE(req: NextRequest) {
     return NextResponse.json({ error: "Admin access required" }, { status: 403 });
   }
 
-  let body: { id?: string };
+  let body: { id?: string; username?: string };
   try {
     body = await req.json();
   } catch {
     return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
   }
 
-  const { id } = body;
+  // Accept either id or username for deletion
+  let id = body.id;
+  if (!id && body.username) {
+    const userByName = getUserByUsername(body.username);
+    if (userByName) id = userByName.id;
+  }
   if (!id || typeof id !== "string") {
-    return NextResponse.json({ error: "User ID is required" }, { status: 400 });
+    return NextResponse.json({ error: "User ID or username is required" }, { status: 400 });
   }
 
   // Prevent deleting the last admin user
@@ -130,6 +135,66 @@ export async function DELETE(req: NextRequest) {
       detail: `deleted user id: ${id}`,
     });
     return NextResponse.json({ success: true });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return NextResponse.json({ error: message }, { status: 404 });
+  }
+}
+
+export async function PATCH(req: NextRequest) {
+  const authMode = getAuthMode();
+  if (authMode !== "local") {
+    return NextResponse.json(
+      { error: "User management requires local auth mode" },
+      { status: 400 }
+    );
+  }
+
+  if (!isAdmin(req)) {
+    return NextResponse.json({ error: "Admin access required" }, { status: 403 });
+  }
+
+  let body: { id?: string; username?: string; role?: "admin" | "user" };
+  try {
+    body = await req.json();
+  } catch {
+    return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+  }
+
+  const { role } = body;
+  if (!role || (role !== "admin" && role !== "user")) {
+    return NextResponse.json({ error: "Role must be 'admin' or 'user'" }, { status: 400 });
+  }
+
+  // Accept either id or username
+  let id = body.id;
+  if (!id && body.username) {
+    const userByName = getUserByUsername(body.username);
+    if (userByName) id = userByName.id;
+  }
+  if (!id) {
+    return NextResponse.json({ error: "User ID or username is required" }, { status: 400 });
+  }
+
+  // Prevent demoting the last admin
+  const targetUser = getUserById(id);
+  if (targetUser && targetUser.role === "admin" && role === "user") {
+    const adminCount = getUsers().filter((u) => u.role === "admin").length;
+    if (adminCount <= 1) {
+      return NextResponse.json(
+        { error: "Cannot demote the last admin user" },
+        { status: 400 }
+      );
+    }
+  }
+
+  try {
+    const updated = await updateUserRole(id, role);
+    audit("user_role_changed", {
+      username: req.headers.get("x-username") || undefined,
+      detail: `changed user ${updated.username} role to ${role}`,
+    });
+    return NextResponse.json({ user: updated });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return NextResponse.json({ error: message }, { status: 404 });

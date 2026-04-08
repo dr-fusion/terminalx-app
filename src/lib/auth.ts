@@ -70,13 +70,19 @@ function saveRevokedTokens(entries: RevokedEntry[]): void {
 }
 
 function cleanupExpiredRevocations(): void {
-  const now = Math.floor(Date.now() / 1000);
-  const entries = loadRevokedTokens().filter((e) => e.exp > now);
-  saveRevokedTokens(entries);
+  try {
+    const now = Math.floor(Date.now() / 1000);
+    const entries = loadRevokedTokens().filter((e) => e.exp > now);
+    saveRevokedTokens(entries);
+  } catch {
+    // Ignore errors during build time or if data dir is not writable
+  }
 }
 
-// Cleanup on startup and every hour
-cleanupExpiredRevocations();
+// Cleanup on startup and every hour (skip during build)
+if (process.env.NODE_ENV !== "production" || !process.env.NEXT_PHASE) {
+  cleanupExpiredRevocations();
+}
 setInterval(cleanupExpiredRevocations, 3600_000);
 
 export function revokeToken(token: string): void {
@@ -144,12 +150,19 @@ export async function verifyJwt(token: string): Promise<JwtPayload | null> {
     };
 
     // Check that the user still exists (deleted users should not retain access)
-    if (result.userId !== "single-user") {
+    // Google OAuth users (userId starts with "google-") and single-user mode skip this check
+    if (result.userId !== "single-user" && !result.userId.startsWith("google-")) {
       const { getUserById } = await import("./users");
       const user = getUserById(result.userId);
       if (!user) return null;
       // Also check if user's role changed since token was issued
       result.role = user.role;
+    }
+
+    // For Google OAuth users, re-verify they are still in the allowed list
+    if (result.userId.startsWith("google-")) {
+      const { isEmailAllowed } = await import("./auth-config");
+      if (!isEmailAllowed(result.username)) return null;
     }
 
     return result;

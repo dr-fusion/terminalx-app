@@ -29,7 +29,7 @@ export async function GET(req: NextRequest) {
   const cookies = parseCookies(cookieHeader);
   const token = cookies["terminalx-session"];
   if (!token) {
-    return NextResponse.json({ error: "Not authenticated", mode: authMode }, { status: 401 });
+    return NextResponse.json({ error: "Not authenticated", authMode }, { status: 401 });
   }
 
   const payload = await verifyJwt(token);
