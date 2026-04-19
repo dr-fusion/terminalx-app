@@ -1,6 +1,6 @@
 # TerminalX
 
-[![CI](https://github.com/dr-fusion/terminalx-app/actions/workflows/ci.yml/badge.svg)](https://github.com/dr-fusion/terminalx-app/actions/workflows/ci.yml)
+[![CI](https://github.com/dudhatparesh/terminalx-app/actions/workflows/ci.yml/badge.svg)](https://github.com/dudhatparesh/terminalx-app/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 A self-hosted terminal IDE for the browser. Manage tmux sessions, browse files, and tail logs from a single web UI.
@@ -31,7 +31,7 @@ Open http://localhost:3000. That's it.
 ### From Source
 
 ```bash
-git clone https://github.com/dr-fusion/terminalx-app.git
+git clone https://github.com/dudhatparesh/terminalx-app.git
 cd terminalx-app
 npm install
 npm run build
