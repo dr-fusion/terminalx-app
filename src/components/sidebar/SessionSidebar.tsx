@@ -241,14 +241,18 @@ export function SessionSidebar({ onOpenSession }: SessionSidebarProps) {
             type="text"
             value={newSessionName}
             onChange={(e) => {
-              setNewSessionName(e.target.value);
+              const cleaned = e.target.value
+                .toLowerCase()
+                .replace(/[^a-z0-9 ]/g, "")
+                .replace(/ /g, "-");
+              setNewSessionName(cleaned);
               setCreateError(null);
             }}
             onKeyDown={(e) => {
               if (e.key === "Enter") handleCreate();
               if (e.key === "Escape") setShowNewSessionDialog(false);
             }}
-            placeholder="e.g. my-project"
+            placeholder="e.g. my project"
             className="w-full px-2 py-1.5 rounded bg-[#0D0F12] border border-[#2A2D3A]
               text-[#E4E4E7] text-[13px] placeholder:text-[#6B7280]/50
               focus:outline-none focus:border-[#3B82F6] transition-colors"
