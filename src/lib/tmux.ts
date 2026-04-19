@@ -62,9 +62,16 @@ export function listSessions(): TmuxSession[] {
   }
 }
 
-export function createSession(name: string, command?: string): void {
+export function createSession(
+  name: string,
+  command?: string,
+  cwd?: string
+): void {
   const safeName = sanitizeSessionName(name);
   const args = ["new-session", "-d", "-s", safeName];
+  if (cwd) {
+    args.push("-c", cwd);
+  }
   if (command) {
     args.push(command);
   }

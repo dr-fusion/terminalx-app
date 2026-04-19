@@ -82,7 +82,8 @@ export async function POST(req: NextRequest) {
     const command = commandForKind(sessionKind, {
       dangerouslySkipPermissions: Boolean(dangerouslySkipPermissions),
     });
-    createSession(finalName, command ?? undefined);
+    const startDir = process.env.TERMINUS_ROOT || process.env.HOME;
+    createSession(finalName, command ?? undefined, startDir);
     if (sessionKind !== "bash") {
       await saveMeta({
         name: finalName,
