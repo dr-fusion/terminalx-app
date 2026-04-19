@@ -68,8 +68,19 @@ export function SessionSidebar({ onOpenSession }: SessionSidebarProps) {
     setTimeout(() => nameInputRef.current?.focus(), 50);
   };
 
+  const slugify = (raw: string) =>
+    raw
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9 ]/g, "")
+      .replace(/\s+/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/^-+|-+$/g, "");
+
+  const previewSlug = slugify(newSessionName);
+
   const handleCreate = async () => {
-    const name = newSessionName.trim();
+    const name = previewSlug;
     if (!name) {
       setCreateError("Session name is required");
       return;
@@ -241,22 +252,25 @@ export function SessionSidebar({ onOpenSession }: SessionSidebarProps) {
             type="text"
             value={newSessionName}
             onChange={(e) => {
-              const cleaned = e.target.value
-                .toLowerCase()
-                .replace(/[^a-z0-9 ]/g, "")
-                .replace(/ /g, "-");
-              setNewSessionName(cleaned);
+              const filtered = e.target.value.replace(/[^A-Za-z0-9 ]/g, "");
+              setNewSessionName(filtered);
               setCreateError(null);
             }}
             onKeyDown={(e) => {
               if (e.key === "Enter") handleCreate();
               if (e.key === "Escape") setShowNewSessionDialog(false);
             }}
-            placeholder="e.g. my project"
+            placeholder="e.g. My Project"
             className="w-full px-2 py-1.5 rounded bg-[#0D0F12] border border-[#2A2D3A]
               text-[#E4E4E7] text-[13px] placeholder:text-[#6B7280]/50
               focus:outline-none focus:border-[#3B82F6] transition-colors"
           />
+          {newSessionName.trim() && (
+            <p className="text-[10px] text-[#6B7280] mt-1">
+              Will be created as{" "}
+              <code className="text-[#E4E4E7]">{previewSlug || "—"}</code>
+            </p>
+          )}
 
           <div className="mt-2">
             <span className="block text-[10px] text-[#6B7280] uppercase tracking-wider mb-1">
