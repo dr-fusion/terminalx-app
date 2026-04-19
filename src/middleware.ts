@@ -18,7 +18,7 @@ function getAuthModeEdge(): "none" | "password" | "local" | "google" {
   return "none";
 }
 
-const PUBLIC_PATHS = ["/login", "/api/auth/", "/api/auth/google", "/api/auth/google/callback", "/_next/", "/favicon.ico"];
+const PUBLIC_PATHS = ["/login", "/api/auth/", "/api/auth/google", "/api/auth/google/callback", "/api/health", "/_next/", "/favicon.ico"];
 
 /**
  * Strip user identity headers to prevent spoofing from untrusted clients.
