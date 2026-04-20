@@ -8,6 +8,7 @@ import {
   isEmailAllowed,
 } from "@/lib/auth-config";
 import { audit } from "@/lib/audit-log";
+import { isRateLimited, clientIp } from "@/lib/rate-limit";
 
 interface GoogleTokenResponse {
   access_token: string;
@@ -40,6 +41,13 @@ export async function GET(req: NextRequest) {
     return NextResponse.redirect(new URL("/login", base));
   }
 
+  // Rate limit by caller IP to prevent OAuth code-exchange abuse.
+  const ip = clientIp(req);
+  if (isRateLimited(`oauth-callback:${ip}`)) {
+    audit("rate_limited", { detail: `oauth callback ip=${ip}` });
+    return NextResponse.redirect(new URL("/login?error=rate_limited", base));
+  }
+
   const { searchParams } = req.nextUrl;
   const code = searchParams.get("code");
   const state = searchParams.get("state");
@@ -68,9 +76,7 @@ export async function GET(req: NextRequest) {
   const callbackPath = getGoogleCallbackUrl();
 
   // Build absolute redirect URI (must match what was sent to Google)
-  const redirectUri = callbackPath.startsWith("http")
-    ? callbackPath
-    : `${base}${callbackPath}`;
+  const redirectUri = callbackPath.startsWith("http") ? callbackPath : `${base}${callbackPath}`;
 
   // Exchange authorization code for tokens
   let tokenData: GoogleTokenResponse;

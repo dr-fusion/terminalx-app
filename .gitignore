@@ -45,3 +45,4 @@ next-env.d.ts
 .terminalx-secret
 /data/
 .revoked-tokens.json
+.gstack/

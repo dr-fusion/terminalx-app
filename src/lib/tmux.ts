@@ -12,9 +12,7 @@ const TMUX_BIN = "tmux";
 function sanitizeSessionName(name: string): string {
   // tmux session names: alphanumeric, underscore, hyphen, dot
   if (!/^[a-zA-Z0-9_.\-]+$/.test(name)) {
-    throw new Error(
-      "Invalid session name: only alphanumeric, underscore, hyphen, and dot allowed"
-    );
+    throw new Error("Invalid session name: only alphanumeric, underscore, hyphen, and dot allowed");
   }
   if (name.length > 128) {
     throw new Error("Session name too long (max 128 characters)");
@@ -39,7 +37,7 @@ export function listSessions(): TmuxSession[] {
       .split("\n")
       .filter((line) => line.length > 0)
       .map((line) => {
-        const [name, windows, attached, created] = line.split("\t");
+        const [name = "", windows = "0", attached = "0", created = "0"] = line.split("\t");
         return {
           name,
           windows: parseInt(windows, 10),
@@ -62,9 +60,16 @@ export function listSessions(): TmuxSession[] {
   }
 }
 
-export function createSession(name: string): void {
+export function createSession(name: string, command?: string, cwd?: string): void {
   const safeName = sanitizeSessionName(name);
-  execFileSync(TMUX_BIN, ["new-session", "-d", "-s", safeName], {
+  const args = ["new-session", "-d", "-s", safeName];
+  if (cwd) {
+    args.push("-c", cwd);
+  }
+  if (command) {
+    args.push(command);
+  }
+  execFileSync(TMUX_BIN, args, {
     encoding: "utf-8",
     timeout: 5000,
   });

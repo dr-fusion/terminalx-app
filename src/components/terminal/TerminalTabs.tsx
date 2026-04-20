@@ -16,13 +16,7 @@ interface TerminalTabsProps {
   onNew: () => void;
 }
 
-export function TerminalTabs({
-  tabs,
-  activeTab,
-  onSelect,
-  onClose,
-  onNew,
-}: TerminalTabsProps) {
+export function TerminalTabs({ tabs, activeTab, onSelect, onClose, onNew }: TerminalTabsProps) {
   return (
     <div className="flex items-center h-9 bg-[#151820] border-b border-[#2A2D3A] overflow-x-auto">
       <div className="flex items-center min-w-0 flex-1">
@@ -64,6 +58,7 @@ export function TerminalTabs({
         className="flex items-center justify-center w-9 h-9 text-[#6B7280]
           hover:text-[#E4E4E7] hover:bg-[#1C1F2B] transition-colors shrink-0"
         title="New terminal"
+        aria-label="New terminal"
       >
         <Plus size={16} />
       </button>

@@ -1,7 +1,9 @@
 "use client";
 
 import { useState, useEffect, useRef, useCallback } from "react";
-import { Search, Pause, Play } from "lucide-react";
+import { Search } from "lucide-react";
+import { Terminal, type TerminalHandle } from "@wterm/react";
+import "@wterm/react/css";
 import { useWebSocket } from "@/hooks/useWebSocket";
 
 interface LogFile {
@@ -9,15 +11,16 @@ interface LogFile {
   path: string;
 }
 
+const CLEAR = "\x1b[2J\x1b[3J\x1b[H";
+
 export function LogViewer() {
   const [logFiles, setLogFiles] = useState<LogFile[]>([]);
   const [selectedLog, setSelectedLog] = useState<LogFile | null>(null);
-  const [lines, setLines] = useState<string[]>([]);
   const [filter, setFilter] = useState("");
-  const [autoScroll, setAutoScroll] = useState(true);
-  const scrollRef = useRef<HTMLDivElement>(null);
+  const termRef = useRef<TerminalHandle>(null);
+  const linesRef = useRef<string[]>([]);
+  const [lineCount, setLineCount] = useState(0);
 
-  // Fetch available log files
   useEffect(() => {
     async function fetchLogs() {
       try {
@@ -36,52 +39,60 @@ export function LogViewer() {
     ? `/ws/logs/${encodeURIComponent(selectedLog.path)}`
     : null;
 
-  const handleMessage = useCallback((data: string | ArrayBuffer) => {
-    const text = typeof data === "string" ? data : new TextDecoder().decode(data as ArrayBuffer);
-    setLines((prev) => {
-      const updated = [...prev, ...text.split("\n").filter(Boolean)];
-      // Cap at 5000 lines
-      return updated.length > 5000 ? updated.slice(-5000) : updated;
-    });
-  }, []);
+  const passesFilter = useCallback(
+    (line: string) => {
+      if (!filter) return true;
+      return line.toLowerCase().includes(filter.toLowerCase());
+    },
+    [filter]
+  );
+
+  const handleMessage = useCallback(
+    (data: string | ArrayBuffer) => {
+      const text =
+        typeof data === "string"
+          ? data
+          : new TextDecoder().decode(data as ArrayBuffer);
+      const incoming = text.split("\n").filter((l) => l.length > 0);
+      if (incoming.length === 0) return;
+      linesRef.current.push(...incoming);
+      if (linesRef.current.length > 5000) {
+        linesRef.current.splice(0, linesRef.current.length - 5000);
+      }
+      setLineCount(linesRef.current.length);
+      const term = termRef.current;
+      if (!term) return;
+      const matched = incoming.filter(passesFilter);
+      if (matched.length > 0) {
+        term.write(matched.join("\r\n") + "\r\n");
+      }
+    },
+    [passesFilter]
+  );
 
   const { readyState } = useWebSocket(wsUrl, {
     onMessage: handleMessage,
   });
 
-  // Clear lines when switching logs
   useEffect(() => {
-    setLines([]);
+    linesRef.current = [];
+    setLineCount(0);
+    termRef.current?.write(CLEAR);
   }, [selectedLog]);
 
-  // Auto-scroll to bottom
   useEffect(() => {
-    if (autoScroll && scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    const term = termRef.current;
+    if (!term) return;
+    term.write(CLEAR);
+    const filtered = linesRef.current.filter(passesFilter);
+    if (filtered.length > 0) {
+      term.write(filtered.join("\r\n") + "\r\n");
     }
-  }, [lines, autoScroll]);
-
-  const filteredLines = filter
-    ? lines.filter((line) =>
-        line.toLowerCase().includes(filter.toLowerCase())
-      )
-    : lines;
-
-  const colorizeLevel = (line: string): string => {
-    const lower = line.toLowerCase();
-    if (lower.includes("error") || lower.includes("err"))
-      return "#F87171";
-    if (lower.includes("warn") || lower.includes("warning"))
-      return "#FBBF24";
-    if (lower.includes("info")) return "#60A5FA";
-    return "#E4E4E7";
-  };
+  }, [passesFilter]);
 
   return (
     <div className="flex flex-col h-full text-[13px] font-sans">
-      {/* Controls */}
       <div className="flex flex-col gap-1.5 px-2 py-2 border-b border-[#2A2D3A]">
-        {/* Log file selector */}
         <select
           value={selectedLog?.path ?? ""}
           onChange={(e) => {
@@ -99,7 +110,6 @@ export function LogViewer() {
           ))}
         </select>
 
-        {/* Search + auto-scroll */}
         <div className="flex items-center gap-1.5">
           <div className="flex items-center flex-1 gap-1 bg-[#1C1F2B] border border-[#2A2D3A] rounded px-2">
             <Search size={12} className="text-[#6B7280] shrink-0" />
@@ -107,26 +117,14 @@ export function LogViewer() {
               type="text"
               value={filter}
               onChange={(e) => setFilter(e.target.value)}
-              placeholder="Filter logs..."
+              placeholder="Filter lines (or use Ctrl+F in page)…"
               className="flex-1 bg-transparent text-[#E4E4E7] text-[12px] py-1
                 outline-none placeholder:text-[#6B7280]"
             />
           </div>
-          <button
-            onClick={() => setAutoScroll(!autoScroll)}
-            className={`p-1.5 rounded transition-colors ${
-              autoScroll
-                ? "bg-[#3B82F6]/20 text-[#3B82F6]"
-                : "text-[#6B7280] hover:text-[#E4E4E7]"
-            }`}
-            title={autoScroll ? "Pause auto-scroll" : "Resume auto-scroll"}
-          >
-            {autoScroll ? <Pause size={12} /> : <Play size={12} />}
-          </button>
         </div>
       </div>
 
-      {/* Status indicator */}
       {selectedLog && (
         <div className="flex items-center gap-1.5 px-2 py-1 border-b border-[#2A2D3A] text-[11px]">
           <span
@@ -142,40 +140,27 @@ export function LogViewer() {
           />
           <span className="text-[#6B7280]">
             {readyState === "open"
-              ? "Streaming"
+              ? "Streaming · ANSI rendered"
               : readyState === "connecting"
                 ? "Connecting..."
                 : "Disconnected"}
           </span>
-          <span className="text-[#6B7280] ml-auto">
-            {filteredLines.length} lines
-          </span>
+          <span className="text-[#6B7280] ml-auto">{lineCount} lines</span>
         </div>
       )}
 
-      {/* Log output */}
-      <div
-        ref={scrollRef}
-        className="flex-1 overflow-y-auto overflow-x-hidden font-mono text-[12px] leading-[1.6]"
-      >
+      <div className="flex-1 overflow-hidden bg-[#0D0F12]">
         {!selectedLog ? (
           <div className="px-3 py-4 text-[#6B7280] text-center font-sans">
             Select a log file to start tailing
           </div>
-        ) : filteredLines.length === 0 ? (
-          <div className="px-3 py-4 text-[#6B7280] text-center font-sans">
-            {lines.length === 0 ? "Waiting for log output..." : "No matching lines"}
-          </div>
         ) : (
-          filteredLines.map((line, i) => (
-            <div
-              key={i}
-              className="px-2 py-px hover:bg-[#1C1F2B] transition-colors whitespace-pre-wrap break-all"
-              style={{ color: colorizeLevel(line) }}
-            >
-              {line}
-            </div>
-          ))
+          <Terminal
+            ref={termRef}
+            autoResize
+            wasmUrl="/wterm.wasm"
+            className="h-full w-full"
+          />
         )}
       </div>
     </div>

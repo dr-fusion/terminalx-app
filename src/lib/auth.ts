@@ -3,6 +3,7 @@ import { hash, compare } from "bcryptjs";
 import * as fs from "fs";
 import * as path from "path";
 import * as crypto from "crypto";
+import { ensureSecureDir } from "./secure-dir";
 
 // ── JWT Secret ──────────────────────────────────────────────────────────────
 
@@ -33,9 +34,7 @@ export function getJwtSecret(): Uint8Array {
   }
 
   const generated = crypto.randomBytes(48).toString("base64");
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
-  }
+  ensureSecureDir(DATA_DIR);
   fs.writeFileSync(SECRET_FILE, generated, { mode: 0o600 });
   cachedSecret = new TextEncoder().encode(generated);
   return cachedSecret;
@@ -60,10 +59,7 @@ function loadRevokedTokens(): RevokedEntry[] {
 }
 
 function saveRevokedTokens(entries: RevokedEntry[]): void {
-  const dir = path.dirname(REVOKED_FILE);
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  }
+  ensureSecureDir(path.dirname(REVOKED_FILE));
   const tmpFile = REVOKED_FILE + ".tmp";
   fs.writeFileSync(tmpFile, JSON.stringify(entries), { mode: 0o600 });
   fs.renameSync(tmpFile, REVOKED_FILE);
@@ -90,7 +86,7 @@ export function revokeToken(token: string): void {
     // Extract JTI and exp without verifying signature (token may be about to expire)
     const parts = token.split(".");
     if (parts.length !== 3) return;
-    const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString());
+    const payload = JSON.parse(Buffer.from(parts[1]!, "base64url").toString());
     const jti = payload.jti as string;
     const exp = (payload.exp as number) || Math.floor(Date.now() / 1000) + 86400;
     if (!jti) return;
@@ -109,7 +105,7 @@ function isTokenRevoked(token: string): boolean {
   try {
     const parts = token.split(".");
     if (parts.length !== 3) return false;
-    const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString());
+    const payload = JSON.parse(Buffer.from(parts[1]!, "base64url").toString());
     const jti = payload.jti as string;
     if (!jti) return false;
     return loadRevokedTokens().some((e) => e.jti === jti);
@@ -177,18 +173,13 @@ export async function hashPassword(password: string): Promise<string> {
   return hash(password, 12);
 }
 
-export async function comparePassword(
-  password: string,
-  passwordHash: string
-): Promise<boolean> {
+export async function comparePassword(password: string, passwordHash: string): Promise<boolean> {
   return compare(password, passwordHash);
 }
 
 // ── Cookie Parsing ──────────────────────────────────────────────────────────
 
-export function parseCookies(
-  cookieHeader: string | undefined | null
-): Record<string, string> {
+export function parseCookies(cookieHeader: string | undefined | null): Record<string, string> {
   if (!cookieHeader) return {};
   const cookies: Record<string, string> = {};
   for (const part of cookieHeader.split("; ")) {

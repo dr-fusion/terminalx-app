@@ -74,7 +74,7 @@ describe("JWT sign and verify", () => {
   it("includes JTI claim for revocation", async () => {
     const token = await signJwt({ userId: "single-user", username: "user", role: "user" });
     const parts = token.split(".");
-    const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString());
+    const payload = JSON.parse(Buffer.from(parts[1]!, "base64url").toString());
     expect(payload.jti).toBeTruthy();
     expect(typeof payload.jti).toBe("string");
   });
@@ -82,7 +82,7 @@ describe("JWT sign and verify", () => {
   it("sets 24h expiry", async () => {
     const token = await signJwt({ userId: "single-user", username: "user", role: "user" });
     const parts = token.split(".");
-    const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString());
+    const payload = JSON.parse(Buffer.from(parts[1]!, "base64url").toString());
     const expiry = payload.exp - payload.iat;
     expect(expiry).toBe(86400); // 24 hours in seconds
   });

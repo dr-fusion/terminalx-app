@@ -10,9 +10,7 @@ const MAX_FILE_SIZE = 100 * 1024 * 1024; // 100MB
 function getUploadDir(username: string | null): string {
   const root = process.env.TERMINUS_ROOT || process.env.HOME || "/";
   // Per-user upload directories in multi-user mode
-  const uploadDir = username
-    ? path.join(root, "uploads", username)
-    : path.join(root, "uploads");
+  const uploadDir = username ? path.join(root, "uploads", username) : path.join(root, "uploads");
   if (!fs.existsSync(uploadDir)) {
     fs.mkdirSync(uploadDir, { recursive: true, mode: 0o755 });
   }
@@ -22,26 +20,17 @@ function getUploadDir(username: string | null): string {
 export async function POST(req: NextRequest) {
   const readOnly = process.env.TERMINUS_READ_ONLY === "true";
   if (readOnly) {
-    return NextResponse.json(
-      { error: "Uploads disabled in read-only mode" },
-      { status: 403 }
-    );
+    return NextResponse.json({ error: "Uploads disabled in read-only mode" }, { status: 403 });
   }
 
   // CSRF protection: require custom header that CORS preflight would block
   if (!req.headers.get("x-requested-with")) {
-    return NextResponse.json(
-      { error: "Missing required header" },
-      { status: 403 }
-    );
+    return NextResponse.json({ error: "Missing required header" }, { status: 403 });
   }
 
   const contentType = req.headers.get("content-type") || "";
   if (!contentType.includes("multipart/form-data")) {
-    return NextResponse.json(
-      { error: "Expected multipart/form-data" },
-      { status: 400 }
-    );
+    return NextResponse.json({ error: "Expected multipart/form-data" }, { status: 400 });
   }
 
   try {
@@ -49,10 +38,7 @@ export async function POST(req: NextRequest) {
     const file = formData.get("file") as File | null;
 
     if (!file) {
-      return NextResponse.json(
-        { error: "No file provided" },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: "No file provided" }, { status: 400 });
     }
 
     if (file.size > MAX_FILE_SIZE) {
@@ -90,7 +76,8 @@ export async function POST(req: NextRequest) {
       path: filePath,
       size: file.size,
     });
-  } catch {
+  } catch (err) {
+    console.error("[api/upload POST]", err);
     return NextResponse.json({ error: "Upload failed" }, { status: 500 });
   }
 }

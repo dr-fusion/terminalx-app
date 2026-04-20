@@ -43,9 +43,7 @@ export function useWebSocket(
   } = options;
 
   const [readyState, setReadyState] = useState<ReadyState>("closed");
-  const [lastMessage, setLastMessage] = useState<string | ArrayBuffer | null>(
-    null
-  );
+  const [lastMessage, setLastMessage] = useState<string | ArrayBuffer | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectAttemptRef = useRef(0);
@@ -144,6 +142,7 @@ export function useWebSocket(
 
   useEffect(() => {
     intentionalCloseRef.current = false;
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- connect() intentionally opens WS and may setState(CONNECTING) on mount
     connect();
     return () => {
       disconnect();

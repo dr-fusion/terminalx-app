@@ -3,8 +3,9 @@
 import { useState } from "react";
 import { FileBrowser } from "@/components/files/FileBrowser";
 import { LogViewer } from "@/components/logs/LogViewer";
+import { SnippetsPanel } from "@/components/snippets/SnippetsPanel";
 
-type RightPanelTab = "files" | "logs";
+type RightPanelTab = "files" | "logs" | "snippets";
 
 interface RightPanelProps {
   defaultTab?: RightPanelTab;
@@ -17,7 +18,7 @@ export function RightPanel({ defaultTab = "files" }: RightPanelProps) {
     <div className="flex flex-col h-full bg-[#151820]">
       {/* Tab switcher */}
       <div className="flex items-center h-9 border-b border-[#2A2D3A]">
-        {(["files", "logs"] as const).map((tab) => (
+        {(["files", "logs", "snippets"] as const).map((tab) => (
           <button
             key={tab}
             onClick={() => setActiveTab(tab)}
@@ -39,7 +40,13 @@ export function RightPanel({ defaultTab = "files" }: RightPanelProps) {
 
       {/* Panel content */}
       <div className="flex-1 overflow-hidden">
-        {activeTab === "files" ? <FileBrowser /> : <LogViewer />}
+        {activeTab === "files" ? (
+          <FileBrowser />
+        ) : activeTab === "logs" ? (
+          <LogViewer />
+        ) : (
+          <SnippetsPanel />
+        )}
       </div>
     </div>
   );

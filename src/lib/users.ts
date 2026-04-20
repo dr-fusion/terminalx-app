@@ -2,6 +2,7 @@ import * as fs from "fs";
 import * as path from "path";
 import { hashPassword } from "./auth";
 import { getAuthMode, getAdminUsername, getAdminPassword } from "./auth-config";
+import { ensureSecureDir } from "./secure-dir";
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
@@ -22,9 +23,7 @@ const DATA_DIR = path.join(process.cwd(), "data");
 const USERS_FILE = path.join(DATA_DIR, "users.json");
 
 function ensureDataDir(): void {
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
-  }
+  ensureSecureDir(DATA_DIR);
 }
 
 // ── In-process Write Lock ───────────────────────────────────────────────────
@@ -136,10 +135,7 @@ export async function deleteUser(id: string): Promise<void> {
   });
 }
 
-export async function updateUserRole(
-  id: string,
-  role: "admin" | "user"
-): Promise<SafeUser> {
+export async function updateUserRole(id: string, role: "admin" | "user"): Promise<SafeUser> {
   return withLock(async () => {
     const users = getUsers();
     const user = users.find((u) => u.id === id);
@@ -177,9 +173,7 @@ export async function ensureDefaultAdmin(): Promise<void> {
   const username = getAdminUsername();
   const password = getAdminPassword();
   if (!password) {
-    console.warn(
-      "[auth] Local mode: set TERMINALX_ADMIN_PASSWORD to auto-create admin user"
-    );
+    console.warn("[auth] Local mode: set TERMINALX_ADMIN_PASSWORD to auto-create admin user");
     return;
   }
 

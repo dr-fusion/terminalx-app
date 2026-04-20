@@ -4,48 +4,7 @@ import { signJwt, comparePassword } from "@/lib/auth";
 import { getAuthMode, getSinglePassword } from "@/lib/auth-config";
 import { getUserByUsername, updateLastLogin, ensureDefaultAdmin } from "@/lib/users";
 import { audit } from "@/lib/audit-log";
-
-// ── Rate Limiting (per-username, bounded sliding window) ─────────────────────
-
-const rateLimitMap = new Map<string, number[]>();
-const RATE_LIMIT_WINDOW_MS = 60_000;
-const RATE_LIMIT_MAX = 5;
-const RATE_LIMIT_MAX_KEYS = 10_000; // Bound memory: max tracked usernames
-
-function isRateLimited(key: string): boolean {
-  const now = Date.now();
-  const attempts = rateLimitMap.get(key) || [];
-  const recent = attempts.filter((t) => now - t < RATE_LIMIT_WINDOW_MS);
-
-  if (recent.length >= RATE_LIMIT_MAX) {
-    rateLimitMap.set(key, recent);
-    return true;
-  }
-
-  // Bound the map size to prevent memory exhaustion from many unique keys
-  if (!rateLimitMap.has(key) && rateLimitMap.size >= RATE_LIMIT_MAX_KEYS) {
-    // Evict oldest entry
-    const oldestKey = rateLimitMap.keys().next().value;
-    if (oldestKey !== undefined) rateLimitMap.delete(oldestKey);
-  }
-
-  recent.push(now);
-  rateLimitMap.set(key, recent);
-  return false;
-}
-
-// Clean up stale entries every 5 minutes
-setInterval(() => {
-  const now = Date.now();
-  for (const [key, attempts] of rateLimitMap) {
-    const recent = attempts.filter((t) => now - t < RATE_LIMIT_WINDOW_MS);
-    if (recent.length === 0) {
-      rateLimitMap.delete(key);
-    } else {
-      rateLimitMap.set(key, recent);
-    }
-  }
-}, 300_000);
+import { isRateLimited } from "@/lib/rate-limit";
 
 // ── Cookie helper ───────────────────────────────────────────────────────────
 
@@ -69,10 +28,7 @@ export async function POST(req: NextRequest) {
   const authMode = getAuthMode();
 
   if (authMode === "none") {
-    return NextResponse.json(
-      { error: "Authentication is disabled" },
-      { status: 400 }
-    );
+    return NextResponse.json({ error: "Authentication is disabled" }, { status: 400 });
   }
 
   let body: { username?: string; password?: string };
@@ -84,10 +40,7 @@ export async function POST(req: NextRequest) {
 
   const { password } = body;
   if (!password || typeof password !== "string") {
-    return NextResponse.json(
-      { error: "Password is required" },
-      { status: 400 }
-    );
+    return NextResponse.json({ error: "Password is required" }, { status: 400 });
   }
 
   // Rate limit per username to prevent brute force without locking out all users.
@@ -115,10 +68,7 @@ export async function POST(req: NextRequest) {
     const b = Buffer.from(expected);
     if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
       audit("login_failed", { detail: "password mode: invalid password" });
-      return NextResponse.json(
-        { error: "Invalid password" },
-        { status: 401 }
-      );
+      return NextResponse.json({ error: "Invalid password" }, { status: 401 });
     }
 
     const token = await signJwt({
@@ -137,10 +87,7 @@ export async function POST(req: NextRequest) {
   if (authMode === "local") {
     const { username } = body;
     if (!username || typeof username !== "string") {
-      return NextResponse.json(
-        { error: "Username is required" },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: "Username is required" }, { status: 400 });
     }
 
     // Ensure default admin exists on first login attempt
@@ -149,19 +96,13 @@ export async function POST(req: NextRequest) {
     const user = getUserByUsername(username);
     if (!user) {
       audit("login_failed", { username, detail: "unknown user" });
-      return NextResponse.json(
-        { error: "Invalid credentials" },
-        { status: 401 }
-      );
+      return NextResponse.json({ error: "Invalid credentials" }, { status: 401 });
     }
 
     const valid = await comparePassword(password, user.passwordHash);
     if (!valid) {
       audit("login_failed", { username, detail: "wrong password" });
-      return NextResponse.json(
-        { error: "Invalid credentials" },
-        { status: 401 }
-      );
+      return NextResponse.json({ error: "Invalid credentials" }, { status: 401 });
     }
 
     await updateLastLogin(user.id);

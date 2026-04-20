@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { jwtVerify } from "jose";
+import { audit } from "@/lib/audit-log";
 
 // Next.js edge middleware cannot use Node.js APIs, so we inline the secret
 // logic here (reads env var only; file-based fallback is server-side only).
@@ -18,7 +19,15 @@ function getAuthModeEdge(): "none" | "password" | "local" | "google" {
   return "none";
 }
 
-const PUBLIC_PATHS = ["/login", "/api/auth/", "/api/auth/google", "/api/auth/google/callback", "/_next/", "/favicon.ico"];
+const PUBLIC_PATHS = [
+  "/login",
+  "/api/auth/",
+  "/api/auth/google",
+  "/api/auth/google/callback",
+  "/api/health",
+  "/_next/",
+  "/favicon.ico",
+];
 
 /**
  * Strip user identity headers to prevent spoofing from untrusted clients.
@@ -71,8 +80,9 @@ export async function middleware(req: NextRequest) {
     response.headers.set("x-user-role", (payload.role as string) || "");
     response.headers.set("x-username", (payload.username as string) || "");
     return response;
-  } catch {
-    // Invalid or expired token
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : "unknown";
+    audit("jwt_verify_failed", { detail: `${pathname} :: ${reason}` });
     const response = NextResponse.redirect(new URL("/login", base));
     response.cookies.delete("terminalx-session");
     return stripUserHeaders(response);

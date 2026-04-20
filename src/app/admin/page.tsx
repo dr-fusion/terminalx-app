@@ -159,12 +159,11 @@ export default function AdminPage() {
               href="/"
               className="p-1.5 text-[#6B7280] hover:text-[#E4E4E7] transition-colors"
               title="Back to workspace"
+              aria-label="Back to workspace"
             >
               <ArrowLeft size={18} />
             </Link>
-            <h1 className="text-xl font-semibold text-[#E4E4E7]">
-              User Management
-            </h1>
+            <h1 className="text-xl font-semibold text-[#E4E4E7]">User Management</h1>
           </div>
 
           <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
@@ -178,9 +177,7 @@ export default function AdminPage() {
             />
             <DialogContent className="border-[#2A2D3A] bg-[#151820]">
               <DialogHeader>
-                <DialogTitle className="text-[#E4E4E7]">
-                  Create New User
-                </DialogTitle>
+                <DialogTitle className="text-[#E4E4E7]">Create New User</DialogTitle>
               </DialogHeader>
               <div className="flex flex-col gap-4 pt-2">
                 <div className="flex flex-col gap-2">
@@ -220,9 +217,7 @@ export default function AdminPage() {
                     </SelectContent>
                   </Select>
                 </div>
-                {createError && (
-                  <p className="text-sm text-[#EF4444]">{createError}</p>
-                )}
+                {createError && <p className="text-sm text-[#EF4444]">{createError}</p>}
                 <Button
                   onClick={handleCreateUser}
                   disabled={createLoading}
@@ -249,9 +244,7 @@ export default function AdminPage() {
               <Loader2 className="h-5 w-5 animate-spin text-[#6B7280]" />
             </div>
           ) : users.length === 0 ? (
-            <div className="py-12 text-center text-[#6B7280]">
-              No users found
-            </div>
+            <div className="py-12 text-center text-[#6B7280]">No users found</div>
           ) : (
             <Table>
               <TableHeader>
@@ -259,20 +252,13 @@ export default function AdminPage() {
                   <TableHead className="text-[#6B7280]">Username</TableHead>
                   <TableHead className="text-[#6B7280]">Role</TableHead>
                   <TableHead className="text-[#6B7280]">Created</TableHead>
-                  <TableHead className="text-right text-[#6B7280]">
-                    Actions
-                  </TableHead>
+                  <TableHead className="text-right text-[#6B7280]">Actions</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
                 {users.map((u) => (
-                  <TableRow
-                    key={u.username}
-                    className="border-[#2A2D3A] hover:bg-[#1C1F2B]"
-                  >
-                    <TableCell className="text-[#E4E4E7] font-medium">
-                      {u.username}
-                    </TableCell>
+                  <TableRow key={u.username} className="border-[#2A2D3A] hover:bg-[#1C1F2B]">
+                    <TableCell className="text-[#E4E4E7] font-medium">{u.username}</TableCell>
                     <TableCell>
                       <Badge
                         variant="secondary"
@@ -286,9 +272,7 @@ export default function AdminPage() {
                       </Badge>
                     </TableCell>
                     <TableCell className="text-[#6B7280]">
-                      {u.createdAt
-                        ? new Date(u.createdAt).toLocaleDateString()
-                        : "-"}
+                      {u.createdAt ? new Date(u.createdAt).toLocaleDateString() : "-"}
                     </TableCell>
                     <TableCell className="text-right">
                       <DropdownMenu>
@@ -299,16 +283,10 @@ export default function AdminPage() {
                             </button>
                           }
                         />
-                        <DropdownMenuContent
-                          align="end"
-                          className="border-[#2A2D3A] bg-[#151820]"
-                        >
+                        <DropdownMenuContent align="end" className="border-[#2A2D3A] bg-[#151820]">
                           <DropdownMenuItem
                             onClick={() =>
-                              handleChangeRole(
-                                u.username,
-                                u.role === "admin" ? "user" : "admin"
-                              )
+                              handleChangeRole(u.username, u.role === "admin" ? "user" : "admin")
                             }
                           >
                             Change to {u.role === "admin" ? "User" : "Admin"}
