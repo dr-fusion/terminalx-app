@@ -35,6 +35,19 @@ export function TerminalViewXterm({
   const dragCounterRef = useRef(0);
   const connectWsRef = useRef<(() => void) | null>(null);
 
+  // Keep callbacks in refs so connectWs doesn't change identity when the
+  // parent re-renders. Otherwise the terminal + WebSocket rebuild on every
+  // tab/state change upstream, which can briefly leave two WebSockets open
+  // on mobile and doubles keystrokes through both PTYs.
+  const onDisconnectRef = useRef(onDisconnect);
+  const onReconnectRef = useRef(onReconnect);
+  const onSessionEndedRef = useRef(onSessionEnded);
+  useEffect(() => {
+    onDisconnectRef.current = onDisconnect;
+    onReconnectRef.current = onReconnect;
+    onSessionEndedRef.current = onSessionEnded;
+  }, [onDisconnect, onReconnect, onSessionEnded]);
+
   const connectWs = useCallback(() => {
     if (!terminalRef.current) return;
 
@@ -47,7 +60,7 @@ export function TerminalViewXterm({
 
     ws.onopen = () => {
       reconnectAttemptRef.current = 0;
-      onReconnect?.();
+      onReconnectRef.current?.();
 
       // Send terminal dimensions
       const term = terminalRef.current;
@@ -81,7 +94,7 @@ export function TerminalViewXterm({
               // Suppress the auto-reconnect loop so we don't silently spawn
               // a new tmux session with the same name.
               intentionalCloseRef.current = true;
-              onSessionEnded?.(sessionId);
+              onSessionEndedRef.current?.(sessionId);
               return;
             }
           } catch {
@@ -93,7 +106,7 @@ export function TerminalViewXterm({
     };
 
     ws.onclose = () => {
-      onDisconnect?.();
+      onDisconnectRef.current?.();
 
       if (!intentionalCloseRef.current) {
         const attempt = reconnectAttemptRef.current;
@@ -109,7 +122,7 @@ export function TerminalViewXterm({
     ws.onerror = () => {
       ws.close();
     };
-  }, [sessionId, onDisconnect, onReconnect, onSessionEnded]);
+  }, [sessionId]);
 
   useEffect(() => {
     connectWsRef.current = connectWs;
@@ -165,21 +178,14 @@ export function TerminalViewXterm({
     terminalRef.current = terminal;
     fitAddonRef.current = fitAddon;
 
-    // Send input to WebSocket
+    // Send input to WebSocket. We do NOT also listen to terminal.onBinary()
+    // — on some mobile IMEs (Android Gboard in particular) both onData and
+    // onBinary fire for the same keystroke, which doubles every character
+    // through the PTY. onData already covers regular typing and escape
+    // sequences; binary paste is an edge case we intentionally don't handle.
     terminal.onData((data) => {
       if (wsRef.current?.readyState === WebSocket.OPEN) {
         wsRef.current.send(data);
-      }
-    });
-
-    // Send binary input to WebSocket
-    terminal.onBinary((data) => {
-      if (wsRef.current?.readyState === WebSocket.OPEN) {
-        const buffer = new Uint8Array(data.length);
-        for (let i = 0; i < data.length; i++) {
-          buffer[i] = data.charCodeAt(i) & 255;
-        }
-        wsRef.current.send(buffer);
       }
     });
 

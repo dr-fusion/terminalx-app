@@ -268,6 +268,23 @@
   z-index: 1;
 }
 
+/* Hide scrollbar utility — used on the top-nav tabs so the mobile tab row
+   can overflow-scroll without a visible bar stealing gesture focus. */
+.no-scrollbar {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+  overscroll-behavior-x: contain;
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+/* Keep nested scroll containers from rubber-banding the outer document
+   (especially on iOS Safari when you scroll past the edge of a pane). */
+.contain-scroll {
+  overscroll-behavior: contain;
+}
+
 /* ============================================================
    xterm.js overrides — dark phosphor well, phosphor scrollbar
    ============================================================ */

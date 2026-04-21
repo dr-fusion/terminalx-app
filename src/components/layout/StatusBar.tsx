@@ -29,7 +29,7 @@ export function StatusBar({ hostname, session, tabCount }: StatusBarProps) {
         text-[11px] text-[#a8b3a6] shrink-0 select-none"
       style={{ fontVariantNumeric: "tabular-nums" }}
     >
-      <span className="flex items-center gap-1.5">
+      <span className="flex items-center gap-1.5 shrink-0">
         <span
           className="w-2 h-2 rounded-full bg-[#00ff88] shrink-0"
           style={{ boxShadow: "0 0 6px #00ff88" }}
@@ -38,14 +38,14 @@ export function StatusBar({ hostname, session, tabCount }: StatusBarProps) {
           {hostname}
         </span>
       </span>
-      {SEP}
-      <span className="text-[#e6f0e4] truncate">{session ?? "no session"}</span>
-      {SEP}
-      <span className="text-[#6b7569]">
+      <span className="hidden sm:inline">{SEP}</span>
+      <span className="text-[#e6f0e4] truncate min-w-0 flex-shrink">{session ?? "no session"}</span>
+      <span className="hidden sm:inline">{SEP}</span>
+      <span className="text-[#6b7569] whitespace-nowrap shrink-0 hidden sm:inline">
         {tabCount} {tabCount === 1 ? "pane" : "panes"}
       </span>
       <span className="flex-1" />
-      <span className="text-[#6b7569]">
+      <span className="text-[#6b7569] hidden md:inline shrink-0">
         <kbd className="px-1 py-0.5 bg-[#0f1117] border border-[#252933] border-b-2 rounded-[2px] text-[10px] text-[#e6f0e4]">
           ⌃
         </kbd>
@@ -54,8 +54,8 @@ export function StatusBar({ hostname, session, tabCount }: StatusBarProps) {
         </kbd>
         <span className="ml-1.5">prefix</span>
       </span>
-      {SEP}
-      <span>{time}</span>
+      <span className="hidden md:inline">{SEP}</span>
+      <span className="shrink-0">{time}</span>
     </div>
   );
 }

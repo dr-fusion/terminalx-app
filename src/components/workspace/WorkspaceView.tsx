@@ -79,7 +79,7 @@ export function WorkspaceView({ activeSession }: WorkspaceViewProps) {
 
   return (
     <div className="h-full flex flex-col bg-[#0a0b10]">
-      <div className="flex items-center h-8 bg-[#0f1117] border-b border-[#1a1d24] overflow-x-auto shrink-0">
+      <div className="flex items-center h-8 bg-[#0f1117] border-b border-[#1a1d24] overflow-x-auto no-scrollbar shrink-0">
         <div className="flex items-center min-w-0 flex-1">
           {tabs.map((t) => {
             const active = t === activeSession;

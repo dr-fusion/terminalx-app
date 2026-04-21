@@ -71,8 +71,8 @@ export function SettingsView() {
     : "…";
 
   return (
-    <div className="h-full overflow-y-auto">
-      <div className="max-w-[720px] mx-auto px-6 py-8">
+    <div className="h-full overflow-y-auto contain-scroll">
+      <div className="max-w-[720px] mx-auto px-4 sm:px-6 py-6 sm:py-8">
         <div className="mb-5">
           <h1 className="text-[26px] font-bold tracking-tight text-[#e6f0e4]">settings</h1>
           <p className="text-[11px] text-[#6b7569] mt-1">

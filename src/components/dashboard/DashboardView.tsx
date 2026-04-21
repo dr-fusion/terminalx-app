@@ -16,9 +16,9 @@ function slugify(raw: string): string {
 }
 
 function KindIcon({ kind }: { kind?: SessionKind }) {
-  if (kind === "claude") return <Sparkles size={14} className="text-[#d58fff]" />;
-  if (kind === "codex") return <Bot size={14} className="text-[#5ccfe6]" />;
-  return <Terminal size={14} className="text-[#6b7569]" />;
+  if (kind === "claude") return <Sparkles size={14} className="text-[#d58fff] shrink-0" />;
+  if (kind === "codex") return <Bot size={14} className="text-[#5ccfe6] shrink-0" />;
+  return <Terminal size={14} className="text-[#6b7569] shrink-0" />;
 }
 
 function SessionRow({
@@ -33,21 +33,22 @@ function SessionRow({
   return (
     <div
       onClick={() => onAttach(s)}
-      className="grid items-center gap-4 px-4 py-3 bg-[#0f1117] border border-[#1a1d24]
+      className="flex items-center gap-3 sm:gap-4 px-3 sm:px-4 py-3 bg-[#0f1117] border border-[#1a1d24]
         rounded cursor-pointer hover:border-[#363b47] transition-colors group"
-      style={{ gridTemplateColumns: "auto 1fr auto auto auto" }}
     >
       <span
         className="w-2 h-2 rounded-full bg-[#00ff88] shrink-0"
         style={{ boxShadow: s.attached ? "0 0 6px #00ff88" : "none" }}
       />
-      <div className="min-w-0">
-        <div className="flex items-center gap-2">
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-2 min-w-0">
           <KindIcon kind={s.kind} />
-          <span className="text-[13px] font-medium text-[#e6f0e4] truncate">{s.name}</span>
+          <span className="flex-1 min-w-0 text-[13px] font-medium text-[#e6f0e4] truncate">
+            {s.name}
+          </span>
           {s.kind && s.kind !== "bash" && (
             <span
-              className={`px-1 py-0.5 text-[9px] uppercase tracking-wider rounded leading-none ${
+              className={`shrink-0 px-1 py-0.5 text-[9px] uppercase tracking-wider rounded leading-none hidden sm:inline ${
                 s.kind === "claude"
                   ? "bg-[#d58fff]/20 text-[#d58fff]"
                   : "bg-[#5ccfe6]/20 text-[#5ccfe6]"
@@ -57,17 +58,20 @@ function SessionRow({
             </span>
           )}
           {s.attached && (
-            <span className="px-1 py-0.5 text-[9px] uppercase tracking-wider rounded bg-[#00ff88]/20 text-[#00ff88] leading-none">
+            <span className="shrink-0 px-1 py-0.5 text-[9px] uppercase tracking-wider rounded bg-[#00ff88]/20 text-[#00ff88] leading-none hidden sm:inline">
               attached
             </span>
           )}
         </div>
-        <div className="text-[10px] text-[#6b7569] mt-1">
-          {s.windows} window{s.windows !== 1 ? "s" : ""} · created{" "}
-          {new Date(s.created).toLocaleString()}
+        <div className="text-[10px] text-[#6b7569] mt-1 truncate">
+          {s.windows} window{s.windows !== 1 ? "s" : ""} · {s.attached ? "live" : "idle"}
+          <span className="hidden sm:inline">
+            {" "}
+            · created {new Date(s.created).toLocaleString()}
+          </span>
         </div>
       </div>
-      <span className="text-[10px] text-[#6b7569] tabular-nums">
+      <span className="hidden sm:inline text-[10px] text-[#6b7569] tabular-nums shrink-0">
         {s.attached ? "live" : "idle"}
       </span>
       <button
@@ -75,14 +79,14 @@ function SessionRow({
           e.stopPropagation();
           onKill(s.name);
         }}
-        className="p-1.5 text-[#6b7569] opacity-0 group-hover:opacity-100 hover:text-[#ff5c5c] transition-all"
+        className="hidden sm:block p-1.5 text-[#6b7569] opacity-0 group-hover:opacity-100 hover:text-[#ff5c5c] transition-all shrink-0"
         title="kill session"
         aria-label={`kill session ${s.name}`}
       >
         <X size={14} />
       </button>
       <span
-        className="px-2.5 py-1 text-[10px] rounded border border-[#00cc6e] text-[#00ff88]
+        className="shrink-0 px-2.5 py-1 text-[10px] rounded border border-[#00cc6e] text-[#00ff88]
           bg-transparent group-hover:bg-[#00ff88]/10 transition-colors"
       >
         attach →
@@ -145,8 +149,8 @@ export function DashboardView() {
   }, []);
 
   return (
-    <div className="h-full overflow-y-auto">
-      <div className="max-w-[960px] mx-auto px-6 py-8">
+    <div className="h-full overflow-y-auto contain-scroll">
+      <div className="max-w-[960px] mx-auto px-4 sm:px-6 py-6 sm:py-8">
         <div className="flex items-baseline gap-4 mb-1">
           <h1 className="text-[26px] font-bold tracking-tight text-[#e6f0e4]">sessions</h1>
           <span className="text-[11px] text-[#6b7569]">
