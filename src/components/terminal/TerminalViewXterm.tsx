@@ -15,6 +15,7 @@ export function TerminalViewXterm({
   sessionId,
   onDisconnect,
   onReconnect,
+  onSessionEnded,
 }: TerminalViewProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const wrapperRef = useRef<HTMLDivElement>(null);
@@ -37,8 +38,7 @@ export function TerminalViewXterm({
   const connectWs = useCallback(() => {
     if (!terminalRef.current) return;
 
-    const protocol =
-      window.location.protocol === "https:" ? "wss:" : "ws:";
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
     const wsUrl = `${protocol}//${window.location.host}/ws/terminal/${encodeURIComponent(sessionId)}`;
 
     const ws = new WebSocket(wsUrl);
@@ -76,6 +76,14 @@ export function TerminalViewXterm({
             if (msg.type === "pty-id" || msg.type === "event") {
               return; // Skip control messages
             }
+            if (msg.type === "session-ended") {
+              // Shell exited / tmux session killed from inside the terminal.
+              // Suppress the auto-reconnect loop so we don't silently spawn
+              // a new tmux session with the same name.
+              intentionalCloseRef.current = true;
+              onSessionEnded?.(sessionId);
+              return;
+            }
           } catch {
             // Not JSON, write to terminal
           }
@@ -101,7 +109,7 @@ export function TerminalViewXterm({
     ws.onerror = () => {
       ws.close();
     };
-  }, [sessionId, onDisconnect, onReconnect]);
+  }, [sessionId, onDisconnect, onReconnect, onSessionEnded]);
 
   useEffect(() => {
     connectWsRef.current = connectWs;
@@ -118,28 +126,28 @@ export function TerminalViewXterm({
       cursorStyle: "block",
       allowProposedApi: true,
       theme: {
-        background: "#0D0F12",
-        foreground: "#E4E4E7",
-        cursor: "#3B82F6",
-        cursorAccent: "#0D0F12",
-        selectionBackground: "#3B82F640",
-        selectionForeground: "#E4E4E7",
-        black: "#1C1F2B",
-        red: "#EF4444",
-        green: "#22C55E",
-        yellow: "#EAB308",
-        blue: "#3B82F6",
-        magenta: "#A855F7",
-        cyan: "#06B6D4",
-        white: "#E4E4E7",
-        brightBlack: "#6B7280",
-        brightRed: "#F87171",
-        brightGreen: "#4ADE80",
-        brightYellow: "#FBBF24",
-        brightBlue: "#60A5FA",
-        brightMagenta: "#C084FC",
-        brightCyan: "#22D3EE",
-        brightWhite: "#FFFFFF",
+        background: "#07080c",
+        foreground: "#e6f0e4",
+        cursor: "#00ff88",
+        cursorAccent: "#05060a",
+        selectionBackground: "#002a17",
+        selectionForeground: "#4dffa8",
+        black: "#0a0b10",
+        red: "#ff5c5c",
+        green: "#00cc6e",
+        yellow: "#ffb454",
+        blue: "#7aa2ff",
+        magenta: "#d58fff",
+        cyan: "#5ccfe6",
+        white: "#c8d0c6",
+        brightBlack: "#3f4742",
+        brightRed: "#ff8080",
+        brightGreen: "#4dffa8",
+        brightYellow: "#ffd080",
+        brightBlue: "#a8c0ff",
+        brightMagenta: "#e6b3ff",
+        brightCyan: "#8fdff0",
+        brightWhite: "#e6f0e4",
       },
     });
 
@@ -370,21 +378,15 @@ export function TerminalViewXterm({
       onDragOver={handleDragOver}
       onDrop={handleDrop}
     >
-      <div
-        ref={containerRef}
-        className="h-full w-full"
-        style={{ backgroundColor: "#0D0F12" }}
-      />
+      <div ref={containerRef} className="h-full w-full" style={{ backgroundColor: "#0a0b10" }} />
 
       {/* Drag overlay */}
       {isDragging && (
-        <div className="absolute inset-0 bg-[#3B82F6]/10 border-2 border-dashed border-[#3B82F6] rounded flex items-center justify-center z-50 pointer-events-none">
-          <div className="flex flex-col items-center gap-2 text-[#3B82F6]">
+        <div className="absolute inset-0 bg-[#00cc6e]/10 border-2 border-dashed border-[#00cc6e] rounded flex items-center justify-center z-50 pointer-events-none">
+          <div className="flex flex-col items-center gap-2 text-[#00cc6e]">
             <Upload size={32} />
-            <span className="text-[14px] font-medium">
-              Drop files to upload
-            </span>
-            <span className="text-[12px] text-[#6B7280]">
+            <span className="text-[14px] font-medium">Drop files to upload</span>
+            <span className="text-[12px] text-[#6b7569]">
               File path will be pasted into terminal
             </span>
           </div>
@@ -396,12 +398,12 @@ export function TerminalViewXterm({
         <button
           onClick={handleCopy}
           className="absolute top-2 right-2 flex items-center gap-1.5 px-2.5 py-1.5
-            rounded bg-[#1C1F2B] border border-[#2A2D3A] text-[12px] text-[#E4E4E7]
-            hover:bg-[#252838] transition-colors shadow-lg z-50 cursor-pointer"
+            rounded bg-[#14161e] border border-[#1a1d24] text-[12px] text-[#e6f0e4]
+            hover:bg-[#1a1d24] transition-colors shadow-lg z-50 cursor-pointer"
         >
           {copied ? (
             <>
-              <Check size={14} className="text-[#22C55E]" />
+              <Check size={14} className="text-[#00ff88]" />
               Copied
             </>
           ) : (
@@ -415,15 +417,18 @@ export function TerminalViewXterm({
 
       {/* Mobile special keys toolbar */}
       {isMobile && (
-        <div className="absolute bottom-0 left-0 right-0 flex items-center gap-1
-          px-2 py-1.5 bg-[#151820] border-t border-[#2A2D3A] z-40 overflow-x-auto">
+        <div
+          className="absolute bottom-0 left-0 right-0 flex items-center gap-1
+          px-2 py-1.5 bg-[#0f1117] border-t border-[#1a1d24] z-40 overflow-x-auto"
+        >
           {/* Modifier keys (toggle) */}
           <button
             onClick={() => setCtrlActive(!ctrlActive)}
             className={`shrink-0 px-2.5 py-1 rounded text-[11px] font-mono font-medium transition-colors
-              ${ctrlActive
-                ? "bg-[#3B82F6] text-white"
-                : "bg-[#1C1F2B] text-[#E4E4E7] border border-[#2A2D3A]"
+              ${
+                ctrlActive
+                  ? "bg-[#00cc6e] text-white"
+                  : "bg-[#14161e] text-[#e6f0e4] border border-[#1a1d24]"
               }`}
           >
             Ctrl
@@ -431,15 +436,16 @@ export function TerminalViewXterm({
           <button
             onClick={() => setAltActive(!altActive)}
             className={`shrink-0 px-2.5 py-1 rounded text-[11px] font-mono font-medium transition-colors
-              ${altActive
-                ? "bg-[#3B82F6] text-white"
-                : "bg-[#1C1F2B] text-[#E4E4E7] border border-[#2A2D3A]"
+              ${
+                altActive
+                  ? "bg-[#00cc6e] text-white"
+                  : "bg-[#14161e] text-[#e6f0e4] border border-[#1a1d24]"
               }`}
           >
             Alt
           </button>
 
-          <div className="w-px h-5 bg-[#2A2D3A] shrink-0" />
+          <div className="w-px h-5 bg-[#1a1d24] shrink-0" />
 
           {/* Common keys */}
           {[
@@ -453,15 +459,15 @@ export function TerminalViewXterm({
             <button
               key={label}
               onClick={() => sendKey(key)}
-              className="shrink-0 px-2.5 py-1 rounded bg-[#1C1F2B] text-[#E4E4E7]
-                border border-[#2A2D3A] text-[11px] font-mono font-medium
-                active:bg-[#252838] transition-colors"
+              className="shrink-0 px-2.5 py-1 rounded bg-[#14161e] text-[#e6f0e4]
+                border border-[#1a1d24] text-[11px] font-mono font-medium
+                active:bg-[#1a1d24] transition-colors"
             >
               {label}
             </button>
           ))}
 
-          <div className="w-px h-5 bg-[#2A2D3A] shrink-0" />
+          <div className="w-px h-5 bg-[#1a1d24] shrink-0" />
 
           {/* Ctrl combos */}
           {[
@@ -478,9 +484,9 @@ export function TerminalViewXterm({
                 wsRef.current?.send(key);
                 terminalRef.current?.focus();
               }}
-              className="shrink-0 px-2.5 py-1 rounded bg-[#1C1F2B] text-[#E4E4E7]
-                border border-[#2A2D3A] text-[11px] font-mono font-medium
-                active:bg-[#252838] transition-colors"
+              className="shrink-0 px-2.5 py-1 rounded bg-[#14161e] text-[#e6f0e4]
+                border border-[#1a1d24] text-[11px] font-mono font-medium
+                active:bg-[#1a1d24] transition-colors"
             >
               {label}
             </button>
@@ -490,7 +496,9 @@ export function TerminalViewXterm({
 
       {/* Upload status toast */}
       {uploadStatus && (
-        <div className={`absolute ${isMobile ? "bottom-12" : "bottom-4"} left-1/2 -translate-x-1/2 px-3 py-1.5 rounded bg-[#1C1F2B] border border-[#2A2D3A] text-[12px] text-[#E4E4E7] shadow-lg z-50`}>
+        <div
+          className={`absolute ${isMobile ? "bottom-12" : "bottom-4"} left-1/2 -translate-x-1/2 px-3 py-1.5 rounded bg-[#14161e] border border-[#1a1d24] text-[12px] text-[#e6f0e4] shadow-lg z-50`}
+        >
           {uploadStatus}
         </div>
       )}

@@ -22,24 +22,24 @@ export function UserSection() {
   }
 
   return (
-    <div className="border-t border-[#2A2D3A] px-3 py-3">
+    <div className="border-t border-[#1a1d24] px-3 py-3">
       <div className="flex items-center gap-2">
         {/* Avatar */}
         <Avatar className="h-8 w-8">
-          <AvatarFallback className="bg-[#3B82F6] text-white text-xs font-medium">
+          <AvatarFallback className="bg-[#00cc6e] text-white text-xs font-medium">
             {getInitials(user.username)}
           </AvatarFallback>
         </Avatar>
 
         {/* User info */}
         <div className="flex flex-1 min-w-0 flex-col">
-          <span className="text-[13px] text-[#E4E4E7] font-medium truncate">{user.username}</span>
+          <span className="text-[13px] text-[#e6f0e4] font-medium truncate">{user.username}</span>
           <Badge
             variant="secondary"
             className={`w-fit text-[10px] px-1.5 py-0 h-4 ${
               user.role === "admin"
-                ? "bg-[#3B82F6]/20 text-[#3B82F6]"
-                : "bg-[#6B7280]/20 text-[#6B7280]"
+                ? "bg-[#00cc6e]/20 text-[#00cc6e]"
+                : "bg-[#6b7569]/20 text-[#6b7569]"
             }`}
           >
             {user.role}
@@ -51,7 +51,7 @@ export function UserSection() {
           {user.role === "admin" && (
             <Link
               href="/admin"
-              className="p-1.5 text-[#6B7280] hover:text-[#3B82F6] transition-colors"
+              className="p-1.5 text-[#6b7569] hover:text-[#00cc6e] transition-colors"
               title="Admin panel"
               aria-label="Admin panel"
             >
@@ -60,7 +60,7 @@ export function UserSection() {
           )}
           <button
             onClick={logout}
-            className="p-1.5 text-[#6B7280] hover:text-[#EF4444] transition-colors"
+            className="p-1.5 text-[#6b7569] hover:text-[#ff5c5c] transition-colors"
             title="Sign out"
             aria-label="Sign out"
           >

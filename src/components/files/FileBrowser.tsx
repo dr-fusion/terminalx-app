@@ -1,13 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
-import {
-  Folder,
-  FolderOpen,
-  File,
-  ChevronRight,
-  ChevronDown,
-} from "lucide-react";
+import { Folder, FolderOpen, File, ChevronRight, ChevronDown } from "lucide-react";
 
 interface FileEntry {
   name: string;
@@ -34,21 +28,16 @@ export function FileBrowser() {
   const [previewContent, setPreviewContent] = useState<string | null>(null);
   const [previewName, setPreviewName] = useState<string | null>(null);
 
-  const fetchDirectory = useCallback(
-    async (path: string): Promise<FileEntry[]> => {
-      try {
-        const res = await fetch(
-          `/api/files?path=${encodeURIComponent(path)}`
-        );
-        if (!res.ok) return [];
-        const data = await res.json();
-        return data.entries ?? data;
-      } catch {
-        return [];
-      }
-    },
-    []
-  );
+  const fetchDirectory = useCallback(async (path: string): Promise<FileEntry[]> => {
+    try {
+      const res = await fetch(`/api/files?path=${encodeURIComponent(path)}`);
+      if (!res.ok) return [];
+      const data = await res.json();
+      return data.entries ?? data;
+    } catch {
+      return [];
+    }
+  }, []);
 
   const loadRoot = useCallback(
     async (path: string) => {
@@ -63,7 +52,8 @@ export function FileBrowser() {
         }))
       );
       // Build breadcrumb parts
-      const parts = path === "." ? ["~"] : ["~", ...path.replace(/^\.\//, "").split("/").filter(Boolean)];
+      const parts =
+        path === "." ? ["~"] : ["~", ...path.replace(/^\.\//, "").split("/").filter(Boolean)];
       setPathParts(parts);
 
       setIsLoading(false);
@@ -79,10 +69,7 @@ export function FileBrowser() {
 
   const toggleDirectory = useCallback(
     async (node: TreeNode, path: number[]) => {
-      const updateNode = (
-        nodes: TreeNode[],
-        indices: number[]
-      ): TreeNode[] => {
+      const updateNode = (nodes: TreeNode[], indices: number[]): TreeNode[] => {
         const [head, ...rest] = indices;
         return nodes.map((n, i) => {
           if (i !== head) return n;
@@ -97,10 +84,7 @@ export function FileBrowser() {
       // If not loaded yet, fetch children
       if (!node.loaded && isDir(node)) {
         const children = await fetchDirectory(node.path);
-        const setChildren = (
-          nodes: TreeNode[],
-          indices: number[]
-        ): TreeNode[] => {
+        const setChildren = (nodes: TreeNode[], indices: number[]): TreeNode[] => {
           const [head, ...rest] = indices;
           return nodes.map((n, i) => {
             if (i !== head) return n;
@@ -133,9 +117,7 @@ export function FileBrowser() {
 
   const handleFileClick = useCallback(async (entry: FileEntry) => {
     try {
-      const res = await fetch(
-        `/api/files?path=${encodeURIComponent(entry.path)}&content=true`
-      );
+      const res = await fetch(`/api/files?path=${encodeURIComponent(entry.path)}&content=true`);
       if (!res.ok) {
         setPreviewContent("Failed to load file");
         setPreviewName(entry.name);
@@ -169,7 +151,7 @@ export function FileBrowser() {
         <div key={node.path}>
           <button
             className="w-full flex items-center gap-1 py-1 px-2 text-[13px]
-              hover:bg-[#252838] transition-colors text-left"
+              hover:bg-[#1a1d24] transition-colors text-left"
             style={{ paddingLeft: `${8 + depth * 16}px` }}
             onClick={() => {
               if (isDir(node)) {
@@ -182,23 +164,23 @@ export function FileBrowser() {
             {isDir(node) ? (
               <>
                 {node.expanded ? (
-                  <ChevronDown size={12} className="text-[#6B7280] shrink-0" />
+                  <ChevronDown size={12} className="text-[#6b7569] shrink-0" />
                 ) : (
-                  <ChevronRight size={12} className="text-[#6B7280] shrink-0" />
+                  <ChevronRight size={12} className="text-[#6b7569] shrink-0" />
                 )}
                 {node.expanded ? (
-                  <FolderOpen size={14} className="text-[#3B82F6] shrink-0" />
+                  <FolderOpen size={14} className="text-[#00cc6e] shrink-0" />
                 ) : (
-                  <Folder size={14} className="text-[#3B82F6] shrink-0" />
+                  <Folder size={14} className="text-[#00cc6e] shrink-0" />
                 )}
               </>
             ) : (
               <>
                 <span className="w-3 shrink-0" />
-                <File size={14} className="text-[#6B7280] shrink-0" />
+                <File size={14} className="text-[#6b7569] shrink-0" />
               </>
             )}
-            <span className="truncate text-[#E4E4E7]">{node.name}</span>
+            <span className="truncate text-[#e6f0e4]">{node.name}</span>
           </button>
           {isDir(node) &&
             node.expanded &&
@@ -212,13 +194,13 @@ export function FileBrowser() {
   return (
     <div className="flex flex-col h-full text-[13px] font-sans">
       {/* Breadcrumbs */}
-      <div className="flex items-center gap-0.5 px-2 py-2 border-b border-[#2A2D3A] overflow-x-auto">
+      <div className="flex items-center gap-0.5 px-2 py-2 border-b border-[#1a1d24] overflow-x-auto">
         {pathParts.map((part, i) => (
           <span key={i} className="flex items-center gap-0.5 whitespace-nowrap">
-            {i > 0 && <span className="text-[#6B7280]">/</span>}
+            {i > 0 && <span className="text-[#6b7569]">/</span>}
             <button
               onClick={() => navigateBreadcrumb(i)}
-              className="text-[#6B7280] hover:text-[#E4E4E7] transition-colors"
+              className="text-[#6b7569] hover:text-[#e6f0e4] transition-colors"
             >
               {part}
             </button>
@@ -229,32 +211,28 @@ export function FileBrowser() {
       {/* File tree or preview */}
       {previewContent !== null ? (
         <div className="flex flex-col flex-1 overflow-hidden">
-          <div className="flex items-center justify-between px-2 py-1.5 border-b border-[#2A2D3A] bg-[#1C1F2B]">
-            <span className="text-[#E4E4E7] truncate">{previewName}</span>
+          <div className="flex items-center justify-between px-2 py-1.5 border-b border-[#1a1d24] bg-[#14161e]">
+            <span className="text-[#e6f0e4] truncate">{previewName}</span>
             <button
               onClick={() => {
                 setPreviewContent(null);
                 setPreviewName(null);
               }}
-              className="text-[#6B7280] hover:text-[#E4E4E7] transition-colors text-xs"
+              className="text-[#6b7569] hover:text-[#e6f0e4] transition-colors text-xs"
             >
               Close
             </button>
           </div>
-          <pre className="flex-1 overflow-auto p-2 text-[12px] font-mono text-[#E4E4E7] leading-relaxed whitespace-pre">
+          <pre className="flex-1 overflow-auto p-2 text-[12px] font-mono text-[#e6f0e4] leading-relaxed whitespace-pre">
             {previewContent}
           </pre>
         </div>
       ) : (
         <div className="flex-1 overflow-y-auto py-1">
           {isLoading ? (
-            <div className="px-3 py-4 text-[#6B7280] text-center">
-              Loading...
-            </div>
+            <div className="px-3 py-4 text-[#6b7569] text-center">Loading...</div>
           ) : entries.length === 0 ? (
-            <div className="px-3 py-4 text-[#6B7280] text-center">
-              Empty directory
-            </div>
+            <div className="px-3 py-4 text-[#6b7569] text-center">Empty directory</div>
           ) : (
             renderTree(entries, 0, [])
           )}

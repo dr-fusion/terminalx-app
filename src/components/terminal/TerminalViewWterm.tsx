@@ -11,6 +11,7 @@ export function TerminalViewWterm({
   sessionId,
   onDisconnect,
   onReconnect,
+  onSessionEnded,
 }: TerminalViewProps) {
   const termRef = useRef<TerminalHandle>(null);
   const wsRef = useRef<WebSocket | null>(null);
@@ -53,6 +54,13 @@ export function TerminalViewWterm({
           try {
             const msg = JSON.parse(data);
             if (msg.type === "pty-id" || msg.type === "event") return;
+            if (msg.type === "session-ended") {
+              // Shell exited / tmux session killed from inside the terminal.
+              // Suppress reconnect so we don't spawn a new session.
+              intentionalCloseRef.current = true;
+              onSessionEnded?.(sessionId);
+              return;
+            }
           } catch {
             // not JSON, fall through
           }
@@ -72,7 +80,7 @@ export function TerminalViewWterm({
     };
 
     ws.onerror = () => ws.close();
-  }, [sessionId, onDisconnect, onReconnect]);
+  }, [sessionId, onDisconnect, onReconnect, onSessionEnded]);
 
   useEffect(() => {
     connectRef.current = connect;
@@ -186,15 +194,15 @@ export function TerminalViewWterm({
         onData={handleData}
         onResize={handleResize}
         className="h-full w-full"
-        style={{ backgroundColor: "#0D0F12" }}
+        style={{ backgroundColor: "#0a0b10" }}
       />
 
       {isDragging && (
-        <div className="absolute inset-0 bg-[#3B82F6]/10 border-2 border-dashed border-[#3B82F6] rounded flex items-center justify-center z-50 pointer-events-none">
-          <div className="flex flex-col items-center gap-2 text-[#3B82F6]">
+        <div className="absolute inset-0 bg-[#00cc6e]/10 border-2 border-dashed border-[#00cc6e] rounded flex items-center justify-center z-50 pointer-events-none">
+          <div className="flex flex-col items-center gap-2 text-[#00cc6e]">
             <Upload size={32} />
             <span className="text-[14px] font-medium">Drop files to upload</span>
-            <span className="text-[12px] text-[#6B7280]">
+            <span className="text-[12px] text-[#6b7569]">
               File path will be pasted into terminal
             </span>
           </div>
@@ -202,7 +210,7 @@ export function TerminalViewWterm({
       )}
 
       {uploadStatus && (
-        <div className="absolute bottom-4 left-1/2 -translate-x-1/2 px-3 py-1.5 rounded bg-[#1C1F2B] border border-[#2A2D3A] text-[12px] text-[#E4E4E7] shadow-lg z-50">
+        <div className="absolute bottom-4 left-1/2 -translate-x-1/2 px-3 py-1.5 rounded bg-[#14161e] border border-[#1a1d24] text-[12px] text-[#e6f0e4] shadow-lg z-50">
           {uploadStatus}
         </div>
       )}

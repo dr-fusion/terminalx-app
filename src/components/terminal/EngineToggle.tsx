@@ -12,24 +12,25 @@ export function EngineToggle() {
   const { engine, setEngine } = useTerminalEngine();
 
   return (
-    <div className="px-3 py-2 border-t border-[#2A2D3A]">
+    <div className="px-3 py-2 border-t border-[#1a1d24]">
       <div className="flex items-center justify-between mb-1.5">
-        <span className="text-[10px] text-[#6B7280] uppercase tracking-wider font-medium">
+        <span className="text-[10px] text-[#6b7569] uppercase tracking-wider font-medium">
           Terminal Engine
         </span>
-        <span className="text-[10px] text-[#6B7280]" title={ENGINES.find((e) => e.value === engine)?.hint}>
+        <span
+          className="text-[10px] text-[#6b7569]"
+          title={ENGINES.find((e) => e.value === engine)?.hint}
+        >
           reloads new tabs
         </span>
       </div>
-      <div className="flex rounded bg-[#0D0F12] border border-[#2A2D3A] p-0.5">
+      <div className="flex rounded bg-[#0a0b10] border border-[#1a1d24] p-0.5">
         {ENGINES.map((e) => (
           <button
             key={e.value}
             onClick={() => setEngine(e.value)}
             className={`flex-1 px-2 py-1 rounded text-[11px] font-mono transition-colors ${
-              engine === e.value
-                ? "bg-[#3B82F6] text-white"
-                : "text-[#6B7280] hover:text-[#E4E4E7]"
+              engine === e.value ? "bg-[#00cc6e] text-white" : "text-[#6b7569] hover:text-[#e6f0e4]"
             }`}
             title={e.hint}
           >

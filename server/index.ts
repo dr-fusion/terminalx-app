@@ -149,6 +149,17 @@ terminalWss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
     recorder?.write(data);
   });
 
+  // PTY exit (user typed `exit`, tmux session killed, shell died) ->
+  // tell the client the session is gone so it can close the tab and
+  // refresh the sidebar. Use close code 4000 to signal "not a network
+  // blip" — the client suppresses auto-reconnect for that code.
+  const exitHandler = ptyInstance.process.onExit(() => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "session-ended", sessionId }));
+      ws.close(4000, "Session ended");
+    }
+  });
+
   // WebSocket -> PTY input
   ws.on("message", (msg: Buffer | string) => {
     const data = typeof msg === "string" ? msg : msg.toString("utf-8");
@@ -171,6 +182,7 @@ terminalWss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
 
   ws.on("close", () => {
     dataHandler.dispose();
+    exitHandler.dispose();
     destroyPty(ptyInstance.id);
     recorder?.close();
     audit("terminal_disconnected", {
@@ -181,6 +193,7 @@ terminalWss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
 
   ws.on("error", () => {
     dataHandler.dispose();
+    exitHandler.dispose();
     destroyPty(ptyInstance.id);
     recorder?.close();
   });

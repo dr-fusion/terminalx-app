@@ -27,8 +27,7 @@ export function TerminalPanel() {
         const filtered = prev.filter((t) => t.id !== id);
         if (activeTab === id) {
           const idx = prev.findIndex((t) => t.id === id);
-          const nextTab =
-            filtered[Math.min(idx, filtered.length - 1)] ?? null;
+          const nextTab = filtered[Math.min(idx, filtered.length - 1)] ?? null;
           setActiveTab(nextTab?.id ?? null);
         }
         return filtered;
@@ -44,7 +43,7 @@ export function TerminalPanel() {
   const activeTerminal = tabs.find((t) => t.id === activeTab);
 
   return (
-    <div className="flex flex-col h-full bg-[#0D0F12]">
+    <div className="flex flex-col h-full bg-[#0a0b10]">
       <TerminalTabs
         tabs={tabs}
         activeTab={activeTab}
@@ -58,13 +57,13 @@ export function TerminalPanel() {
             <TerminalView sessionId={activeTerminal.sessionId} />
           </div>
         ) : (
-          <div className="flex items-center justify-center h-full text-[#6B7280] text-[13px] font-sans">
+          <div className="flex items-center justify-center h-full text-[#6b7569] text-[13px] font-sans">
             <div className="text-center">
               <p className="mb-2">No terminal open</p>
               <button
                 onClick={handleNew}
-                className="px-3 py-1.5 rounded bg-[#1C1F2B] text-[#E4E4E7]
-                  hover:bg-[#252838] transition-colors text-[13px]"
+                className="px-3 py-1.5 rounded bg-[#14161e] text-[#e6f0e4]
+                  hover:bg-[#1a1d24] transition-colors text-[13px]"
               >
                 New Terminal
               </button>
