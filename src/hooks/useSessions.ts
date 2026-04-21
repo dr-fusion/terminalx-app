@@ -9,6 +9,8 @@ export interface TmuxSession {
   windows: number;
   attached: boolean;
   created: string;
+  lastActivity?: string;
+  activePath?: string;
   kind?: SessionKind;
 }
 

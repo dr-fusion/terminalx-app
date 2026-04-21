@@ -1,12 +1,5 @@
-"use client";
-
-import dynamic from "next/dynamic";
-
-const WorkspaceLayout = dynamic(
-  () => import("@/components/layout/WorkspaceLayout"),
-  { ssr: false }
-);
+import { redirect } from "next/navigation";
 
 export default function Home() {
-  return <WorkspaceLayout />;
+  redirect("/dashboard");
 }

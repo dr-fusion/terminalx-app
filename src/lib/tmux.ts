@@ -5,6 +5,8 @@ export interface TmuxSession {
   windows: number;
   attached: boolean;
   created: string;
+  lastActivity?: string;
+  activePath?: string;
 }
 
 const TMUX_BIN = "tmux";
@@ -27,7 +29,7 @@ export function listSessions(): TmuxSession[] {
       [
         "list-sessions",
         "-F",
-        "#{session_name}\t#{session_windows}\t#{session_attached}\t#{session_created}",
+        "#{session_name}\t#{session_windows}\t#{session_attached}\t#{session_created}\t#{session_activity}\t#{session_path}",
       ],
       { encoding: "utf-8", timeout: 5000 }
     );
@@ -37,12 +39,17 @@ export function listSessions(): TmuxSession[] {
       .split("\n")
       .filter((line) => line.length > 0)
       .map((line) => {
-        const [name = "", windows = "0", attached = "0", created = "0"] = line.split("\t");
+        const [name = "", windows = "0", attached = "0", created = "0", activity = "0", path = ""] =
+          line.split("\t");
+        const createdN = parseInt(created, 10);
+        const activityN = parseInt(activity, 10);
         return {
           name,
           windows: parseInt(windows, 10),
           attached: attached === "1",
-          created: new Date(parseInt(created, 10) * 1000).toISOString(),
+          created: new Date(createdN * 1000).toISOString(),
+          lastActivity: activityN > 0 ? new Date(activityN * 1000).toISOString() : undefined,
+          activePath: path || undefined,
         };
       });
   } catch (err: unknown) {
