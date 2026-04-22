@@ -162,11 +162,11 @@ export function ReplayView({ id }: ReplayViewProps) {
   const percent = totalDuration > 0 ? (position / totalDuration) * 100 : 0;
 
   return (
-    <div className="flex flex-col h-full bg-[#0D0F12]">
-      <div className="flex items-center gap-3 h-11 px-3 bg-[#151820] border-b border-[#2A2D3A]">
+    <div className="flex flex-col h-full bg-[#0a0b10]">
+      <div className="flex items-center gap-3 h-11 px-3 bg-[#0f1117] border-b border-[#1a1d24]">
         <button
           onClick={rewind}
-          className="p-1.5 text-[#6B7280] hover:text-[#E4E4E7] transition-colors"
+          className="p-1.5 text-[#6b7569] hover:text-[#e6f0e4] transition-colors"
           title="Rewind"
           aria-label="Rewind"
         >
@@ -175,18 +175,18 @@ export function ReplayView({ id }: ReplayViewProps) {
         <button
           onClick={() => (playing ? stop() : play())}
           disabled={!loaded || !!error}
-          className="flex items-center gap-1 px-3 py-1 rounded bg-[#3B82F6] text-white
-            hover:bg-[#2563EB] transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          className="flex items-center gap-1 px-3 py-1 rounded bg-[#00cc6e] text-white
+            hover:bg-[#00ff88] transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
         >
           {playing ? <Pause size={12} /> : <Play size={12} />}
           <span className="text-[12px]">{playing ? "Pause" : "Play"}</span>
         </button>
         <div className="flex items-center gap-1">
-          <FastForward size={12} className="text-[#6B7280]" />
+          <FastForward size={12} className="text-[#6b7569]" />
           <select
             value={speed}
             onChange={(e) => setSpeed(parseFloat(e.target.value))}
-            className="bg-[#1C1F2B] text-[#E4E4E7] border border-[#2A2D3A] rounded px-1 py-0.5 text-[11px]"
+            className="bg-[#14161e] text-[#e6f0e4] border border-[#1a1d24] rounded px-1 py-0.5 text-[11px]"
           >
             {SPEEDS.map((s) => (
               <option key={s} value={s}>
@@ -195,14 +195,14 @@ export function ReplayView({ id }: ReplayViewProps) {
             ))}
           </select>
         </div>
-        <div className="flex-1 h-1.5 bg-[#1C1F2B] rounded-full overflow-hidden">
+        <div className="flex-1 h-1.5 bg-[#14161e] rounded-full overflow-hidden">
           <div
-            className="h-full bg-[#3B82F6] transition-[width] duration-100"
+            className="h-full bg-[#00cc6e] transition-[width] duration-100"
             style={{ width: `${percent}%` }}
           />
         </div>
         <span
-          className="text-[11px] text-[#6B7280] tabular-nums"
+          className="text-[11px] text-[#6b7569] tabular-nums"
           style={{ fontFamily: "var(--font-jetbrains-mono), monospace" }}
         >
           {formatMs(position)} / {formatMs(totalDuration)}
@@ -210,7 +210,7 @@ export function ReplayView({ id }: ReplayViewProps) {
       </div>
 
       {header && (
-        <div className="flex items-center gap-3 px-3 py-1.5 text-[11px] text-[#6B7280] border-b border-[#2A2D3A]">
+        <div className="flex items-center gap-3 px-3 py-1.5 text-[11px] text-[#6b7569] border-b border-[#1a1d24]">
           <span>{header.sessionId}</span>
           <span>·</span>
           <span>{header.startedAt}</span>
@@ -225,7 +225,7 @@ export function ReplayView({ id }: ReplayViewProps) {
       )}
 
       {error ? (
-        <div className="flex-1 flex items-center justify-center text-[#EF4444] text-[13px]">
+        <div className="flex-1 flex items-center justify-center text-[#ff5c5c] text-[13px]">
           {error}
         </div>
       ) : (

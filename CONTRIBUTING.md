@@ -9,7 +9,7 @@ Thanks for your interest in contributing! Here's how to get started.
 # macOS: xcode-select --install
 # Ubuntu: sudo apt install tmux build-essential
 
-git clone https://github.com/dr-fusion/terminalx-app.git
+git clone https://github.com/dudhatparesh/terminalx-app.git
 cd terminalx-app
 npm install
 npm run dev

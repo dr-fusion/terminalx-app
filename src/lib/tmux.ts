@@ -5,9 +5,50 @@ export interface TmuxSession {
   windows: number;
   attached: boolean;
   created: string;
+  lastActivity?: string;
+  activePath?: string;
 }
 
 const TMUX_BIN = "tmux";
+
+/**
+ * Capture the last N lines of a session's scrollback as a single chunk,
+ * with ANSI escape codes preserved (colors, cursor movement).
+ *
+ * We use this at WS attach time to seed xterm.js's scrollback buffer so
+ * the user can scroll up with the mouse wheel / touch swipe to see history,
+ * without needing tmux's mouse-mode (which would break browser-native
+ * text selection + Cmd+C copy).
+ */
+export function capturePaneHistory(name: string, lines = 10000): string {
+  const safeName = sanitizeSessionName(name);
+  try {
+    return execFileSync(
+      TMUX_BIN,
+      ["capture-pane", "-p", "-e", "-J", "-S", `-${lines}`, "-t", safeName],
+      { encoding: "utf-8", timeout: 5000, maxBuffer: 16 * 1024 * 1024 }
+    );
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Raise tmux's per-session scrollback limit for any session the server
+ * creates from now on. Runs at server startup; also invoked defensively
+ * from createSession. Failures are ignored (e.g. no tmux server running
+ * yet — the next new-session call will start one and pick up the option).
+ */
+export function applyGlobalOptions(historyLimit = 50000): void {
+  try {
+    execFileSync(TMUX_BIN, ["set-option", "-g", "history-limit", String(historyLimit)], {
+      encoding: "utf-8",
+      timeout: 2000,
+    });
+  } catch {
+    // no tmux server or option not supported — ignore
+  }
+}
 
 function sanitizeSessionName(name: string): string {
   // tmux session names: alphanumeric, underscore, hyphen, dot
@@ -27,7 +68,7 @@ export function listSessions(): TmuxSession[] {
       [
         "list-sessions",
         "-F",
-        "#{session_name}\t#{session_windows}\t#{session_attached}\t#{session_created}",
+        "#{session_name}\t#{session_windows}\t#{session_attached}\t#{session_created}\t#{session_activity}\t#{session_path}",
       ],
       { encoding: "utf-8", timeout: 5000 }
     );
@@ -37,12 +78,17 @@ export function listSessions(): TmuxSession[] {
       .split("\n")
       .filter((line) => line.length > 0)
       .map((line) => {
-        const [name = "", windows = "0", attached = "0", created = "0"] = line.split("\t");
+        const [name = "", windows = "0", attached = "0", created = "0", activity = "0", path = ""] =
+          line.split("\t");
+        const createdN = parseInt(created, 10);
+        const activityN = parseInt(activity, 10);
         return {
           name,
           windows: parseInt(windows, 10),
           attached: attached === "1",
-          created: new Date(parseInt(created, 10) * 1000).toISOString(),
+          created: new Date(createdN * 1000).toISOString(),
+          lastActivity: activityN > 0 ? new Date(activityN * 1000).toISOString() : undefined,
+          activePath: path || undefined,
         };
       });
   } catch (err: unknown) {
@@ -62,6 +108,10 @@ export function listSessions(): TmuxSession[] {
 
 export function createSession(name: string, command?: string, cwd?: string): void {
   const safeName = sanitizeSessionName(name);
+  // Idempotent: raises the history-limit option on whatever tmux server
+  // this call is about to touch. Guarantees deep scrollback on the very
+  // first session a server ever creates.
+  applyGlobalOptions();
   const args = ["new-session", "-d", "-s", safeName];
   if (cwd) {
     args.push("-c", cwd);

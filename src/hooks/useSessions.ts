@@ -9,6 +9,8 @@ export interface TmuxSession {
   windows: number;
   attached: boolean;
   created: string;
+  lastActivity?: string;
+  activePath?: string;
   kind?: SessionKind;
 }
 
@@ -67,17 +69,13 @@ export function useSessions(): UseSessionsReturn {
         });
         if (!res.ok) {
           const j = await res.json().catch(() => null);
-          throw new Error(
-            j?.error ?? `Failed to create session: ${res.status}`
-          );
+          throw new Error(j?.error ?? `Failed to create session: ${res.status}`);
         }
         const session = await res.json();
         await refresh();
         return session;
       } catch (err) {
-        setError(
-          err instanceof Error ? err.message : "Failed to create session"
-        );
+        setError(err instanceof Error ? err.message : "Failed to create session");
         return null;
       }
     },
@@ -94,9 +92,7 @@ export function useSessions(): UseSessionsReturn {
         await refresh();
         return true;
       } catch (err) {
-        setError(
-          err instanceof Error ? err.message : "Failed to kill session"
-        );
+        setError(err instanceof Error ? err.message : "Failed to kill session");
         return false;
       }
     },
@@ -105,6 +101,17 @@ export function useSessions(): UseSessionsReturn {
 
   useEffect(() => {
     refresh();
+  }, [refresh]);
+
+  // Refresh when a terminal reports its session ended from the inside
+  // (user typed `exit`, killed the tmux session, etc.). The terminal
+  // view dispatches this event after the server closes the PTY.
+  useEffect(() => {
+    const handler = () => {
+      refresh();
+    };
+    window.addEventListener("terminalx:session-ended", handler);
+    return () => window.removeEventListener("terminalx:session-ended", handler);
   }, [refresh]);
 
   return { sessions, isLoading, error, createSession, killSession, refresh };

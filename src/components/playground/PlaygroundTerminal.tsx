@@ -46,20 +46,20 @@ export function PlaygroundTerminal() {
   }, []);
 
   return (
-    <div className="flex flex-col h-full bg-[#0D0F12]">
-      <div className="flex items-center justify-between px-3 h-9 bg-[#151820] border-b border-[#2A2D3A] shrink-0">
+    <div className="flex flex-col h-full bg-[#0a0b10]">
+      <div className="flex items-center justify-between px-3 h-9 bg-[#0f1117] border-b border-[#1a1d24] shrink-0">
         <span
-          className="text-[12px] text-[#E4E4E7]"
+          className="text-[12px] text-[#e6f0e4]"
           style={{ fontFamily: "var(--font-jetbrains-mono), monospace" }}
         >
           Playground · in-browser bash
         </span>
         <div className="flex items-center gap-2">
-          <label className="text-[11px] text-[#6B7280]">Theme</label>
+          <label className="text-[11px] text-[#6b7569]">Theme</label>
           <select
             value={themeLabel}
             onChange={(e) => setThemeLabel(e.target.value)}
-            className="h-6 px-1.5 rounded bg-[#1C1F2B] border border-[#2A2D3A] text-[11px] text-[#E4E4E7]"
+            className="h-6 px-1.5 rounded bg-[#14161e] border border-[#1a1d24] text-[11px] text-[#e6f0e4]"
           >
             {THEMES.map((t) => (
               <option key={t.label} value={t.label}>

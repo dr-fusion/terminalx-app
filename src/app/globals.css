@@ -4,12 +4,17 @@
 
 @custom-variant dark (&:is(.dark *));
 
+/* ============================================================
+   TerminalX — SuperTerminal design tokens
+   Dark-only. Phosphor green is the signal color. All mono.
+   ============================================================ */
+
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
-  --font-sans: var(--font-inter);
+  --font-sans: var(--font-jetbrains-mono);
   --font-mono: var(--font-jetbrains-mono);
-  --font-heading: var(--font-inter);
+  --font-heading: var(--font-jetbrains-mono);
   --color-sidebar-ring: var(--sidebar-ring);
   --color-sidebar-border: var(--sidebar-border);
   --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
@@ -39,82 +44,164 @@
   --color-popover: var(--popover);
   --color-card-foreground: var(--card-foreground);
   --color-card: var(--card);
-  --radius-sm: calc(var(--radius) * 0.6);
-  --radius-md: calc(var(--radius) * 0.8);
+  --radius-sm: calc(var(--radius) * 0.5);
+  --radius-md: calc(var(--radius) * 0.75);
   --radius-lg: var(--radius);
-  --radius-xl: calc(var(--radius) * 1.4);
-  --radius-2xl: calc(var(--radius) * 1.8);
-  --radius-3xl: calc(var(--radius) * 2.2);
-  --radius-4xl: calc(var(--radius) * 2.6);
+  --radius-xl: calc(var(--radius) * 1.5);
+  --radius-2xl: calc(var(--radius) * 2);
+  --radius-3xl: calc(var(--radius) * 2.5);
+  --radius-4xl: calc(var(--radius) * 3);
 }
 
 :root {
-  --background: #0D0F12;
-  --foreground: #E4E4E7;
-  --card: #151820;
-  --card-foreground: #E4E4E7;
-  --popover: #1C1F2B;
-  --popover-foreground: #E4E4E7;
-  --primary: #3B82F6;
-  --primary-foreground: #FFFFFF;
-  --secondary: #1C1F2B;
-  --secondary-foreground: #E4E4E7;
-  --muted: #1C1F2B;
-  --muted-foreground: #6B7280;
-  --accent: #3B82F6;
-  --accent-foreground: #FFFFFF;
-  --destructive: #EF4444;
-  --border: #2A2D3A;
-  --input: #2A2D3A;
-  --ring: #3B82F6;
-  --chart-1: #3B82F6;
-  --chart-2: #22C55E;
-  --chart-3: #EAB308;
-  --chart-4: #EF4444;
-  --chart-5: #6B7280;
-  --radius: 0.5rem;
-  --sidebar: #151820;
-  --sidebar-foreground: #E4E4E7;
-  --sidebar-primary: #3B82F6;
-  --sidebar-primary-foreground: #FFFFFF;
-  --sidebar-accent: #1C1F2B;
-  --sidebar-accent-foreground: #E4E4E7;
-  --sidebar-border: #2A2D3A;
-  --sidebar-ring: #3B82F6;
+  /* Surfaces — near-black, layered */
+  --bg-void:      #05060a;
+  --bg-base:      #0a0b10;
+  --bg-surface:   #0f1117;
+  --bg-raised:    #14161e;
+  --bg-sunken:    #07080c;
+
+  /* Foregrounds — slightly phosphor-tinted, never pure white */
+  --fg-1:         #e6f0e4;
+  --fg-2:         #a8b3a6;
+  --fg-3:         #6b7569;
+  --fg-4:         #3f4742;
+  --fg-inverse:   #05060a;
+
+  /* Lines */
+  --line-1:       #1a1d24;
+  --line-2:       #252933;
+  --line-3:       #363b47;
+
+  /* Phosphor — P1 CRT green. The signal. Use sparingly. */
+  --phosphor:          #00ff88;
+  --phosphor-bright:   #4dffa8;
+  --phosphor-dim:      #00cc6e;
+  --phosphor-deep:     #006b3a;
+  --phosphor-ghost:    #002a17;
+  --phosphor-glow:     0 0 12px rgba(0, 255, 136, 0.45);
+  --phosphor-glow-sm:  0 0 6px  rgba(0, 255, 136, 0.35);
+
+  /* Amber — warn/pending */
+  --amber:        #ffb454;
+  --amber-dim:    #c98a2a;
+  --amber-ghost:  #2a1d0a;
+
+  /* Red — destructive/dead */
+  --red:          #ff5c5c;
+  --red-dim:      #c94444;
+  --red-ghost:    #2a0e0e;
+
+  /* Cyan — info/links */
+  --cyan:         #5ccfe6;
+  --cyan-dim:     #3ca5ba;
+  --cyan-ghost:   #0d2730;
+
+  /* Magenta — identity / you-are-here */
+  --magenta:      #d58fff;
+  --magenta-dim:  #a76fd0;
+  --magenta-ghost:#1f1328;
+
+  /* ANSI — real terminal output colors */
+  --ansi-black:      #0a0b10;
+  --ansi-red:        #ff5c5c;
+  --ansi-green:      #00cc6e;
+  --ansi-yellow:     #ffb454;
+  --ansi-blue:       #7aa2ff;
+  --ansi-magenta:    #d58fff;
+  --ansi-cyan:       #5ccfe6;
+  --ansi-white:      #c8d0c6;
+  --ansi-br-black:   #3f4742;
+  --ansi-br-red:     #ff8080;
+  --ansi-br-green:   #4dffa8;
+  --ansi-br-yellow:  #ffd080;
+  --ansi-br-blue:    #a8c0ff;
+  --ansi-br-magenta: #e6b3ff;
+  --ansi-br-cyan:    #8fdff0;
+  --ansi-br-white:   #e6f0e4;
+
+  /* Glows */
+  --glow-sm:    0 0 6px  rgba(0, 255, 136, 0.35);
+  --glow-md:    0 0 12px rgba(0, 255, 136, 0.45);
+  --glow-lg:    0 0 24px rgba(0, 255, 136, 0.55), 0 0 4px rgba(0, 255, 136, 0.8);
+  --glow-amber: 0 0 10px rgba(255, 180, 84, 0.4);
+  --glow-red:   0 0 10px rgba(255, 92, 92, 0.45);
+
+  /* Motion */
+  --dur-fast:    80ms;
+  --dur-base:    140ms;
+  --dur-slow:    240ms;
+  --ease-out:    cubic-bezier(0.2, 0.7, 0.3, 1);
+  --ease-in:     cubic-bezier(0.7, 0, 0.8, 0.3);
+  --ease-inout:  cubic-bezier(0.5, 0, 0.3, 1);
+
+  /* shadcn aliases — map to the phosphor palette so built-in ui/* inherits */
+  --background: var(--bg-base);
+  --foreground: var(--fg-1);
+  --card: var(--bg-surface);
+  --card-foreground: var(--fg-1);
+  --popover: var(--bg-raised);
+  --popover-foreground: var(--fg-1);
+  --primary: var(--phosphor);
+  --primary-foreground: var(--fg-inverse);
+  --secondary: var(--bg-raised);
+  --secondary-foreground: var(--fg-1);
+  --muted: var(--bg-raised);
+  --muted-foreground: var(--fg-3);
+  --accent: var(--phosphor);
+  --accent-foreground: var(--fg-inverse);
+  --destructive: var(--red);
+  --border: var(--line-1);
+  --input: var(--line-2);
+  --ring: var(--phosphor);
+  --chart-1: var(--phosphor);
+  --chart-2: var(--phosphor-dim);
+  --chart-3: var(--amber);
+  --chart-4: var(--red);
+  --chart-5: var(--cyan);
+  --radius: 0.25rem; /* corners are almost square */
+  --sidebar: var(--bg-surface);
+  --sidebar-foreground: var(--fg-1);
+  --sidebar-primary: var(--phosphor);
+  --sidebar-primary-foreground: var(--fg-inverse);
+  --sidebar-accent: var(--bg-raised);
+  --sidebar-accent-foreground: var(--fg-1);
+  --sidebar-border: var(--line-1);
+  --sidebar-ring: var(--phosphor);
 }
 
 .dark {
-  --background: #0D0F12;
-  --foreground: #E4E4E7;
-  --card: #151820;
-  --card-foreground: #E4E4E7;
-  --popover: #1C1F2B;
-  --popover-foreground: #E4E4E7;
-  --primary: #3B82F6;
-  --primary-foreground: #FFFFFF;
-  --secondary: #1C1F2B;
-  --secondary-foreground: #E4E4E7;
-  --muted: #1C1F2B;
-  --muted-foreground: #6B7280;
-  --accent: #3B82F6;
-  --accent-foreground: #FFFFFF;
-  --destructive: #EF4444;
-  --border: #2A2D3A;
-  --input: #2A2D3A;
-  --ring: #3B82F6;
-  --chart-1: #3B82F6;
-  --chart-2: #22C55E;
-  --chart-3: #EAB308;
-  --chart-4: #EF4444;
-  --chart-5: #6B7280;
-  --sidebar: #151820;
-  --sidebar-foreground: #E4E4E7;
-  --sidebar-primary: #3B82F6;
-  --sidebar-primary-foreground: #FFFFFF;
-  --sidebar-accent: #1C1F2B;
-  --sidebar-accent-foreground: #E4E4E7;
-  --sidebar-border: #2A2D3A;
-  --sidebar-ring: #3B82F6;
+  --background: var(--bg-base);
+  --foreground: var(--fg-1);
+  --card: var(--bg-surface);
+  --card-foreground: var(--fg-1);
+  --popover: var(--bg-raised);
+  --popover-foreground: var(--fg-1);
+  --primary: var(--phosphor);
+  --primary-foreground: var(--fg-inverse);
+  --secondary: var(--bg-raised);
+  --secondary-foreground: var(--fg-1);
+  --muted: var(--bg-raised);
+  --muted-foreground: var(--fg-3);
+  --accent: var(--phosphor);
+  --accent-foreground: var(--fg-inverse);
+  --destructive: var(--red);
+  --border: var(--line-1);
+  --input: var(--line-2);
+  --ring: var(--phosphor);
+  --chart-1: var(--phosphor);
+  --chart-2: var(--phosphor-dim);
+  --chart-3: var(--amber);
+  --chart-4: var(--red);
+  --chart-5: var(--cyan);
+  --sidebar: var(--bg-surface);
+  --sidebar-foreground: var(--fg-1);
+  --sidebar-primary: var(--phosphor);
+  --sidebar-primary-foreground: var(--fg-inverse);
+  --sidebar-accent: var(--bg-raised);
+  --sidebar-accent-foreground: var(--fg-1);
+  --sidebar-border: var(--line-1);
+  --sidebar-ring: var(--phosphor);
 }
 
 @layer base {
@@ -123,26 +210,105 @@
   }
   body {
     @apply bg-background text-foreground;
+    font-feature-settings: "calt" 1, "liga" 1, "ss01" 1, "ss02" 1, "zero" 1;
   }
   html {
-    @apply font-sans;
+    font-family: var(--font-jetbrains-mono), ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  ::selection {
+    background: var(--phosphor-ghost);
+    color: var(--phosphor-bright);
+  }
+  :focus-visible {
+    outline: 1px solid var(--phosphor);
+    outline-offset: 2px;
+    box-shadow: var(--glow-sm);
   }
 }
 
-/* xterm.js overrides */
+/* ============================================================
+   Brand cursor — blinking phosphor bar. Used in the logo mark.
+   ============================================================ */
+.stx-cursor {
+  display: inline-block;
+  width: 0.55em;
+  height: 1em;
+  background: var(--phosphor);
+  box-shadow: var(--phosphor-glow-sm);
+  vertical-align: text-bottom;
+  margin-left: 2px;
+  animation: stx-cursor-blink 1.05s steps(2, end) infinite;
+}
+.stx-cursor.bar { width: 2px; height: 1em; }
+.stx-cursor.underscore { width: 0.55em; height: 2px; align-self: flex-end; }
+
+@keyframes stx-cursor-blink {
+  0%, 50% { opacity: 1; }
+  50.01%, 100% { opacity: 0; }
+}
+
+/* Phosphor text + glow utilities */
+.text-phosphor { color: var(--phosphor); text-shadow: var(--phosphor-glow-sm); }
+.text-phosphor-dim { color: var(--phosphor-dim); }
+
+/* Subtle scanlines overlay — CRT feel. Pair with position: relative parent. */
+.crt-scanlines { position: relative; }
+.crt-scanlines::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: repeating-linear-gradient(
+    0deg,
+    rgba(0, 255, 136, 0.03) 0px,
+    rgba(0, 255, 136, 0.03) 1px,
+    transparent 1px,
+    transparent 3px
+  );
+  pointer-events: none;
+  z-index: 1;
+}
+
+/* Hide scrollbar utility — used on the top-nav tabs so the mobile tab row
+   can overflow-scroll without a visible bar stealing gesture focus. */
+.no-scrollbar {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+  overscroll-behavior-x: contain;
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+/* Keep nested scroll containers from rubber-banding the outer document
+   (especially on iOS Safari when you scroll past the edge of a pane). */
+.contain-scroll {
+  overscroll-behavior: contain;
+}
+
+/* ============================================================
+   xterm.js overrides — dark phosphor well, phosphor scrollbar
+   ============================================================ */
 .xterm {
   padding: 4px;
+  background: var(--bg-sunken);
 }
-.xterm-viewport::-webkit-scrollbar {
-  width: 8px;
-}
-.xterm-viewport::-webkit-scrollbar-track {
-  background: #0D0F12;
-}
+.xterm-viewport::-webkit-scrollbar { width: 8px; }
+.xterm-viewport::-webkit-scrollbar-track { background: var(--bg-sunken); }
 .xterm-viewport::-webkit-scrollbar-thumb {
-  background: #2A2D3A;
-  border-radius: 4px;
+  background: var(--line-2);
+  border-radius: 999px;
 }
-.xterm-viewport::-webkit-scrollbar-thumb:hover {
-  background: #3B82F6;
+.xterm-viewport::-webkit-scrollbar-thumb:hover { background: var(--phosphor-dim); }
+
+/* Slim phosphor scrollbar globally */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--line-2) transparent;
 }
+*::-webkit-scrollbar { width: 8px; height: 8px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb {
+  background: var(--line-2);
+  border-radius: 999px;
+}
+*::-webkit-scrollbar-thumb:hover { background: var(--line-3); }
