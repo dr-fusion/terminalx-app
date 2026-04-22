@@ -54,6 +54,11 @@ export function TerminalViewWterm({
           try {
             const msg = JSON.parse(data);
             if (msg.type === "pty-id" || msg.type === "event") return;
+            if (msg.type === "scrollback" && typeof msg.data === "string") {
+              term.write(msg.data);
+              if (!msg.data.endsWith("\n")) term.write("\r\n");
+              return;
+            }
             if (msg.type === "session-ended") {
               // Shell exited / tmux session killed from inside the terminal.
               // Suppress reconnect so we don't spawn a new session.

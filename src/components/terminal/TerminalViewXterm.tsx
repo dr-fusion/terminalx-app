@@ -89,6 +89,18 @@ export function TerminalViewXterm({
             if (msg.type === "pty-id" || msg.type === "event") {
               return; // Skip control messages
             }
+            if (msg.type === "scrollback" && typeof msg.data === "string") {
+              // Seed xterm's scrollback with tmux's pane history. We write
+              // the captured bytes (which include ANSI color codes) so it
+              // lands in scrollback the same way live output would. The
+              // subsequent tmux attach will redraw the current screen on
+              // top, which is exactly what we want.
+              terminalRef.current.write(msg.data);
+              // Make sure the captured chunk ends with a clean line so
+              // the live redraw doesn't glue onto the last line.
+              if (!msg.data.endsWith("\n")) terminalRef.current.write("\r\n");
+              return;
+            }
             if (msg.type === "session-ended") {
               // Shell exited / tmux session killed from inside the terminal.
               // Suppress the auto-reconnect loop so we don't silently spawn
@@ -138,6 +150,9 @@ export function TerminalViewXterm({
       cursorBlink: true,
       cursorStyle: "block",
       allowProposedApi: true,
+      scrollback: 10000,
+      // Keep xterm.js's default scrollbar / wheel behavior so browser
+      // native scroll and text selection work. Tmux mouse-mode is off.
       theme: {
         background: "#07080c",
         foreground: "#e6f0e4",

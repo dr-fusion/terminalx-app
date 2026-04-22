@@ -21,6 +21,7 @@ import {
   setMaxSessions,
   destroyAllPtys,
 } from "../src/lib/pty-manager";
+import { applyGlobalOptions, capturePaneHistory } from "../src/lib/tmux";
 import { createLogStream, destroyLogStream, destroyAllLogStreams } from "../src/lib/log-streamer";
 import { startRecorder, sweepExpiredRecordings } from "../src/lib/session-recorder";
 import { verifyJwt, parseCookies } from "../src/lib/auth";
@@ -38,6 +39,9 @@ const TERMINUS_READ_ONLY = process.env.TERMINUS_READ_ONLY === "true";
 const TERMINUS_HOST = process.env.TERMINUS_HOST || "0.0.0.0";
 
 setMaxSessions(TERMINUS_MAX_SESSIONS);
+// Bump tmux's global history-limit so newly-spawned sessions keep deep
+// scrollback. Safe no-op if no tmux server is running yet.
+applyGlobalOptions();
 
 const AUTH_MODE = getAuthMode();
 
@@ -126,6 +130,24 @@ terminalWss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
 
   // Send PTY ID to client
   ws.send(JSON.stringify({ type: "pty-id", id: ptyInstance.id }));
+
+  // Seed xterm's scrollback with tmux's history for this session so the
+  // user can mouse-wheel / touch-scroll to see prior output. We keep tmux
+  // mouse-mode OFF (otherwise tmux hijacks drag-select and browser Cmd+C
+  // stops working), so the history has to live client-side in xterm.
+  //
+  // Wrap the capture in a "scrollback" marker pair so the client knows
+  // this chunk isn't fresh PTY output — it writes it to the terminal
+  // verbatim (which populates scrollback via xterm's line buffer) and
+  // then resets the cursor/screen before the live attach redraws.
+  try {
+    const history = capturePaneHistory(sessionId, TERMINUS_SCROLLBACK);
+    if (history && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "scrollback", data: history }));
+    }
+  } catch {
+    // Capture failed — fall through without seeding.
+  }
 
   // Optional session recording
   const recorder = startRecorder({
