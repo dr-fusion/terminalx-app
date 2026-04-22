@@ -3,7 +3,7 @@
 # compile and runtime (glibc must match). Single stage avoids version mismatches.
 #
 # Pinned to minor version. Dependabot updates patch releases and digest.
-FROM node:20.18-bookworm-slim
+FROM node:25.9-bookworm-slim
 
 # Install system dependencies: tmux (terminal multiplexer), build tools (node-pty),
 # tini (PID 1 signal handling), curl (HEALTHCHECK).
