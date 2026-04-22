@@ -81,20 +81,20 @@ TerminalX runs **directly on your server** via node-pty + tmux. No SSH tunneling
 
 All settings via environment variables. See [`.env.example`](.env.example) for the full list.
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PORT` | `3000` | Server port |
-| `TERMINUS_ROOT` | `$HOME` | File browser root |
-| `TERMINUS_SHELL` | `$SHELL` | Default shell |
-| `TERMINUS_READ_ONLY` | `false` | Read-only mode (disables terminal, uploads, session management) |
-| `TERMINUS_MAX_SESSIONS` | `20` | Max terminal sessions |
-| `TERMINUS_SCROLLBACK` | `10000` | tmux scrollback history lines |
-| `TERMINUS_LOG_PATHS` | `/var/log,~/.pm2/logs` | Log directories to scan |
-| `TERMINUS_RECORD_SESSIONS` | `false` | Record every PTY session to `data/recordings/*.jsonl` for replay (⚠ captures everything you type, including secrets) |
-| `TERMINALX_AUTH_MODE` | `none` | Auth mode: `none`, `password`, `local`, `google` |
-| `TERMINALX_GOOGLE_CLIENT_ID` | — | Google OAuth client ID (when `AUTH_MODE=google`) |
-| `TERMINALX_GOOGLE_CLIENT_SECRET` | — | Google OAuth client secret |
-| `TERMINALX_ALLOWED_EMAILS` | — | Comma-separated allowlist of Google emails; empty denies everyone |
+| Variable                         | Default                | Description                                                                                                          |
+| -------------------------------- | ---------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `PORT`                           | `3000`                 | Server port                                                                                                          |
+| `TERMINUS_ROOT`                  | `$HOME`                | File browser root                                                                                                    |
+| `TERMINUS_SHELL`                 | `$SHELL`               | Default shell                                                                                                        |
+| `TERMINUS_READ_ONLY`             | `false`                | Read-only mode (disables terminal, uploads, session management)                                                      |
+| `TERMINUS_MAX_SESSIONS`          | `20`                   | Max terminal sessions                                                                                                |
+| `TERMINUS_SCROLLBACK`            | `10000`                | tmux scrollback history lines                                                                                        |
+| `TERMINUS_LOG_PATHS`             | `/var/log,~/.pm2/logs` | Log directories to scan                                                                                              |
+| `TERMINUS_RECORD_SESSIONS`       | `false`                | Record every PTY session to `data/recordings/*.jsonl` for replay (⚠ captures everything you type, including secrets) |
+| `TERMINALX_AUTH_MODE`            | `none`                 | Auth mode: `none`, `password`, `local`, `google`                                                                     |
+| `TERMINALX_GOOGLE_CLIENT_ID`     | —                      | Google OAuth client ID (when `AUTH_MODE=google`)                                                                     |
+| `TERMINALX_GOOGLE_CLIENT_SECRET` | —                      | Google OAuth client secret                                                                                           |
+| `TERMINALX_ALLOWED_EMAILS`       | —                      | Comma-separated allowlist of Google emails; empty denies everyone                                                    |
 
 ## Authentication
 
@@ -121,15 +121,15 @@ In `local` mode, non-admin users can only access their own terminal sessions (pr
 
 ## How It Compares
 
-| Feature | TerminalX | ttyd/Wetty | Cockpit | code-server |
-|---------|-----------|------------|---------|-------------|
-| Web terminal | Yes | Yes | Yes | Yes |
-| File browser | Yes | No | Yes | Yes (full IDE) |
-| Log viewer | Yes | No | Yes | No |
-| tmux sessions | Native | No | No | No |
-| Persistent sessions | Yes (tmux) | No | No | Yes |
-| Lightweight | Yes (~50MB) | Yes | Medium | Heavy (~1GB) |
-| Self-contained | Yes | Yes | Yes | Yes |
+| Feature             | TerminalX   | ttyd/Wetty | Cockpit | code-server    |
+| ------------------- | ----------- | ---------- | ------- | -------------- |
+| Web terminal        | Yes         | Yes        | Yes     | Yes            |
+| File browser        | Yes         | No         | Yes     | Yes (full IDE) |
+| Log viewer          | Yes         | No         | Yes     | No             |
+| tmux sessions       | Native      | No         | No      | No             |
+| Persistent sessions | Yes (tmux)  | No         | No      | Yes            |
+| Lightweight         | Yes (~50MB) | Yes        | Medium  | Heavy (~1GB)   |
+| Self-contained      | Yes         | Yes        | Yes     | Yes            |
 
 ## Development
 
@@ -144,7 +144,7 @@ npm run lint         # ESLint
 
 - [Next.js](https://nextjs.org) 16 + custom WebSocket server
 - [shadcn/ui](https://ui.shadcn.com) + [Tailwind CSS](https://tailwindcss.com) 4
-- [xterm.js](https://xtermjs.org) (default) and [wterm](https://github.com/vercel-labs/wterm) (DOM/WASM renderer) + [node-pty](https://github.com/nicedudeng/node-pty)
+- [xterm.js](https://xtermjs.org) (default) and [wterm](https://github.com/vercel-labs/wterm) (DOM/WASM renderer) + [node-pty](https://github.com/microsoft/node-pty)
 - [@wterm/just-bash](https://github.com/vercel-labs/wterm) for the in-browser Playground
 - [react-resizable-panels](https://github.com/bvaughn/react-resizable-panels)
 

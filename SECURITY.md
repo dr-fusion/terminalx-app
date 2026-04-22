@@ -16,8 +16,9 @@ Use GitHub's private vulnerability reporting:
 2. Describe the issue, impact, and (if possible) a reproduction.
 3. You'll get an acknowledgement within 72 hours.
 
-If GitHub's advisory system is unavailable to you, email the maintainer
-listed in `package.json` with the subject line `SECURITY: terminalx-app`.
+If GitHub's advisory system is unavailable to you, open a minimal issue
+that says "security report — please contact me privately" and leave a
+way to reach you. A maintainer will respond off-thread.
 
 ## What we treat as in-scope
 
