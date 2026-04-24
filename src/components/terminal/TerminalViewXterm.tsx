@@ -35,6 +35,12 @@ export function TerminalViewXterm({
   const [altActive, setAltActive] = useState(false);
   const dragCounterRef = useRef(0);
   const connectWsRef = useRef<(() => void) | null>(null);
+  // Touch-scroll bookkeeping. Mobile browsers sometimes don't forward
+  // touch-drag to xterm's viewport (the canvas swallows events for
+  // selection/focus), so we manage scrolling ourselves on touchmove.
+  const touchStartYRef = useRef<number | null>(null);
+  const touchLastYRef = useRef<number | null>(null);
+  const touchScrolledRef = useRef(false);
 
   // Keep callbacks in refs so connectWs doesn't change identity when the
   // parent re-renders. Otherwise the terminal + WebSocket rebuild on every
@@ -278,6 +284,13 @@ export function TerminalViewXterm({
     const wrapper = wrapperRef.current;
     const term = terminalRef.current;
     if (!wrapper || !term) return;
+    // A touch-scroll gesture also fires pointerup when the finger lifts;
+    // in that case we don't want to anchor the copy button because the
+    // user wasn't selecting, just scrolling.
+    if (touchScrolledRef.current) {
+      touchScrolledRef.current = false;
+      return;
+    }
     const clientX = e.clientX;
     const clientY = e.clientY;
     // Give xterm a frame to finalize the selection before we peek at it.
@@ -301,6 +314,50 @@ export function TerminalViewXterm({
       y = Math.max(4, y);
       setCopyBtnPos({ x, y });
     });
+  }, []);
+
+  // Touch scroll handlers — on mobile, drag a finger vertically in the
+  // terminal area to scroll xterm's scrollback. Below a small threshold
+  // the gesture is treated as a tap so focus / selection still work.
+  const handleTouchStart = useCallback((e: React.TouchEvent) => {
+    if (e.touches.length !== 1) return;
+    const y = e.touches[0]!.clientY;
+    touchStartYRef.current = y;
+    touchLastYRef.current = y;
+    touchScrolledRef.current = false;
+  }, []);
+
+  const handleTouchMove = useCallback((e: React.TouchEvent) => {
+    if (e.touches.length !== 1) return;
+    const term = terminalRef.current;
+    const startY = touchStartYRef.current;
+    const lastY = touchLastYRef.current;
+    if (!term || startY === null || lastY === null) return;
+    const y = e.touches[0]!.clientY;
+    // Ignore short drags so a tap still focuses / starts selection.
+    const totalDelta = Math.abs(y - startY);
+    const SCROLL_THRESHOLD = 8;
+    if (!touchScrolledRef.current && totalDelta < SCROLL_THRESHOLD) return;
+    const fontSize = (term.options.fontSize ?? 14) as number;
+    const lineHeightMult = (term.options.lineHeight ?? 1.4) as number;
+    const lineHeightPx = Math.max(1, Math.round(fontSize * lineHeightMult));
+    const delta = y - lastY;
+    const lines = Math.trunc(delta / lineHeightPx);
+    if (lines !== 0) {
+      // Finger down = scroll up into history (negative lines for xterm).
+      term.scrollLines(-lines);
+      // Advance the baseline by the whole number of lines we consumed so
+      // remainder pixels accumulate for the next move event.
+      touchLastYRef.current = lastY + lines * lineHeightPx;
+    }
+    touchScrolledRef.current = true;
+  }, []);
+
+  const handleTouchEnd = useCallback(() => {
+    touchStartYRef.current = null;
+    touchLastYRef.current = null;
+    // touchScrolledRef stays true for the onPointerUp that fires right
+    // after — handlePointerUp reads + clears it.
   }, []);
 
   // Receive snippet injections from the terminal bus
@@ -436,11 +493,15 @@ export function TerminalViewXterm({
     <div
       ref={wrapperRef}
       className="h-full w-full relative"
+      style={{ touchAction: "pan-y" }}
       onDragEnter={handleDragEnter}
       onDragLeave={handleDragLeave}
       onDragOver={handleDragOver}
       onDrop={handleDrop}
       onPointerUp={handlePointerUp}
+      onTouchStart={handleTouchStart}
+      onTouchMove={handleTouchMove}
+      onTouchEnd={handleTouchEnd}
     >
       <div ref={containerRef} className="h-full w-full" style={{ backgroundColor: "#0a0b10" }} />
 
