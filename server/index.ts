@@ -21,7 +21,8 @@ import {
   setMaxSessions,
   destroyAllPtys,
 } from "../src/lib/pty-manager";
-import { applyGlobalOptions, capturePaneHistory } from "../src/lib/tmux";
+import { execFileSync } from "child_process";
+import { applyGlobalOptions } from "../src/lib/tmux";
 import { createLogStream, destroyLogStream, destroyAllLogStreams } from "../src/lib/log-streamer";
 import { startRecorder, sweepExpiredRecordings } from "../src/lib/session-recorder";
 import { verifyJwt, parseCookies } from "../src/lib/auth";
@@ -82,7 +83,10 @@ const handle = app.getRequestHandler();
 
 // ── WebSocket Servers (noServer mode) ───────────────────────────────────────
 
-const terminalWss = new WebSocketServer({ noServer: true, maxPayload: 1 * 1024 * 1024 }); // 1MB
+// maxPayload is a receive-side limit, but the ws library also guards
+// sends against truly oversized frames. 4 MB gives comfortable headroom
+// for scrollback-chunk payloads after JSON/ANSI-escape expansion.
+const terminalWss = new WebSocketServer({ noServer: true, maxPayload: 4 * 1024 * 1024 });
 const logsWss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 }); // 64KB
 const filesWss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 }); // 64KB
 
@@ -131,41 +135,10 @@ terminalWss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
   // Send PTY ID to client
   ws.send(JSON.stringify({ type: "pty-id", id: ptyInstance.id }));
 
-  // Seed xterm's scrollback with tmux's history for this session so the
-  // user can mouse-wheel / touch-scroll to see prior output. We keep tmux
-  // mouse-mode OFF (otherwise tmux hijacks drag-select and browser Cmd+C
-  // stops working), so the history has to live client-side in xterm.
-  //
-  // The capture can be large (ANSI bytes for 10k lines routinely crosses
-  // 1 MB) and our WebSocket's maxPayload is 1 MB, so we chunk the
-  // payload into frames that fit comfortably inside the limit — framed
-  // with begin/chunk/end control messages so the client can reconstruct
-  // and write it in order before the live PTY feed arrives.
-  try {
-    const history = capturePaneHistory(sessionId, TERMINUS_SCROLLBACK);
-    if (history && ws.readyState === WebSocket.OPEN) {
-      const CHUNK_BYTES = 512 * 1024; // half of maxPayload, JSON-safe
-      if (history.length <= CHUNK_BYTES) {
-        ws.send(JSON.stringify({ type: "scrollback", data: history }));
-      } else {
-        ws.send(JSON.stringify({ type: "scrollback-begin" }));
-        for (let i = 0; i < history.length; i += CHUNK_BYTES) {
-          if (ws.readyState !== WebSocket.OPEN) break;
-          ws.send(
-            JSON.stringify({
-              type: "scrollback-chunk",
-              data: history.slice(i, i + CHUNK_BYTES),
-            })
-          );
-        }
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: "scrollback-end" }));
-        }
-      }
-    }
-  } catch {
-    // Capture failed — fall through without seeding.
-  }
+  // (We don't seed xterm's scrollback buffer anymore. tmux attach puts
+  // every client on the tmux alt-screen, so anything written to xterm's
+  // main buffer is invisible. Scrolling is driven via tmux copy-mode
+  // through the {type:"scroll"} control messages below.)
 
   // Optional session recording
   const recorder = startRecorder({
@@ -210,6 +183,40 @@ terminalWss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
         const parsed = JSON.parse(data);
         if (parsed.type === "resize" && parsed.cols && parsed.rows) {
           resizePty(ptyInstance.id, parsed.cols, parsed.rows);
+          return;
+        }
+        // Scroll control — tmux always runs its client on the alternate
+        // screen buffer, so xterm-level scroll can't reach the shell's
+        // real history. Drive tmux's own copy-mode from the server:
+        // enter copy mode (no-op if already in), run a scroll command,
+        // or cancel to return to live output.
+        if (parsed.type === "scroll" && typeof parsed.action === "string") {
+          const action = parsed.action;
+          const scrollCmd: Record<string, string> = {
+            up: "page-up",
+            down: "page-down",
+            "up-line": "scroll-up",
+            "down-line": "scroll-down",
+            top: "history-top",
+            bottom: "history-bottom",
+          };
+          try {
+            if (action === "resume" || action === "cancel") {
+              // Kick out of copy mode back to live output. Safe to run
+              // even if not currently in copy mode (tmux ignores it).
+              execFileSync("tmux", ["send-keys", "-t", sessionId, "-X", "cancel"], {
+                timeout: 2000,
+              });
+            } else if (scrollCmd[action]) {
+              // Make sure we're in copy mode before sending a scroll key.
+              execFileSync("tmux", ["copy-mode", "-t", sessionId], { timeout: 2000 });
+              execFileSync("tmux", ["send-keys", "-t", sessionId, "-X", scrollCmd[action]], {
+                timeout: 2000,
+              });
+            }
+          } catch (err) {
+            console.error("[scroll] tmux command failed", err);
+          }
           return;
         }
       } catch {

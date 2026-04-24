@@ -96,27 +96,18 @@ export function TerminalViewXterm({
             if (msg.type === "pty-id" || msg.type === "event") {
               return; // Skip control messages
             }
-            if (msg.type === "scrollback" && typeof msg.data === "string") {
-              // Seed xterm's scrollback with tmux's pane history. Write
-              // the captured bytes (ANSI included) so they land in
-              // scrollback the same way live output would. The tmux
-              // attach will redraw the current screen on top.
-              terminalRef.current.write(msg.data);
-              if (!msg.data.endsWith("\n")) terminalRef.current.write("\r\n");
-              return;
-            }
-            // Large scrollback captures (e.g. 10k ANSI lines ~1 MB) arrive
-            // chunked because a single WS frame would exceed the 1 MB
-            // maxPayload. Stream chunks straight into xterm in order; the
-            // live PTY feed is held back on the server until the last
-            // chunk is queued.
-            if (msg.type === "scrollback-begin") return;
-            if (msg.type === "scrollback-chunk" && typeof msg.data === "string") {
-              terminalRef.current.write(msg.data);
-              return;
-            }
-            if (msg.type === "scrollback-end") {
-              terminalRef.current.write("\r\n");
+            // Legacy scrollback control messages — the server stopped
+            // sending these once we switched scrolling to tmux copy-mode
+            // (tmux attach puts every pane on the alt-screen buffer,
+            // which ignores the main-buffer scrollback we used to seed
+            // here). Accept + drop them so clients connecting to a
+            // server that still sends them don't choke.
+            if (
+              msg.type === "scrollback" ||
+              msg.type === "scrollback-begin" ||
+              msg.type === "scrollback-chunk" ||
+              msg.type === "scrollback-end"
+            ) {
               return;
             }
             if (msg.type === "session-ended") {
@@ -579,10 +570,11 @@ export function TerminalViewXterm({
         </button>
       )}
 
-      {/* Scroll pad — explicit controls for paginating scrollback.
-          Native touch/wheel scroll is always best-effort on mobile given
-          xterm's own event handling, so these buttons give users a
-          reliable way to page up/down and jump back to live output. */}
+      {/* Scroll pad — drives tmux's own copy-mode on the server. xterm's
+          built-in scroll can't reach the shell's history because tmux
+          attach puts every pane on the alt-screen buffer, so we send
+          {type:"scroll"} control messages and the server runs
+          `tmux copy-mode` + `send-keys -X page-up/page-down/cancel`. */}
       <div
         className="absolute z-40 flex flex-col gap-1 right-2"
         style={{ bottom: isMobile ? 48 : 12 }}
@@ -593,7 +585,12 @@ export function TerminalViewXterm({
           title="scroll up"
           onPointerDown={(e) => e.stopPropagation()}
           onPointerUp={(e) => e.stopPropagation()}
-          onClick={() => terminalRef.current?.scrollPages(-1)}
+          onClick={() => {
+            const w = wsRef.current;
+            if (w?.readyState === WebSocket.OPEN) {
+              w.send(JSON.stringify({ type: "scroll", action: "up" }));
+            }
+          }}
           className="w-8 h-8 flex items-center justify-center rounded
             bg-[#14161e]/90 border border-[#252933] text-[#a8b3a6]
             hover:text-[#00ff88] hover:border-[#00cc6e] transition-colors
@@ -607,7 +604,12 @@ export function TerminalViewXterm({
           title="scroll down"
           onPointerDown={(e) => e.stopPropagation()}
           onPointerUp={(e) => e.stopPropagation()}
-          onClick={() => terminalRef.current?.scrollPages(1)}
+          onClick={() => {
+            const w = wsRef.current;
+            if (w?.readyState === WebSocket.OPEN) {
+              w.send(JSON.stringify({ type: "scroll", action: "down" }));
+            }
+          }}
           className="w-8 h-8 flex items-center justify-center rounded
             bg-[#14161e]/90 border border-[#252933] text-[#a8b3a6]
             hover:text-[#00ff88] hover:border-[#00cc6e] transition-colors
@@ -617,11 +619,16 @@ export function TerminalViewXterm({
         </button>
         <button
           type="button"
-          aria-label="jump to live output"
-          title="jump to bottom"
+          aria-label="return to live output"
+          title="return to live"
           onPointerDown={(e) => e.stopPropagation()}
           onPointerUp={(e) => e.stopPropagation()}
-          onClick={() => terminalRef.current?.scrollToBottom()}
+          onClick={() => {
+            const w = wsRef.current;
+            if (w?.readyState === WebSocket.OPEN) {
+              w.send(JSON.stringify({ type: "scroll", action: "resume" }));
+            }
+          }}
           className="w-8 h-8 flex items-center justify-center rounded
             bg-[#14161e]/90 border border-[#252933] text-[#a8b3a6]
             hover:text-[#00ff88] hover:border-[#00cc6e] transition-colors
