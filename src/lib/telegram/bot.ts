@@ -1,7 +1,13 @@
 import { Bot, type Context } from "grammy";
-import { listSessions, createSession, killSession, hasSession } from "@/lib/tmux";
+import {
+  listSessions,
+  createSession,
+  killSession,
+  hasSession,
+  getSessionCreatedMs,
+  isPaneTui,
+} from "@/lib/tmux";
 import { canAccessSession, scopedSessionName } from "@/lib/session-scope";
-import { isPaneTui } from "@/lib/tmux";
 import { commandForKind, saveMeta, isValidKind, type SessionKind } from "@/lib/ai-sessions";
 import { resolveTelegramIdentity, botIsConfigured, type BotIdentity } from "./auth";
 import { sessionsKeyboard, CB } from "./keyboard";
@@ -66,9 +72,19 @@ async function attachToTopic(b: Bot, identity: BotIdentity, binding: TopicBindin
   const mode = binding.viewMode ?? defaultViewMode(binding.kind);
   await setTopic({ ...binding, viewMode: mode });
   startStreamer(b, binding.topicId);
+  let resolvedJsonl: string | undefined = binding.jsonlPath;
   if (binding.kind === "claude") {
-    const started = startClaudeTranscript(b, chatId, binding.topicId, binding.jsonlOffset);
-    if (started) await patchTopic(binding.topicId, { jsonlPath: started.jsonl });
+    const sinceMs = getSessionCreatedMs(binding.sessionName) ?? Date.now();
+    const started = startClaudeTranscript(b, chatId, binding.topicId, {
+      cwd: binding.cwd,
+      sinceMs,
+      persistedJsonl: binding.jsonlPath,
+      initialOffset: binding.jsonlOffset,
+    });
+    if (started) {
+      resolvedJsonl = started.jsonl;
+      await patchTopic(binding.topicId, { jsonlPath: started.jsonl });
+    }
   }
 
   // Welcome banner so the user sees the bot did something. /view to
@@ -86,7 +102,7 @@ async function attachToTopic(b: Bot, identity: BotIdentity, binding: TopicBindin
   // the most recent assistant message from the latest JSONL so they
   // immediately have context for what was happening.
   if (mode === "chat" && isPaneTui(binding.sessionName)) {
-    const last = readLastAssistantText();
+    const last = readLastAssistantText(resolvedJsonl);
     if (last) {
       try {
         await b.api.sendMessage(chatId, last, {
@@ -572,7 +588,14 @@ export async function startTelegramBot(): Promise<Bot | null> {
   // resume any persisted topic streamers
   resumePersistedStreamers(bot);
   for (const t of listTopics()) {
-    if (t.kind === "claude") startClaudeTranscript(bot, forumChatId, t.topicId, t.jsonlOffset);
+    if (t.kind !== "claude") continue;
+    const sinceMs = getSessionCreatedMs(t.sessionName) ?? 0;
+    startClaudeTranscript(bot, forumChatId, t.topicId, {
+      cwd: t.cwd,
+      sinceMs,
+      persistedJsonl: t.jsonlPath,
+      initialOffset: t.jsonlOffset,
+    });
   }
   return bot;
 }

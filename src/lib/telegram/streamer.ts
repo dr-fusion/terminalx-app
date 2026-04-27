@@ -1,6 +1,6 @@
 import { execFileSync } from "child_process";
 import type { Bot } from "grammy";
-import { hasSession, captureVisiblePane, isPaneTui } from "@/lib/tmux";
+import { hasSession, captureVisiblePane, isPaneTui, getSessionCreatedMs } from "@/lib/tmux";
 import { renderScreen, stripAnsi } from "./render";
 import { attachedKeyboard } from "./keyboard";
 import {
@@ -34,14 +34,10 @@ interface RuntimeState {
 }
 
 /** Default view mode for a freshly-attached topic. */
-export function defaultViewMode(kind: string): ViewMode {
-  // Chat for plain bash — the line-diff stream reads like a conversation.
-  // Screen for claude / codex by default because the JSONL transcript
-  // pick is global ("the most recently modified JSONL across all
-  // ~/.claude/projects/"), which gets confused if you have several Claude
-  // topics open at once and they all tail the same file. Users can flip
-  // a single topic to chat with /view chat.
-  if (kind === "claude" || kind === "codex") return "screen";
+export function defaultViewMode(_kind: string): ViewMode {
+  // Chat reads like a normal conversation; for claude / codex topics it
+  // routes through the per-topic JSONL transcript so the user sees only
+  // the assistant's final replies.
   return "chat";
 }
 
@@ -206,7 +202,13 @@ async function flushChat(
     // formatted assistant / tool / thinking messages instead of the
     // raw screen redraws.
     if (!isClaudeTranscriptRunning(topicId)) {
-      const started = startClaudeTranscript(bot, chatId, topicId, 0);
+      const sinceMs = getSessionCreatedMs(sessionName) ?? Date.now();
+      const started = startClaudeTranscript(bot, chatId, topicId, {
+        cwd: binding?.cwd,
+        sinceMs,
+        persistedJsonl: binding?.jsonlPath,
+        initialOffset: binding?.jsonlOffset,
+      });
       if (started) {
         await patchTopic(topicId, { jsonlPath: started.jsonl });
         return;

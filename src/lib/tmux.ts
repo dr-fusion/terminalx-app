@@ -212,6 +212,26 @@ export function renameSession(oldName: string, newName: string): void {
   });
 }
 
+/**
+ * Unix-epoch milliseconds at which the named session was created. Used by
+ * the Telegram JSONL router to match a topic to its own claude transcript
+ * file (claude writes one JSONL per session, file ctime ≈ session start).
+ */
+export function getSessionCreatedMs(name: string): number | null {
+  const safeName = sanitizeSessionName(name);
+  try {
+    const out = execFileSync(
+      TMUX_BIN,
+      ["display-message", "-p", "-t", safeName, "#{session_created}"],
+      { encoding: "utf-8", timeout: 2000 }
+    );
+    const secs = parseInt(out.trim(), 10);
+    return Number.isFinite(secs) && secs > 0 ? secs * 1000 : null;
+  } catch {
+    return null;
+  }
+}
+
 export function hasSession(name: string): boolean {
   const safeName = sanitizeSessionName(name);
   try {

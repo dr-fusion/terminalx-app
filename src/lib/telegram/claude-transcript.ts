@@ -22,7 +22,13 @@ interface ToolResultEntry {
 
 type TranscriptEntry = AssistantEntry | ThinkingEntry | ToolResultEntry | { type: string };
 
-const watchers = new Map<number, { watcher: FSWatcher; offset: number; jsonl: string }>();
+interface WatcherRecord {
+  watcher: FSWatcher;
+  offset: number;
+  jsonl: string;
+}
+
+const watchers = new Map<number, WatcherRecord>();
 
 /**
  * Per-topic minimum-spacing send queue. Telegram allows ~1 message/sec to
@@ -75,10 +81,84 @@ function sleep(ms: number): Promise<void> {
 
 const PROJECTS_DIR = path.join(os.homedir(), ".claude", "projects");
 
-/** Find the most recently modified JSONL anywhere under ~/.claude/projects/. */
-function findLatestJsonl(): string | null {
+/**
+ * Claude Code stores transcripts under
+ * `~/.claude/projects/<cwd-with-slashes-as-dashes>/<sessionId>.jsonl`.
+ * For `/home/agent/code/foo` the directory is `-home-agent-code-foo`.
+ */
+function projectDirForCwd(cwd: string): string {
+  const transformed = cwd.replace(/[\\/]/g, "-");
+  return path.join(PROJECTS_DIR, transformed);
+}
+
+interface JsonlCandidate {
+  path: string;
+  ctimeMs: number;
+  mtimeMs: number;
+}
+
+function listJsonlIn(dir: string): JsonlCandidate[] {
+  if (!fs.existsSync(dir)) return [];
+  const out: JsonlCandidate[] = [];
+  for (const name of fs.readdirSync(dir)) {
+    if (!name.endsWith(".jsonl")) continue;
+    const p = path.join(dir, name);
+    try {
+      const s = fs.statSync(p);
+      const ctime = s.birthtimeMs && s.birthtimeMs > 0 ? s.birthtimeMs : s.ctimeMs;
+      out.push({ path: p, ctimeMs: ctime, mtimeMs: s.mtimeMs });
+    } catch {
+      /* skip unreadable */
+    }
+  }
+  return out;
+}
+
+function claimedJsonls(skipTopicId?: number): Set<string> {
+  const set = new Set<string>();
+  for (const [tid, rec] of watchers.entries()) {
+    if (tid === skipTopicId) continue;
+    set.add(rec.jsonl);
+  }
+  return set;
+}
+
+/**
+ * Find the JSONL that belongs to a specific tmux session. We narrow to
+ * the project directory derived from the session's cwd, exclude JSONLs
+ * already claimed by other topics, and pick the one whose ctime is just
+ * after `sinceMs` (claude writes the first line within milliseconds of
+ * starting). Falls back to most-recent if nothing matches the timestamp
+ * window — better than nothing for legacy / pre-existing topics.
+ */
+function findJsonlForSession(opts: {
+  cwd: string;
+  sinceMs: number;
+  exclude: Set<string>;
+}): string | null {
+  const { cwd, sinceMs, exclude } = opts;
+  const dir = projectDirForCwd(cwd);
+  const candidates = listJsonlIn(dir).filter((c) => !exclude.has(c.path));
+  if (candidates.length === 0) return null;
+  // Allow a few seconds of clock skew between tmux and the file system.
+  const grace = 5000;
+  const created = candidates
+    .filter((c) => c.ctimeMs + grace >= sinceMs)
+    .sort((a, b) => a.ctimeMs - b.ctimeMs);
+  if (created.length > 0) return created[0]!.path;
+  // Fallback: most recently modified — best guess for an older session
+  // we attached to without a tmux creation timestamp.
+  return candidates.sort((a, b) => b.mtimeMs - a.mtimeMs)[0]!.path;
+}
+
+/**
+ * Legacy fallback: pick the globally most-recently-modified JSONL across
+ * every project directory. Only used by `readLastAssistantText()` when no
+ * cwd is supplied — never as a routing decision (which would mix topics).
+ */
+function findLatestJsonlGlobal(): string | null {
   if (!fs.existsSync(PROJECTS_DIR)) return null;
-  let latest: { p: string; mtime: number } | null = null;
+  let latest: JsonlCandidate | null = null;
   for (const dir of fs.readdirSync(PROJECTS_DIR)) {
     const full = path.join(PROJECTS_DIR, dir);
     let stat: fs.Stats;
@@ -88,20 +168,11 @@ function findLatestJsonl(): string | null {
       continue;
     }
     if (!stat.isDirectory()) continue;
-    for (const name of fs.readdirSync(full)) {
-      if (!name.endsWith(".jsonl")) continue;
-      const file = path.join(full, name);
-      try {
-        const fstat = fs.statSync(file);
-        if (!latest || fstat.mtimeMs > latest.mtime) {
-          latest = { p: file, mtime: fstat.mtimeMs };
-        }
-      } catch {
-        // skip
-      }
+    for (const c of listJsonlIn(full)) {
+      if (!latest || c.mtimeMs > latest.mtimeMs) latest = c;
     }
   }
-  return latest?.p ?? null;
+  return latest?.path ?? null;
 }
 
 function renderEntry(entry: TranscriptEntry): string | null {
@@ -120,27 +191,52 @@ function renderEntry(entry: TranscriptEntry): string | null {
   return null;
 }
 
+export interface StartTranscriptOpts {
+  /** tmux pane cwd — used to narrow JSONL search to one project dir. */
+  cwd?: string;
+  /** tmux `session_created` in ms — match the JSONL whose ctime is just after this. */
+  sinceMs?: number;
+  /** Resume from a previously-stored path (skip rediscovery). */
+  persistedJsonl?: string;
+  /** Resume byte offset — skip replaying entries we've already sent. */
+  initialOffset?: number;
+}
+
 /**
  * Tail a JSONL transcript and forward each new entry as a topic message.
- * For v1 we use the most-recently-modified JSONL globally — works for the
- * common case of one active claude session.
+ * The JSONL is identified per-session: each topic gets its own file,
+ * matched by `cwd + sinceMs`, with already-claimed files excluded so two
+ * topics in the same project never tail the same JSONL.
  *
- * If `initialOffset` is omitted (or 0), we start at end-of-file so we
- * don't replay tens of thousands of historical entries on first attach.
- * Caller can pass a known offset (from persisted state) to resume.
+ * Returns null if no candidate JSONL is found yet — callers (the streamer's
+ * 5 s flush loop) will retry on the next tick, by which time claude will
+ * have written its first line.
  */
 export function startClaudeTranscript(
   bot: Bot,
   chatId: number,
   topicId: number,
-  initialOffset?: number
+  opts: StartTranscriptOpts = {}
 ): { stop: () => void; jsonl: string } | null {
-  const jsonl = findLatestJsonl();
+  // If this topic already has a watcher, don't double-start — caller
+  // should have stopped it first if they meant to swap.
+  if (watchers.has(topicId)) return null;
+
+  let jsonl: string | null = null;
+  if (opts.persistedJsonl && fs.existsSync(opts.persistedJsonl)) {
+    jsonl = opts.persistedJsonl;
+  } else if (opts.cwd && typeof opts.sinceMs === "number") {
+    jsonl = findJsonlForSession({
+      cwd: opts.cwd,
+      sinceMs: opts.sinceMs,
+      exclude: claimedJsonls(topicId),
+    });
+  }
   if (!jsonl) return null;
 
   let offset: number;
-  if (initialOffset && initialOffset > 0) {
-    offset = initialOffset;
+  if (opts.initialOffset && opts.initialOffset > 0) {
+    offset = opts.initialOffset;
   } else {
     // Start at EOF — only forward entries written from now on.
     try {
@@ -149,14 +245,15 @@ export function startClaudeTranscript(
       offset = 0;
     }
   }
+
   const flush = async () => {
     try {
-      const stat = fs.statSync(jsonl);
+      const stat = fs.statSync(jsonl!);
       if (stat.size < offset) {
         offset = 0; // file was rotated/truncated
       }
       if (stat.size === offset) return;
-      const fd = fs.openSync(jsonl, "r");
+      const fd = fs.openSync(jsonl!, "r");
       const buf = Buffer.alloc(stat.size - offset);
       fs.readSync(fd, buf, 0, buf.length, offset);
       fs.closeSync(fd);
@@ -177,16 +274,6 @@ export function startClaudeTranscript(
       console.error("[telegram/claude] flush failed", err);
     }
   };
-
-  // Only one topic can own the JSONL transcript watcher at a time —
-  // findLatestJsonl() is a global pick, so two topics tailing
-  // simultaneously would emit the same lines into both. Stop any existing
-  // watcher (in another topic) first.
-  for (const [otherTopicId, w] of watchers.entries()) {
-    if (otherTopicId === topicId) continue;
-    void w.watcher.close();
-    watchers.delete(otherTopicId);
-  }
 
   const watcher = watch(jsonl, { ignoreInitial: true });
   watcher.on("change", () => void flush());
@@ -222,16 +309,16 @@ export function stopAllClaudeTranscripts(): void {
 }
 
 /**
- * Read the most-recently-written JSONL transcript backwards and return
- * the last assistant text entry, MarkdownV2-escaped. Returns null when
- * no JSONL is found or no assistant entries exist. Used to give the user
- * immediate context when they attach to a chat-mode topic.
+ * Read a JSONL transcript backwards and return the last assistant text
+ * entry, MarkdownV2-escaped. When `jsonlPath` is supplied (the topic's
+ * own transcript), reads that; otherwise falls back to the globally
+ * most-recently-modified JSONL.
  *
- * Caps the scan at the last 256 KB of the file so we don't read 100 MB
- * to find a quote.
+ * Caps the scan at the last 256 KB so we don't read 100 MB to find a
+ * quote.
  */
-export function readLastAssistantText(): string | null {
-  const jsonl = findLatestJsonl();
+export function readLastAssistantText(jsonlPath?: string): string | null {
+  const jsonl = jsonlPath && fs.existsSync(jsonlPath) ? jsonlPath : findLatestJsonlGlobal();
   if (!jsonl) return null;
   try {
     const stat = fs.statSync(jsonl);
@@ -242,7 +329,6 @@ export function readLastAssistantText(): string | null {
     fs.readSync(fd, buf, 0, tailBytes, start);
     fs.closeSync(fd);
     const lines = buf.toString("utf-8").split("\n").filter(Boolean);
-    // Walk backwards.
     for (let i = lines.length - 1; i >= 0; i--) {
       try {
         const entry = JSON.parse(lines[i]!) as TranscriptEntry;
