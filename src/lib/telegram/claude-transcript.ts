@@ -105,36 +105,17 @@ function findLatestJsonl(): string | null {
 }
 
 function renderEntry(entry: TranscriptEntry): string | null {
+  // chat mode = "Claude's reply only" — skip tool_use, tool_result, and
+  // thinking blocks. The user can /view screen or look at the web UI for
+  // the full play-by-play.
   if (entry.type === "assistant") {
     const e = entry as AssistantEntry;
     const parts = e.message?.content ?? [];
-    const out: string[] = [];
-    for (const p of parts) {
-      if (p.type === "text" && p.text) out.push(escapeMarkdownV2(p.text));
-      if (p.type === "tool_use") {
-        const args = p.input ? JSON.stringify(p.input).slice(0, 400) : "";
-        out.push(`🔧 *${escapeMarkdownV2(p.name ?? "tool")}*\n\`\`\`\n${args}\n\`\`\``);
-      }
-    }
-    return out.join("\n\n") || null;
-  }
-  if (entry.type === "thinking") {
-    const e = entry as ThinkingEntry;
-    const text = e.message?.content?.find((c) => c.type === "thinking")?.text ?? "";
-    if (!text) return null;
-    // MarkdownV2 expandable blockquote: each line prefixed with `**>` on first, `>` after.
-    const lines = escapeMarkdownV2(text)
-      .split("\n")
-      .map((l, i) => (i === 0 ? `**>${l}` : `>${l}`))
-      .join("\n");
-    return lines + "||";
-  }
-  if (entry.type === "tool_result") {
-    const e = entry as ToolResultEntry;
-    const text = e.message?.content?.find((c) => c.type === "text")?.text ?? "";
-    if (!text) return null;
-    const truncated = text.length > 400 ? text.slice(0, 400) + "…" : text;
-    return `↳ \`\`\`\n${truncated}\n\`\`\``;
+    const text = parts
+      .filter((p) => p.type === "text" && p.text)
+      .map((p) => escapeMarkdownV2(p.text!))
+      .join("\n\n");
+    return text || null;
   }
   return null;
 }
