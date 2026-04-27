@@ -1,7 +1,7 @@
 import { execFileSync } from "child_process";
 import type { Bot } from "grammy";
 import { hasSession, captureVisiblePane } from "@/lib/tmux";
-import { asCodeBlock, renderScreen, stripAnsi } from "./render";
+import { renderScreen, stripAnsi } from "./render";
 import { attachedKeyboard } from "./keyboard";
 import {
   getTopic,
@@ -167,9 +167,10 @@ async function flushScreen(
 
 /**
  * chat mode — diff the visible screen against what we last sent and post
- * only the new lines as a fresh message. The first flush after a switch
- * just establishes a baseline (no message). The inline keyboard rides on
- * the latest message so the buttons are always reachable.
+ * only the new lines as a fresh plain-text message. No code block, no
+ * inline keyboard — meant to read like a normal Telegram conversation.
+ * Use slash commands (/snap, /detach, /kill, /view, /ctrlc, etc.) for
+ * control instead.
  */
 async function flushChat(
   bot: Bot,
@@ -196,11 +197,12 @@ async function flushChat(
   rt.lastSentText = text;
   if (newLines.length === 0) return;
 
-  const body = asCodeBlock(newLines.join("\n"));
-  await bot.api.sendMessage(chatId, body, {
-    parse_mode: "MarkdownV2",
+  // Plain text — no parse_mode means special chars stay literal, no
+  // backslash-escaping noise, no monospace box.
+  const body = newLines.join("\n").trim();
+  if (!body) return;
+  await bot.api.sendMessage(chatId, body.slice(0, 4000), {
     message_thread_id: topicId,
-    reply_markup: attachedKeyboard(),
   });
 }
 
