@@ -210,3 +210,40 @@ export function stopAllClaudeTranscripts(): void {
   for (const w of watchers.values()) void w.watcher.close();
   watchers.clear();
 }
+
+/**
+ * Read the most-recently-written JSONL transcript backwards and return
+ * the last assistant text entry, MarkdownV2-escaped. Returns null when
+ * no JSONL is found or no assistant entries exist. Used to give the user
+ * immediate context when they attach to a chat-mode topic.
+ *
+ * Caps the scan at the last 256 KB of the file so we don't read 100 MB
+ * to find a quote.
+ */
+export function readLastAssistantText(): string | null {
+  const jsonl = findLatestJsonl();
+  if (!jsonl) return null;
+  try {
+    const stat = fs.statSync(jsonl);
+    const tailBytes = Math.min(stat.size, 256 * 1024);
+    const start = stat.size - tailBytes;
+    const fd = fs.openSync(jsonl, "r");
+    const buf = Buffer.alloc(tailBytes);
+    fs.readSync(fd, buf, 0, tailBytes, start);
+    fs.closeSync(fd);
+    const lines = buf.toString("utf-8").split("\n").filter(Boolean);
+    // Walk backwards.
+    for (let i = lines.length - 1; i >= 0; i--) {
+      try {
+        const entry = JSON.parse(lines[i]!) as TranscriptEntry;
+        const md = renderEntry(entry);
+        if (md) return md;
+      } catch {
+        /* skip non-JSON line */
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  return null;
+}

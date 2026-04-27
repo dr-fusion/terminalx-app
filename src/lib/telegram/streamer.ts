@@ -33,12 +33,13 @@ interface RuntimeState {
   tuiHinted: boolean;
 }
 
-/** Default view mode by session kind. */
-export function defaultViewMode(kind: string): ViewMode {
-  // claude has a richer JSONL transcript stream alongside the screen
-  // streamer; chat mode there hides the noisy code-block screen and
-  // shows just the formatted assistant / tool / thinking messages.
-  return kind === "claude" ? "chat" : "screen";
+/** Default view mode for a freshly-attached topic. */
+export function defaultViewMode(_kind: string): ViewMode {
+  // Chat for everything — feels like a normal Telegram conversation. For
+  // bash that means the line-diff stream; for claude / other TUIs the
+  // JSONL transcript carries it. Users can /view screen any time to flip
+  // to the pinned-screen mode.
+  return "chat";
 }
 
 const runtimes = new Map<number, RuntimeState>();
