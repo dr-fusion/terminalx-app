@@ -22,7 +22,7 @@ import {
   destroyAllPtys,
 } from "../src/lib/pty-manager";
 import { execFileSync } from "child_process";
-import { applyGlobalOptions } from "../src/lib/tmux";
+import { applyGlobalOptions, tmuxTarget } from "../src/lib/tmux";
 import { createLogStream, destroyLogStream, destroyAllLogStreams } from "../src/lib/log-streamer";
 import { startRecorder, sweepExpiredRecordings } from "../src/lib/session-recorder";
 import { verifyJwt, parseCookies } from "../src/lib/auth";
@@ -202,16 +202,17 @@ terminalWss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
             bottom: "history-bottom",
           };
           try {
+            const target = tmuxTarget(sessionId);
             if (action === "resume" || action === "cancel") {
               // Kick out of copy mode back to live output. Safe to run
               // even if not currently in copy mode (tmux ignores it).
-              execFileSync("tmux", ["send-keys", "-t", sessionId, "-X", "cancel"], {
+              execFileSync("tmux", ["send-keys", "-t", target, "-X", "cancel"], {
                 timeout: 2000,
               });
             } else if (scrollCmd[action]) {
               // Make sure we're in copy mode before sending a scroll key.
-              execFileSync("tmux", ["copy-mode", "-t", sessionId], { timeout: 2000 });
-              execFileSync("tmux", ["send-keys", "-t", sessionId, "-X", scrollCmd[action]], {
+              execFileSync("tmux", ["copy-mode", "-t", target], { timeout: 2000 });
+              execFileSync("tmux", ["send-keys", "-t", target, "-X", scrollCmd[action]], {
                 timeout: 2000,
               });
             }

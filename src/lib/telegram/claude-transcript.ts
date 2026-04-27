@@ -20,7 +20,18 @@ interface ToolResultEntry {
   message?: { content?: Array<{ type: string; text?: string }> };
 }
 
-type TranscriptEntry = AssistantEntry | ThinkingEntry | ToolResultEntry | { type: string };
+interface UserEntry {
+  type: "user";
+  timestamp?: string;
+  message?: { content?: string | Array<{ type: string; text?: string }> };
+}
+
+type TranscriptEntry =
+  | AssistantEntry
+  | ThinkingEntry
+  | ToolResultEntry
+  | UserEntry
+  | { type: string; timestamp?: string };
 
 interface WatcherRecord {
   watcher: FSWatcher;
@@ -97,6 +108,16 @@ interface JsonlCandidate {
   mtimeMs: number;
 }
 
+interface JsonlMatch {
+  path: string;
+  offset?: number;
+}
+
+interface PromptMatch {
+  timestampMs: number;
+  offset: number;
+}
+
 function listJsonlIn(dir: string): JsonlCandidate[] {
   if (!fs.existsSync(dir)) return [];
   const out: JsonlCandidate[] = [];
@@ -123,6 +144,73 @@ function claimedJsonls(skipTopicId?: number): Set<string> {
   return set;
 }
 
+function normalizePrompt(text: string): string {
+  return text.replace(/\r\n/g, "\n").trim();
+}
+
+function userText(entry: TranscriptEntry): string | null {
+  if (entry.type !== "user") return null;
+  const content = (entry as UserEntry).message?.content;
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    const text = content
+      .filter((part) => part.type === "text" && part.text)
+      .map((part) => part.text)
+      .join("\n");
+    return text || null;
+  }
+  return null;
+}
+
+function findPromptMatch(jsonl: string, promptText: string, sinceMs: number): PromptMatch | null {
+  const expected = normalizePrompt(promptText);
+  if (!expected) return null;
+
+  try {
+    const stat = fs.statSync(jsonl);
+    const scanBytes = Math.min(stat.size, 2 * 1024 * 1024);
+    const start = stat.size - scanBytes;
+    const fd = fs.openSync(jsonl, "r");
+    const buf = Buffer.alloc(scanBytes);
+    fs.readSync(fd, buf, 0, scanBytes, start);
+    fs.closeSync(fd);
+
+    let offset = start;
+    let best: PromptMatch | null = null;
+    const lines = buf.toString("utf-8").split("\n");
+    for (const line of lines) {
+      const lineBytes = Buffer.byteLength(line + "\n");
+      const nextOffset = offset + lineBytes;
+      offset = nextOffset;
+      if (!line) continue;
+
+      let entry: TranscriptEntry;
+      try {
+        entry = JSON.parse(line) as TranscriptEntry;
+      } catch {
+        continue;
+      }
+
+      const text = userText(entry);
+      if (text === null || normalizePrompt(text) !== expected) continue;
+
+      const timestamp = (entry as { timestamp?: string }).timestamp;
+      const timestampMs = timestamp ? Date.parse(timestamp) : Number.NaN;
+      if (Number.isFinite(timestampMs) && timestampMs + 30_000 < sinceMs) continue;
+      const match = {
+        timestampMs: Number.isFinite(timestampMs) ? timestampMs : stat.mtimeMs,
+        offset: nextOffset,
+      };
+      if (!best || Math.abs(match.timestampMs - sinceMs) < Math.abs(best.timestampMs - sinceMs)) {
+        best = match;
+      }
+    }
+    return best;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Find the JSONL that belongs to a specific tmux session. We narrow to
  * the project directory derived from the session's cwd, exclude JSONLs
@@ -131,15 +219,36 @@ function claimedJsonls(skipTopicId?: number): Set<string> {
  * starting). If that match is ambiguous, do not guess: a missing Telegram
  * transcript is safer than sending one session's answer into another topic.
  */
-export function findJsonlForSession(opts: {
+function resolveJsonlForSession(opts: {
   cwd: string;
   sinceMs: number;
   exclude: Set<string>;
-}): string | null {
-  const { cwd, sinceMs, exclude } = opts;
+  promptText?: string;
+}): JsonlMatch | null {
+  const { cwd, sinceMs, exclude, promptText } = opts;
   const dir = projectDirForCwd(cwd);
   const candidates = listJsonlIn(dir).filter((c) => !exclude.has(c.path));
   if (candidates.length === 0) return null;
+
+  if (promptText) {
+    const promptMatches = candidates
+      .map((candidate) => {
+        const match = findPromptMatch(candidate.path, promptText, sinceMs);
+        return match ? { candidate, match } : null;
+      })
+      .filter((match): match is { candidate: JsonlCandidate; match: PromptMatch } => !!match)
+      .sort(
+        (a, b) =>
+          Math.abs(a.match.timestampMs - sinceMs) - Math.abs(b.match.timestampMs - sinceMs) ||
+          a.candidate.ctimeMs - b.candidate.ctimeMs
+      );
+
+    if (promptMatches.length > 0) {
+      const best = promptMatches[0]!;
+      return { path: best.candidate.path, offset: best.match.offset };
+    }
+  }
+
   // Allow a few seconds of clock skew between tmux and the file system,
   // but require the transcript to appear shortly after the session/CLI was
   // observed. Long-lived topics in the same cwd may have many Claude JSONLs.
@@ -151,8 +260,17 @@ export function findJsonlForSession(opts: {
       (a, b) =>
         Math.abs(a.ctimeMs - sinceMs) - Math.abs(b.ctimeMs - sinceMs) || a.ctimeMs - b.ctimeMs
     );
-  if (created.length > 0) return created[0]!.path;
-  return candidates.length === 1 ? candidates[0]!.path : null;
+  if (created.length > 0) return { path: created[0]!.path };
+  return candidates.length === 1 ? { path: candidates[0]!.path } : null;
+}
+
+export function findJsonlForSession(opts: {
+  cwd: string;
+  sinceMs: number;
+  exclude: Set<string>;
+  promptText?: string;
+}): string | null {
+  return resolveJsonlForSession(opts)?.path ?? null;
 }
 
 function renderEntry(entry: TranscriptEntry): string | null {
@@ -174,8 +292,10 @@ function renderEntry(entry: TranscriptEntry): string | null {
 export interface StartTranscriptOpts {
   /** tmux pane cwd — used to narrow JSONL search to one project dir. */
   cwd?: string;
-  /** tmux `session_created` in ms — match the JSONL whose ctime is just after this. */
+  /** Unix ms for either tmux session creation or the Telegram prompt send. */
   sinceMs?: number;
+  /** Prompt text to match against Claude's user transcript entries. */
+  promptText?: string;
   /** Resume from a previously-stored path (skip rediscovery). */
   persistedJsonl?: string;
   /** Resume byte offset — skip replaying entries we've already sent. */
@@ -202,25 +322,39 @@ export function startClaudeTranscript(
   // should have stopped it first if they meant to swap.
   if (watchers.has(topicId)) return null;
 
-  let jsonl: string | null = null;
-  if (
-    opts.persistedJsonl &&
-    fs.existsSync(opts.persistedJsonl) &&
-    !claimedJsonls(topicId).has(opts.persistedJsonl)
-  ) {
-    jsonl = opts.persistedJsonl;
-  } else if (opts.cwd && typeof opts.sinceMs === "number") {
-    jsonl = findJsonlForSession({
+  let match: JsonlMatch | null = null;
+  if (opts.cwd && typeof opts.sinceMs === "number" && opts.promptText) {
+    match = resolveJsonlForSession({
       cwd: opts.cwd,
       sinceMs: opts.sinceMs,
       exclude: claimedJsonls(topicId),
+      promptText: opts.promptText,
     });
   }
-  if (!jsonl) return null;
+  if (!match) {
+    if (
+      opts.persistedJsonl &&
+      fs.existsSync(opts.persistedJsonl) &&
+      !claimedJsonls(topicId).has(opts.persistedJsonl)
+    ) {
+      match = { path: opts.persistedJsonl };
+    } else if (opts.cwd && typeof opts.sinceMs === "number") {
+      match = resolveJsonlForSession({
+        cwd: opts.cwd,
+        sinceMs: opts.sinceMs,
+        exclude: claimedJsonls(topicId),
+      });
+    }
+  }
+  if (!match) return null;
+
+  const jsonl = match.path;
 
   let offset: number;
   if (opts.initialOffset && opts.initialOffset > 0) {
     offset = opts.initialOffset;
+  } else if (typeof match.offset === "number") {
+    offset = match.offset;
   } else {
     // Start at EOF — only forward entries written from now on.
     try {

@@ -21,11 +21,11 @@ const TMUX_BIN = "tmux";
  * text selection + Cmd+C copy).
  */
 export function capturePaneHistory(name: string, lines = 10000): string {
-  const safeName = sanitizeSessionName(name);
+  const target = tmuxTarget(name);
   try {
     return execFileSync(
       TMUX_BIN,
-      ["capture-pane", "-p", "-e", "-J", "-S", `-${lines}`, "-t", safeName],
+      ["capture-pane", "-p", "-e", "-J", "-S", `-${lines}`, "-t", target],
       { encoding: "utf-8", timeout: 5000, maxBuffer: 16 * 1024 * 1024 }
     );
   } catch {
@@ -39,9 +39,9 @@ export function capturePaneHistory(name: string, lines = 10000): string {
  * Telegram streamer to render a screen snapshot every few seconds.
  */
 export function captureVisiblePane(name: string): string {
-  const safeName = sanitizeSessionName(name);
+  const target = tmuxTarget(name);
   try {
-    return execFileSync(TMUX_BIN, ["capture-pane", "-p", "-e", "-J", "-t", safeName], {
+    return execFileSync(TMUX_BIN, ["capture-pane", "-p", "-e", "-J", "-t", target], {
       encoding: "utf-8",
       timeout: 5000,
       maxBuffer: 4 * 1024 * 1024,
@@ -58,13 +58,12 @@ export function captureVisiblePane(name: string): string {
  * `isPaneTui` for a more reliable TUI check.
  */
 export function isPaneAlternate(name: string): boolean {
-  const safeName = sanitizeSessionName(name);
+  const target = tmuxTarget(name);
   try {
-    const out = execFileSync(
-      TMUX_BIN,
-      ["display-message", "-p", "-t", safeName, "#{alternate_on}"],
-      { encoding: "utf-8", timeout: 2000 }
-    );
+    const out = execFileSync(TMUX_BIN, ["display-message", "-p", "-t", target, "#{alternate_on}"], {
+      encoding: "utf-8",
+      timeout: 2000,
+    });
     return out.trim() === "1";
   } catch {
     return false;
@@ -77,11 +76,11 @@ export function isPaneAlternate(name: string): boolean {
  * failure.
  */
 export function paneForegroundCommand(name: string): string {
-  const safeName = sanitizeSessionName(name);
+  const target = tmuxTarget(name);
   try {
     return execFileSync(
       TMUX_BIN,
-      ["display-message", "-p", "-t", safeName, "#{pane_current_command}"],
+      ["display-message", "-p", "-t", target, "#{pane_current_command}"],
       { encoding: "utf-8", timeout: 2000 }
     ).trim();
   } catch {
@@ -129,6 +128,11 @@ function sanitizeSessionName(name: string): string {
     throw new Error("Session name too long (max 128 characters)");
   }
   return name;
+}
+
+export function tmuxTarget(name: string): string {
+  const safeName = sanitizeSessionName(name);
+  return `=${safeName}:`;
 }
 
 export function listSessions(): TmuxSession[] {
@@ -196,17 +200,17 @@ export function createSession(name: string, command?: string, cwd?: string): voi
 }
 
 export function killSession(name: string): void {
-  const safeName = sanitizeSessionName(name);
-  execFileSync(TMUX_BIN, ["kill-session", "-t", safeName], {
+  const target = tmuxTarget(name);
+  execFileSync(TMUX_BIN, ["kill-session", "-t", target], {
     encoding: "utf-8",
     timeout: 5000,
   });
 }
 
 export function renameSession(oldName: string, newName: string): void {
-  const safeOld = sanitizeSessionName(oldName);
+  const target = tmuxTarget(oldName);
   const safeNew = sanitizeSessionName(newName);
-  execFileSync(TMUX_BIN, ["rename-session", "-t", safeOld, safeNew], {
+  execFileSync(TMUX_BIN, ["rename-session", "-t", target, safeNew], {
     encoding: "utf-8",
     timeout: 5000,
   });
@@ -218,11 +222,11 @@ export function renameSession(oldName: string, newName: string): void {
  * file (claude writes one JSONL per session, file ctime ≈ session start).
  */
 export function getSessionCreatedMs(name: string): number | null {
-  const safeName = sanitizeSessionName(name);
+  const target = tmuxTarget(name);
   try {
     const out = execFileSync(
       TMUX_BIN,
-      ["display-message", "-p", "-t", safeName, "#{session_created}"],
+      ["display-message", "-p", "-t", target, "#{session_created}"],
       { encoding: "utf-8", timeout: 2000 }
     );
     const secs = parseInt(out.trim(), 10);
@@ -233,9 +237,9 @@ export function getSessionCreatedMs(name: string): number | null {
 }
 
 export function hasSession(name: string): boolean {
-  const safeName = sanitizeSessionName(name);
+  const target = tmuxTarget(name);
   try {
-    execFileSync(TMUX_BIN, ["has-session", "-t", safeName], {
+    execFileSync(TMUX_BIN, ["has-session", "-t", target], {
       encoding: "utf-8",
       timeout: 5000,
     });

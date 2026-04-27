@@ -422,14 +422,41 @@ async function handleText(ctx: Context) {
     await reply(ctx, "this topic isn't bound to a session anymore.");
     return;
   }
+  const mode = binding.viewMode ?? "screen";
+  const promptSentAtMs = Date.now();
+  if (binding.kind === "claude") {
+    await patchTopic(topicId, {
+      pendingPrompt: text,
+      lastPromptAtMs: promptSentAtMs,
+    });
+  }
   sendText(binding.sessionName, text, true);
+
+  if (binding.kind === "claude" && mode === "chat") {
+    const chatId = ctxChatId();
+    if (chatId) {
+      const started = startClaudeTranscript(bot, chatId, topicId, {
+        cwd: binding.cwd,
+        sinceMs: promptSentAtMs,
+        promptText: text,
+        persistedJsonl: binding.jsonlPath,
+        initialOffset: binding.jsonlOffset,
+      });
+      if (started) {
+        await patchTopic(topicId, {
+          jsonlPath: started.jsonl,
+          pendingPrompt: undefined,
+          lastPromptAtMs: undefined,
+        });
+      }
+    }
+  }
 
   // In chat mode against a TUI (claude, etc.) the actual response can
   // take many seconds to land via the JSONL transcript. Ack the input
   // right away so the user knows the bot received it instead of staring
   // at silence.
-  const mode = binding.viewMode ?? "screen";
-  if (mode === "chat" && isPaneTui(binding.sessionName)) {
+  if (mode === "chat" && (binding.kind !== "bash" || isPaneTui(binding.sessionName))) {
     try {
       await reply(ctx, "📩 received · processing…");
     } catch {

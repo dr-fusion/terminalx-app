@@ -6,6 +6,7 @@ import {
   isPaneTui,
   paneForegroundCommand,
   getSessionCreatedMs,
+  tmuxTarget,
 } from "@/lib/tmux";
 import { renderScreen, stripAnsi } from "./render";
 import { attachedKeyboard } from "./keyboard";
@@ -53,7 +54,7 @@ const runtimes = new Map<number, RuntimeState>();
 
 function tmuxSend(sessionName: string, args: string[]): void {
   try {
-    execFileSync(TMUX, ["send-keys", "-t", sessionName, ...args], { timeout: 2000 });
+    execFileSync(TMUX, ["send-keys", "-t", tmuxTarget(sessionName), ...args], { timeout: 2000 });
   } catch (err) {
     console.error("[telegram/streamer] send-keys failed", err);
   }
@@ -77,12 +78,15 @@ export function sendKey(sessionName: string, key: string): void {
 export function scroll(sessionName: string, action: "up" | "down" | "cancel"): void {
   try {
     if (action === "cancel") {
-      execFileSync(TMUX, ["send-keys", "-t", sessionName, "-X", "cancel"], { timeout: 2000 });
+      execFileSync(TMUX, ["send-keys", "-t", tmuxTarget(sessionName), "-X", "cancel"], {
+        timeout: 2000,
+      });
       return;
     }
-    execFileSync(TMUX, ["copy-mode", "-t", sessionName], { timeout: 2000 });
+    const target = tmuxTarget(sessionName);
+    execFileSync(TMUX, ["copy-mode", "-t", target], { timeout: 2000 });
     const cmd = action === "up" ? "page-up" : "page-down";
-    execFileSync(TMUX, ["send-keys", "-t", sessionName, "-X", cmd], { timeout: 2000 });
+    execFileSync(TMUX, ["send-keys", "-t", target, "-X", cmd], { timeout: 2000 });
   } catch (err) {
     console.error("[telegram/streamer] scroll failed", err);
   }
@@ -216,17 +220,23 @@ async function flushChat(
         rt.claudeDetectedAtMs = Date.now() - FLUSH_INTERVAL_MS - 5000;
       }
       const sinceMs =
-        binding?.kind === "claude"
+        binding?.lastPromptAtMs ??
+        (binding?.kind === "claude"
           ? (getSessionCreatedMs(sessionName) ?? Date.now())
-          : (rt.claudeDetectedAtMs ?? Date.now());
+          : (rt.claudeDetectedAtMs ?? Date.now()));
       const started = startClaudeTranscript(bot, chatId, topicId, {
         cwd: binding?.cwd,
         sinceMs,
+        promptText: binding?.pendingPrompt,
         persistedJsonl: binding?.jsonlPath,
         initialOffset: binding?.jsonlOffset,
       });
       if (started) {
-        await patchTopic(topicId, { jsonlPath: started.jsonl });
+        await patchTopic(topicId, {
+          jsonlPath: started.jsonl,
+          pendingPrompt: undefined,
+          lastPromptAtMs: undefined,
+        });
         return;
       }
     }

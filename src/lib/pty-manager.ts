@@ -1,5 +1,5 @@
 import * as pty from "node-pty";
-import { hasSession, createSession } from "./tmux";
+import { hasSession, createSession, tmuxTarget } from "./tmux";
 
 export interface PtyInstance {
   id: string;
@@ -31,9 +31,7 @@ export function createPty(
   rows: number
 ): PtyInstance {
   if (activePtys.size >= maxSessions) {
-    throw new Error(
-      `Maximum number of PTY sessions reached (${maxSessions})`
-    );
+    throw new Error(`Maximum number of PTY sessions reached (${maxSessions})`);
   }
 
   // Validate sessionName
@@ -51,11 +49,33 @@ export function createPty(
   // Build a sanitized environment for PTY processes.
   // NEVER spread process.env — it contains server secrets (JWT secret, admin password, etc.)
   const safeEnvKeys = [
-    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LANGUAGE",
-    "LC_ALL", "LC_CTYPE", "LC_MESSAGES", "LC_COLLATE", "LC_NUMERIC",
-    "LC_TIME", "LC_MONETARY", "TZ", "EDITOR", "VISUAL", "PAGER",
-    "LESS", "LESSOPEN", "LESSCLOSE", "COLORTERM", "DISPLAY",
-    "SSH_AUTH_SOCK", "XDG_RUNTIME_DIR", "XDG_DATA_HOME", "XDG_CONFIG_HOME",
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "LANGUAGE",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_MESSAGES",
+    "LC_COLLATE",
+    "LC_NUMERIC",
+    "LC_TIME",
+    "LC_MONETARY",
+    "TZ",
+    "EDITOR",
+    "VISUAL",
+    "PAGER",
+    "LESS",
+    "LESSOPEN",
+    "LESSCLOSE",
+    "COLORTERM",
+    "DISPLAY",
+    "SSH_AUTH_SOCK",
+    "XDG_RUNTIME_DIR",
+    "XDG_DATA_HOME",
+    "XDG_CONFIG_HOME",
     "TERMINUS_ROOT",
   ];
   const safeEnv: Record<string, string> = {};
@@ -68,7 +88,7 @@ export function createPty(
   safeEnv.SHELL = shell;
 
   // Spawn node-pty that attaches to the tmux session
-  const proc = pty.spawn("tmux", ["attach-session", "-t", sessionName], {
+  const proc = pty.spawn("tmux", ["attach-session", "-t", tmuxTarget(sessionName)], {
     name: "xterm-256color",
     cols: Math.max(1, Math.min(cols, 500)),
     rows: Math.max(1, Math.min(rows, 200)),
@@ -98,10 +118,7 @@ export function resizePty(id: string, cols: number, rows: number): void {
   if (!instance) {
     throw new Error(`PTY not found: ${id}`);
   }
-  instance.process.resize(
-    Math.max(1, Math.min(cols, 500)),
-    Math.max(1, Math.min(rows, 200))
-  );
+  instance.process.resize(Math.max(1, Math.min(cols, 500)), Math.max(1, Math.min(rows, 200)));
 }
 
 export function destroyPty(id: string): void {

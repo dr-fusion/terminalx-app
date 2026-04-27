@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { tmuxTarget } from "@/lib/tmux";
 
 // Import the sanitizer directly — tmux operations require tmux installed
 // so we test the validation logic, not the tmux commands themselves
@@ -49,5 +50,10 @@ describe("tmux session name validation", () => {
   it("rejects names exceeding max length", () => {
     expect(validateSessionName("a".repeat(129))).toBe(false);
     expect(validateSessionName("a".repeat(128))).toBe(true);
+  });
+
+  it("builds exact tmux session targets", () => {
+    expect(tmuxTarget("b")).toBe("=b:");
+    expect(tmuxTarget("fix-terminalx")).toBe("=fix-terminalx:");
   });
 });

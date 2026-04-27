@@ -17,6 +17,10 @@ export interface TopicBinding {
   cwd: string;
   jsonlPath?: string;
   jsonlOffset?: number;
+  /** Last Telegram prompt sent to Claude before its transcript was bound. */
+  pendingPrompt?: string;
+  /** Unix ms when pendingPrompt was sent to tmux. */
+  lastPromptAtMs?: number;
   pinnedMsgId?: number;
   /** screen = pinned code-block edits; chat = each new chunk as its own msg. */
   viewMode?: ViewMode;

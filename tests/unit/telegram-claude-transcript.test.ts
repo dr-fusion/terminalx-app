@@ -24,6 +24,31 @@ function writeJsonl(cwd: string, name: string): string {
   return file;
 }
 
+function writePromptJsonl(cwd: string, name: string, prompt: string, reply: string): string {
+  const dir = projectDirFor(cwd);
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, name);
+  const timestamp = new Date().toISOString();
+  fs.writeFileSync(
+    file,
+    [
+      {
+        type: "user",
+        timestamp,
+        message: { content: prompt },
+      },
+      {
+        type: "assistant",
+        timestamp,
+        message: { content: [{ type: "text", text: reply }] },
+      },
+    ]
+      .map((entry) => JSON.stringify(entry))
+      .join("\n") + "\n"
+  );
+  return file;
+}
+
 async function loadTranscriptModule() {
   vi.resetModules();
   vi.doMock("os", () => ({
@@ -63,6 +88,22 @@ describe("telegram Claude transcript routing", () => {
     const { readLastAssistantText } = await loadTranscriptModule();
 
     expect(readLastAssistantText()).toBeNull();
+  });
+
+  it("can match a delayed transcript by the Telegram prompt text", async () => {
+    const cwd = "/work/project";
+    const prompt = "hello from topic a";
+    const jsonl = writePromptJsonl(cwd, "session.jsonl", prompt, "hi");
+    const { findJsonlForSession } = await loadTranscriptModule();
+
+    expect(
+      findJsonlForSession({
+        cwd,
+        sinceMs: Date.now() - 120_000,
+        exclude: new Set(),
+        promptText: prompt,
+      })
+    ).toBe(jsonl);
   });
 
   it("does not let two topics tail the same persisted transcript", async () => {
