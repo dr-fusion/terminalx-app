@@ -45,6 +45,12 @@ import {
   stopAllClaudeTranscripts,
   readLastAssistantText,
 } from "./claude-transcript";
+import {
+  startCodexTranscript,
+  stopCodexTranscript,
+  stopAllCodexTranscripts,
+  readLastCodexAssistantText,
+} from "./codex-transcript";
 import { downloadFromTelegram, sendFromServer } from "./files";
 
 let bot: Bot | null = null;
@@ -108,7 +114,8 @@ async function attachToTopic(b: Bot, identity: BotIdentity, binding: TopicBindin
   const mode = binding.viewMode ?? defaultViewMode(binding.kind);
   await setTopic({ ...binding, viewMode: mode });
   startStreamer(b, binding.topicId);
-  let resolvedJsonl: string | undefined = binding.jsonlPath;
+  let resolvedJsonl: string | undefined;
+  let resolvedTranscriptKind: "claude" | "codex" | undefined;
   if (binding.kind === "claude") {
     const sinceMs = getSessionCreatedMs(binding.sessionName) ?? Date.now();
     const started = startClaudeTranscript(b, chatId, binding.topicId, {
@@ -119,7 +126,18 @@ async function attachToTopic(b: Bot, identity: BotIdentity, binding: TopicBindin
     });
     if (started) {
       resolvedJsonl = started.jsonl;
+      resolvedTranscriptKind = "claude";
       await patchTopic(binding.topicId, { jsonlPath: started.jsonl });
+    }
+  } else if (binding.kind === "codex" && binding.jsonlPath) {
+    const started = startCodexTranscript(b, chatId, binding.topicId, {
+      cwd: binding.cwd,
+      persistedJsonl: binding.jsonlPath,
+      initialOffset: binding.jsonlOffset,
+    });
+    if (started) {
+      resolvedJsonl = started.jsonl;
+      resolvedTranscriptKind = "codex";
     }
   }
 
@@ -133,17 +151,20 @@ async function attachToTopic(b: Bot, identity: BotIdentity, binding: TopicBindin
     /* ignore */
   }
 
-  // For TUI sessions (claude, vim, …) the user starts in chat mode but
+  // For TUI sessions (claude, codex, vim, ...) the user starts in chat mode but
   // would otherwise see nothing until the next assistant entry. Surface
   // the most recent assistant message from the topic's JSONL so they
   // immediately have context for what was happening.
   if (mode === "chat" && isPaneTui(binding.sessionName) && resolvedJsonl) {
-    const last = readLastAssistantText(resolvedJsonl);
+    const last =
+      resolvedTranscriptKind === "codex"
+        ? readLastCodexAssistantText(resolvedJsonl)
+        : readLastAssistantText(resolvedJsonl);
     if (last) {
       try {
         await b.api.sendMessage(chatId, last, {
           message_thread_id: binding.topicId,
-          parse_mode: "MarkdownV2",
+          ...(resolvedTranscriptKind === "codex" ? {} : { parse_mode: "MarkdownV2" as const }),
         });
       } catch {
         /* ignore */
@@ -291,6 +312,7 @@ async function handleDetach(ctx: Context) {
   if (!topicId) return;
   await stopStreamer(topicId);
   stopClaudeTranscript(topicId);
+  stopCodexTranscript(topicId);
   await deleteTopic(topicId);
   await reply(ctx, "detached. tmux session is still running.");
 }
@@ -321,6 +343,7 @@ async function handleKill(ctx: Context) {
   if (topicId) {
     await stopStreamer(topicId);
     stopClaudeTranscript(topicId);
+    stopCodexTranscript(topicId);
     await deleteTopic(topicId);
     const chatId = ctxChatId();
     if (chatId) {
@@ -422,9 +445,9 @@ async function handleText(ctx: Context) {
     await reply(ctx, "this topic isn't bound to a session anymore.");
     return;
   }
-  const mode = binding.viewMode ?? "screen";
+  const mode = binding.viewMode ?? defaultViewMode(binding.kind);
   const promptSentAtMs = Date.now();
-  if (binding.kind === "claude") {
+  if (binding.kind === "claude" || binding.kind === "codex") {
     await patchTopic(topicId, {
       pendingPrompt: text,
       lastPromptAtMs: promptSentAtMs,
@@ -439,6 +462,25 @@ async function handleText(ctx: Context) {
         cwd: binding.cwd,
         sinceMs: promptSentAtMs,
         promptText: text,
+        persistedJsonl: binding.jsonlPath,
+        initialOffset: binding.jsonlOffset,
+      });
+      if (started) {
+        await patchTopic(topicId, {
+          jsonlPath: started.jsonl,
+          pendingPrompt: undefined,
+          lastPromptAtMs: undefined,
+        });
+      }
+    }
+  } else if (binding.kind === "codex" && mode === "chat") {
+    const chatId = ctxChatId();
+    if (chatId) {
+      const started = startCodexTranscript(bot, chatId, topicId, {
+        cwd: binding.cwd,
+        sinceMs: promptSentAtMs,
+        promptText: text,
+        sessionStartedMs: getSessionCreatedMs(binding.sessionName) ?? undefined,
         persistedJsonl: binding.jsonlPath,
         initialOffset: binding.jsonlOffset,
       });
@@ -518,6 +560,7 @@ async function handleCallback(ctx: Context) {
     if (t) {
       await stopStreamer(t.topicId);
       stopClaudeTranscript(t.topicId);
+      stopCodexTranscript(t.topicId);
       await deleteTopic(t.topicId);
     }
     return;
@@ -571,6 +614,7 @@ async function handleCallback(ctx: Context) {
     case CB.DETACH:
       await stopStreamer(topicId);
       stopClaudeTranscript(topicId);
+      stopCodexTranscript(topicId);
       await deleteTopic(topicId);
       await reply(ctx, "detached.");
       return;
@@ -582,6 +626,7 @@ async function handleCallback(ctx: Context) {
       }
       await stopStreamer(topicId);
       stopClaudeTranscript(topicId);
+      stopCodexTranscript(topicId);
       await deleteTopic(topicId);
       const chatId = ctxChatId();
       if (chatId) {
@@ -655,18 +700,30 @@ export async function startTelegramBot(): Promise<Bot | null> {
   }
   resumePersistedStreamers(bot);
   for (const t of listTopics()) {
-    if (t.kind !== "claude") continue;
-    if (!t.jsonlPath && !(t.viewMode === "chat" && t.pendingPrompt && t.lastPromptAtMs)) {
+    if (t.kind !== "claude" && t.kind !== "codex") continue;
+    const hasResumeSource =
+      !!t.jsonlPath || (t.viewMode === "chat" && !!t.pendingPrompt && !!t.lastPromptAtMs);
+    if (!hasResumeSource) {
       continue;
     }
     const sinceMs = t.lastPromptAtMs ?? getSessionCreatedMs(t.sessionName) ?? 0;
-    const started = startClaudeTranscript(bot, forumChatId, t.topicId, {
-      cwd: t.cwd,
-      sinceMs,
-      promptText: t.pendingPrompt,
-      persistedJsonl: t.jsonlPath,
-      initialOffset: t.jsonlOffset,
-    });
+    const started =
+      t.kind === "codex"
+        ? startCodexTranscript(bot, forumChatId, t.topicId, {
+            cwd: t.cwd,
+            sinceMs,
+            promptText: t.pendingPrompt,
+            sessionStartedMs: getSessionCreatedMs(t.sessionName) ?? undefined,
+            persistedJsonl: t.jsonlPath,
+            initialOffset: t.jsonlOffset,
+          })
+        : startClaudeTranscript(bot, forumChatId, t.topicId, {
+            cwd: t.cwd,
+            sinceMs,
+            promptText: t.pendingPrompt,
+            persistedJsonl: t.jsonlPath,
+            initialOffset: t.jsonlOffset,
+          });
     if (started) {
       await patchTopic(t.topicId, {
         jsonlPath: started.jsonl,
@@ -710,6 +767,7 @@ export async function stopTelegramBot(): Promise<void> {
   if (!bot) return;
   stopAllStreamers();
   stopAllClaudeTranscripts();
+  stopAllCodexTranscripts();
   try {
     await bot.api.deleteWebhook();
   } catch {

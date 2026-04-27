@@ -19,6 +19,7 @@ import {
   type ViewMode,
 } from "./state";
 import { startClaudeTranscript, isClaudeTranscriptRunning } from "./claude-transcript";
+import { startCodexTranscript, isCodexTranscriptRunning } from "./codex-transcript";
 
 const FLUSH_INTERVAL_MS = 5000;
 const TMUX = "tmux";
@@ -189,7 +190,7 @@ async function flushScreen(
  *
  * If the pane is on the alt-screen buffer (a TUI is running), we don't
  * try to diff the rendered screen at all — too noisy. Instead we lean
- * on the Claude JSONL transcript stream when available; if no JSONL
+ * on an AI CLI transcript stream when available; if no JSONL
  * exists, we send a one-time hint and stay quiet.
  */
 async function flushChat(
@@ -200,8 +201,8 @@ async function flushChat(
   ansi: string,
   rt: RuntimeState
 ): Promise<void> {
-  // For sessions that the user explicitly created as kind=claude, always
-  // route through JSONL — regardless of what `pane_current_command`
+  // For sessions that the user explicitly created as an AI CLI, always
+  // route through JSONL - regardless of what `pane_current_command`
   // currently says. There's a race on first attach where the parent bash
   // hasn't yet exec'd `claude`, and isPaneTui briefly returns false. We
   // don't want the welcome banner of Claude Code dumped as raw chat text
@@ -209,12 +210,11 @@ async function flushChat(
   const binding = getTopic(topicId);
   const foreground = paneForegroundCommand(sessionName);
   const isClaudeCli = binding?.kind === "claude" || foreground === "claude";
-  const knownTui = isClaudeCli || binding?.kind === "codex";
+  const isCodexCli = binding?.kind === "codex" || foreground === "codex";
+  const knownTui = isClaudeCli || isCodexCli;
   if (knownTui || isPaneTui(sessionName)) {
-    // Claude writes a per-session JSONL transcript that can be safely
-    // streamed to Telegram. Other TUIs, including Codex, do not use that
-    // source, so guessing here can route another topic's Claude replies
-    // into this topic.
+    // Claude and Codex each write per-session JSONL transcripts. Other TUIs
+    // do not have a topic-safe source, so we stay quiet for those in chat mode.
     if (isClaudeCli && !isClaudeTranscriptRunning(topicId)) {
       if (foreground === "claude" && !rt.claudeDetectedAtMs) {
         rt.claudeDetectedAtMs = Date.now() - FLUSH_INTERVAL_MS - 5000;
@@ -239,6 +239,28 @@ async function flushChat(
         });
         return;
       }
+    }
+    if (isCodexCli && !isCodexTranscriptRunning(topicId)) {
+      const sinceMs = binding?.lastPromptAtMs ?? Date.now();
+      const started = startCodexTranscript(bot, chatId, topicId, {
+        cwd: binding?.cwd,
+        sinceMs,
+        promptText: binding?.pendingPrompt,
+        sessionStartedMs: getSessionCreatedMs(sessionName) ?? undefined,
+        persistedJsonl: binding?.jsonlPath,
+        initialOffset: binding?.jsonlOffset,
+      });
+      if (started) {
+        await patchTopic(topicId, {
+          jsonlPath: started.jsonl,
+          pendingPrompt: undefined,
+          lastPromptAtMs: undefined,
+        });
+        return;
+      }
+    }
+    if ((isClaudeCli || isCodexCli) && binding?.pendingPrompt && binding.lastPromptAtMs) {
+      return;
     }
     if (!rt.tuiHinted) {
       rt.tuiHinted = true;

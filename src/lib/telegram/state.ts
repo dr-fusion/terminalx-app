@@ -17,7 +17,7 @@ export interface TopicBinding {
   cwd: string;
   jsonlPath?: string;
   jsonlOffset?: number;
-  /** Last Telegram prompt sent to Claude before its transcript was bound. */
+  /** Last Telegram prompt sent to an AI CLI before its transcript was bound. */
   pendingPrompt?: string;
   /** Unix ms when pendingPrompt was sent to tmux. */
   lastPromptAtMs?: number;
