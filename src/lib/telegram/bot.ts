@@ -1,6 +1,7 @@
 import { Bot, type Context } from "grammy";
 import { listSessions, createSession, killSession, hasSession } from "@/lib/tmux";
 import { canAccessSession, scopedSessionName } from "@/lib/session-scope";
+import { isPaneTui } from "@/lib/tmux";
 import { commandForKind, saveMeta, isValidKind, type SessionKind } from "@/lib/ai-sessions";
 import { resolveTelegramIdentity, botIsConfigured, type BotIdentity } from "./auth";
 import { sessionsKeyboard, CB } from "./keyboard";
@@ -329,6 +330,20 @@ async function handleText(ctx: Context) {
     return;
   }
   sendText(binding.sessionName, text, true);
+
+  // In chat mode against a TUI (claude, etc.) the actual response can
+  // take many seconds to land via the JSONL transcript. Ack the input
+  // right away so the user knows the bot received it instead of staring
+  // at silence.
+  const mode = binding.viewMode ?? "screen";
+  if (mode === "chat" && isPaneTui(binding.sessionName)) {
+    try {
+      await ctx.reply("📩 received · processing…");
+    } catch {
+      /* ignore */
+    }
+  }
+
   setTimeout(() => snap(bot!, topicId), 250);
 }
 
@@ -525,22 +540,27 @@ export async function startTelegramBot(): Promise<Bot | null> {
 /** Hand a parsed Telegram update from the webhook into the bot. */
 export async function handleTelegramUpdate(update: object): Promise<void> {
   if (!bot) return;
-  // TEMP debug — log enough to triage why /start does nothing.
-  try {
-    const u = update as {
-      update_id?: number;
-      message?: {
-        from?: { id?: number; username?: string };
-        chat?: { id?: number; type?: string };
-        text?: string;
+  // Optional debug — set TERMINALX_TELEGRAM_DEBUG=1 to log every incoming
+  // update's chat / from / text. Useful for triaging delivery problems
+  // without rebuilding; off by default since each update would otherwise
+  // print a line.
+  if (process.env.TERMINALX_TELEGRAM_DEBUG === "1") {
+    try {
+      const u = update as {
+        update_id?: number;
+        message?: {
+          from?: { id?: number; username?: string };
+          chat?: { id?: number; type?: string };
+          text?: string;
+        };
       };
-    };
-    const m = u.message;
-    console.log(
-      `[telegram] update id=${u.update_id} chat=${m?.chat?.id}/${m?.chat?.type} from=${m?.from?.id}/@${m?.from?.username} text=${JSON.stringify(m?.text)}`
-    );
-  } catch {
-    /* ignore */
+      const m = u.message;
+      console.log(
+        `[telegram] update id=${u.update_id} chat=${m?.chat?.id}/${m?.chat?.type} from=${m?.from?.id}/@${m?.from?.username} text=${JSON.stringify(m?.text)}`
+      );
+    } catch {
+      /* ignore */
+    }
   }
   await bot.handleUpdate(update as Parameters<Bot["handleUpdate"]>[0]);
 }
