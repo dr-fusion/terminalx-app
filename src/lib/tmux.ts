@@ -53,9 +53,9 @@ export function captureVisiblePane(name: string): string {
 
 /**
  * True when the pane's foreground program is using the alternate screen
- * buffer — i.e. a TUI like vim, htop, claude code, less. Used by the
- * Telegram chat-mode flush to decide whether the screen diff is going to
- * be too noisy to render line-by-line.
+ * buffer (vim, htop, less, etc.). Note: Claude Code renders in the main
+ * buffer so this returns false for it — see `paneForegroundCommand` /
+ * `isPaneTui` for a more reliable TUI check.
  */
 export function isPaneAlternate(name: string): boolean {
   const safeName = sanitizeSessionName(name);
@@ -69,6 +69,38 @@ export function isPaneAlternate(name: string): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * The basename of the pane's foreground process — what `tmux
+ * display-message #{pane_current_command}` returns. Empty string on
+ * failure.
+ */
+export function paneForegroundCommand(name: string): string {
+  const safeName = sanitizeSessionName(name);
+  try {
+    return execFileSync(
+      TMUX_BIN,
+      ["display-message", "-p", "-t", safeName, "#{pane_current_command}"],
+      { encoding: "utf-8", timeout: 2000 }
+    ).trim();
+  } catch {
+    return "";
+  }
+}
+
+const SHELL_COMMANDS = new Set(["bash", "zsh", "sh", "fish", "dash", "ash", "ksh", "tcsh"]);
+
+/**
+ * Heuristic: is the pane currently running something other than a plain
+ * shell? Used to decide whether chat-mode line-diffing is going to be
+ * useful (it isn't, against any TUI app — claude code, vim, htop, less).
+ */
+export function isPaneTui(name: string): boolean {
+  if (isPaneAlternate(name)) return true;
+  const cmd = paneForegroundCommand(name);
+  if (!cmd) return false;
+  return !SHELL_COMMANDS.has(cmd);
 }
 
 /**

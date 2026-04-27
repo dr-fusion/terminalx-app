@@ -1,6 +1,6 @@
 import { execFileSync } from "child_process";
 import type { Bot } from "grammy";
-import { hasSession, captureVisiblePane, isPaneAlternate } from "@/lib/tmux";
+import { hasSession, captureVisiblePane, isPaneTui } from "@/lib/tmux";
 import { renderScreen, stripAnsi } from "./render";
 import { attachedKeyboard } from "./keyboard";
 import {
@@ -188,7 +188,7 @@ async function flushChat(
   ansi: string,
   rt: RuntimeState
 ): Promise<void> {
-  if (isPaneAlternate(sessionName)) {
+  if (isPaneTui(sessionName)) {
     // TUI active. Try to wire up the JSONL transcript watcher; if a
     // recent claude session JSONL exists, the user will start seeing
     // formatted assistant / tool / thinking messages instead of the
