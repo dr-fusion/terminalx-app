@@ -34,11 +34,14 @@ interface RuntimeState {
 }
 
 /** Default view mode for a freshly-attached topic. */
-export function defaultViewMode(_kind: string): ViewMode {
-  // Chat for everything — feels like a normal Telegram conversation. For
-  // bash that means the line-diff stream; for claude / other TUIs the
-  // JSONL transcript carries it. Users can /view screen any time to flip
-  // to the pinned-screen mode.
+export function defaultViewMode(kind: string): ViewMode {
+  // Chat for plain bash — the line-diff stream reads like a conversation.
+  // Screen for claude / codex by default because the JSONL transcript
+  // pick is global ("the most recently modified JSONL across all
+  // ~/.claude/projects/"), which gets confused if you have several Claude
+  // topics open at once and they all tail the same file. Users can flip
+  // a single topic to chat with /view chat.
+  if (kind === "claude" || kind === "codex") return "screen";
   return "chat";
 }
 

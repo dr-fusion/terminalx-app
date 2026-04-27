@@ -178,6 +178,16 @@ export function startClaudeTranscript(
     }
   };
 
+  // Only one topic can own the JSONL transcript watcher at a time —
+  // findLatestJsonl() is a global pick, so two topics tailing
+  // simultaneously would emit the same lines into both. Stop any existing
+  // watcher (in another topic) first.
+  for (const [otherTopicId, w] of watchers.entries()) {
+    if (otherTopicId === topicId) continue;
+    void w.watcher.close();
+    watchers.delete(otherTopicId);
+  }
+
   const watcher = watch(jsonl, { ignoreInitial: true });
   watcher.on("change", () => void flush());
   watcher.on("add", () => void flush());
