@@ -24,6 +24,55 @@ type TranscriptEntry = AssistantEntry | ThinkingEntry | ToolResultEntry | { type
 
 const watchers = new Map<number, { watcher: FSWatcher; offset: number; jsonl: string }>();
 
+/**
+ * Per-topic minimum-spacing send queue. Telegram allows ~1 message/sec to
+ * a chat (groups stricter on bursts). We spread messages out + respect
+ * 429 retry-after.
+ */
+const sendQueues = new Map<number, Promise<void>>();
+const cooldownUntil = new Map<number, number>();
+
+const MIN_GAP_MS = 1100;
+
+async function enqueueSend(
+  bot: Bot,
+  chatId: number,
+  topicId: number,
+  text: string,
+  parseMode: "MarkdownV2" | undefined
+): Promise<void> {
+  const prev = sendQueues.get(topicId) ?? Promise.resolve();
+  const next = prev.then(async () => {
+    const cool = cooldownUntil.get(topicId) ?? 0;
+    const waitMs = Math.max(0, cool - Date.now());
+    if (waitMs > 0) await sleep(waitMs);
+    try {
+      await bot.api.sendMessage(chatId, text, {
+        message_thread_id: topicId,
+        parse_mode: parseMode,
+      });
+      await sleep(MIN_GAP_MS);
+    } catch (err) {
+      const e = err as { error_code?: number; parameters?: { retry_after?: number } };
+      if (e.error_code === 429) {
+        const retry = e.parameters?.retry_after ?? 30;
+        cooldownUntil.set(topicId, Date.now() + (retry + 1) * 1000);
+        // Drop this message rather than queue forever — the user can /snap
+        // or wait for fresh entries.
+        return;
+      }
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error("[telegram/claude] send failed:", msg);
+    }
+  });
+  sendQueues.set(topicId, next);
+  return next;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 const PROJECTS_DIR = path.join(os.homedir(), ".claude", "projects");
 
 /** Find the most recently modified JSONL anywhere under ~/.claude/projects/. */
@@ -94,17 +143,31 @@ function renderEntry(entry: TranscriptEntry): string | null {
  * Tail a JSONL transcript and forward each new entry as a topic message.
  * For v1 we use the most-recently-modified JSONL globally — works for the
  * common case of one active claude session.
+ *
+ * If `initialOffset` is omitted (or 0), we start at end-of-file so we
+ * don't replay tens of thousands of historical entries on first attach.
+ * Caller can pass a known offset (from persisted state) to resume.
  */
 export function startClaudeTranscript(
   bot: Bot,
   chatId: number,
   topicId: number,
-  initialOffset = 0
+  initialOffset?: number
 ): { stop: () => void; jsonl: string } | null {
   const jsonl = findLatestJsonl();
   if (!jsonl) return null;
 
-  let offset = initialOffset || 0;
+  let offset: number;
+  if (initialOffset && initialOffset > 0) {
+    offset = initialOffset;
+  } else {
+    // Start at EOF — only forward entries written from now on.
+    try {
+      offset = fs.statSync(jsonl).size;
+    } catch {
+      offset = 0;
+    }
+  }
   const flush = async () => {
     try {
       const stat = fs.statSync(jsonl);
@@ -127,14 +190,7 @@ export function startClaudeTranscript(
         }
         const md = renderEntry(entry);
         if (!md) continue;
-        try {
-          await bot.api.sendMessage(chatId, md, {
-            parse_mode: "MarkdownV2",
-            message_thread_id: topicId,
-          });
-        } catch (err) {
-          console.error("[telegram/claude] send failed", err);
-        }
+        await enqueueSend(bot, chatId, topicId, md, "MarkdownV2");
       }
     } catch (err) {
       console.error("[telegram/claude] flush failed", err);
