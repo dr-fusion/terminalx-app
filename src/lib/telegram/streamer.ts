@@ -189,7 +189,15 @@ async function flushChat(
   ansi: string,
   rt: RuntimeState
 ): Promise<void> {
-  if (isPaneTui(sessionName)) {
+  // For sessions that the user explicitly created as kind=claude, always
+  // route through JSONL — regardless of what `pane_current_command`
+  // currently says. There's a race on first attach where the parent bash
+  // hasn't yet exec'd `claude`, and isPaneTui briefly returns false. We
+  // don't want the welcome banner of Claude Code dumped as raw chat text
+  // during that window.
+  const binding = getTopic(topicId);
+  const knownTui = binding?.kind === "claude" || binding?.kind === "codex";
+  if (knownTui || isPaneTui(sessionName)) {
     // TUI active. Try to wire up the JSONL transcript watcher; if a
     // recent claude session JSONL exists, the user will start seeing
     // formatted assistant / tool / thinking messages instead of the

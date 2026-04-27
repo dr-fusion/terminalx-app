@@ -193,6 +193,13 @@ async function handleNew(ctx: Context) {
   });
 }
 
+/** Build a `https://t.me/c/<id>/<thread>` deep link for a topic. */
+function topicLink(chatId: number, topicId: number): string {
+  // Supergroup ids look like -100<rest>; the public link uses just <rest>.
+  const internal = String(chatId).replace(/^-100/, "");
+  return `https://t.me/c/${internal}/${topicId}`;
+}
+
 async function handleAttachByName(ctx: Context, name: string) {
   const identity = await gate(ctx);
   if (!identity) return;
@@ -205,13 +212,16 @@ async function handleAttachByName(ctx: Context, name: string) {
     await reply(ctx, `session ${name} not found.`);
     return;
   }
-  const existing = getTopicByName(name);
-  if (existing) {
-    await reply(ctx, `already bound to topic ${existing.topicId}.`);
-    return;
-  }
   const chatId = ctxChatId();
   if (!chatId) return;
+  const existing = getTopicByName(name);
+  if (existing) {
+    const url = topicLink(chatId, existing.topicId);
+    await reply(ctx, `already attached → ${url}`, {
+      link_preview_options: { is_disabled: true },
+    });
+    return;
+  }
   const topic = await bot.api.createForumTopic(chatId, name);
   await attachToTopic(bot, identity, {
     topicId: topic.message_thread_id,
