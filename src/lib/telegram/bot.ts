@@ -15,7 +15,18 @@ import {
   isValidKind,
   type SessionKind,
 } from "@/lib/ai-sessions";
-import { resolveTelegramIdentity, botIsConfigured, type BotIdentity } from "./auth";
+import {
+  resolveTelegramIdentity,
+  botIsConfigured,
+  getTelegramForumChatId,
+  telegramAllowedUserCount,
+  type BotIdentity,
+} from "./auth";
+import {
+  getConfiguredMaxSessions,
+  getTelegramMaxTopics,
+  isReadOnlyMode,
+} from "@/lib/security-config";
 import { sessionsKeyboard, CB } from "./keyboard";
 import {
   setTopic,
@@ -64,8 +75,8 @@ async function gate(ctx: Context): Promise<BotIdentity | null> {
   const tgId = ctx.from?.id;
   const chatId = ctx.chat?.id;
   if (!tgId || !chatId) return null;
-  const expected = Number(process.env.TERMINALX_TELEGRAM_FORUM_CHAT_ID);
-  if (expected && chatId !== expected) return null;
+  const expected = getTelegramForumChatId();
+  if (!expected || chatId !== expected) return null;
   const identity = await resolveTelegramIdentity(tgId);
   if (!identity) return null;
   return identity;
@@ -85,6 +96,46 @@ async function reply(ctx: Context, text: string, opts: Parameters<Context["reply
 
 function topicIdFromContext(ctx: Context): number | undefined {
   return (ctx.msg as { message_thread_id?: number } | undefined)?.message_thread_id;
+}
+
+async function rejectReadOnly(ctx: Context): Promise<boolean> {
+  if (!isReadOnlyMode()) return false;
+  await reply(ctx, "read-only mode is enabled.");
+  return true;
+}
+
+function canUseTopic(identity: BotIdentity, binding: TopicBinding): boolean {
+  return canAccessSession(identity.username, identity.role, binding.sessionName);
+}
+
+async function topicBindingForMessage(
+  ctx: Context,
+  identity: BotIdentity,
+  topicId: number | undefined,
+  missingReply?: string
+): Promise<TopicBinding | null> {
+  if (!topicId) return null;
+  const binding = getTopic(topicId);
+  if (!binding) {
+    if (missingReply) await reply(ctx, missingReply);
+    return null;
+  }
+  if (!canUseTopic(identity, binding)) {
+    await reply(ctx, "session not yours.");
+    return null;
+  }
+  return binding;
+}
+
+function topicQuotaReached(): number | null {
+  const maxTopics = getTelegramMaxTopics();
+  if (!Number.isFinite(maxTopics)) return null;
+  return listTopics().length >= maxTopics ? maxTopics : null;
+}
+
+function sessionQuotaReached(): number | null {
+  const maxSessions = getConfiguredMaxSessions();
+  return listSessions().length >= maxSessions ? maxSessions : null;
 }
 
 function sessionBindingDefaults(
@@ -112,6 +163,7 @@ async function reconcileTopicBinding(binding: TopicBinding): Promise<TopicBindin
 async function attachToTopic(b: Bot, identity: BotIdentity, binding: TopicBinding): Promise<void> {
   const chatId = ctxChatId();
   if (!chatId) return;
+  if (!canUseTopic(identity, binding)) return;
   const mode = binding.viewMode ?? defaultViewMode(binding.kind);
   await setTopic({ ...binding, viewMode: mode });
   startStreamer(b, binding.topicId);
@@ -175,8 +227,7 @@ async function attachToTopic(b: Bot, identity: BotIdentity, binding: TopicBindin
 }
 
 function ctxChatId(): number | null {
-  const expected = Number(process.env.TERMINALX_TELEGRAM_FORUM_CHAT_ID);
-  return Number.isFinite(expected) ? expected : null;
+  return getTelegramForumChatId();
 }
 
 /* ────────────── command handlers ────────────── */
@@ -220,6 +271,7 @@ async function handleSessions(ctx: Context) {
 async function handleNew(ctx: Context) {
   const identity = await gate(ctx);
   if (!identity) return;
+  if (await rejectReadOnly(ctx)) return;
   if (!bot) return;
   const text = ctx.message?.text ?? "";
   const args = text.split(/\s+/).slice(1);
@@ -235,6 +287,11 @@ async function handleNew(ctx: Context) {
     await reply(ctx, `session ${scoped} already exists.`);
     return;
   }
+  const maxSessions = sessionQuotaReached();
+  if (maxSessions !== null) {
+    await reply(ctx, `maximum number of sessions reached (${maxSessions}).`);
+    return;
+  }
   const cwd = process.env.TERMINUS_ROOT || process.env.HOME || "/";
   const cmd = commandForKind(kind);
   try {
@@ -248,6 +305,11 @@ async function handleNew(ctx: Context) {
   const chatId = ctxChatId();
   if (!chatId) {
     await reply(ctx, "no forum chat configured.");
+    return;
+  }
+  const maxTopics = topicQuotaReached();
+  if (maxTopics !== null) {
+    await reply(ctx, `maximum number of Telegram topics reached (${maxTopics}).`);
     return;
   }
   let topicId: number;
@@ -297,6 +359,11 @@ async function handleAttachByName(ctx: Context, name: string) {
     });
     return;
   }
+  const maxTopics = topicQuotaReached();
+  if (maxTopics !== null) {
+    await reply(ctx, `maximum number of Telegram topics reached (${maxTopics}).`);
+    return;
+  }
   const topic = await bot.api.createForumTopic(chatId, name);
   const defaults = sessionBindingDefaults(name);
   await attachToTopic(bot, identity, {
@@ -309,8 +376,11 @@ async function handleAttachByName(ctx: Context, name: string) {
 async function handleDetach(ctx: Context) {
   const identity = await gate(ctx);
   if (!identity) return;
+  if (await rejectReadOnly(ctx)) return;
   const topicId = ctx.message?.message_thread_id;
   if (!topicId) return;
+  const binding = await topicBindingForMessage(ctx, identity, topicId);
+  if (!binding) return;
   await stopStreamer(topicId);
   stopClaudeTranscript(topicId);
   stopCodexTranscript(topicId);
@@ -321,6 +391,7 @@ async function handleDetach(ctx: Context) {
 async function handleKill(ctx: Context) {
   const identity = await gate(ctx);
   if (!identity) return;
+  if (await rejectReadOnly(ctx)) return;
   if (!bot) return;
   const topicId = ctx.message?.message_thread_id;
   let target = ctx.message?.text?.split(/\s+/)[1];
@@ -364,6 +435,8 @@ async function handleSnap(ctx: Context) {
   if (!identity) return;
   const topicId = ctx.message?.message_thread_id;
   if (!topicId) return;
+  const binding = await topicBindingForMessage(ctx, identity, topicId);
+  if (!binding) return;
   snap(bot, topicId);
 }
 
@@ -384,6 +457,8 @@ async function handleView(ctx: Context) {
   if (!identity) return;
   const topicId = ctx.message?.message_thread_id;
   if (!topicId) return;
+  const binding = await topicBindingForMessage(ctx, identity, topicId);
+  if (!binding) return;
   const arg = (ctx.message?.text?.split(/\s+/)[1] ?? "").toLowerCase();
   if (arg === "screen" || arg === "chat") {
     await patchTopic(topicId, { viewMode: arg });
@@ -404,6 +479,8 @@ async function handleGet(ctx: Context) {
   const topicId = ctx.message?.message_thread_id;
   const chatId = ctxChatId();
   if (!topicId || !chatId) return;
+  const binding = await topicBindingForMessage(ctx, identity, topicId);
+  if (!binding) return;
   const arg = ctx.message?.text?.split(/\s+/).slice(1).join(" ").trim();
   if (!arg) {
     await reply(ctx, "usage: /get <relpath>");
@@ -419,10 +496,11 @@ async function handleGet(ctx: Context) {
 async function handleSlashKey(ctx: Context, key: string) {
   const identity = await gate(ctx);
   if (!identity) return;
+  if (await rejectReadOnly(ctx)) return;
   if (!bot) return;
   const topicId = ctx.message?.message_thread_id;
   if (!topicId) return;
-  const binding = getTopic(topicId);
+  const binding = await topicBindingForMessage(ctx, identity, topicId);
   if (!binding) return;
   sendKey(binding.sessionName, key);
   setTimeout(() => snap(bot!, topicId), 250);
@@ -432,6 +510,7 @@ async function handleText(ctx: Context) {
   if (!bot) return;
   const identity = await gate(ctx);
   if (!identity) return;
+  if (await rejectReadOnly(ctx)) return;
   const text = ctx.message?.text;
   if (!text || text.startsWith("/")) return; // commands handled by their own hooks
   const topicId = ctx.message?.message_thread_id;
@@ -441,11 +520,13 @@ async function handleText(ctx: Context) {
     await reply(ctx, "type inside a session topic to send to its terminal. /sessions to list.");
     return;
   }
-  const binding = getTopic(topicId);
-  if (!binding) {
-    await reply(ctx, "this topic isn't bound to a session anymore.");
-    return;
-  }
+  const binding = await topicBindingForMessage(
+    ctx,
+    identity,
+    topicId,
+    "this topic isn't bound to a session anymore."
+  );
+  if (!binding) return;
   const mode = binding.viewMode ?? defaultViewMode(binding.kind);
   const promptSentAtMs = Date.now();
   if (binding.kind === "claude" || binding.kind === "codex") {
@@ -518,9 +599,10 @@ async function handleFileUpload(ctx: Context) {
   if (!bot) return;
   const identity = await gate(ctx);
   if (!identity) return;
+  if (await rejectReadOnly(ctx)) return;
   const topicId = ctx.message?.message_thread_id;
   if (!topicId) return;
-  const binding = getTopic(topicId);
+  const binding = await topicBindingForMessage(ctx, identity, topicId);
   if (!binding) return;
 
   const photo = ctx.message?.photo?.[ctx.message.photo.length - 1];
@@ -554,6 +636,7 @@ async function handleCallback(ctx: Context) {
     return;
   }
   if (data.startsWith(CB.KILL_PREFIX)) {
+    if (await rejectReadOnly(ctx)) return;
     const name = data.slice(CB.KILL_PREFIX.length);
     if (!canAccessSession(identity.username, identity.role, name)) return;
     try {
@@ -575,7 +658,23 @@ async function handleCallback(ctx: Context) {
   if (!topicId) return;
   const binding = getTopic(topicId);
   if (!binding) return;
+  if (!canUseTopic(identity, binding)) return;
   const session = binding.sessionName;
+  const mutatingTerminalAction = new Set<string>([
+    CB.CTRL_C,
+    CB.CTRL_D,
+    CB.TAB,
+    CB.ENTER,
+    CB.UP,
+    CB.DOWN,
+    CB.LEFT,
+    CB.RIGHT,
+    CB.SCROLL_UP,
+    CB.SCROLL_DOWN,
+    CB.DETACH,
+    CB.KILL,
+  ]);
+  if (mutatingTerminalAction.has(data) && (await rejectReadOnly(ctx))) return;
   switch (data) {
     case CB.CTRL_C:
       sendKey(session, "C-c");
@@ -649,7 +748,14 @@ async function handleCallback(ctx: Context) {
 /* ────────────── lifecycle ────────────── */
 
 export async function startTelegramBot(): Promise<Bot | null> {
-  if (!botIsConfigured()) return null;
+  if (!botIsConfigured()) {
+    if (process.env.TERMINALX_TELEGRAM_BOT_TOKEN || telegramAllowedUserCount() > 0) {
+      console.error(
+        "[telegram] bot disabled: token, allowed users, and valid forum chat id are required"
+      );
+    }
+    return null;
+  }
   if (bot) return bot;
   const token = process.env.TERMINALX_TELEGRAM_BOT_TOKEN!;
   bot = new Bot(token);
@@ -682,8 +788,9 @@ export async function startTelegramBot(): Promise<Bot | null> {
   await bot.init();
 
   // remember the configured forum chat id so other modules can reach it
-  const forumChatId = Number(process.env.TERMINALX_TELEGRAM_FORUM_CHAT_ID);
-  if (Number.isFinite(forumChatId)) await setForumChatId(forumChatId);
+  const forumChatId = getTelegramForumChatId();
+  if (!forumChatId) return bot;
+  await setForumChatId(forumChatId);
 
   // webhook setup
   const webhookUrl = process.env.TERMINALX_TELEGRAM_WEBHOOK_URL;

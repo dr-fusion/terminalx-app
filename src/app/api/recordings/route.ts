@@ -6,6 +6,9 @@ export async function GET(req: NextRequest) {
   try {
     const { username, shouldScope } = getUserScoping(req.headers);
     let recordings = listRecordings();
+    if (shouldScope && !username) {
+      return NextResponse.json({ error: "Access denied" }, { status: 403 });
+    }
     if (shouldScope && username) {
       recordings = recordings.filter((r) => r.createdBy === username);
     }

@@ -4,6 +4,7 @@ import next from "next";
 import { WebSocketServer, WebSocket } from "ws";
 import { watch, FSWatcher } from "chokidar";
 import * as path from "path";
+import * as fs from "fs";
 import type { Socket } from "net";
 import { audit } from "../src/lib/audit-log";
 import { canAccessSession } from "../src/lib/session-scope";
@@ -29,6 +30,11 @@ import { verifyJwt, parseCookies } from "../src/lib/auth";
 import { getAuthMode } from "../src/lib/auth-config";
 import { ensureDefaultAdmin } from "../src/lib/users";
 import { startTelegramBot, stopTelegramBot, handleTelegramUpdate } from "../src/lib/telegram/bot";
+import {
+  allowsNoAuthOnPublicHost,
+  getConfiguredMaxSessions,
+  shouldRefuseNoAuth,
+} from "../src/lib/security-config";
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -36,9 +42,9 @@ const PORT = parseInt(process.env.PORT || "3000", 10);
 const TERMINUS_ROOT = path.resolve(process.env.TERMINUS_ROOT || process.env.HOME || "/");
 const TERMINUS_SHELL = process.env.TERMINUS_SHELL || process.env.SHELL || "/bin/bash";
 const TERMINUS_SCROLLBACK = parseInt(process.env.TERMINUS_SCROLLBACK || "10000", 10);
-const TERMINUS_MAX_SESSIONS = parseInt(process.env.TERMINUS_MAX_SESSIONS || "20", 10);
+const TERMINUS_MAX_SESSIONS = getConfiguredMaxSessions();
 const TERMINUS_READ_ONLY = process.env.TERMINUS_READ_ONLY === "true";
-const TERMINUS_HOST = process.env.TERMINUS_HOST || "0.0.0.0";
+const TERMINUS_HOST = process.env.TERMINUS_HOST || "127.0.0.1";
 
 setMaxSessions(TERMINUS_MAX_SESSIONS);
 // Bump tmux's global history-limit so newly-spawned sessions keep deep
@@ -46,6 +52,30 @@ setMaxSessions(TERMINUS_MAX_SESSIONS);
 applyGlobalOptions();
 
 const AUTH_MODE = getAuthMode();
+
+if (shouldRefuseNoAuth(AUTH_MODE, TERMINUS_HOST)) {
+  console.error(
+    "[security] refusing to start with TERMINALX_AUTH_MODE=none on a non-loopback host. " +
+      "Set TERMINALX_AUTH_MODE=local/password/google, bind to 127.0.0.1, or set TERMINALX_ALLOW_NO_AUTH=1."
+  );
+  process.exit(1);
+}
+
+if (AUTH_MODE === "none" && allowsNoAuthOnPublicHost()) {
+  console.warn("[security] authentication is disabled by TERMINALX_ALLOW_NO_AUTH=1");
+}
+
+function warnIfReadableByGroupOrWorld(filePath: string): void {
+  if (process.platform === "win32") return;
+  try {
+    const stat = fs.statSync(filePath);
+    if ((stat.mode & 0o077) !== 0) {
+      console.warn(`[security] ${filePath} is group/world readable; expected mode 0600`);
+    }
+  } catch {
+    // Missing files are normal on first run.
+  }
+}
 
 // ── WebSocket Auth Helper ──────────────────────────────────────────────────
 
@@ -370,7 +400,17 @@ function ensureFileWatcher(): void {
   sharedWatcher.on("unlinkDir", (p: string) => broadcast("unlinkDir", p));
 }
 
-filesWss.on("connection", (ws: WebSocket) => {
+filesWss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
+  const user = (req as AuthenticatedRequest).user;
+  if (AUTH_MODE === "local" && (!user || user.role !== "admin")) {
+    audit("file_access_denied", {
+      username: user?.username,
+      detail: "admin required",
+    });
+    ws.close(1008, "Access denied");
+    return;
+  }
+
   ensureFileWatcher();
   fileWatcherClients.add(ws);
 
@@ -508,6 +548,11 @@ app.prepare().then(() => {
   if (sweep.deleted > 0) {
     console.log(`[recorder] swept ${sweep.deleted} expired recording(s)`);
   }
+
+  warnIfReadableByGroupOrWorld(path.resolve(process.cwd(), ".env"));
+  warnIfReadableByGroupOrWorld(path.resolve(process.cwd(), "data", "users.json"));
+  warnIfReadableByGroupOrWorld(path.resolve(process.cwd(), "data", ".revoked-tokens.json"));
+  warnIfReadableByGroupOrWorld(path.resolve(process.cwd(), "data", "telegram-state.json"));
 
   // Start the Telegram bot if env is configured. Safe no-op when not.
   startTelegramBot().catch((err) => {

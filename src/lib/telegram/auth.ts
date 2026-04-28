@@ -62,5 +62,16 @@ export async function resolveTelegramIdentity(
 export function botIsConfigured(): boolean {
   const token = process.env.TERMINALX_TELEGRAM_BOT_TOKEN;
   const hasUsers = allowedUsers().size > 0;
-  return Boolean(token && hasUsers);
+  return Boolean(token && hasUsers && getTelegramForumChatId() !== null);
+}
+
+export function telegramAllowedUserCount(): number {
+  return allowedUsers().size;
+}
+
+export function getTelegramForumChatId(): number | null {
+  const raw = process.env.TERMINALX_TELEGRAM_FORUM_CHAT_ID;
+  if (!raw) return null;
+  const chatId = Number(raw);
+  return Number.isFinite(chatId) && chatId !== 0 ? chatId : null;
 }

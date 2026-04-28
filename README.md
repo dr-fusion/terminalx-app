@@ -85,6 +85,7 @@ All settings via environment variables. See [`.env.example`](.env.example) for t
 | Variable                         | Default                | Description                                                                                                          |
 | -------------------------------- | ---------------------- | -------------------------------------------------------------------------------------------------------------------- |
 | `PORT`                           | `3000`                 | Server port                                                                                                          |
+| `TERMINUS_HOST`                  | `127.0.0.1`            | Bind host. Use `0.0.0.0` only with authentication or an explicit trusted-network setup                               |
 | `TERMINUS_ROOT`                  | `$HOME`                | File browser root                                                                                                    |
 | `TERMINUS_SHELL`                 | `$SHELL`               | Default shell                                                                                                        |
 | `TERMINUS_READ_ONLY`             | `false`                | Read-only mode (disables terminal, uploads, session management)                                                      |
@@ -92,16 +93,19 @@ All settings via environment variables. See [`.env.example`](.env.example) for t
 | `TERMINUS_SCROLLBACK`            | `10000`                | tmux scrollback history lines                                                                                        |
 | `TERMINUS_LOG_PATHS`             | `/var/log,~/.pm2/logs` | Log directories to scan                                                                                              |
 | `TERMINUS_RECORD_SESSIONS`       | `false`                | Record every PTY session to `data/recordings/*.jsonl` for replay (⚠ captures everything you type, including secrets) |
-| `TERMINALX_AUTH_MODE`            | `none`                 | Auth mode: `none`, `password`, `local`, `google`                                                                     |
+| `TERMINALX_AUTH_MODE`            | `local`                | Auth mode: `local`, `password`, `google`, `none`                                                                     |
+| `TERMINALX_PUBLIC_URL`           | —                      | Canonical external URL for OAuth and redirects behind a proxy                                                        |
+| `TERMINALX_TRUST_PROXY_HEADERS`  | `false`                | Trust `X-Forwarded-*` headers only when a trusted proxy overwrites them                                              |
+| `TERMINALX_ALLOW_NO_AUTH`        | —                      | Required to run `AUTH_MODE=none` on a non-loopback bind address                                                      |
 | `TERMINALX_GOOGLE_CLIENT_ID`     | —                      | Google OAuth client ID (when `AUTH_MODE=google`)                                                                     |
 | `TERMINALX_GOOGLE_CLIENT_SECRET` | —                      | Google OAuth client secret                                                                                           |
 | `TERMINALX_ALLOWED_EMAILS`       | —                      | Comma-separated allowlist of Google emails; empty denies everyone                                                    |
 
 ## Authentication
 
-TerminalX defaults to **no authentication** — designed to run behind Tailscale, a VPN, or on a trusted network.
+TerminalX defaults to local username/password auth in the Docker and example configs. `AUTH_MODE=none` is available for loopback, Tailscale, VPN, or other trusted-network deployments, but the server refuses no-auth mode on a non-loopback bind address unless `TERMINALX_ALLOW_NO_AUTH=1` is set.
 
-For exposed deployments, enable auth:
+Choose an auth mode:
 
 ```bash
 # Shared password (simplest)

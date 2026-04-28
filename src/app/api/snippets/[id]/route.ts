@@ -3,10 +3,7 @@ import { deleteSnippet, getSnippet } from "@/lib/snippets";
 import { getUserScoping } from "@/lib/session-scope";
 import { audit } from "@/lib/audit-log";
 
-export async function DELETE(
-  req: NextRequest,
-  { params }: { params: Promise<{ id: string }> }
-) {
+export async function DELETE(req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   if (process.env.TERMINUS_READ_ONLY === "true") {
     return NextResponse.json(
       { error: "Snippet deletion disabled in read-only mode" },
@@ -24,13 +21,9 @@ export async function DELETE(
     if (
       shouldScope &&
       role !== "admin" &&
-      snippet.createdBy &&
-      snippet.createdBy !== username
+      (!username || (snippet.createdBy && snippet.createdBy !== username))
     ) {
-      return NextResponse.json(
-        { error: "Cannot delete another user's snippet" },
-        { status: 403 }
-      );
+      return NextResponse.json({ error: "Cannot delete another user's snippet" }, { status: 403 });
     }
 
     await deleteSnippet(id);

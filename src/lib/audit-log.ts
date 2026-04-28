@@ -13,6 +13,7 @@ export type AuditEvent =
   | "session_created"
   | "session_deleted"
   | "file_uploaded"
+  | "file_access_denied"
   | "terminal_connected"
   | "terminal_disconnected"
   | "ws_origin_rejected"

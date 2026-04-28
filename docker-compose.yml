@@ -2,7 +2,7 @@ services:
   terminalx:
     build: .
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     volumes:
       # Persist user data and secrets across container restarts
       - terminalx-data:/app/data
@@ -14,13 +14,15 @@ services:
       - TERMINUS_SHELL=/bin/bash
       - TERMINUS_MAX_SESSIONS=20
       - TERMINUS_READ_ONLY=false
-      # Auth: set to "local" for username/password, "password" for shared password
-      - TERMINALX_AUTH_MODE=${TERMINALX_AUTH_MODE:-none}
+      # Auth: set TERMINALX_ADMIN_PASSWORD before first startup.
+      - TERMINALX_AUTH_MODE=${TERMINALX_AUTH_MODE:-local}
       # Required when TERMINALX_AUTH_MODE=local (first run creates this admin user)
       - TERMINALX_ADMIN_USERNAME=${TERMINALX_ADMIN_USERNAME:-admin}
       - TERMINALX_ADMIN_PASSWORD=${TERMINALX_ADMIN_PASSWORD:-}
       # Required when TERMINALX_AUTH_MODE=password
       - TERMINALX_PASSWORD=${TERMINALX_PASSWORD:-}
+      # Required only if you intentionally expose auth mode "none" beyond loopback
+      - TERMINALX_ALLOW_NO_AUTH=${TERMINALX_ALLOW_NO_AUTH:-}
     restart: unless-stopped
 
 volumes:

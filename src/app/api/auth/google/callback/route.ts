@@ -9,6 +9,7 @@ import {
 } from "@/lib/auth-config";
 import { audit } from "@/lib/audit-log";
 import { isRateLimited, clientIp } from "@/lib/rate-limit";
+import { externalBaseUrl, isSecureRequest } from "@/lib/security-config";
 
 interface GoogleTokenResponse {
   access_token: string;
@@ -24,18 +25,11 @@ interface GoogleUserInfo {
   picture: string;
 }
 
-/** Build the external-facing base URL (respects reverse proxy headers). */
-function getExternalBase(req: NextRequest): string {
-  const proto = req.headers.get("x-forwarded-proto") || req.nextUrl.protocol.replace(":", "");
-  const host = req.headers.get("x-forwarded-host") || req.headers.get("host") || req.nextUrl.host;
-  return `${proto}://${host}`;
-}
-
 /**
  * GET /api/auth/google/callback — Handles the OAuth2 callback from Google.
  */
 export async function GET(req: NextRequest) {
-  const base = getExternalBase(req);
+  const base = externalBaseUrl(req);
 
   if (getAuthMode() !== "google") {
     return NextResponse.redirect(new URL("/login", base));
@@ -146,7 +140,7 @@ export async function GET(req: NextRequest) {
   // Set session cookie and clear OAuth state cookie using the cookies API
   // (mixing headers.set("Set-Cookie") with cookies.delete() causes Next.js to clobber the header)
   const loginRedirect = NextResponse.redirect(new URL("/", base));
-  const secureCookie = base.startsWith("https");
+  const secureCookie = isSecureRequest(req);
 
   loginRedirect.cookies.set("terminalx-session", token, {
     path: "/",

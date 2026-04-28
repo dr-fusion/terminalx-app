@@ -14,7 +14,10 @@ beforeAll(() => {
   // Create test fixtures
   fs.mkdirSync(path.join(TEST_ROOT, "subdir"), { recursive: true });
   fs.writeFileSync(path.join(TEST_ROOT, "test.txt"), "hello world");
+  fs.writeFileSync(path.join(TEST_ROOT, ".env"), "SECRET=do-not-read");
   fs.writeFileSync(path.join(TEST_ROOT, "subdir", "nested.txt"), "nested content");
+  fs.mkdirSync(path.join(TEST_ROOT, "data"), { recursive: true });
+  fs.writeFileSync(path.join(TEST_ROOT, "data", "users.json"), "[]");
   fs.writeFileSync(
     path.join(TEST_ROOT, "large.txt"),
     "x".repeat(2 * 1024 * 1024) // 2MB file
@@ -24,6 +27,7 @@ beforeAll(() => {
 afterAll(() => {
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
   delete process.env.TERMINUS_ROOT;
+  delete process.env.TERMINALX_ALLOW_SENSITIVE_FILE_ACCESS;
 });
 
 describe("resolveSafePath", () => {
@@ -48,30 +52,22 @@ describe("resolveSafePath", () => {
   });
 
   it("rejects path traversal with ../", () => {
-    expect(() => resolveSafePath("../../../etc/passwd")).toThrow(
-      "outside the allowed root"
-    );
+    expect(() => resolveSafePath("../../../etc/passwd")).toThrow("outside the allowed root");
   });
 
   it("rejects path traversal with encoded ../", () => {
-    expect(() => resolveSafePath("subdir/../../etc/passwd")).toThrow(
-      "outside the allowed root"
-    );
+    expect(() => resolveSafePath("subdir/../../etc/passwd")).toThrow("outside the allowed root");
   });
 
   it("rejects absolute path outside root", () => {
-    expect(() => resolveSafePath("/etc/passwd")).toThrow(
-      "outside the allowed root"
-    );
+    expect(() => resolveSafePath("/etc/passwd")).toThrow("outside the allowed root");
   });
 
   it("handles symlink traversal if symlink points outside root", () => {
     const symlinkPath = path.join(TEST_ROOT, "escape-link");
     try {
       fs.symlinkSync("/etc", symlinkPath);
-      expect(() => resolveSafePath("escape-link")).toThrow(
-        "outside the allowed root"
-      );
+      expect(() => resolveSafePath("escape-link")).toThrow("outside the allowed root");
     } finally {
       fs.unlinkSync(symlinkPath);
     }
@@ -100,6 +96,7 @@ describe("listDirectory", () => {
     const names = entries.map((e) => e.name);
     expect(names).toContain("test.txt");
     expect(names).toContain("subdir");
+    expect(names).not.toContain(".env");
   });
 
   it("sorts directories before files", () => {
@@ -118,6 +115,11 @@ describe("readFile", () => {
   it("reads file content", () => {
     const content = readFile("test.txt");
     expect(content).toBe("hello world");
+  });
+
+  it("rejects sensitive files", () => {
+    expect(() => readFile(".env")).toThrow("sensitive path");
+    expect(() => readFile("data/users.json")).toThrow("sensitive path");
   });
 
   it("throws for directory", () => {

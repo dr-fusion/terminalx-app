@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, afterEach } from "vitest";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
@@ -28,6 +28,10 @@ beforeAll(async () => {
 afterAll(() => {
   fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
   delete process.env.TERMINALX_JWT_SECRET;
+});
+
+afterEach(() => {
+  delete process.env.TERMINALX_AUTH_MODE;
 });
 
 describe("JWT sign and verify", () => {
@@ -149,5 +153,24 @@ describe("token revocation", () => {
     // Token rejected after revocation
     const after = await verifyJwt(token);
     expect(after).toBeNull();
+  });
+});
+
+describe("/api/auth/me", () => {
+  it("ignores spoofed identity headers when no session cookie is present", async () => {
+    process.env.TERMINALX_AUTH_MODE = "local";
+    const { GET } = await import("@/app/api/auth/me/route");
+    const req = {
+      headers: {
+        get: (name: string) =>
+          ({
+            "x-username": "admin",
+            "x-user-role": "admin",
+          })[name.toLowerCase()] ?? null,
+      },
+    } as never;
+
+    const res = await GET(req);
+    expect(res.status).toBe(401);
   });
 });

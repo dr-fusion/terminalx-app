@@ -9,7 +9,7 @@ cd "$(dirname "$0")"
 
 # ── Defaults ────────────────────────────────────────────────────────────────
 PORT="${PORT:-3000}"
-TERMINUS_HOST="${TERMINUS_HOST:-0.0.0.0}"
+TERMINUS_HOST="${TERMINUS_HOST:-127.0.0.1}"
 TERMINUS_ROOT="${TERMINUS_ROOT:-$HOME}"
 TERMINUS_SHELL="${TERMINUS_SHELL:-$SHELL}"
 TERMINUS_MAX_SESSIONS="${TERMINUS_MAX_SESSIONS:-20}"

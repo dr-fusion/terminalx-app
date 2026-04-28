@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { jwtVerify } from "jose";
 import { audit } from "@/lib/audit-log";
+import { externalBaseUrl } from "@/lib/security-config";
 
 // Next.js edge middleware cannot use Node.js APIs, so we inline the secret
 // logic here (reads env var only; file-based fallback is server-side only).
@@ -12,7 +13,7 @@ function getJwtSecretEdge(): Uint8Array | null {
 }
 
 function getAuthModeEdge(): "none" | "password" | "local" | "google" {
-  const mode = process.env.TERMINALX_AUTH_MODE || "none";
+  const mode = process.env.TERMINALX_AUTH_MODE || "local";
   if (mode === "password" || mode === "local" || mode === "google") {
     return mode;
   }
@@ -32,23 +33,27 @@ const PUBLIC_PATHS = [
   "/favicon.ico",
 ];
 
-/**
- * Strip user identity headers to prevent spoofing from untrusted clients.
- * These headers are only set by the middleware itself after JWT verification.
- */
-function stripUserHeaders(response: NextResponse): NextResponse {
-  response.headers.set("x-user-id", "");
-  response.headers.set("x-user-role", "");
-  response.headers.set("x-username", "");
-  return response;
+const USER_HEADER_NAMES = ["x-user-id", "x-user-role", "x-username"];
+
+function sanitizedRequestHeaders(req: NextRequest): Headers {
+  const headers = new Headers(req.headers);
+  for (const name of USER_HEADER_NAMES) {
+    headers.delete(name);
+  }
+  return headers;
+}
+
+function nextWithHeaders(headers: Headers): NextResponse {
+  return NextResponse.next({ request: { headers } });
 }
 
 export async function middleware(req: NextRequest) {
   const authMode = getAuthModeEdge();
+  const requestHeaders = sanitizedRequestHeaders(req);
 
   // No auth required
   if (authMode === "none") {
-    return stripUserHeaders(NextResponse.next());
+    return nextWithHeaders(requestHeaders);
   }
 
   const { pathname } = req.nextUrl;
@@ -56,39 +61,35 @@ export async function middleware(req: NextRequest) {
   // Skip auth for public paths
   for (const p of PUBLIC_PATHS) {
     if (pathname === p || pathname.startsWith(p)) {
-      return stripUserHeaders(NextResponse.next());
+      return nextWithHeaders(requestHeaders);
     }
   }
 
-  // Build external-facing base URL for redirects (behind reverse proxy)
-  const proto = req.headers.get("x-forwarded-proto") || req.nextUrl.protocol.replace(":", "");
-  const host = req.headers.get("x-forwarded-host") || req.headers.get("host") || req.nextUrl.host;
-  const base = `${proto}://${host}`;
+  const base = externalBaseUrl(req);
 
   // Parse JWT from cookie
   const token = req.cookies.get("terminalx-session")?.value;
   if (!token) {
-    return stripUserHeaders(NextResponse.redirect(new URL("/login", base)));
+    return NextResponse.redirect(new URL("/login", base));
   }
 
   const secret = getJwtSecretEdge();
   if (!secret) {
-    return stripUserHeaders(NextResponse.redirect(new URL("/login", base)));
+    return NextResponse.redirect(new URL("/login", base));
   }
 
   try {
     const { payload } = await jwtVerify(token, secret);
-    const response = NextResponse.next();
-    response.headers.set("x-user-id", (payload.userId as string) || "");
-    response.headers.set("x-user-role", (payload.role as string) || "");
-    response.headers.set("x-username", (payload.username as string) || "");
-    return response;
+    requestHeaders.set("x-user-id", (payload.userId as string) || "");
+    requestHeaders.set("x-user-role", (payload.role as string) || "");
+    requestHeaders.set("x-username", (payload.username as string) || "");
+    return nextWithHeaders(requestHeaders);
   } catch (err) {
     const reason = err instanceof Error ? err.message : "unknown";
     audit("jwt_verify_failed", { detail: `${pathname} :: ${reason}` });
     const response = NextResponse.redirect(new URL("/login", base));
     response.cookies.delete("terminalx-session");
-    return stripUserHeaders(response);
+    return response;
   }
 }
 

@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import crypto from "crypto";
 import { getAuthMode, getGoogleClientId, getGoogleCallbackUrl } from "@/lib/auth-config";
+import { externalBaseUrl, isSecureRequest } from "@/lib/security-config";
 
 /**
  * GET /api/auth/google — Redirects to Google's OAuth2 consent screen.
@@ -15,14 +16,9 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: "Google OAuth not configured" }, { status: 500 });
   }
 
-  // Build the absolute callback URL (respect reverse proxy headers)
-  const proto = req.headers.get("x-forwarded-proto") || req.nextUrl.protocol.replace(":", "");
-  const host = req.headers.get("x-forwarded-host") || req.headers.get("host") || req.nextUrl.host;
-  const base = `${proto}://${host}`;
+  const base = externalBaseUrl(req);
   const callbackPath = getGoogleCallbackUrl();
-  const redirectUri = callbackPath.startsWith("http")
-    ? callbackPath
-    : `${base}${callbackPath}`;
+  const redirectUri = callbackPath.startsWith("http") ? callbackPath : `${base}${callbackPath}`;
 
   // Generate CSRF state token
   const state = crypto.randomBytes(32).toString("hex");
@@ -46,6 +42,7 @@ export async function GET(req: NextRequest) {
     sameSite: "lax",
     maxAge: 600, // 10 minutes
     path: "/",
+    secure: isSecureRequest(req),
   });
 
   return response;

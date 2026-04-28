@@ -13,6 +13,9 @@ export async function GET(req: NextRequest, { params }: { params: Promise<{ id: 
     }
 
     const { username, shouldScope } = getUserScoping(req.headers);
+    if (shouldScope && !username) {
+      return NextResponse.json({ error: "Not found" }, { status: 404 });
+    }
     if (shouldScope && username) {
       const meta = getRecordingMeta(id);
       if (!meta || meta.createdBy !== username) {

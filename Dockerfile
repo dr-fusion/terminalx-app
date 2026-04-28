@@ -42,7 +42,7 @@ ENV NODE_ENV=production
 ENV PORT=3000
 ENV TERMINUS_HOST=0.0.0.0
 ENV TERMINUS_ROOT=/home/terminus
-ENV TERMINALX_AUTH_MODE=none
+ENV TERMINALX_AUTH_MODE=local
 
 # Drop privileges.
 USER terminus

@@ -13,18 +13,8 @@ export async function GET(req: NextRequest) {
     });
   }
 
-  // Try headers set by middleware first
-  const headerUsername = req.headers.get("x-username");
-  const headerRole = req.headers.get("x-user-role");
-  if (headerUsername && headerRole) {
-    return NextResponse.json({
-      username: headerUsername,
-      role: headerRole,
-      authMode,
-    });
-  }
-
-  // Fallback: verify JWT directly
+  // This route is intentionally public so the login page can call it. Do not
+  // trust identity headers here; verify the session cookie directly.
   const cookieHeader = req.headers.get("cookie");
   const cookies = parseCookies(cookieHeader);
   const token = cookies["terminalx-session"];

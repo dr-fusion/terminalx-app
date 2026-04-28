@@ -1,3 +1,5 @@
+import { trustProxyHeaders } from "./security-config";
+
 const WINDOW_MS = 60_000;
 const MAX_ATTEMPTS = 5;
 const MAX_KEYS = 10_000;
@@ -34,9 +36,11 @@ setInterval(() => {
 }, 300_000).unref?.();
 
 export function clientIp(req: { headers: { get(name: string): string | null } }): string {
-  const fwd = req.headers.get("x-forwarded-for");
-  if (fwd) return fwd.split(",")[0]!.trim();
-  const real = req.headers.get("x-real-ip");
-  if (real) return real.trim();
+  if (trustProxyHeaders()) {
+    const fwd = req.headers.get("x-forwarded-for");
+    if (fwd) return fwd.split(",")[0]!.trim();
+    const real = req.headers.get("x-real-ip");
+    if (real) return real.trim();
+  }
   return "unknown";
 }

@@ -32,8 +32,10 @@ way to reach you. A maintainer will respond off-thread.
 ## Out of scope
 
 - Attacks that require prior filesystem or root access on the host
-- Issues in `TERMINALX_AUTH_MODE=none` — this mode is explicitly unauthenticated
-  and intended only for single-user, trusted-network deployments
+- Issues in explicitly allowed `TERMINALX_AUTH_MODE=none` deployments — this
+  mode is unauthenticated and intended only for loopback, single-user,
+  Tailscale/VPN, or other trusted-network deployments. Non-loopback no-auth
+  startup requires `TERMINALX_ALLOW_NO_AUTH=1`.
 - Dependency CVEs already tracked upstream and not yet patched
 
 ## Disclosure

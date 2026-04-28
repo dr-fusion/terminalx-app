@@ -4,15 +4,24 @@ import * as path from "path";
 import * as crypto from "crypto";
 import { getUserScoping } from "@/lib/session-scope";
 import { audit } from "@/lib/audit-log";
+import { assertNotSensitivePath } from "@/lib/file-service";
 
 const MAX_FILE_SIZE = 100 * 1024 * 1024; // 100MB
+const USERNAME_SEGMENT_REGEX = /^[a-zA-Z0-9_.]+$/;
 
 function getUploadDir(username: string | null): string {
-  const root = process.env.TERMINUS_ROOT || process.env.HOME || "/";
-  // Per-user upload directories in multi-user mode
-  const uploadDir = username ? path.join(root, "uploads", username) : path.join(root, "uploads");
+  const root = path.resolve(process.env.TERMINUS_ROOT || process.env.HOME || "/");
+  const uploadsRoot = path.resolve(root, "uploads");
+  if (username && !USERNAME_SEGMENT_REGEX.test(username)) {
+    throw new Error("Invalid username for upload path");
+  }
+  const uploadDir = username ? path.resolve(uploadsRoot, username) : uploadsRoot;
+  if (!uploadDir.startsWith(uploadsRoot + path.sep) && uploadDir !== uploadsRoot) {
+    throw new Error("Upload path is outside the allowed upload root");
+  }
+  assertNotSensitivePath(uploadDir);
   if (!fs.existsSync(uploadDir)) {
-    fs.mkdirSync(uploadDir, { recursive: true, mode: 0o755 });
+    fs.mkdirSync(uploadDir, { recursive: true, mode: 0o700 });
   }
   return uploadDir;
 }
@@ -57,27 +66,40 @@ export async function POST(req: NextRequest) {
     const uniqueSuffix = crypto.randomBytes(4).toString("hex");
     const safeFilename = `${baseName}-${uniqueSuffix}${ext}`;
 
-    const { username } = getUserScoping(req.headers);
-    const uploadDir = getUploadDir(username);
+    const { username, shouldScope, hasIdentity } = getUserScoping(req.headers);
+    if (!hasIdentity || (shouldScope && !username)) {
+      return NextResponse.json({ error: "Access denied" }, { status: 403 });
+    }
+    const uploadDir = getUploadDir(shouldScope ? username : null);
     const filePath = path.join(uploadDir, safeFilename);
 
     // Write file
     const arrayBuffer = await file.arrayBuffer();
-    fs.writeFileSync(filePath, Buffer.from(arrayBuffer));
+    fs.writeFileSync(filePath, Buffer.from(arrayBuffer), { mode: 0o600 });
 
     audit("file_uploaded", {
       username: username || undefined,
       detail: `${safeFilename} (${file.size} bytes)`,
     });
 
+    const root = path.resolve(process.env.TERMINUS_ROOT || process.env.HOME || "/");
+    const relativePath = path.relative(root, filePath);
+
     return NextResponse.json({
       success: true,
       filename: safeFilename,
-      path: filePath,
+      path: relativePath,
       size: file.size,
     });
   } catch (err) {
     console.error("[api/upload POST]", err);
+    const message = err instanceof Error ? err.message : "Upload failed";
+    if (message.includes("Invalid username") || message.includes("outside the allowed")) {
+      return NextResponse.json({ error: message }, { status: 400 });
+    }
+    if (message.includes("sensitive path")) {
+      return NextResponse.json({ error: "Access denied" }, { status: 403 });
+    }
     return NextResponse.json({ error: "Upload failed" }, { status: 500 });
   }
 }

@@ -3,12 +3,16 @@ import { listSessions, createSession, killSession } from "@/lib/tmux";
 import { getUserScoping, canAccessSession, scopedSessionName } from "@/lib/session-scope";
 import { audit } from "@/lib/audit-log";
 import { listMetadata, saveMeta, deleteMeta, commandForKind, isValidKind } from "@/lib/ai-sessions";
+import { getConfiguredMaxSessions } from "@/lib/security-config";
 
 export async function GET(req: NextRequest) {
   try {
     const { username, shouldScope } = getUserScoping(req.headers);
     let sessions = listSessions();
 
+    if (shouldScope && !username) {
+      return NextResponse.json({ error: "Access denied" }, { status: 403 });
+    }
     if (shouldScope && username) {
       sessions = sessions.filter((s) => canAccessSession(username, "user", s.name));
     }
@@ -58,8 +62,18 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const { username } = getUserScoping(req.headers);
+    const { username, hasIdentity } = getUserScoping(req.headers);
+    if (!hasIdentity) {
+      return NextResponse.json({ error: "Access denied" }, { status: 403 });
+    }
     const finalName = scopedSessionName(name, username);
+    const maxSessions = getConfiguredMaxSessions();
+    if (listSessions().length >= maxSessions) {
+      return NextResponse.json(
+        { error: `Maximum number of sessions reached (${maxSessions})` },
+        { status: 429 }
+      );
+    }
 
     const command = commandForKind(sessionKind, {
       dangerouslySkipPermissions: Boolean(dangerouslySkipPermissions),
@@ -106,7 +120,7 @@ export async function DELETE(req: NextRequest) {
 
     const { username, role, shouldScope } = getUserScoping(req.headers);
 
-    if (shouldScope && username && !canAccessSession(username, role, name)) {
+    if (shouldScope && (!username || !canAccessSession(username, role, name))) {
       return NextResponse.json({ error: "Cannot delete another user's session" }, { status: 403 });
     }
 

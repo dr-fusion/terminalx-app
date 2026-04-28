@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { canAccessSession, scopedSessionName } from "@/lib/session-scope";
+import { canAccessSession, getUserScoping, scopedSessionName } from "@/lib/session-scope";
 
 describe("canAccessSession", () => {
   beforeEach(() => {
@@ -58,5 +58,45 @@ describe("scopedSessionName", () => {
 
   afterEach(() => {
     delete process.env.TERMINALX_AUTH_MODE;
+  });
+});
+
+describe("getUserScoping", () => {
+  const headers = (values: Record<string, string> = {}) => ({
+    get: (name: string) => values[name.toLowerCase()] ?? null,
+  });
+
+  afterEach(() => {
+    delete process.env.TERMINALX_AUTH_MODE;
+  });
+
+  it("fails closed in local mode when trusted identity is missing", () => {
+    process.env.TERMINALX_AUTH_MODE = "local";
+    expect(getUserScoping(headers())).toEqual({
+      username: null,
+      role: null,
+      shouldScope: true,
+      hasIdentity: false,
+    });
+  });
+
+  it("accepts a trusted local user identity", () => {
+    process.env.TERMINALX_AUTH_MODE = "local";
+    expect(getUserScoping(headers({ "x-username": "alice", "x-user-role": "user" }))).toEqual({
+      username: "alice",
+      role: "user",
+      shouldScope: true,
+      hasIdentity: true,
+    });
+  });
+
+  it("treats password mode as single-admin mode", () => {
+    process.env.TERMINALX_AUTH_MODE = "password";
+    expect(getUserScoping(headers())).toEqual({
+      username: null,
+      role: "admin",
+      shouldScope: false,
+      hasIdentity: true,
+    });
   });
 });

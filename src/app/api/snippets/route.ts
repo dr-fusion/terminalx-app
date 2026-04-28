@@ -7,6 +7,9 @@ export async function GET(req: NextRequest) {
   try {
     const { username, shouldScope } = getUserScoping(req.headers);
     let snippets = listSnippets();
+    if (shouldScope && !username) {
+      return NextResponse.json({ error: "Access denied" }, { status: 403 });
+    }
     if (shouldScope && username) {
       snippets = snippets.filter((s) => !s.createdBy || s.createdBy === username);
     }
@@ -33,14 +36,17 @@ export async function POST(req: NextRequest) {
     if (description !== undefined && typeof description !== "string") {
       return NextResponse.json({ error: "description must be a string" }, { status: 400 });
     }
-    const username = req.headers.get("x-username") || undefined;
+    const { username, hasIdentity } = getUserScoping(req.headers);
+    if (!hasIdentity) {
+      return NextResponse.json({ error: "Access denied" }, { status: 403 });
+    }
     const snippet = await createSnippet({
       name,
       command,
       description,
-      createdBy: username,
+      createdBy: username || undefined,
     });
-    audit("snippet_created", { username, detail: snippet.name });
+    audit("snippet_created", { username: username || undefined, detail: snippet.name });
     return NextResponse.json({ snippet }, { status: 201 });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Failed to create snippet";

@@ -19,10 +19,7 @@ export function canAccessSession(
 /**
  * Prefix a session name with the username for scoping in multi-user mode.
  */
-export function scopedSessionName(
-  name: string,
-  username: string | null
-): string {
+export function scopedSessionName(name: string, username: string | null): string {
   const authMode = getAuthMode();
   if (authMode === "local" && username) {
     return `${username}-${name}`;
@@ -33,23 +30,40 @@ export function scopedSessionName(
 /**
  * Get user scoping info from request headers (set by middleware).
  */
-export function getUserScoping(headers: {
-  get(name: string): string | null;
-}): {
+export function getUserScoping(headers: { get(name: string): string | null }): {
   username: string | null;
   role: string | null;
   shouldScope: boolean;
+  hasIdentity: boolean;
 } {
   const authMode = getAuthMode();
   if (authMode === "none" || authMode === "password") {
-    return { username: null, role: "admin", shouldScope: false };
+    return { username: null, role: "admin", shouldScope: false, hasIdentity: true };
   }
 
   const username = headers.get("x-username");
   const role = headers.get("x-user-role");
+  if (role === "admin") {
+    return {
+      username,
+      role,
+      shouldScope: false,
+      hasIdentity: true,
+    };
+  }
+  if (role === "user" && username) {
+    return {
+      username,
+      role,
+      shouldScope: true,
+      hasIdentity: true,
+    };
+  }
+
   return {
-    username,
-    role,
-    shouldScope: role === "user",
+    username: null,
+    role: null,
+    shouldScope: true,
+    hasIdentity: false,
   };
 }

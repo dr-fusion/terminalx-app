@@ -1,10 +1,19 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getUsers, createUser, deleteUser, getUserById, getUserByUsername, updateUserRole } from "@/lib/users";
+import {
+  getUsers,
+  createUser,
+  deleteUser,
+  getUserById,
+  getUserByUsername,
+  updateUserRole,
+} from "@/lib/users";
 import { getAuthMode } from "@/lib/auth-config";
 import { audit } from "@/lib/audit-log";
+import { getUserScoping } from "@/lib/session-scope";
 
 function isAdmin(req: NextRequest): boolean {
-  return req.headers.get("x-user-role") === "admin";
+  const { role, hasIdentity } = getUserScoping(req.headers);
+  return hasIdentity && role === "admin";
 }
 
 const USERNAME_REGEX = /^[a-zA-Z0-9_.]+$/;
@@ -60,17 +69,11 @@ export async function POST(req: NextRequest) {
   }
 
   if (!password || typeof password !== "string" || password.length < 8) {
-    return NextResponse.json(
-      { error: "Password is required (min 8 characters)" },
-      { status: 400 }
-    );
+    return NextResponse.json({ error: "Password is required (min 8 characters)" }, { status: 400 });
   }
 
   if (role && role !== "admin" && role !== "user") {
-    return NextResponse.json(
-      { error: "Role must be 'admin' or 'user'" },
-      { status: 400 }
-    );
+    return NextResponse.json({ error: "Role must be 'admin' or 'user'" }, { status: 400 });
   }
 
   try {
@@ -121,10 +124,7 @@ export async function DELETE(req: NextRequest) {
   if (targetUser && targetUser.role === "admin") {
     const adminCount = getUsers().filter((u) => u.role === "admin").length;
     if (adminCount <= 1) {
-      return NextResponse.json(
-        { error: "Cannot delete the last admin user" },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: "Cannot delete the last admin user" }, { status: 400 });
     }
   }
 
@@ -181,10 +181,7 @@ export async function PATCH(req: NextRequest) {
   if (targetUser && targetUser.role === "admin" && role === "user") {
     const adminCount = getUsers().filter((u) => u.role === "admin").length;
     if (adminCount <= 1) {
-      return NextResponse.json(
-        { error: "Cannot demote the last admin user" },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: "Cannot demote the last admin user" }, { status: 400 });
     }
   }
 

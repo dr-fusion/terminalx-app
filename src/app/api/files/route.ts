@@ -1,13 +1,14 @@
 import { NextRequest, NextResponse } from "next/server";
-import {
-  listDirectory,
-  readFile,
-  getFileInfo,
-  resolveSafePath,
-} from "@/lib/file-service";
+import { listDirectory, readFile, getFileInfo, resolveSafePath } from "@/lib/file-service";
+import { getUserScoping } from "@/lib/session-scope";
 import * as fs from "fs";
 
 export async function GET(req: NextRequest) {
+  const { role, hasIdentity } = getUserScoping(req.headers);
+  if (!hasIdentity || role !== "admin") {
+    return NextResponse.json({ error: "Admin access required" }, { status: 403 });
+  }
+
   const searchParams = req.nextUrl.searchParams;
   const requestedPath = searchParams.get("path") || ".";
   const action = searchParams.get("action") || "auto"; // auto, list, read, info
@@ -39,14 +40,14 @@ export async function GET(req: NextRequest) {
       });
     }
 
-    return NextResponse.json(
-      { error: "Cannot determine action for this path" },
-      { status: 400 }
-    );
+    return NextResponse.json({ error: "Cannot determine action for this path" }, { status: 400 });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     // Sanitize error messages to avoid leaking internal filesystem paths
     if (message.includes("outside the allowed root")) {
+      return NextResponse.json({ error: "Access denied" }, { status: 403 });
+    }
+    if (message.includes("sensitive path")) {
       return NextResponse.json({ error: "Access denied" }, { status: 403 });
     }
     if (message.includes("ENOENT") || message.includes("no such file")) {

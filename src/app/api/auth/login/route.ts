@@ -5,12 +5,12 @@ import { getAuthMode, getSinglePassword } from "@/lib/auth-config";
 import { getUserByUsername, updateLastLogin, ensureDefaultAdmin } from "@/lib/users";
 import { audit } from "@/lib/audit-log";
 import { isRateLimited } from "@/lib/rate-limit";
+import { isSecureRequest } from "@/lib/security-config";
 
 // ── Cookie helper ───────────────────────────────────────────────────────────
 
 function makeSessionCookie(token: string, req: NextRequest): string {
-  const proto = req.headers.get("x-forwarded-proto") || req.nextUrl.protocol.replace(":", "");
-  const secure = proto === "https";
+  const secure = isSecureRequest(req);
   const parts = [
     `terminalx-session=${token}`,
     "Path=/",

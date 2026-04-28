@@ -19,12 +19,25 @@ function mockRequest(headers: Record<string, string> = {}) {
   } as never;
 }
 
+function mockFileRequest(pathname = "test.txt", headers: Record<string, string> = {}) {
+  return {
+    headers: {
+      get: (name: string) => headers[name.toLowerCase()] ?? null,
+    },
+    nextUrl: { searchParams: new URLSearchParams({ path: pathname, action: "read" }) },
+  } as never;
+}
+
 async function loadSnippetsRoute() {
   return await import("@/app/api/snippets/route");
 }
 
 async function loadLogsRoute() {
   return await import("@/app/api/logs/route");
+}
+
+async function loadFilesRoute() {
+  return await import("@/app/api/files/route");
 }
 
 describe("snippets GET scoping", () => {
@@ -98,5 +111,40 @@ describe("logs GET admin gate", () => {
     const body = await res.json();
     expect(body).toHaveProperty("files");
     expect(Array.isArray(body.files)).toBe(true);
+  });
+});
+
+describe("files GET admin gate", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "tx-files-gate-"));
+    process.env.TERMINUS_ROOT = tmpDir;
+    process.env.TERMINALX_AUTH_MODE = "local";
+    fs.writeFileSync(path.join(tmpDir, "test.txt"), "ok");
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    delete process.env.TERMINUS_ROOT;
+    delete process.env.TERMINALX_AUTH_MODE;
+  });
+
+  it("denies non-admin local users", async () => {
+    const { GET } = await loadFilesRoute();
+    const res = await GET(
+      mockFileRequest("test.txt", { "x-username": "alice", "x-user-role": "user" })
+    );
+    expect(res.status).toBe(403);
+  });
+
+  it("allows admins to read non-sensitive files", async () => {
+    const { GET } = await loadFilesRoute();
+    const res = await GET(
+      mockFileRequest("test.txt", { "x-username": "admin", "x-user-role": "admin" })
+    );
+    const body = await res.json();
+    expect(res.status).toBe(200);
+    expect(body.content).toBe("ok");
   });
 });

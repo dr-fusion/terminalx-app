@@ -25,7 +25,7 @@ export async function DELETE(req: NextRequest, ctx: Ctx) {
     }
 
     const { username, role, shouldScope } = getUserScoping(req.headers);
-    if (shouldScope && username && !canAccessSession(username, role, name)) {
+    if (shouldScope && (!username || !canAccessSession(username, role, name))) {
       return NextResponse.json({ error: "cannot delete another user's session" }, { status: 403 });
     }
 

@@ -3,7 +3,7 @@
 export type AuthMode = "none" | "password" | "local" | "google";
 
 export function getAuthMode(): AuthMode {
-  const mode = process.env.TERMINALX_AUTH_MODE || "none";
+  const mode = process.env.TERMINALX_AUTH_MODE || "local";
   if (mode === "password" || mode === "local" || mode === "google") {
     return mode;
   }
@@ -43,7 +43,10 @@ export function getGoogleCallbackUrl(): string {
 export function getAllowedEmails(): string[] {
   const raw = process.env.TERMINALX_ALLOWED_EMAILS || "";
   if (!raw.trim()) return [];
-  return raw.split(",").map((e) => e.trim().toLowerCase()).filter(Boolean);
+  return raw
+    .split(",")
+    .map((e) => e.trim().toLowerCase())
+    .filter(Boolean);
 }
 
 /**
