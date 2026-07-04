@@ -1,4 +1,5 @@
 import * as fs from "fs";
+import * as path from "path";
 import { Bot, type Context } from "grammy";
 import {
   listSessions,
@@ -55,12 +56,14 @@ import {
 } from "./streamer";
 import {
   startClaudeTranscript,
+  isClaudeTranscriptRunning,
   stopClaudeTranscript,
   stopAllClaudeTranscripts,
   readLastAssistantText,
 } from "./claude-transcript";
 import {
   startCodexTranscript,
+  isCodexTranscriptRunning,
   stopCodexTranscript,
   stopAllCodexTranscripts,
   readLastCodexAssistantText,
@@ -69,6 +72,14 @@ import { markdownToTelegramV2 } from "./render";
 import { downloadFromTelegram, downloadTelegramFileToTemp, sendFromServer } from "./files";
 import { transcribeAudioFile } from "./transcription";
 import { forumTopicExists } from "./topic-health";
+import { createGitWorktreeForSession, removeGitWorktree } from "@/lib/git-worktree";
+import { resolveWorkspaceConfig, copyConfiguredFiles } from "@/lib/workspace-config";
+import { allocateWorkspacePort } from "@/lib/workspace-port";
+import { withWorkspaceEnv, runSetup } from "@/lib/workspace-setup";
+import { resolveSessionModelSettings } from "@/lib/settings/session-settings";
+import { modelOptionsForKind } from "@/lib/harnesses/session-model";
+import { getHarness, listHarnesses } from "@/lib/harnesses/registry";
+import { autoWorktreeName, parseWorktreeCommand, slugifySessionName } from "./worktree-command";
 
 let bot: Bot | null = null;
 
@@ -153,6 +164,39 @@ function sessionQuotaReached(): number | null {
   return listSessions().filter((s) => ensureManagedSession(s.name)).length >= maxSessions
     ? maxSessions
     : null;
+}
+
+function fullAccessCommand(kind: SessionKind, cwd: string, env: Record<string, string> = {}) {
+  const sessionModel = resolveSessionModelSettings(cwd);
+  const modelOpts = modelOptionsForKind(kind, {
+    modelId: sessionModel.modelExplicit ? sessionModel.modelId : undefined,
+    planMode: sessionModel.planMode,
+  });
+  const base = commandForKind(kind, {
+    dangerouslySkipPermissions: true,
+    ...modelOpts,
+  });
+  return {
+    command: withWorkspaceEnv(base ?? "exec bash -l", env),
+    sessionModel,
+    persistModelMeta: getHarness(kind)?.command.bin != null,
+  };
+}
+
+function harnessListForHelp(): string {
+  return listHarnesses()
+    .map((h) => h.id)
+    .join("|");
+}
+
+function uniqueAutoSessionName(repoName: string, username: string | null): string {
+  const base = autoWorktreeName(repoName);
+  for (let i = 0; i < 100; i++) {
+    const raw = i === 0 ? base : `${base}-${i + 1}`;
+    const scoped = scopedSessionName(raw, username);
+    if (!hasSession(scoped) && !getMeta(scoped)) return raw;
+  }
+  return `${base}-${Date.now().toString(36)}`;
 }
 
 function sessionBindingDefaults(
@@ -379,6 +423,7 @@ async function handleStart(ctx: Context) {
       "",
       "/sessions — list sessions",
       "/new <name> [bash|claude|codex] — create + attach in a new topic",
+      `/worktree <repo-path> [name] [${harnessListForHelp()}] — create a git worktree session`,
       "",
       "inside a session topic:",
       "  • text → stdin",
@@ -423,6 +468,15 @@ async function handleNew(ctx: Context) {
   }
   const scoped = scopedSessionName(rawName, identity.username);
   if (hasSession(scoped)) {
+    const existing = getTopicByName(scoped);
+    const chatId = ctxChatId();
+    if (existing && chatId) {
+      const url = topicLink(chatId, existing.topicId);
+      await reply(ctx, `session ${scoped} already exists -> ${url}`, {
+        link_preview_options: { is_disabled: true },
+      });
+      return;
+    }
     await reply(ctx, `session ${scoped} already exists.`);
     return;
   }
@@ -432,7 +486,7 @@ async function handleNew(ctx: Context) {
     return;
   }
   const cwd = process.env.TERMINUS_ROOT || process.env.HOME || "/";
-  const cmd = commandForKind(kind);
+  const { command: cmd } = fullAccessCommand(kind, cwd);
   try {
     createSession(scoped, cmd ?? undefined, cwd);
     await saveMeta({ name: scoped, kind, createdAt: new Date().toISOString(), managed: true });
@@ -466,6 +520,159 @@ async function handleNew(ctx: Context) {
     kind,
     cwd,
   });
+}
+
+async function handleWorktree(ctx: Context) {
+  const identity = await gate(ctx);
+  if (!identity) return;
+  if (await rejectReadOnly(ctx)) return;
+  if (!bot) return;
+
+  const parsed = parseWorktreeCommand(ctx.message?.text ?? "");
+  if (!parsed) {
+    await reply(ctx, `usage: /worktree <repo-path> [name] [${harnessListForHelp()}]`);
+    return;
+  }
+
+  const repoName = slugifySessionName(path.basename(parsed.directory)) || "repo";
+  const rawName = parsed.name ?? uniqueAutoSessionName(repoName, identity.username);
+  if (!/^[a-zA-Z0-9_.\-]+$/.test(rawName)) {
+    await reply(ctx, "worktree name can only use letters, numbers, _ - .");
+    return;
+  }
+  const scoped = scopedSessionName(rawName, identity.username);
+  if (hasSession(scoped)) {
+    await reply(ctx, `session ${scoped} already exists.`);
+    return;
+  }
+  const maxSessions = sessionQuotaReached();
+  if (maxSessions !== null) {
+    await reply(ctx, `maximum number of sessions reached (${maxSessions}).`);
+    return;
+  }
+  const maxTopics = topicQuotaReached();
+  if (maxTopics !== null) {
+    await reply(ctx, `maximum number of Telegram topics reached (${maxTopics}).`);
+    return;
+  }
+
+  const branch = `feature/${rawName}`;
+  let created:
+    | {
+        repoRoot: string;
+        worktreePath: string;
+        startDir: string;
+        branch: string;
+        linkedPaths: string[];
+      }
+    | undefined;
+
+  try {
+    created = createGitWorktreeForSession(parsed.directory, branch);
+  } catch (err) {
+    await reply(ctx, `failed to create worktree: ${(err as Error).message}`);
+    return;
+  }
+
+  let port: number;
+  try {
+    port = await allocateWorkspacePort();
+  } catch {
+    removeGitWorktree(created.worktreePath, created.repoRoot, created.linkedPaths);
+    await reply(ctx, "failed to create worktree: no free workspace port available.");
+    return;
+  }
+
+  const wsConfig = resolveWorkspaceConfig(created.repoRoot, { port });
+  try {
+    copyConfiguredFiles(created.repoRoot, created.worktreePath, wsConfig.copyFiles);
+  } catch (err) {
+    removeGitWorktree(created.worktreePath, created.repoRoot, created.linkedPaths);
+    await reply(ctx, `failed to prepare worktree: ${(err as Error).message}`);
+    return;
+  }
+
+  const wsEnv = { TERMINALX_PORT: String(port), ...wsConfig.env };
+  const { command, sessionModel, persistModelMeta } = fullAccessCommand(
+    parsed.kind,
+    created.repoRoot,
+    wsEnv
+  );
+
+  try {
+    createSession(scoped, command, created.startDir);
+    const willRunSetup = Boolean(wsConfig.setup);
+    await saveMeta({
+      name: scoped,
+      kind: parsed.kind,
+      createdAt: new Date().toISOString(),
+      createdBy: identity.username || undefined,
+      managed: true,
+      cwd: created.startDir,
+      worktree: {
+        repoRoot: created.repoRoot,
+        path: created.worktreePath,
+        branch: created.branch,
+        linkedPaths: created.linkedPaths,
+      },
+      port,
+      setup: wsConfig.setup ? { status: willRunSetup ? "pending" : "skipped" } : undefined,
+      ...(persistModelMeta
+        ? {
+            modelId: sessionModel.modelId,
+            effort: sessionModel.effort,
+            personality: sessionModel.personality,
+            planMode: sessionModel.planMode,
+            fastMode: sessionModel.fastMode,
+          }
+        : {}),
+    });
+
+    if (willRunSetup && wsConfig.setup) {
+      void runSetup({
+        sessionName: scoped,
+        cwd: created.worktreePath,
+        command: wsConfig.setup.command,
+        env: wsEnv,
+        timeoutSeconds: wsConfig.setup.timeoutSeconds ?? 1800,
+      });
+    }
+  } catch (err) {
+    removeGitWorktree(created.worktreePath, created.repoRoot, created.linkedPaths);
+    await reply(ctx, `failed to create session: ${(err as Error).message}`);
+    return;
+  }
+
+  const chatId = ctxChatId();
+  if (!chatId) {
+    await reply(ctx, "no forum chat configured.");
+    return;
+  }
+  let topicId: number;
+  try {
+    const topic = await bot.api.createForumTopic(chatId, scoped);
+    topicId = topic.message_thread_id;
+  } catch (err) {
+    await reply(ctx, `failed to create topic: ${(err as Error).message}`);
+    return;
+  }
+
+  await attachToTopic(bot, identity, {
+    topicId,
+    sessionName: scoped,
+    kind: parsed.kind,
+    cwd: created.startDir,
+  });
+  const url = topicLink(chatId, topicId);
+  await reply(
+    ctx,
+    [
+      `created ${scoped} -> ${url}`,
+      `worktree: ${created.worktreePath}`,
+      `branch: ${created.branch}`,
+    ].join("\n"),
+    { link_preview_options: { is_disabled: true } }
+  );
 }
 
 /** Build a `https://t.me/c/<id>/<thread>` deep link for a topic. */
@@ -713,14 +920,17 @@ async function sendPromptToBinding(
     return false;
   }
 
-  if (binding.kind === "claude" || binding.kind === "codex") {
+  const tracksTranscriptPrompt =
+    !/^(?:[0-9]+|y|yes|n|no|d)$/i.test(text.trim()) &&
+    (binding.kind === "claude" || binding.kind === "codex");
+  if (tracksTranscriptPrompt) {
     await patchTopic(topicId, {
       pendingPrompt: text,
       lastPromptAtMs: promptSentAtMs,
     });
   }
 
-  if (binding.kind === "claude" && mode === "chat") {
+  if (tracksTranscriptPrompt && binding.kind === "claude" && mode === "chat") {
     const chatId = ctxChatId();
     if (chatId) {
       const started = startClaudeTranscript(bot, chatId, topicId, {
@@ -736,9 +946,14 @@ async function sendPromptToBinding(
           pendingPrompt: undefined,
           lastPromptAtMs: undefined,
         });
+      } else if (isClaudeTranscriptRunning(topicId)) {
+        await patchTopic(topicId, {
+          pendingPrompt: undefined,
+          lastPromptAtMs: undefined,
+        });
       }
     }
-  } else if (binding.kind === "codex" && mode === "chat") {
+  } else if (tracksTranscriptPrompt && binding.kind === "codex" && mode === "chat") {
     const chatId = ctxChatId();
     if (chatId) {
       const started = startCodexTranscript(bot, chatId, topicId, {
@@ -752,6 +967,11 @@ async function sendPromptToBinding(
       if (started) {
         await patchTopic(topicId, {
           jsonlPath: started.jsonl,
+          pendingPrompt: undefined,
+          lastPromptAtMs: undefined,
+        });
+      } else if (isCodexTranscriptRunning(topicId)) {
+        await patchTopic(topicId, {
           pendingPrompt: undefined,
           lastPromptAtMs: undefined,
         });
@@ -1039,6 +1259,7 @@ export async function startTelegramBot(): Promise<Bot | null> {
   bot.command("start", handleStart);
   bot.command("sessions", handleSessions);
   bot.command("new", handleNew);
+  bot.command("worktree", handleWorktree);
   bot.command("detach", handleDetach);
   bot.command("kill", handleKill);
   bot.command("delete", handleDelete);
@@ -1087,7 +1308,6 @@ export async function startTelegramBot(): Promise<Bot | null> {
   for (const t of listTopics()) {
     await reconcileTopicBinding(t);
   }
-  resumePersistedStreamers(bot);
   for (const t of listTopics()) {
     if (t.endedAtMs) continue;
     if (t.kind !== "claude" && t.kind !== "codex") continue;
@@ -1122,6 +1342,7 @@ export async function startTelegramBot(): Promise<Bot | null> {
       });
     }
   }
+  resumePersistedStreamers(bot);
   return bot;
 }
 

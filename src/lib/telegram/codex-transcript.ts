@@ -1,10 +1,11 @@
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
+import { createHash } from "crypto";
 import type { Bot } from "grammy";
 import { watch, FSWatcher } from "chokidar";
 import { markdownToTelegramV2, splitForTelegram } from "./render";
-import { listTopics } from "./state";
+import { getTopic, listTopics, patchTopic, type TelegramSentMessageHash } from "./state";
 import { sendReferencedAttachments } from "./attachments";
 
 interface SessionMetaEntry {
@@ -56,13 +57,47 @@ interface PromptMatch {
 const CODEX_SESSIONS_DIR = path.join(os.homedir(), ".codex", "sessions");
 const MIN_GAP_MS = 1100;
 const MAX_SCAN_BYTES = 4 * 1024 * 1024;
+const SENT_HASH_LIMIT = 200;
 
 const watchers = new Map<number, WatcherRecord>();
-const sendQueues = new Map<number, Promise<void>>();
+const sendQueues = new Map<number, Promise<boolean>>();
 const cooldownUntil = new Map<number, number>();
+const lastSendAt = new Map<number, number>();
+const inFlightHashes = new Map<number, Set<string>>();
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function messageHash(raw: string): string {
+  return createHash("sha256").update(raw).digest("hex");
+}
+
+function topicHasSentHash(topicId: number, hash: string): boolean {
+  if (inFlightHashes.get(topicId)?.has(hash)) return true;
+  return (getTopic(topicId)?.telegramSentMessageHashes ?? []).some((entry) => entry.hash === hash);
+}
+
+function markHashInFlight(topicId: number, hash: string): void {
+  let hashes = inFlightHashes.get(topicId);
+  if (!hashes) {
+    hashes = new Set();
+    inFlightHashes.set(topicId, hashes);
+  }
+  hashes.add(hash);
+}
+
+function unmarkHashInFlight(topicId: number, hash: string): void {
+  const hashes = inFlightHashes.get(topicId);
+  if (!hashes) return;
+  hashes.delete(hash);
+  if (hashes.size === 0) inFlightHashes.delete(topicId);
+}
+
+function nextSentHashes(topicId: number, hash: string): TelegramSentMessageHash[] {
+  const prior = getTopic(topicId)?.telegramSentMessageHashes ?? [];
+  const filtered = prior.filter((entry) => entry.hash !== hash);
+  return [...filtered, { hash, atMs: Date.now() }].slice(-SENT_HASH_LIMIT);
 }
 
 async function enqueueSend(
@@ -71,54 +106,59 @@ async function enqueueSend(
   topicId: number,
   raw: string,
   baseDir?: string
-): Promise<void> {
-  const prev = sendQueues.get(topicId) ?? Promise.resolve();
-  const next = prev.then(async () => {
-    const send = async (text: string, parseMode: "MarkdownV2" | undefined) => {
-      const cool = cooldownUntil.get(topicId) ?? 0;
-      const waitMs = Math.max(0, cool - Date.now());
-      if (waitMs > 0) await sleep(waitMs);
-      await bot.api.sendMessage(chatId, text, {
-        message_thread_id: topicId,
-        parse_mode: parseMode,
-      });
-      await sleep(MIN_GAP_MS);
-    };
-    // Formatted first; if Telegram rejects the entities (a converter gap),
-    // fall back to the raw text — losing styling is fine, losing the
-    // message is not.
-    try {
-      for (const chunk of splitForTelegram(markdownToTelegramV2(raw), 3900)) {
-        await send(chunk, "MarkdownV2");
+): Promise<boolean> {
+  const prev = sendQueues.get(topicId) ?? Promise.resolve(true);
+  const next = prev
+    .catch(() => false)
+    .then(async () => {
+      const send = async (text: string, parseMode: "MarkdownV2" | undefined) => {
+        const cool = cooldownUntil.get(topicId) ?? 0;
+        const nextAllowed = Math.max(cool, (lastSendAt.get(topicId) ?? 0) + MIN_GAP_MS);
+        const waitMs = Math.max(0, nextAllowed - Date.now());
+        if (waitMs > 0) await sleep(waitMs);
+        await bot.api.sendMessage(chatId, text, {
+          message_thread_id: topicId,
+          parse_mode: parseMode,
+        });
+        lastSendAt.set(topicId, Date.now());
+      };
+      // Formatted first; if Telegram rejects the entities (a converter gap),
+      // fall back to the raw text — losing styling is fine, losing the
+      // message is not.
+      try {
+        for (const chunk of splitForTelegram(markdownToTelegramV2(raw), 3900)) {
+          await send(chunk, "MarkdownV2");
+        }
+        await sendReferencedAttachments(bot, chatId, topicId, raw, { baseDir });
+        return true;
+      } catch (err) {
+        const e = err as { error_code?: number; parameters?: { retry_after?: number } };
+        if (e.error_code === 429) {
+          const retry = e.parameters?.retry_after ?? 30;
+          cooldownUntil.set(topicId, Date.now() + (retry + 1) * 1000);
+          return false;
+        }
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error("[telegram/codex] formatted send failed, retrying plain:", msg);
       }
-      await sendReferencedAttachments(bot, chatId, topicId, raw, { baseDir });
-      return;
-    } catch (err) {
-      const e = err as { error_code?: number; parameters?: { retry_after?: number } };
-      if (e.error_code === 429) {
-        const retry = e.parameters?.retry_after ?? 30;
-        cooldownUntil.set(topicId, Date.now() + (retry + 1) * 1000);
-        return;
+      try {
+        for (const chunk of chunkText(raw, 3900)) {
+          await send(chunk, undefined);
+        }
+        await sendReferencedAttachments(bot, chatId, topicId, raw, { baseDir });
+        return true;
+      } catch (err) {
+        const e = err as { error_code?: number; parameters?: { retry_after?: number } };
+        if (e.error_code === 429) {
+          const retry = e.parameters?.retry_after ?? 30;
+          cooldownUntil.set(topicId, Date.now() + (retry + 1) * 1000);
+          return false;
+        }
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error("[telegram/codex] send failed:", msg);
+        return false;
       }
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error("[telegram/codex] formatted send failed, retrying plain:", msg);
-    }
-    try {
-      for (const chunk of chunkText(raw, 3900)) {
-        await send(chunk, undefined);
-      }
-      await sendReferencedAttachments(bot, chatId, topicId, raw, { baseDir });
-    } catch (err) {
-      const e = err as { error_code?: number; parameters?: { retry_after?: number } };
-      if (e.error_code === 429) {
-        const retry = e.parameters?.retry_after ?? 30;
-        cooldownUntil.set(topicId, Date.now() + (retry + 1) * 1000);
-        return;
-      }
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error("[telegram/codex] send failed:", msg);
-    }
-  });
+    });
   sendQueues.set(topicId, next);
   return next;
 }
@@ -407,6 +447,10 @@ export function findCodexJsonlForSession(opts: {
 }
 
 function renderEntry(entry: CodexEntry): string | null {
+  if (entry.type === "event_msg") {
+    const phase = (entry as EventMessageEntry).payload?.phase;
+    if (phase && phase !== "final_answer") return null;
+  }
   const message = eventMessage(entry, "agent_message");
   if (!message) return null;
   return message.trim() || null;
@@ -455,7 +499,7 @@ export function startCodexTranscript(
 
   const jsonl = match.path;
   let offset: number;
-  if (opts.initialOffset && opts.initialOffset > 0) {
+  if (typeof opts.initialOffset === "number" && opts.initialOffset >= 0) {
     offset = opts.initialOffset;
   } else if (typeof match.offset === "number") {
     offset = match.offset;
@@ -466,19 +510,87 @@ export function startCodexTranscript(
       offset = 0;
     }
   }
+  let initialSize = offset;
+  try {
+    initialSize = fs.statSync(jsonl).size;
+  } catch {
+    initialSize = offset;
+  }
+  void patchTopic(topicId, {
+    jsonlPath: jsonl,
+    jsonlOffset: offset,
+    telegramDelivery: {
+      status: initialSize > offset ? "pending" : "sent",
+      jsonlPath: jsonl,
+      jsonlOffset: offset,
+      updatedAtMs: Date.now(),
+    },
+  });
+
+  const persistOffset = (nextOffset: number) => {
+    offset = nextOffset;
+    const record = watchers.get(topicId);
+    if (record) record.offset = offset;
+    void patchTopic(topicId, {
+      jsonlPath: jsonl,
+      jsonlOffset: offset,
+      telegramDelivery: {
+        status: "sent",
+        jsonlPath: jsonl,
+        jsonlOffset: offset,
+        updatedAtMs: Date.now(),
+      },
+    });
+  };
+
+  const persistSent = (nextOffset: number, hash: string) => {
+    offset = nextOffset;
+    const record = watchers.get(topicId);
+    if (record) record.offset = offset;
+    void patchTopic(topicId, {
+      jsonlPath: jsonl,
+      jsonlOffset: offset,
+      telegramSentMessageHashes: nextSentHashes(topicId, hash),
+      telegramDelivery: {
+        status: "sent",
+        jsonlPath: jsonl,
+        jsonlOffset: offset,
+        updatedAtMs: Date.now(),
+      },
+    });
+  };
+
+  const persistFailure = (nextOffset: number) => {
+    void patchTopic(topicId, {
+      jsonlPath: jsonl,
+      jsonlOffset: offset,
+      telegramDelivery: {
+        status: "failed",
+        jsonlPath: jsonl,
+        jsonlOffset: offset,
+        nextJsonlOffset: nextOffset,
+        error: "telegram_send_failed",
+        updatedAtMs: Date.now(),
+      },
+    });
+  };
 
   const flush = async () => {
     try {
       const stat = fs.statSync(jsonl);
-      if (stat.size < offset) offset = 0;
+      if (stat.size < offset) persistOffset(0);
       if (stat.size === offset) return;
+      const startOffset = offset;
       const fd = fs.openSync(jsonl, "r");
       const buf = Buffer.alloc(stat.size - offset);
       fs.readSync(fd, buf, 0, buf.length, offset);
       fs.closeSync(fd);
-      offset = stat.size;
-      const lines = buf.toString("utf-8").split("\n").filter(Boolean);
-      for (const line of lines) {
+      let lineOffset = startOffset;
+      const rawLines = buf.toString("utf-8").split("\n");
+      for (const line of rawLines) {
+        const nextOffset = lineOffset + Buffer.byteLength(line + "\n");
+        lineOffset = nextOffset;
+        if (!line) continue;
         let entry: CodexEntry;
         try {
           entry = JSON.parse(line) as CodexEntry;
@@ -486,8 +598,23 @@ export function startCodexTranscript(
           continue;
         }
         const text = renderEntry(entry);
-        if (!text) continue;
-        await enqueueSend(bot, chatId, topicId, text, opts.cwd);
+        if (!text) {
+          persistOffset(nextOffset);
+          continue;
+        }
+        const hash = messageHash(text);
+        if (topicHasSentHash(topicId, hash)) {
+          persistOffset(nextOffset);
+          continue;
+        }
+        markHashInFlight(topicId, hash);
+        const sent = await enqueueSend(bot, chatId, topicId, text, opts.cwd);
+        if (!sent) {
+          unmarkHashInFlight(topicId, hash);
+          persistFailure(nextOffset);
+          break;
+        }
+        persistSent(nextOffset, hash);
       }
     } catch (err) {
       console.error("[telegram/codex] flush failed", err);
@@ -505,6 +632,7 @@ export function startCodexTranscript(
     stop: () => {
       void watcher.close();
       watchers.delete(topicId);
+      inFlightHashes.delete(topicId);
     },
   };
 }
@@ -523,6 +651,7 @@ export function isCodexTranscriptRunning(topicId: number): boolean {
 export function stopAllCodexTranscripts(): void {
   for (const w of watchers.values()) void w.watcher.close();
   watchers.clear();
+  inFlightHashes.clear();
 }
 
 export function readLastCodexAssistantText(jsonlPath?: string): string | null {

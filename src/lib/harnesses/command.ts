@@ -22,6 +22,9 @@ function resolveBin(id: string, declared: string | null): string | null {
   return declared;
 }
 
+const HARNESS_PATH_PREFIX =
+  'export PATH="$HOME/.local/bin:$HOME/bin:/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"; ';
+
 /**
  * Build the tmux session command for a harness id.
  * Returns null for harnesses with no binary (bash), matching the existing
@@ -49,7 +52,7 @@ export function commandForHarness(id: string, opts: CommandOptions = {}): string
     args.push(h.command.modelFlag, opts.model.trim());
   }
 
-  const invocation = [bin, ...args].join(" ");
+  const invocation = HARNESS_PATH_PREFIX + [bin, ...args].join(" ");
   // Identical fallback-to-bash wrapper as the old commandForKind (keeps the
   // tmux session alive so the user can inspect the error and retry).
   return `bash -lc '${invocation}; ec=$?; echo; echo "[${bin} exited with code $ec — dropping to bash]"; exec bash -l'`;

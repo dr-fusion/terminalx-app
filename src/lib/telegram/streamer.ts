@@ -357,7 +357,7 @@ async function flushChat(
     if ((isClaudeCli || isCodexCli) && binding?.pendingPrompt && binding.lastPromptAtMs) {
       return;
     }
-    if (!rt.tuiHinted) {
+    if (!rt.tuiHinted && !binding?.tuiHintedAtMs) {
       rt.tuiHinted = true;
       try {
         await bot.api.sendMessage(
@@ -365,9 +365,12 @@ async function flushChat(
           "(TUI app running. /view screen to see the live screen, or attach via web for full fidelity.)",
           { message_thread_id: topicId }
         );
+        await patchTopic(topicId, { tuiHintedAtMs: Date.now() });
       } catch {
         /* ignore */
       }
+    } else if (binding?.tuiHintedAtMs) {
+      rt.tuiHinted = true;
     }
     return;
   }
