@@ -49,7 +49,7 @@ describeGit("restoreGitWorktree (issue #9)", () => {
     repoDir = path.join(tmpDir, "repo");
     process.env.TERMINUS_ROOT = tmpDir;
     fs.mkdirSync(repoDir, { recursive: true });
-    git(tmpDir, ["init", repoDir]);
+    git(tmpDir, ["init", "-b", "main", repoDir]);
     git(repoDir, ["config", "user.email", "terminalx@example.test"]);
     git(repoDir, ["config", "user.name", "TerminalX Test"]);
     // A shared dir we can symlink into the worktree (the #10 path-sharing).

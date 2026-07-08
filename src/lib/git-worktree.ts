@@ -5,7 +5,9 @@ import { execFileSync } from "child_process";
 import { assertNotSensitivePath, getTerminusRoot, resolveSafePath } from "./file-service";
 
 const GIT_TIMEOUT_MS = 5000;
+const GIT_REFRESH_TIMEOUT_MS = 60000;
 const GIT_WORKTREE_TIMEOUT_MS = 20000;
+const WORKTREE_BASE_BRANCH = "main";
 
 export interface GitDirectoryInfo {
   isRepo: boolean;
@@ -100,6 +102,109 @@ function branchExists(repoRoot: string, branch: string): boolean {
   } catch {
     return false;
   }
+}
+
+function refExists(repoRoot: string, ref: string): boolean {
+  try {
+    git(["-C", repoRoot, "show-ref", "--verify", "--quiet", ref]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function currentBranch(repoRoot: string): string | undefined {
+  const branch = git(["-C", repoRoot, "branch", "--show-current"]);
+  return branch || undefined;
+}
+
+function worktreePathForBranch(repoRoot: string, branch: string): string | undefined {
+  const raw = git(["-C", repoRoot, "worktree", "list", "--porcelain"]);
+  let currentPath: string | undefined;
+  for (const line of raw.split("\n")) {
+    if (line.startsWith("worktree ")) {
+      currentPath = line.slice("worktree ".length);
+      continue;
+    }
+    if (line === `branch refs/heads/${branch}`) {
+      return currentPath;
+    }
+    if (line === "") {
+      currentPath = undefined;
+    }
+  }
+  return undefined;
+}
+
+function assertCleanGitWorktree(repoRoot: string, label: string): void {
+  const status = git(["-C", repoRoot, "status", "--porcelain"]);
+  if (status) {
+    throw new Error(
+      `${label} has uncommitted changes; commit or stash them before creating a worktree`
+    );
+  }
+}
+
+function checkoutMainBranch(repoRoot: string): void {
+  if (branchExists(repoRoot, WORKTREE_BASE_BRANCH)) {
+    git(["-C", repoRoot, "checkout", WORKTREE_BASE_BRANCH], GIT_REFRESH_TIMEOUT_MS);
+    return;
+  }
+
+  const originMain = `origin/${WORKTREE_BASE_BRANCH}`;
+  if (refExists(repoRoot, `refs/remotes/${originMain}`)) {
+    git(
+      ["-C", repoRoot, "checkout", "-b", WORKTREE_BASE_BRANCH, "--track", originMain],
+      GIT_REFRESH_TIMEOUT_MS
+    );
+    return;
+  }
+
+  throw new Error(`Branch "${WORKTREE_BASE_BRANCH}" does not exist`);
+}
+
+function hasUpstream(repoRoot: string): boolean {
+  try {
+    git(["-C", repoRoot, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function pullLatestMain(repoRoot: string): void {
+  if (hasUpstream(repoRoot)) {
+    git(["-C", repoRoot, "pull", "--ff-only"], GIT_REFRESH_TIMEOUT_MS);
+    return;
+  }
+
+  if (refExists(repoRoot, `refs/remotes/origin/${WORKTREE_BASE_BRANCH}`)) {
+    git(
+      ["-C", repoRoot, "pull", "--ff-only", "origin", WORKTREE_BASE_BRANCH],
+      GIT_REFRESH_TIMEOUT_MS
+    );
+  }
+}
+
+function refreshMainBeforeWorktree(repoRoot: string): void {
+  git(["-C", repoRoot, "fetch", "--all", "--prune"], GIT_REFRESH_TIMEOUT_MS);
+
+  const mainWorktree = worktreePathForBranch(repoRoot, WORKTREE_BASE_BRANCH);
+  if (mainWorktree) {
+    const safeMainWorktree = resolveSafePath(mainWorktree);
+    assertNotSensitivePath(safeMainWorktree);
+    assertCleanGitWorktree(safeMainWorktree, "Main checkout");
+    pullLatestMain(safeMainWorktree);
+    return;
+  }
+
+  assertCleanGitWorktree(repoRoot, "Selected checkout");
+  checkoutMainBranch(repoRoot);
+  if (currentBranch(repoRoot) !== WORKTREE_BASE_BRANCH) {
+    throw new Error(`Failed to check out ${WORKTREE_BASE_BRANCH}`);
+  }
+  assertCleanGitWorktree(repoRoot, "Main checkout");
+  pullLatestMain(repoRoot);
 }
 
 export function getGitDirectoryInfo(directory: string): GitDirectoryInfo {
@@ -284,6 +389,12 @@ export function createGitWorktreeForSession(
     throw new Error("Selected directory is outside the Git repository");
   }
 
+  try {
+    refreshMainBeforeWorktree(info.root);
+  } catch (err) {
+    throw new Error(`Failed to refresh main before creating Git worktree: ${gitErrorMessage(err)}`);
+  }
+
   const baseDir = worktreesBaseDir();
   const repoName = info.repoName || path.basename(info.root);
   const worktreeName = `${repoName}-${repoHash(info.root)}-${branchPathSlug(branch)}`;
@@ -303,7 +414,10 @@ export function createGitWorktreeForSession(
   }
 
   try {
-    git(["-C", info.root, "worktree", "add", "-b", branch, worktreePath], GIT_WORKTREE_TIMEOUT_MS);
+    git(
+      ["-C", info.root, "worktree", "add", "-b", branch, worktreePath, WORKTREE_BASE_BRANCH],
+      GIT_WORKTREE_TIMEOUT_MS
+    );
   } catch (err) {
     throw new Error(`Failed to create Git worktree: ${gitErrorMessage(err)}`);
   }

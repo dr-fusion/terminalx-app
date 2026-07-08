@@ -74,7 +74,7 @@ describeGit("createGitWorktreeForSession symlinkPaths", () => {
     repoDir = path.join(tmpDir, "repo");
     process.env.TERMINUS_ROOT = tmpDir;
     fs.mkdirSync(path.join(repoDir, "src"), { recursive: true });
-    git(tmpDir, ["init", repoDir]);
+    git(tmpDir, ["init", "-b", "main", repoDir]);
     git(repoDir, ["config", "user.email", "terminalx@example.test"]);
     git(repoDir, ["config", "user.name", "TerminalX Test"]);
     fs.writeFileSync(path.join(repoDir, "README.md"), "hello\n");

@@ -25,6 +25,15 @@ function git(repo: string, args: string[]): string {
   }).trim();
 }
 
+function branchExists(repo: string, branch: string): boolean {
+  try {
+    git(repo, ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 const describeGit = hasGit() ? describe : describe.skip;
 
 describeGit("git worktree helpers", () => {
@@ -36,7 +45,7 @@ describeGit("git worktree helpers", () => {
     repoDir = path.join(tmpDir, "repo");
     process.env.TERMINUS_ROOT = tmpDir;
     fs.mkdirSync(path.join(repoDir, "src"), { recursive: true });
-    git(tmpDir, ["init", repoDir]);
+    git(tmpDir, ["init", "-b", "main", repoDir]);
     git(repoDir, ["config", "user.email", "terminalx@example.test"]);
     git(repoDir, ["config", "user.name", "TerminalX Test"]);
     fs.writeFileSync(path.join(repoDir, "README.md"), "hello\n");
@@ -68,6 +77,50 @@ describeGit("git worktree helpers", () => {
     expect(result.startDir).toBe(path.join(result.worktreePath, "src"));
     expect(fs.existsSync(path.join(result.worktreePath, "README.md"))).toBe(true);
     expect(git(result.worktreePath, ["branch", "--show-current"])).toBe("feature/test-one");
+  });
+
+  it("fetches and fast-forwards main before creating the new branch worktree", () => {
+    const originDir = path.join(tmpDir, "origin.git");
+    const seedDir = path.join(tmpDir, "seed");
+    const cloneDir = path.join(tmpDir, "clone");
+
+    git(tmpDir, ["init", "--bare", originDir]);
+    git(tmpDir, ["clone", originDir, seedDir]);
+    git(seedDir, ["checkout", "-b", "main"]);
+    git(seedDir, ["config", "user.email", "terminalx@example.test"]);
+    git(seedDir, ["config", "user.name", "TerminalX Test"]);
+    fs.writeFileSync(path.join(seedDir, "README.md"), "old\n");
+    git(seedDir, ["add", "."]);
+    git(seedDir, ["commit", "-m", "initial"]);
+    git(seedDir, ["push", "-u", "origin", "main"]);
+    git(originDir, ["symbolic-ref", "HEAD", "refs/heads/main"]);
+
+    git(tmpDir, ["clone", originDir, cloneDir]);
+    git(cloneDir, ["checkout", "-b", "topic/old-base"]);
+
+    fs.writeFileSync(path.join(seedDir, "README.md"), "latest\n");
+    git(seedDir, ["add", "."]);
+    git(seedDir, ["commit", "-m", "latest"]);
+    git(seedDir, ["push"]);
+
+    const result = createGitWorktreeForSession(cloneDir, "feature/from-latest-main");
+
+    expect(git(cloneDir, ["branch", "--show-current"])).toBe("main");
+    expect(fs.readFileSync(path.join(result.worktreePath, "README.md"), "utf-8")).toBe("latest\n");
+    expect(git(result.worktreePath, ["rev-parse", "HEAD"])).toBe(
+      git(cloneDir, ["rev-parse", "main"])
+    );
+  });
+
+  it("fails before creating a worktree when main has uncommitted changes", () => {
+    fs.writeFileSync(path.join(repoDir, "README.md"), "dirty\n");
+
+    expect(() => createGitWorktreeForSession(repoDir, "feature/dirty-main")).toThrow(
+      /uncommitted changes/
+    );
+
+    expect(branchExists(repoDir, "feature/dirty-main")).toBe(false);
+    expect(fs.existsSync(path.join(tmpDir, ".terminalx-worktrees"))).toBe(false);
   });
 
   it("rejects invalid branch names before running worktree add", () => {
