@@ -26,6 +26,7 @@ const CLAUDE_RATING_OPTIONS_RE = /\b1:\s*Bad\b.*\b2:\s*Fine\b.*\b3:\s*Good\b.*\b
 const CLAUDE_CONSENT_QUESTION_RE =
   /Can Anthropic look at your session transcript to help us improve Claude Code\?/iu;
 const CLAUDE_CONSENT_OPTIONS_RE = /\by:\s*Yes\b.*\bn:\s*No\b.*\bd:\s*Don.t ask again\b/iu;
+const FOOTER_RE = /^(?:Press\s+enter\s+to\s+confirm\b|Use\s+.+\bto\s+(?:navigate|select)\b)/iu;
 
 const MAX_CONTEXT_LINES = 14;
 const SEPARATOR_LOOKBACK = 18;
@@ -46,6 +47,12 @@ export function extractSelectionPrompt(paneText: string): SelectionPrompt | null
   // Ignore trailing blank lines off the bottom of the pane.
   let end = lines.length - 1;
   while (end >= 0 && lines[end]!.trim() === "") end--;
+  if (end < 0) return null;
+
+  while (end >= 0 && isPromptFooter(lines[end]!)) {
+    end--;
+    while (end >= 0 && lines[end]!.trim() === "") end--;
+  }
   if (end < 0) return null;
 
   const inlineRating = extractInlineRatingPrompt(lines, end);
@@ -174,6 +181,10 @@ function cleanLine(line: string): string {
     .replace(/^[\s←]+/u, "")
     .replace(/[\s→]+$/u, "")
     .trim();
+}
+
+function isPromptFooter(line: string): boolean {
+  return FOOTER_RE.test(cleanLine(line));
 }
 
 function hash(s: string): string {

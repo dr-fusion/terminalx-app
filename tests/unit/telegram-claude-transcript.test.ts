@@ -5,6 +5,7 @@ import type { Bot } from "grammy";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 let tmpHome: string;
+let patchTopicMock: ReturnType<typeof vi.fn>;
 
 function projectDirFor(cwd: string): string {
   return path.join(tmpHome, ".claude", "projects", cwd.replace(/[\\/]/g, "-"));
@@ -51,8 +52,14 @@ function writePromptJsonl(cwd: string, name: string, prompt: string, reply: stri
 
 async function loadTranscriptModule() {
   vi.resetModules();
+  patchTopicMock = vi.fn().mockResolvedValue(undefined);
   vi.doMock("os", () => ({
     homedir: () => tmpHome,
+  }));
+  vi.doMock("@/lib/telegram/state", () => ({
+    getTopic: () => undefined,
+    listTopics: () => [],
+    patchTopic: patchTopicMock,
   }));
   return import("@/lib/telegram/claude-transcript");
 }
@@ -64,6 +71,7 @@ describe("telegram Claude transcript routing", () => {
 
   afterEach(() => {
     vi.doUnmock("os");
+    vi.doUnmock("@/lib/telegram/state");
     vi.resetModules();
     fs.rmSync(tmpHome, { recursive: true, force: true });
   });
@@ -121,5 +129,93 @@ describe("telegram Claude transcript routing", () => {
     expect(first).not.toBeNull();
     expect(second).toBeNull();
     first?.stop();
+  });
+
+  it("resumes from a persisted offset without replaying prior Telegram messages", async () => {
+    const jsonl = writeJsonl("/work/project", "session.jsonl");
+    const initialOffset = fs.statSync(jsonl).size;
+    const bot = {
+      api: {
+        sendMessage: vi.fn().mockResolvedValue({}),
+      },
+    } as unknown as Bot;
+    const { startClaudeTranscript } = await loadTranscriptModule();
+
+    const started = startClaudeTranscript(bot, 1, 101, {
+      persistedJsonl: jsonl,
+      initialOffset,
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(bot.api.sendMessage).not.toHaveBeenCalled();
+    expect(patchTopicMock).toHaveBeenCalledWith(
+      101,
+      expect.objectContaining({
+        jsonlPath: jsonl,
+        jsonlOffset: initialOffset,
+      })
+    );
+    started?.stop();
+  });
+
+  it("does not advance the persisted offset when Telegram rejects a message", async () => {
+    const jsonl = writeJsonl("/work/project", "retry.jsonl");
+    const fullOffset = fs.statSync(jsonl).size;
+    const bot = {
+      api: {
+        sendMessage: vi.fn().mockRejectedValue({
+          error_code: 429,
+          parameters: { retry_after: 1 },
+        }),
+      },
+    } as unknown as Bot;
+    const { startClaudeTranscript } = await loadTranscriptModule();
+
+    const started = startClaudeTranscript(bot, 1, 101, {
+      persistedJsonl: jsonl,
+      initialOffset: 0,
+    });
+
+    await vi.waitFor(() => expect(bot.api.sendMessage).toHaveBeenCalled());
+    expect(patchTopicMock).not.toHaveBeenCalledWith(101, {
+      jsonlPath: jsonl,
+      jsonlOffset: fullOffset,
+    });
+    expect(patchTopicMock).toHaveBeenCalledWith(
+      101,
+      expect.objectContaining({
+        jsonlPath: jsonl,
+        jsonlOffset: 0,
+        telegramDelivery: expect.objectContaining({
+          status: "failed",
+          jsonlPath: jsonl,
+          jsonlOffset: 0,
+          nextJsonlOffset: fullOffset,
+        }),
+      })
+    );
+    started?.stop();
+
+    const reloaded = await loadTranscriptModule();
+    (bot.api.sendMessage as ReturnType<typeof vi.fn>).mockReset().mockResolvedValue({});
+    const restarted = reloaded.startClaudeTranscript(bot, 1, 101, {
+      persistedJsonl: jsonl,
+      initialOffset: 0,
+    });
+
+    await vi.waitFor(() => expect(bot.api.sendMessage).toHaveBeenCalled());
+    expect(patchTopicMock).toHaveBeenCalledWith(
+      101,
+      expect.objectContaining({
+        jsonlPath: jsonl,
+        jsonlOffset: fullOffset,
+        telegramDelivery: expect.objectContaining({
+          status: "sent",
+          jsonlPath: jsonl,
+          jsonlOffset: fullOffset,
+        }),
+      })
+    );
+    restarted?.stop();
   });
 });

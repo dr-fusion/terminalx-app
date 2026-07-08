@@ -5,6 +5,7 @@ import type { Bot } from "grammy";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 let tmpHome: string;
+let patchTopicMock: ReturnType<typeof vi.fn>;
 
 type TestCodexEntry = {
   timestamp: string;
@@ -66,8 +67,14 @@ function writeCodexJsonl(opts: {
 
 async function loadTranscriptModule() {
   vi.resetModules();
+  patchTopicMock = vi.fn().mockResolvedValue(undefined);
   vi.doMock("os", () => ({
     homedir: () => tmpHome,
+  }));
+  vi.doMock("@/lib/telegram/state", () => ({
+    getTopic: () => undefined,
+    listTopics: () => [],
+    patchTopic: patchTopicMock,
   }));
   return import("@/lib/telegram/codex-transcript");
 }
@@ -79,6 +86,7 @@ describe("telegram Codex transcript routing", () => {
 
   afterEach(() => {
     vi.doUnmock("os");
+    vi.doUnmock("@/lib/telegram/state");
     vi.resetModules();
     fs.rmSync(tmpHome, { recursive: true, force: true });
   });
@@ -216,6 +224,45 @@ describe("telegram Codex transcript routing", () => {
     started?.stop();
   });
 
+  it("checkpoints commentary without sending it to Telegram", async () => {
+    const dir = sessionsDir();
+    fs.mkdirSync(dir, { recursive: true });
+    const jsonl = path.join(dir, "rollout-commentary.jsonl");
+    fs.writeFileSync(
+      jsonl,
+      JSON.stringify({
+        timestamp: "2026-04-27T18:00:05.000Z",
+        type: "event_msg",
+        payload: {
+          type: "agent_message",
+          phase: "commentary",
+          message: "working on it",
+        },
+      }) + "\n"
+    );
+    const fullOffset = fs.statSync(jsonl).size;
+    const bot = {
+      api: {
+        sendMessage: vi.fn().mockResolvedValue({}),
+      },
+    } as unknown as Bot;
+    const { startCodexTranscript } = await loadTranscriptModule();
+
+    const started = startCodexTranscript(bot, 1, 101, {
+      persistedJsonl: jsonl,
+      initialOffset: 0,
+    });
+
+    await vi.waitFor(() =>
+      expect(patchTopicMock).toHaveBeenCalledWith(
+        101,
+        expect.objectContaining({ jsonlPath: jsonl, jsonlOffset: fullOffset })
+      )
+    );
+    expect(bot.api.sendMessage).not.toHaveBeenCalled();
+    started?.stop();
+  });
+
   it("refuses to bind a promptless transcript that started much later", async () => {
     const cwd = "/work/project";
     writeCodexJsonl({
@@ -257,5 +304,113 @@ describe("telegram Codex transcript routing", () => {
     expect(first).not.toBeNull();
     expect(second).toBeNull();
     first?.stop();
+  });
+
+  it("resumes from a persisted offset without replaying prior Telegram messages", async () => {
+    const jsonl = writeCodexJsonl({
+      name: "rollout-resume.jsonl",
+      cwd: "/work/project",
+      sessionStartedAt: "2026-04-27T18:00:00.000Z",
+      reply: "already sent",
+      replyAt: "2026-04-27T18:00:05.000Z",
+    });
+    const initialOffset = fs.statSync(jsonl).size;
+    const bot = {
+      api: {
+        sendMessage: vi.fn().mockResolvedValue({}),
+      },
+    } as unknown as Bot;
+    const { startCodexTranscript } = await loadTranscriptModule();
+
+    const started = startCodexTranscript(bot, 1, 101, {
+      persistedJsonl: jsonl,
+      initialOffset,
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(bot.api.sendMessage).not.toHaveBeenCalled();
+    expect(patchTopicMock).toHaveBeenCalledWith(
+      101,
+      expect.objectContaining({
+        jsonlPath: jsonl,
+        jsonlOffset: initialOffset,
+      })
+    );
+    started?.stop();
+  });
+
+  it("does not advance the persisted offset when Telegram rejects a message", async () => {
+    const dir = sessionsDir();
+    fs.mkdirSync(dir, { recursive: true });
+    const jsonl = path.join(dir, "rollout-failure.jsonl");
+    fs.writeFileSync(
+      jsonl,
+      JSON.stringify({
+        timestamp: "2026-04-27T18:00:05.000Z",
+        type: "event_msg",
+        payload: {
+          type: "agent_message",
+          phase: "final_answer",
+          message: "retry me",
+        },
+      }) + "\n"
+    );
+    const fullOffset = fs.statSync(jsonl).size;
+    const bot = {
+      api: {
+        sendMessage: vi.fn().mockRejectedValue({
+          error_code: 429,
+          parameters: { retry_after: 1 },
+        }),
+      },
+    } as unknown as Bot;
+    const { startCodexTranscript } = await loadTranscriptModule();
+
+    const started = startCodexTranscript(bot, 1, 101, {
+      persistedJsonl: jsonl,
+      initialOffset: 0,
+    });
+
+    await vi.waitFor(() => expect(bot.api.sendMessage).toHaveBeenCalled());
+    expect(patchTopicMock).not.toHaveBeenCalledWith(101, {
+      jsonlPath: jsonl,
+      jsonlOffset: fullOffset,
+    });
+    expect(patchTopicMock).toHaveBeenCalledWith(
+      101,
+      expect.objectContaining({
+        jsonlPath: jsonl,
+        jsonlOffset: 0,
+        telegramDelivery: expect.objectContaining({
+          status: "failed",
+          jsonlPath: jsonl,
+          jsonlOffset: 0,
+          nextJsonlOffset: fullOffset,
+        }),
+      })
+    );
+    started?.stop();
+
+    const reloaded = await loadTranscriptModule();
+    (bot.api.sendMessage as ReturnType<typeof vi.fn>).mockReset().mockResolvedValue({});
+    const restarted = reloaded.startCodexTranscript(bot, 1, 101, {
+      persistedJsonl: jsonl,
+      initialOffset: 0,
+    });
+
+    await vi.waitFor(() => expect(bot.api.sendMessage).toHaveBeenCalled());
+    expect(patchTopicMock).toHaveBeenCalledWith(
+      101,
+      expect.objectContaining({
+        jsonlPath: jsonl,
+        jsonlOffset: fullOffset,
+        telegramDelivery: expect.objectContaining({
+          status: "sent",
+          jsonlPath: jsonl,
+          jsonlOffset: fullOffset,
+        }),
+      })
+    );
+    restarted?.stop();
   });
 });

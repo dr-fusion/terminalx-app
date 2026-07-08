@@ -75,3 +75,8 @@ is the per-workspace value injected into each session. See
 - All file paths validated against TERMINUS_ROOT to prevent traversal
 - tmux session names validated against `[a-zA-Z0-9_.-]`
 - Dark theme only for v1
+- Production restarts must not kill live tmux sessions. The `terminalx.service`
+  systemd unit should use `KillMode=process` and stop only the TerminalX web
+  server process, not the whole cgroup. Before restarting, verify with
+  `systemctl show terminalx.service -p KillMode -p ExecStop`; after restarting,
+  verify `tmux list-sessions` still shows existing sessions.
