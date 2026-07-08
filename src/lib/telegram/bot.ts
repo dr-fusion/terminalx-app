@@ -1,6 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import { Bot, type Context } from "grammy";
+import type { InlineKeyboardMarkup } from "grammy/types";
 import {
   listSessions,
   createSession,
@@ -51,6 +52,7 @@ import {
   sendText,
   scroll,
   snap,
+  snapScreenMessage,
   defaultViewMode,
   resetChatBaseline,
 } from "./streamer";
@@ -82,6 +84,19 @@ import { getHarness, listHarnesses } from "@/lib/harnesses/registry";
 import { autoWorktreeName, parseWorktreeCommand, slugifySessionName } from "./worktree-command";
 
 let bot: Bot | null = null;
+
+type StartWizard =
+  | { action: "new"; step: "name" | "kind"; name?: string }
+  | { action: "worktree"; step: "directory" | "name" | "kind"; directory?: string; name?: string };
+
+const startWizards = new Map<string, StartWizard>();
+
+const START_CB = {
+  SESSIONS: "w:sess",
+  CANCEL: "w:cancel",
+  SKIP_NAME: "w:skip",
+  KIND_PREFIX: "w:k:",
+} as const;
 
 /**
  * Resolve the Telegram identity for the user behind a Context, OR null if
@@ -126,6 +141,37 @@ function canUseTopic(identity: BotIdentity, binding: TopicBinding): boolean {
 
 function clipTelegramText(text: string, maxLength = 900): string {
   return text.length > maxLength ? `${text.slice(0, maxLength - 1)}…` : text;
+}
+
+function wizardKey(ctx: Context): string | null {
+  const chatId = ctx.chat?.id;
+  const userId = ctx.from?.id;
+  if (!chatId || !userId) return null;
+  return `${chatId}:${userId}`;
+}
+
+function startMenuKeyboard(): InlineKeyboardMarkup {
+  return {
+    inline_keyboard: [[{ text: "Sessions", callback_data: START_CB.SESSIONS }]],
+  };
+}
+
+function kindKeyboard(includeBash = true): InlineKeyboardMarkup {
+  const harnesses = listHarnesses().filter((h) => includeBash || h.id !== "bash");
+  const rows = harnesses.map((h) => [
+    { text: h.label, callback_data: `${START_CB.KIND_PREFIX}${h.id}` },
+  ]);
+  rows.push([{ text: "Cancel", callback_data: START_CB.CANCEL }]);
+  return { inline_keyboard: rows };
+}
+
+function worktreeNameKeyboard(): InlineKeyboardMarkup {
+  return {
+    inline_keyboard: [
+      [{ text: "Auto-generate name", callback_data: START_CB.SKIP_NAME }],
+      [{ text: "Cancel", callback_data: START_CB.CANCEL }],
+    ],
+  };
 }
 
 async function topicBindingForMessage(
@@ -421,18 +467,16 @@ async function handleStart(ctx: Context) {
     [
       "terminalx bot online.",
       "",
-      "/sessions — list sessions",
-      "/new <name> [bash|claude|codex] — create + attach in a new topic",
-      `/worktree <repo-path> [name] [${harnessListForHelp()}] — create a git worktree session`,
+      "/sessions - list sessions",
+      "/new - create a session",
+      "/new <name> [bash|claude|codex] - create directly",
+      "/worktree - create a git worktree session",
+      `/worktree <repo-path> [name] [${harnessListForHelp()}] - create directly`,
+      "/send <text> - send slash commands or raw input to this session",
       "",
-      "inside a session topic:",
-      "  • text → stdin",
-      "  • voice note → local transcription → stdin",
-      "  • reply with a file → upload to session cwd",
-      "  • /snap, /detach, /kill, /delete, /get <relpath>",
-      "  • /view [chat|screen|off] — control session responses in this topic",
-      "  • inline keyboard: ^C ^D Tab ↵ arrows scroll snap view detach kill",
-    ].join("\n")
+      "Send terminal input inside a session topic. Prefix with // to send a leading /.",
+    ].join("\n"),
+    { reply_markup: startMenuKeyboard() }
   );
 }
 
@@ -462,10 +506,27 @@ async function handleNew(ctx: Context) {
   const rawName = (args[0] ?? "").toLowerCase();
   const kindRaw = args[1] ?? "bash";
   const kind: SessionKind = isValidKind(kindRaw) ? (kindRaw as SessionKind) : "bash";
-  if (!rawName || !/^[a-zA-Z0-9_.\-]+$/.test(rawName)) {
+  if (!rawName) {
+    const key = wizardKey(ctx);
+    if (!key) return;
+    startWizards.set(key, { action: "new", step: "name" });
+    await reply(ctx, "Enter the session name.");
+    return;
+  }
+  if (!/^[a-zA-Z0-9_.\-]+$/.test(rawName)) {
     await reply(ctx, "usage: /new <name> [bash|claude|codex]");
     return;
   }
+  await createNewSessionFromInput(ctx, identity, rawName, kind);
+}
+
+async function createNewSessionFromInput(
+  ctx: Context,
+  identity: BotIdentity,
+  rawName: string,
+  kind: SessionKind
+): Promise<void> {
+  if (!bot) return;
   const scoped = scopedSessionName(rawName, identity.username);
   if (hasSession(scoped)) {
     const existing = getTopicByName(scoped);
@@ -520,6 +581,10 @@ async function handleNew(ctx: Context) {
     kind,
     cwd,
   });
+  const url = topicLink(chatId, topicId);
+  await reply(ctx, `created ${scoped} -> ${url}`, {
+    link_preview_options: { is_disabled: true },
+  });
 }
 
 async function handleWorktree(ctx: Context) {
@@ -530,10 +595,21 @@ async function handleWorktree(ctx: Context) {
 
   const parsed = parseWorktreeCommand(ctx.message?.text ?? "");
   if (!parsed) {
-    await reply(ctx, `usage: /worktree <repo-path> [name] [${harnessListForHelp()}]`);
+    const key = wizardKey(ctx);
+    if (!key) return;
+    startWizards.set(key, { action: "worktree", step: "directory" });
+    await reply(ctx, "Enter the git repository path.");
     return;
   }
+  await createWorktreeSessionFromInput(ctx, identity, parsed);
+}
 
+async function createWorktreeSessionFromInput(
+  ctx: Context,
+  identity: BotIdentity,
+  parsed: { directory: string; name?: string; kind: SessionKind }
+): Promise<void> {
+  if (!bot) return;
   const repoName = slugifySessionName(path.basename(parsed.directory)) || "repo";
   const rawName = parsed.name ?? uniqueAutoSessionName(repoName, identity.username);
   if (!/^[a-zA-Z0-9_.\-]+$/.test(rawName)) {
@@ -1002,8 +1078,102 @@ async function sendPromptToBinding(
     }
   }
 
+  const forwardedSlashCommand = text.trimStart().startsWith("/");
+  const tuiSession = binding.kind !== "bash" || isPaneTui(binding.sessionName);
   setTimeout(() => snap(bot!, topicId), 250);
+  if (mode === "chat" && forwardedSlashCommand && tuiSession) {
+    for (const delay of [800, 2500, 5000]) {
+      setTimeout(() => snapScreenMessage(bot!, topicId), delay);
+    }
+  }
   return true;
+}
+
+async function handleWizardText(
+  ctx: Context,
+  identity: BotIdentity,
+  key: string,
+  text: string
+): Promise<boolean> {
+  const wizard = startWizards.get(key);
+  if (!wizard) return false;
+
+  if (wizard.action === "new") {
+    if (wizard.step !== "name") return false;
+    const name = slugifySessionName(text);
+    if (!name) {
+      await reply(ctx, "Enter a session name using letters, numbers, spaces, _ - or .");
+      return true;
+    }
+    startWizards.set(key, { action: "new", step: "kind", name });
+    await reply(ctx, "Choose the session type.", { reply_markup: kindKeyboard(true) });
+    return true;
+  }
+
+  if (wizard.step === "directory") {
+    const directory = text.trim();
+    if (!directory) {
+      await reply(ctx, "Enter the git repository path.");
+      return true;
+    }
+    startWizards.set(key, { action: "worktree", step: "name", directory });
+    await reply(ctx, "Enter the worktree name, or use the button to auto-generate it.", {
+      reply_markup: worktreeNameKeyboard(),
+    });
+    return true;
+  }
+
+  if (wizard.step === "name") {
+    const name = slugifySessionName(text);
+    if (!name) {
+      await reply(ctx, "Enter a worktree name using letters, numbers, spaces, _ - or .");
+      return true;
+    }
+    startWizards.set(key, {
+      action: "worktree",
+      step: "kind",
+      directory: wizard.directory,
+      name,
+    });
+    await reply(ctx, "Choose the worktree session type.", { reply_markup: kindKeyboard(false) });
+    return true;
+  }
+
+  return false;
+}
+
+async function completeWizardWithKind(
+  ctx: Context,
+  identity: BotIdentity,
+  key: string,
+  kind: SessionKind
+): Promise<void> {
+  const wizard = startWizards.get(key);
+  if (!wizard) return;
+  if (wizard.step !== "kind") {
+    await reply(ctx, "This flow is waiting for text input.");
+    return;
+  }
+  startWizards.delete(key);
+
+  if (wizard.action === "new") {
+    if (!wizard.name) {
+      await reply(ctx, "Missing session name. Run /new again.");
+      return;
+    }
+    await createNewSessionFromInput(ctx, identity, wizard.name, kind);
+    return;
+  }
+
+  if (!wizard.directory) {
+    await reply(ctx, "Missing repository path. Run /worktree again.");
+    return;
+  }
+  await createWorktreeSessionFromInput(ctx, identity, {
+    directory: wizard.directory,
+    name: wizard.name,
+    kind,
+  });
 }
 
 async function handleText(ctx: Context) {
@@ -1012,7 +1182,38 @@ async function handleText(ctx: Context) {
   if (!identity) return;
   if (await rejectReadOnly(ctx)) return;
   const text = ctx.message?.text;
-  if (!text || text.startsWith("/")) return; // commands handled by their own hooks
+  if (!text) return;
+  const key = wizardKey(ctx);
+  if (key && (await handleWizardText(ctx, identity, key, text))) return;
+  if (text.startsWith("/")) return; // commands handled by their own hooks
+  await sendTextToSessionTopic(ctx, identity, text);
+}
+
+async function handleSend(ctx: Context) {
+  if (!bot) return;
+  const identity = await gate(ctx);
+  if (!identity) return;
+  if (await rejectReadOnly(ctx)) return;
+  const text = ctx.message?.text ?? "";
+  const rawInput = text.replace(/^\/(?:send|stdin)(?:@\w+)?(?:\s+)?/i, "");
+  if (!rawInput) {
+    await reply(ctx, "usage: /send <text>");
+    return;
+  }
+  await sendTextToSessionTopic(ctx, identity, rawInput);
+}
+
+async function handleRawSlashText(ctx: Context) {
+  if (!bot) return;
+  const identity = await gate(ctx);
+  if (!identity) return;
+  if (await rejectReadOnly(ctx)) return;
+  const text = ctx.message?.text;
+  if (!text?.startsWith("//")) return;
+  await sendTextToSessionTopic(ctx, identity, text.slice(1));
+}
+
+async function sendTextToSessionTopic(ctx: Context, identity: BotIdentity, text: string) {
   const topicId = ctx.message?.message_thread_id;
   if (!topicId) {
     // User typed in the General topic. The bot doesn't forward text from
@@ -1115,6 +1316,45 @@ async function handleCallback(ctx: Context) {
   const data = ctx.callbackQuery?.data ?? "";
   const topicId = ctx.callbackQuery?.message?.message_thread_id;
   await ctx.answerCallbackQuery();
+
+  if (data === START_CB.CANCEL) {
+    const key = wizardKey(ctx);
+    if (key) startWizards.delete(key);
+    await reply(ctx, "Cancelled.");
+    return;
+  }
+  if (data === START_CB.SESSIONS) {
+    await handleSessions(ctx);
+    return;
+  }
+  if (data === START_CB.SKIP_NAME) {
+    if (await rejectReadOnly(ctx)) return;
+    const key = wizardKey(ctx);
+    const wizard = key ? startWizards.get(key) : undefined;
+    if (!key || !wizard || wizard.action !== "worktree" || wizard.step !== "name") {
+      await reply(ctx, "No worktree flow is waiting for a name.");
+      return;
+    }
+    startWizards.set(key, {
+      action: "worktree",
+      step: "kind",
+      directory: wizard.directory,
+    });
+    await reply(ctx, "Choose the worktree session type.", { reply_markup: kindKeyboard(false) });
+    return;
+  }
+  if (data.startsWith(START_CB.KIND_PREFIX)) {
+    if (await rejectReadOnly(ctx)) return;
+    const kind = data.slice(START_CB.KIND_PREFIX.length);
+    if (!isValidKind(kind)) {
+      await reply(ctx, "Unknown session type.");
+      return;
+    }
+    const key = wizardKey(ctx);
+    if (!key) return;
+    await completeWizardWithKind(ctx, identity, key, kind);
+    return;
+  }
 
   // attach / kill from /sessions list
   if (data.startsWith(CB.ATTACH_PREFIX)) {
@@ -1266,6 +1506,8 @@ export async function startTelegramBot(): Promise<Bot | null> {
   bot.command("snap", handleSnap);
   bot.command("view", handleView);
   bot.command("get", handleGet);
+  bot.command("send", handleSend);
+  bot.command("stdin", handleSend);
   bot.command("tab", (ctx) => handleSlashKey(ctx, "Tab"));
   bot.command("enter", (ctx) => handleSlashKey(ctx, "Enter"));
   bot.command("ctrlc", (ctx) => handleSlashKey(ctx, "C-c"));
@@ -1274,6 +1516,7 @@ export async function startTelegramBot(): Promise<Bot | null> {
   bot.command("down", (ctx) => handleSlashKey(ctx, "Down"));
 
   // text & file uploads inside topics
+  bot.hears(/^\/\//, handleRawSlashText);
   bot.on("message:text", handleText);
   bot.on(["message:voice", "message:audio"], handleVoice);
   bot.on(["message:photo", "message:document"], handleFileUpload);
