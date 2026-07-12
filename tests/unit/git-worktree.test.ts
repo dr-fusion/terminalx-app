@@ -105,11 +105,22 @@ describeGit("git worktree helpers", () => {
 
     const result = createGitWorktreeForSession(cloneDir, "feature/from-latest-main");
 
-    expect(git(cloneDir, ["branch", "--show-current"])).toBe("main");
+    expect(git(cloneDir, ["branch", "--show-current"])).toBe("topic/old-base");
     expect(fs.readFileSync(path.join(result.worktreePath, "README.md"), "utf-8")).toBe("latest\n");
     expect(git(result.worktreePath, ["rev-parse", "HEAD"])).toBe(
       git(cloneDir, ["rev-parse", "main"])
     );
+  });
+
+  it("refreshes an unattached main ref without switching or cleaning the selected branch", () => {
+    git(repoDir, ["checkout", "-b", "topic/in-progress"]);
+    fs.writeFileSync(path.join(repoDir, "README.md"), "unfinished topic work\n");
+
+    const result = createGitWorktreeForSession(repoDir, "feature/keeps-selected-checkout");
+
+    expect(git(repoDir, ["branch", "--show-current"])).toBe("topic/in-progress");
+    expect(git(repoDir, ["status", "--porcelain"])).toContain("README.md");
+    expect(fs.readFileSync(path.join(result.worktreePath, "README.md"), "utf-8")).toBe("hello\n");
   });
 
   it("fails before creating a worktree when main has uncommitted changes", () => {
@@ -120,6 +131,17 @@ describeGit("git worktree helpers", () => {
     );
 
     expect(branchExists(repoDir, "feature/dirty-main")).toBe(false);
+    expect(fs.existsSync(path.join(tmpDir, ".terminalx-worktrees"))).toBe(false);
+  });
+
+  it("fails without creating a branch or worktree when the main refresh cannot fetch", () => {
+    git(repoDir, ["remote", "add", "origin", path.join(tmpDir, "missing-origin.git")]);
+
+    expect(() => createGitWorktreeForSession(repoDir, "feature/fetch-failure")).toThrow(
+      /Failed to refresh main before creating Git worktree/
+    );
+
+    expect(branchExists(repoDir, "feature/fetch-failure")).toBe(false);
     expect(fs.existsSync(path.join(tmpDir, ".terminalx-worktrees"))).toBe(false);
   });
 

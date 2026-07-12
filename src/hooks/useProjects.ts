@@ -1,8 +1,9 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 // BROWSER-SAFE import only: types + pure formatters, no Node/server modules.
 import type { ProjectView } from "@/types/project";
+import { refreshSessionStore, removeSessionsFromStore } from "@/hooks/useSessions";
 
 interface UseProjectsReturn {
   projects: ProjectView[];
@@ -23,35 +24,47 @@ export function useProjects(): UseProjectsReturn {
   const [projects, setProjects] = useState<ProjectView[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const latestRefresh = useRef(0);
 
   const refresh = useCallback(async () => {
+    const refreshId = ++latestRefresh.current;
     try {
       setIsLoading(true);
       setError(null);
       const res = await fetch("/api/projects");
       if (!res.ok) throw new Error(`Failed to fetch projects: ${res.status}`);
       const data = await res.json();
+      if (refreshId !== latestRefresh.current) return;
       setProjects(data.projects ?? []);
     } catch (err) {
+      if (refreshId !== latestRefresh.current) return;
       setError(err instanceof Error ? err.message : "Failed to fetch projects");
     } finally {
-      setIsLoading(false);
+      if (refreshId === latestRefresh.current) setIsLoading(false);
     }
   }, []);
+
+  const refreshWorkspaceViews = useCallback(async () => {
+    await Promise.all([refresh(), refreshSessionStore()]);
+  }, [refresh]);
 
   const deleteProject = useCallback(
     async (id: string): Promise<boolean> => {
       try {
+        const removedSessionNames =
+          projects.find((project) => project.id === id)?.workspaces.map((ws) => ws.sessionName) ??
+          [];
         const res = await fetch(`/api/projects/${encodeURIComponent(id)}`, { method: "DELETE" });
         if (!res.ok) throw new Error(`Failed to delete project: ${res.status}`);
-        await refresh();
+        removeSessionsFromStore(removedSessionNames);
+        await refreshWorkspaceViews();
         return true;
       } catch (err) {
         setError(err instanceof Error ? err.message : "Failed to delete project");
         return false;
       }
     },
-    [refresh]
+    [projects, refreshWorkspaceViews]
   );
 
   const patchSession = useCallback(
@@ -92,14 +105,14 @@ export function useProjects(): UseProjectsReturn {
           body: JSON.stringify({}),
         });
         if (!res.ok) throw new Error(`Failed to archive workspace: ${res.status}`);
-        await refresh();
+        await refreshWorkspaceViews();
         return true;
       } catch (err) {
         setError(err instanceof Error ? err.message : "Failed to archive workspace");
         return false;
       }
     },
-    [refresh]
+    [refreshWorkspaceViews]
   );
 
   const restoreWorkspace = useCallback(
@@ -111,14 +124,14 @@ export function useProjects(): UseProjectsReturn {
           body: JSON.stringify({}),
         });
         if (!res.ok) throw new Error(`Failed to restore workspace: ${res.status}`);
-        await refresh();
+        await refreshWorkspaceViews();
         return true;
       } catch (err) {
         setError(err instanceof Error ? err.message : "Failed to restore workspace");
         return false;
       }
     },
-    [refresh]
+    [refreshWorkspaceViews]
   );
 
   useEffect(() => {

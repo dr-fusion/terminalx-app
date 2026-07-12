@@ -567,8 +567,22 @@ export function ProjectSidebar({ activeSession }: { activeSession: string | null
     setWorkspaceCollapsed,
     archiveWorkspace,
     restoreWorkspace,
+    refresh: refreshProjects,
   } = useProjects();
-  const { sessions, isLoading: sessionsLoading } = useSessions();
+  const {
+    sessions,
+    isLoading: sessionsLoading,
+    hasLoadedSuccessfully,
+    membershipVersion,
+  } = useSessions();
+
+  // Project workspaces are derived from session/worktree metadata. Refresh the
+  // derived project view only when that membership changes; ordinary session
+  // revalidations do not fan out into another projects request.
+  useEffect(() => {
+    if (!hasLoadedSuccessfully) return;
+    void refreshProjects();
+  }, [hasLoadedSuccessfully, membershipVersion, refreshProjects]);
 
   // The review-panel Archive button (ReviewStatusBar) dispatches this event for
   // the CURRENT workspace; the sidebar owns the archive flow (#9), so it listens

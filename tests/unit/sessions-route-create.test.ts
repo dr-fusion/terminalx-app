@@ -199,4 +199,31 @@ describe("POST /api/sessions", () => {
       created: true,
     });
   });
+
+  it("surfaces a main refresh failure without creating the session", async () => {
+    mocks.createGitWorktreeForSession.mockImplementation(() => {
+      throw new Error(
+        "Failed to refresh main before creating Git worktree: fatal: unable to access origin"
+      );
+    });
+
+    const { POST } = await import("@/app/api/sessions/route");
+    const res = await POST(
+      mockReq({
+        name: "agent",
+        kind: "codex",
+        cwd: tmpDir,
+        worktree: { create: true, branch: "feature/refresh-failure" },
+      })
+    );
+    const body = await res.json();
+
+    expect(res.status).toBe(400);
+    expect(body).toEqual({
+      error: "Failed to refresh main before creating Git worktree: fatal: unable to access origin",
+    });
+    expect(mocks.allocateWorkspacePort).not.toHaveBeenCalled();
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(mocks.saveMeta).not.toHaveBeenCalled();
+  });
 });
