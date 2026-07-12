@@ -69,6 +69,45 @@ test("a session created from the dashboard appears in the persistent sidebar", a
   }
 });
 
+test("a worktree session without a registered project remains visible in the sidebar", async ({
+  page,
+}) => {
+  const name = sessionName("orphan-worktree");
+  const session = {
+    name,
+    windows: 1,
+    attached: false,
+    created: new Date().toISOString(),
+    kind: "codex",
+    managed: true,
+    worktree: {
+      repoRoot: "/repos/unregistered",
+      path: `/worktrees/${name}`,
+      branch: `feature/${name}`,
+    },
+  };
+
+  await page.route("**/api/sessions", async (route) => {
+    if (route.request().method() === "GET") {
+      await route.fulfill({ json: { sessions: [session] } });
+      return;
+    }
+    await route.continue();
+  });
+  await page.route("**/api/projects", async (route) => {
+    if (route.request().method() === "GET") {
+      await route.fulfill({ json: { projects: [] } });
+      return;
+    }
+    await route.continue();
+  });
+
+  await page.goto("/dashboard");
+
+  await expect(page.getByRole("button", { name: `kill session ${name}` })).toBeVisible();
+  await expect(sidebarSession(page, name)).toBeVisible();
+});
+
 test("a successful create stays synchronized when immediate revalidation fails", async ({
   page,
   request,
