@@ -56,16 +56,35 @@ export function TerminalViewXterm({
   }, [onDisconnect, onReconnect, onSessionEnded]);
 
   const connectWs = useCallback(() => {
-    if (!terminalRef.current) return;
+    const terminal = terminalRef.current;
+    if (!terminal) return;
+
+    const activeSocket = wsRef.current;
+    if (
+      activeSocket &&
+      (activeSocket.readyState === WebSocket.CONNECTING ||
+        activeSocket.readyState === WebSocket.OPEN)
+    ) {
+      return;
+    }
 
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const wsUrl = `${protocol}//${window.location.host}/ws/terminal/${encodeURIComponent(sessionId)}`;
+    const dimensions = new URLSearchParams({
+      cols: String(terminal.cols),
+      rows: String(terminal.rows),
+    });
+    const wsUrl = `${protocol}//${window.location.host}/ws/terminal/${encodeURIComponent(sessionId)}?${dimensions}`;
 
     const ws = new WebSocket(wsUrl);
     ws.binaryType = "arraybuffer";
     wsRef.current = ws;
 
     ws.onopen = () => {
+      if (wsRef.current !== ws) {
+        ws.close();
+        return;
+      }
+
       reconnectAttemptRef.current = 0;
       onReconnectRef.current?.();
 
@@ -83,7 +102,7 @@ export function TerminalViewXterm({
     };
 
     ws.onmessage = (event) => {
-      if (!terminalRef.current) return;
+      if (wsRef.current !== ws || !terminalRef.current) return;
 
       if (event.data instanceof ArrayBuffer) {
         terminalRef.current.write(new Uint8Array(event.data));
@@ -127,6 +146,11 @@ export function TerminalViewXterm({
     };
 
     ws.onclose = () => {
+      // A prior socket can finish closing after React has mounted a new
+      // terminal. Never let that stale event disconnect or reconnect it.
+      if (wsRef.current !== ws) return;
+
+      wsRef.current = null;
       onDisconnectRef.current?.();
 
       if (!intentionalCloseRef.current) {
@@ -135,13 +159,14 @@ export function TerminalViewXterm({
         reconnectAttemptRef.current = attempt + 1;
 
         reconnectTimerRef.current = setTimeout(() => {
+          reconnectTimerRef.current = null;
           connectWsRef.current?.();
         }, delay);
       }
     };
 
     ws.onerror = () => {
-      ws.close();
+      if (wsRef.current === ws) ws.close();
     };
   }, [sessionId]);
 
@@ -227,10 +252,6 @@ export function TerminalViewXterm({
       }
     });
 
-    // Connect WebSocket
-    intentionalCloseRef.current = false;
-    connectWs();
-
     // Resize observer
     const resizeObserver = new ResizeObserver(() => {
       try {
@@ -251,17 +272,33 @@ export function TerminalViewXterm({
 
     resizeObserver.observe(containerRef.current);
 
+    // Wait until this mount survives the current frame before attaching.
+    // Besides giving layout one final chance to settle, this prevents the
+    // throwaway mount in React Strict Mode from creating a second tmux client.
+    intentionalCloseRef.current = false;
+    const initialConnectFrame = requestAnimationFrame(() => {
+      if (terminalRef.current !== terminal) return;
+      try {
+        fitAddon.fit();
+      } catch {
+        // The initial synchronous fit above remains the best available size.
+      }
+      connectWs();
+    });
+
     return () => {
+      cancelAnimationFrame(initialConnectFrame);
       intentionalCloseRef.current = true;
       resizeObserver.disconnect();
 
       if (reconnectTimerRef.current) {
         clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
       }
-      if (wsRef.current) {
-        wsRef.current.close();
-        wsRef.current = null;
-      }
+
+      const activeSocket = wsRef.current;
+      wsRef.current = null;
+      activeSocket?.close();
 
       terminal.dispose();
       terminalRef.current = null;
