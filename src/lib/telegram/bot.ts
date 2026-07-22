@@ -37,6 +37,7 @@ import {
   listTopics,
   setForumChatId,
   patchTopic,
+  topicSessionIncarnationPatch,
   type ViewMode,
   type TopicBinding,
 } from "./state";
@@ -52,6 +53,7 @@ import {
   snap,
   defaultViewMode,
   resetChatBaseline,
+  resetStreamerSessionState,
 } from "./streamer";
 import {
   startClaudeTranscript,
@@ -69,6 +71,11 @@ import { markdownToTelegramV2 } from "./render";
 import { downloadFromTelegram, downloadTelegramFileToTemp, sendFromServer } from "./files";
 import { transcribeAudioFile } from "./transcription";
 import { forumTopicExists } from "./topic-health";
+import {
+  getTelegramMessageAuditor,
+  installTelegramMessageAudit,
+  withTelegramMessageAuditSource,
+} from "./message-audit";
 
 let bot: Bot | null = null;
 
@@ -173,9 +180,26 @@ function sessionBindingDefaults(
 
 async function reconcileTopicBinding(binding: TopicBinding): Promise<TopicBinding> {
   const defaults = sessionBindingDefaults(binding.sessionName, binding);
-  if (defaults.kind !== binding.kind || defaults.cwd !== binding.cwd) {
-    await patchTopic(binding.topicId, defaults);
-    return { ...binding, ...defaults };
+  const incarnation = topicSessionIncarnationPatch(
+    binding,
+    getSessionCreatedMs(binding.sessionName)
+  );
+  const patch = {
+    ...defaults,
+    ...incarnation.patch,
+  };
+  if (
+    patch.kind !== binding.kind ||
+    patch.cwd !== binding.cwd ||
+    patch.sessionCreatedAtMs !== binding.sessionCreatedAtMs
+  ) {
+    if (incarnation.changed) {
+      stopClaudeTranscript(binding.topicId);
+      stopCodexTranscript(binding.topicId);
+      resetStreamerSessionState(binding.topicId);
+    }
+    await patchTopic(binding.topicId, patch);
+    return { ...binding, ...patch };
   }
   return binding;
 }
@@ -197,13 +221,22 @@ async function attachToTopic(b: Bot, identity: BotIdentity, binding: TopicBindin
   if (!chatId) return;
   if (!canUseTopic(identity, binding)) return;
   const mode = binding.viewMode ?? defaultViewMode(binding.kind);
-  await setTopic({ ...binding, viewMode: mode, endedAtMs: undefined });
+  const sessionCreatedAtMs =
+    binding.sessionCreatedAtMs ?? getSessionCreatedMs(binding.sessionName) ?? Date.now();
+  await setTopic({
+    ...binding,
+    sessionCreatedAtMs,
+    viewMode: mode,
+    endedAtMs: undefined,
+  });
   startStreamer(b, binding.topicId);
   let resolvedJsonl: string | undefined;
   let resolvedTranscriptKind: "claude" | "codex" | undefined;
   if (binding.kind === "claude") {
     const sinceMs = getSessionCreatedMs(binding.sessionName) ?? Date.now();
     const started = startClaudeTranscript(b, chatId, binding.topicId, {
+      sessionId: binding.sessionName,
+      sessionCreatedAtMs,
       cwd: binding.cwd,
       sinceMs,
       persistedJsonl: binding.jsonlPath,
@@ -212,10 +245,15 @@ async function attachToTopic(b: Bot, identity: BotIdentity, binding: TopicBindin
     if (started) {
       resolvedJsonl = started.jsonl;
       resolvedTranscriptKind = "claude";
-      await patchTopic(binding.topicId, { jsonlPath: started.jsonl });
+      await patchTopic(binding.topicId, {
+        jsonlPath: started.jsonl,
+        transcriptSessionId: started.transcriptSessionId,
+      });
     }
   } else if (binding.kind === "codex" && binding.jsonlPath) {
     const started = startCodexTranscript(b, chatId, binding.topicId, {
+      sessionId: binding.sessionName,
+      sessionCreatedAtMs,
       cwd: binding.cwd,
       persistedJsonl: binding.jsonlPath,
       initialOffset: binding.jsonlOffset,
@@ -223,6 +261,10 @@ async function attachToTopic(b: Bot, identity: BotIdentity, binding: TopicBindin
     if (started) {
       resolvedJsonl = started.jsonl;
       resolvedTranscriptKind = "codex";
+      await patchTopic(binding.topicId, {
+        jsonlPath: started.jsonl,
+        transcriptSessionId: started.transcriptSessionId,
+      });
     }
   }
 
@@ -268,7 +310,9 @@ function botForTopicManagement(): Bot | null {
   if (bot) return bot;
   const config = getTelegramConfig();
   if (!config.enabled || !config.botToken) return null;
-  return new Bot(config.botToken);
+  const managementBot = new Bot(config.botToken);
+  installTelegramMessageAudit(managementBot);
+  return managementBot;
 }
 
 export interface EnsureTopicResult {
@@ -724,6 +768,9 @@ async function sendPromptToBinding(
     const chatId = ctxChatId();
     if (chatId) {
       const started = startClaudeTranscript(bot, chatId, topicId, {
+        sessionId: binding.sessionName,
+        sessionCreatedAtMs:
+          binding.sessionCreatedAtMs ?? getSessionCreatedMs(binding.sessionName) ?? undefined,
         cwd: binding.cwd,
         sinceMs: promptSentAtMs,
         promptText: text,
@@ -733,6 +780,7 @@ async function sendPromptToBinding(
       if (started) {
         await patchTopic(topicId, {
           jsonlPath: started.jsonl,
+          transcriptSessionId: started.transcriptSessionId,
           pendingPrompt: undefined,
           lastPromptAtMs: undefined,
         });
@@ -742,6 +790,9 @@ async function sendPromptToBinding(
     const chatId = ctxChatId();
     if (chatId) {
       const started = startCodexTranscript(bot, chatId, topicId, {
+        sessionId: binding.sessionName,
+        sessionCreatedAtMs:
+          binding.sessionCreatedAtMs ?? getSessionCreatedMs(binding.sessionName) ?? undefined,
         cwd: binding.cwd,
         sinceMs: promptSentAtMs,
         promptText: text,
@@ -752,6 +803,7 @@ async function sendPromptToBinding(
       if (started) {
         await patchTopic(topicId, {
           jsonlPath: started.jsonl,
+          transcriptSessionId: started.transcriptSessionId,
           pendingPrompt: undefined,
           lastPromptAtMs: undefined,
         });
@@ -1021,6 +1073,13 @@ async function handleCallback(ctx: Context) {
 
 /* ────────────── lifecycle ────────────── */
 
+function botIdFromToken(token: string): number | undefined {
+  const raw = token.split(":", 1)[0];
+  if (!raw || !/^\d+$/.test(raw)) return undefined;
+  const id = Number(raw);
+  return Number.isSafeInteger(id) && id > 0 ? id : undefined;
+}
+
 export async function startTelegramBot(): Promise<Bot | null> {
   if (!botIsConfigured()) {
     if (telegramHasPartialConfig() || telegramAllowedUserCount() > 0) {
@@ -1033,40 +1092,45 @@ export async function startTelegramBot(): Promise<Bot | null> {
   if (bot) return bot;
   const config = getTelegramConfig();
   const token = config.botToken;
-  bot = new Bot(token);
+  const candidate = new Bot(token);
+  const auditor = getTelegramMessageAuditor();
+  auditor.setTelegramBotId(botIdFromToken(token));
+  installTelegramMessageAudit(candidate, auditor);
 
   // commands
-  bot.command("start", handleStart);
-  bot.command("sessions", handleSessions);
-  bot.command("new", handleNew);
-  bot.command("detach", handleDetach);
-  bot.command("kill", handleKill);
-  bot.command("delete", handleDelete);
-  bot.command("snap", handleSnap);
-  bot.command("view", handleView);
-  bot.command("get", handleGet);
-  bot.command("tab", (ctx) => handleSlashKey(ctx, "Tab"));
-  bot.command("enter", (ctx) => handleSlashKey(ctx, "Enter"));
-  bot.command("ctrlc", (ctx) => handleSlashKey(ctx, "C-c"));
-  bot.command("ctrld", (ctx) => handleSlashKey(ctx, "C-d"));
-  bot.command("up", (ctx) => handleSlashKey(ctx, "Up"));
-  bot.command("down", (ctx) => handleSlashKey(ctx, "Down"));
+  candidate.command("start", handleStart);
+  candidate.command("sessions", handleSessions);
+  candidate.command("new", handleNew);
+  candidate.command("detach", handleDetach);
+  candidate.command("kill", handleKill);
+  candidate.command("delete", handleDelete);
+  candidate.command("snap", handleSnap);
+  candidate.command("view", handleView);
+  candidate.command("get", handleGet);
+  candidate.command("tab", (ctx) => handleSlashKey(ctx, "Tab"));
+  candidate.command("enter", (ctx) => handleSlashKey(ctx, "Enter"));
+  candidate.command("ctrlc", (ctx) => handleSlashKey(ctx, "C-c"));
+  candidate.command("ctrld", (ctx) => handleSlashKey(ctx, "C-d"));
+  candidate.command("up", (ctx) => handleSlashKey(ctx, "Up"));
+  candidate.command("down", (ctx) => handleSlashKey(ctx, "Down"));
 
   // text & file uploads inside topics
-  bot.on("message:text", handleText);
-  bot.on(["message:voice", "message:audio"], handleVoice);
-  bot.on(["message:photo", "message:document"], handleFileUpload);
+  candidate.on("message:text", handleText);
+  candidate.on(["message:voice", "message:audio"], handleVoice);
+  candidate.on(["message:photo", "message:document"], handleFileUpload);
 
   // inline keyboard
-  bot.on("callback_query:data", handleCallback);
+  candidate.on("callback_query:data", handleCallback);
 
   // grammy needs bot.init() to fetch its own info before handleUpdate works
   // when we're driving updates ourselves (webhook mode without bot.start()).
-  await bot.init();
+  await candidate.init();
+  auditor.setTelegramBotId(candidate.botInfo.id);
+  bot = candidate;
 
   // remember the configured forum chat id so other modules can reach it
   const forumChatId = getTelegramForumChatId();
-  if (!forumChatId) return bot;
+  if (!forumChatId) return candidate;
   await setForumChatId(forumChatId);
 
   // webhook setup
@@ -1074,10 +1138,10 @@ export async function startTelegramBot(): Promise<Bot | null> {
   const secret = config.webhookSecret;
   if (!webhookUrl || !secret) {
     console.error("[telegram] webhook url / secret missing — bot won't receive updates");
-    return bot;
+    return candidate;
   }
   try {
-    await bot.api.setWebhook(webhookUrl, { secret_token: secret });
+    await candidate.api.setWebhook(webhookUrl, { secret_token: secret });
     console.log(`[telegram] webhook set ${webhookUrl}`);
   } catch (err) {
     console.error("[telegram] setWebhook failed", err);
@@ -1087,7 +1151,7 @@ export async function startTelegramBot(): Promise<Bot | null> {
   for (const t of listTopics()) {
     await reconcileTopicBinding(t);
   }
-  resumePersistedStreamers(bot);
+  resumePersistedStreamers(candidate);
   for (const t of listTopics()) {
     if (t.endedAtMs) continue;
     if (t.kind !== "claude" && t.kind !== "codex") continue;
@@ -1099,7 +1163,9 @@ export async function startTelegramBot(): Promise<Bot | null> {
     const sinceMs = t.lastPromptAtMs ?? getSessionCreatedMs(t.sessionName) ?? 0;
     const started =
       t.kind === "codex"
-        ? startCodexTranscript(bot, forumChatId, t.topicId, {
+        ? startCodexTranscript(candidate, forumChatId, t.topicId, {
+            sessionId: t.sessionName,
+            sessionCreatedAtMs: t.sessionCreatedAtMs,
             cwd: t.cwd,
             sinceMs,
             promptText: t.pendingPrompt,
@@ -1107,7 +1173,9 @@ export async function startTelegramBot(): Promise<Bot | null> {
             persistedJsonl: t.jsonlPath,
             initialOffset: t.jsonlOffset,
           })
-        : startClaudeTranscript(bot, forumChatId, t.topicId, {
+        : startClaudeTranscript(candidate, forumChatId, t.topicId, {
+            sessionId: t.sessionName,
+            sessionCreatedAtMs: t.sessionCreatedAtMs,
             cwd: t.cwd,
             sinceMs,
             promptText: t.pendingPrompt,
@@ -1117,17 +1185,36 @@ export async function startTelegramBot(): Promise<Bot | null> {
     if (started) {
       await patchTopic(t.topicId, {
         jsonlPath: started.jsonl,
+        transcriptSessionId: started.transcriptSessionId,
         pendingPrompt: undefined,
         lastPromptAtMs: undefined,
       });
     }
   }
-  return bot;
+  return candidate;
 }
 
-/** Hand a parsed Telegram update from the webhook into the bot. */
-export async function handleTelegramUpdate(update: object): Promise<void> {
-  if (!bot) return;
+/** Persist and hand a parsed Telegram update from the webhook into the bot. */
+export function handleTelegramUpdate(update: object): Promise<void> {
+  let botId = botIdFromToken(getTelegramConfig().botToken);
+  if (bot) {
+    try {
+      botId = bot.botInfo.id;
+    } catch {
+      // The update is still durable even if bot initialization failed.
+    }
+  }
+  const auditor = getTelegramMessageAuditor();
+  const recorded = auditor.recordInboundUpdate(update, botId);
+  const activeBot = bot;
+  if (!activeBot) {
+    throw new Error("Telegram bot is not ready; update was stored for retry");
+  }
+  const claimed = auditor.claimInboundDispatch(recorded.event.id);
+  if (claimed.status === "processed") return Promise.resolve();
+  if (claimed.status === "busy") {
+    throw new Error("Telegram update is already being processed; retry later");
+  }
   // Optional debug — set TERMINALX_TELEGRAM_DEBUG=1 to log every incoming
   // update's chat / from / text. Useful for triaging delivery problems
   // without rebuilding; off by default since each update would otherwise
@@ -1150,7 +1237,30 @@ export async function handleTelegramUpdate(update: object): Promise<void> {
       /* ignore */
     }
   }
-  await bot.handleUpdate(update as Parameters<Bot["handleUpdate"]>[0]);
+  const event = claimed.event;
+  const processing = withTelegramMessageAuditSource(
+    {
+      source: "telegram-handler",
+      sourceRef: event.sourceRef,
+      correlationId: event.correlationId,
+      sessionId: event.sessionId,
+      sessionCreatedAtMs: event.sessionCreatedAtMs,
+      expectedChatId: event.expectedChatId,
+      expectedTopicId: event.expectedTopicId,
+      transcriptSessionId: event.transcriptSessionId,
+      transcriptPath: event.transcriptPath,
+    },
+    () => activeBot.handleUpdate(update as Parameters<Bot["handleUpdate"]>[0])
+  );
+  return processing.then(
+    async () => {
+      await auditor.completeInboundDispatch(event.id);
+    },
+    async (error: unknown) => {
+      await auditor.failInboundDispatch(event.id, error);
+      throw error;
+    }
+  );
 }
 
 export async function stopTelegramBot(): Promise<void> {

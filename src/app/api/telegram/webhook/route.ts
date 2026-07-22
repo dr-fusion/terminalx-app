@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { handleTelegramUpdate } from "@/lib/telegram/bot";
+import { acceptTelegramWebhookUpdate } from "@/lib/telegram/webhook-acceptance";
 
 /**
  * Telegram webhook endpoint. Telegram POSTs updates here. Each request must
@@ -7,9 +7,8 @@ import { handleTelegramUpdate } from "@/lib/telegram/bot";
  * passed to `setWebhook`. We verify it before doing anything else so an
  * attacker can't drive the bot via this URL even though the path is public.
  *
- * Telegram retries on responses slower than ~2 s — we ack 200 immediately
- * and process the update without `await`. Updates are best-effort; loss is
- * preferable to delaying the ack and triggering a duplicate retry.
+ * The inbound envelope is committed synchronously before we acknowledge it;
+ * handler work continues asynchronously so Telegram still gets a fast 200.
  */
 export async function POST(req: NextRequest): Promise<NextResponse> {
   const expected = process.env.TERMINALX_TELEGRAM_WEBHOOK_SECRET;
@@ -28,9 +27,19 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     return NextResponse.json({ error: "invalid json" }, { status: 400 });
   }
 
-  // Process asynchronously so we can ack within Telegram's 2 s window.
-  void handleTelegramUpdate(update).catch((err) => {
-    console.error("[telegram/webhook] handleUpdate threw", err);
+  const acceptance = acceptTelegramWebhookUpdate(update);
+  if (!acceptance.accepted) {
+    console.error("[telegram/webhook] could not persist/accept update:", acceptance.errorMessage);
+    return NextResponse.json(
+      { error: "telegram bot unavailable" },
+      { status: 503, headers: { "Retry-After": "1" } }
+    );
+  }
+
+  // Process asynchronously so we can ack within Telegram's deadline.
+  void acceptance.processing.catch((err) => {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error("[telegram/webhook] handleUpdate failed:", message);
   });
 
   return NextResponse.json({ ok: true });

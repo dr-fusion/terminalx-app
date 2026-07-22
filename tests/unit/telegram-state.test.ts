@@ -64,4 +64,39 @@ describe("telegram state", () => {
     expect(state.getTopic(2)?.sessionName).toBe("beta");
     expect(state.getTopic(3)?.sessionName).toBe("gamma");
   });
+
+  it("clears transcript state when tmux reuses a session name", () => {
+    const binding = {
+      topicId: 7,
+      sessionName: "admin-alpha",
+      sessionCreatedAtMs: 1_000,
+      kind: "codex" as const,
+      cwd: "/srv/alpha",
+      jsonlPath: "/old/rollout.jsonl",
+      transcriptSessionId: "old-codex-id",
+      jsonlOffset: 42,
+      pendingPrompt: "old prompt",
+      lastPromptAtMs: 1_500,
+      pinnedMsgId: 99,
+      endedAtMs: 1_900,
+    };
+
+    expect(state.topicSessionIncarnationPatch(binding, 2_000)).toEqual({
+      changed: true,
+      patch: {
+        sessionCreatedAtMs: 2_000,
+        jsonlPath: undefined,
+        transcriptSessionId: undefined,
+        jsonlOffset: undefined,
+        pendingPrompt: undefined,
+        lastPromptAtMs: undefined,
+        pinnedMsgId: undefined,
+        endedAtMs: undefined,
+      },
+    });
+    expect(state.topicSessionIncarnationPatch(binding, 1_000)).toEqual({
+      changed: false,
+      patch: { sessionCreatedAtMs: 1_000 },
+    });
+  });
 });

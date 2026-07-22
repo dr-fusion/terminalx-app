@@ -131,24 +131,25 @@ TerminalX runs **directly on your server** via node-pty + tmux. No SSH tunneling
 
 All settings via environment variables. See [`.env.example`](.env.example) for the full list.
 
-| Variable                         | Default                               | Description                                                                                                          |
-| -------------------------------- | ------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
-| `PORT`                           | `3000`                                | Server port                                                                                                          |
-| `TERMINUS_HOST`                  | `127.0.0.1`                           | Bind host. Use `0.0.0.0` only with authentication or an explicit trusted-network setup                               |
-| `TERMINUS_ROOT`                  | `$HOME`                               | File browser root                                                                                                    |
-| `TERMINALX_WORKTREES_ROOT`       | `$TERMINUS_ROOT/.terminalx-worktrees` | Generated Git worktree directory; must remain under `TERMINUS_ROOT`                                                  |
-| `TERMINUS_SHELL`                 | `$SHELL`                              | Default shell                                                                                                        |
-| `TERMINUS_READ_ONLY`             | `false`                               | Read-only mode (disables terminal, uploads, session management)                                                      |
-| `TERMINUS_MAX_SESSIONS`          | `20`                                  | Max terminal sessions                                                                                                |
-| `TERMINUS_SCROLLBACK`            | `10000`                               | tmux scrollback history lines                                                                                        |
-| `TERMINUS_LOG_PATHS`             | `/var/log,~/.pm2/logs`                | Log directories to scan                                                                                              |
-| `TERMINUS_RECORD_SESSIONS`       | `false`                               | Record every PTY session to `data/recordings/*.jsonl` for replay (⚠ captures everything you type, including secrets) |
-| `TERMINALX_AUTH_MODE`            | `local`                               | Auth mode: `local`, `password`, or `google`. `none` is refused at startup                                            |
-| `TERMINALX_PUBLIC_URL`           | —                                     | Canonical external URL for OAuth and redirects behind a proxy                                                        |
-| `TERMINALX_TRUST_PROXY_HEADERS`  | `false`                               | Trust `X-Forwarded-*` headers only when a trusted proxy overwrites them                                              |
-| `TERMINALX_GOOGLE_CLIENT_ID`     | —                                     | Google OAuth client ID (when `AUTH_MODE=google`)                                                                     |
-| `TERMINALX_GOOGLE_CLIENT_SECRET` | —                                     | Google OAuth client secret                                                                                           |
-| `TERMINALX_ALLOWED_EMAILS`       | —                                     | Comma-separated allowlist of Google emails; empty denies everyone                                                    |
+| Variable                             | Default                               | Description                                                                                                          |
+| ------------------------------------ | ------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `PORT`                               | `3000`                                | Server port                                                                                                          |
+| `TERMINUS_HOST`                      | `127.0.0.1`                           | Bind host. Use `0.0.0.0` only with authentication or an explicit trusted-network setup                               |
+| `TERMINUS_ROOT`                      | `$HOME`                               | File browser root                                                                                                    |
+| `TERMINALX_WORKTREES_ROOT`           | `$TERMINUS_ROOT/.terminalx-worktrees` | Generated Git worktree directory; must remain under `TERMINUS_ROOT`                                                  |
+| `TERMINUS_SHELL`                     | `$SHELL`                              | Default shell                                                                                                        |
+| `TERMINUS_READ_ONLY`                 | `false`                               | Read-only mode (disables terminal, uploads, session management)                                                      |
+| `TERMINUS_MAX_SESSIONS`              | `20`                                  | Max terminal sessions                                                                                                |
+| `TERMINUS_SCROLLBACK`                | `10000`                               | tmux scrollback history lines                                                                                        |
+| `TERMINUS_LOG_PATHS`                 | `/var/log,~/.pm2/logs`                | Log directories to scan                                                                                              |
+| `TERMINUS_RECORD_SESSIONS`           | `false`                               | Record every PTY session to `data/recordings/*.jsonl` for replay (⚠ captures everything you type, including secrets) |
+| `TERMINALX_AUTH_MODE`                | `local`                               | Auth mode: `local`, `password`, or `google`. `none` is refused at startup                                            |
+| `TERMINALX_PUBLIC_URL`               | —                                     | Canonical external URL for OAuth and redirects behind a proxy                                                        |
+| `TERMINALX_TRUST_PROXY_HEADERS`      | `false`                               | Trust `X-Forwarded-*` headers only when a trusted proxy overwrites them                                              |
+| `TERMINALX_GOOGLE_CLIENT_ID`         | —                                     | Google OAuth client ID (when `AUTH_MODE=google`)                                                                     |
+| `TERMINALX_GOOGLE_CLIENT_SECRET`     | —                                     | Google OAuth client secret                                                                                           |
+| `TERMINALX_ALLOWED_EMAILS`           | —                                     | Comma-separated allowlist of Google emails; empty denies everyone                                                    |
+| `TERMINALX_TELEGRAM_MESSAGE_DB_PATH` | `data/telegram-messages.sqlite`       | Private SQLite audit log for inbound and outbound Telegram messages                                                  |
 
 ## Authentication
 
@@ -184,6 +185,17 @@ Telegram can be configured either with environment variables or from the Setting
 ```
 
 The same response mode is available from the dashboard and Settings UI for sessions that already have a Telegram topic.
+
+TerminalX keeps a durable audit trail of Telegram traffic from the moment this version is activated. Inbound webhook envelopes are committed before acknowledgement, and outbound send/edit attempts are recorded with their final Telegram result. Each row snapshots the bot, update, chat, topic, message, sender, reply, source and bound sessions, both tmux-session creation times, the native Claude/Codex transcript ID and path/offset, delivery status, and routing status. Reused tmux names and chat-scoped topic IDs remain distinguishable. An outbound row left `pending` means Telegram's final result could not be committed and should be investigated as an uncertain delivery.
+
+The database defaults to `data/telegram-messages.sqlite`; override it with `TERMINALX_TELEGRAM_MESSAGE_DB_PATH` and preferably place custom paths in a dedicated private directory. It intentionally contains message text and raw Telegram update/result data, but redacts secret-like fields and stores uploaded-file metadata instead of bytes. TerminalX enforces mode `0600` on the database and its SQLite sidecars without changing permissions on an existing parent directory. Treat the database plus its `-wal` and `-shm` files as sensitive, keep them together for live backups, and monitor disk growth because records are retained indefinitely.
+
+Authenticated admins can inspect it through `GET /api/telegram/messages`. Results default to 100 newest events and omit full content; use `includeContent=true` for full text/payloads and `includeSummary=true` for the more expensive route/anomaly summary. Inbound rows also show receipt count and `pending`/`processing`/`processed`/`failed` dispatch state. A 15-minute processing lease prevents overlapping server instances from executing the same update; after a crashed owner’s lease expires, a Telegram retry can reclaim it. Filters include `direction`, `operation`, `deliveryStatus`, `routingStatus`, `processingStatus`, `source`, `messageType`, `sessionId`, `botId`, `updateId`, `messageId`, `chatId`, `topicId`, `telegramUserId`, `from`, and `to`. Pagination uses the returned opaque `page.nextCursor`:
+
+```text
+/api/telegram/messages?sessionId=admin-alpha&topicId=77&includeSummary=true
+/api/telegram/messages?routingStatus=mismatch&includeContent=true&limit=50
+```
 
 Voice notes sent inside a session topic are downloaded by the bot, converted with the bundled ffmpeg binary, transcribed locally with whisper.cpp, and sent to the bound tmux session as normal text input. Install the default small native model with:
 

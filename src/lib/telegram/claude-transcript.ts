@@ -6,6 +6,7 @@ import { watch, FSWatcher } from "chokidar";
 import { markdownToTelegramV2, splitForTelegram } from "./render";
 import { listTopics } from "./state";
 import { sendReferencedAttachments } from "./attachments";
+import { withTelegramMessageAuditSource } from "./message-audit";
 
 interface AssistantEntry {
   type: "assistant";
@@ -58,59 +59,78 @@ async function enqueueSend(
   chatId: number,
   topicId: number,
   raw: string,
-  baseDir?: string
+  baseDir?: string,
+  sourceRef?: string,
+  transcriptPath?: string,
+  sessionId?: string,
+  sessionCreatedAtMs?: number,
+  transcriptSessionId?: string
 ): Promise<void> {
-  const prev = sendQueues.get(topicId) ?? Promise.resolve();
-  const next = prev.then(async () => {
-    const send = async (text: string, parseMode: "MarkdownV2" | undefined) => {
-      const cool = cooldownUntil.get(topicId) ?? 0;
-      const waitMs = Math.max(0, cool - Date.now());
-      if (waitMs > 0) await sleep(waitMs);
-      await bot.api.sendMessage(chatId, text, {
-        message_thread_id: topicId,
-        parse_mode: parseMode,
+  return withTelegramMessageAuditSource(
+    {
+      source: "claude-transcript",
+      sourceRef,
+      sessionId,
+      sessionCreatedAtMs,
+      expectedChatId: chatId,
+      expectedTopicId: topicId,
+      transcriptSessionId,
+      transcriptPath,
+    },
+    async () => {
+      const prev = sendQueues.get(topicId) ?? Promise.resolve();
+      const next = prev.then(async () => {
+        const send = async (text: string, parseMode: "MarkdownV2" | undefined) => {
+          const cool = cooldownUntil.get(topicId) ?? 0;
+          const waitMs = Math.max(0, cool - Date.now());
+          if (waitMs > 0) await sleep(waitMs);
+          await bot.api.sendMessage(chatId, text, {
+            message_thread_id: topicId,
+            parse_mode: parseMode,
+          });
+          await sleep(MIN_GAP_MS);
+        };
+        // Formatted first; if Telegram rejects the entities (a converter gap),
+        // fall back to the raw text — losing styling is fine, losing the
+        // message is not.
+        try {
+          for (const chunk of splitForTelegram(markdownToTelegramV2(raw), 4000)) {
+            await send(chunk, "MarkdownV2");
+          }
+          await sendReferencedAttachments(bot, chatId, topicId, raw, { baseDir });
+          return;
+        } catch (err) {
+          const e = err as { error_code?: number; parameters?: { retry_after?: number } };
+          if (e.error_code === 429) {
+            const retry = e.parameters?.retry_after ?? 30;
+            cooldownUntil.set(topicId, Date.now() + (retry + 1) * 1000);
+            // Drop this message rather than queue forever — the user can /snap
+            // or wait for fresh entries.
+            return;
+          }
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error("[telegram/claude] formatted send failed, retrying plain:", msg);
+        }
+        try {
+          for (const chunk of splitForTelegram(raw, 4000)) {
+            await send(chunk, undefined);
+          }
+          await sendReferencedAttachments(bot, chatId, topicId, raw, { baseDir });
+        } catch (err) {
+          const e = err as { error_code?: number; parameters?: { retry_after?: number } };
+          if (e.error_code === 429) {
+            const retry = e.parameters?.retry_after ?? 30;
+            cooldownUntil.set(topicId, Date.now() + (retry + 1) * 1000);
+            return;
+          }
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error("[telegram/claude] send failed:", msg);
+        }
       });
-      await sleep(MIN_GAP_MS);
-    };
-    // Formatted first; if Telegram rejects the entities (a converter gap),
-    // fall back to the raw text — losing styling is fine, losing the
-    // message is not.
-    try {
-      for (const chunk of splitForTelegram(markdownToTelegramV2(raw), 4000)) {
-        await send(chunk, "MarkdownV2");
-      }
-      await sendReferencedAttachments(bot, chatId, topicId, raw, { baseDir });
-      return;
-    } catch (err) {
-      const e = err as { error_code?: number; parameters?: { retry_after?: number } };
-      if (e.error_code === 429) {
-        const retry = e.parameters?.retry_after ?? 30;
-        cooldownUntil.set(topicId, Date.now() + (retry + 1) * 1000);
-        // Drop this message rather than queue forever — the user can /snap
-        // or wait for fresh entries.
-        return;
-      }
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error("[telegram/claude] formatted send failed, retrying plain:", msg);
+      sendQueues.set(topicId, next);
+      await next;
     }
-    try {
-      for (const chunk of splitForTelegram(raw, 4000)) {
-        await send(chunk, undefined);
-      }
-      await sendReferencedAttachments(bot, chatId, topicId, raw, { baseDir });
-    } catch (err) {
-      const e = err as { error_code?: number; parameters?: { retry_after?: number } };
-      if (e.error_code === 429) {
-        const retry = e.parameters?.retry_after ?? 30;
-        cooldownUntil.set(topicId, Date.now() + (retry + 1) * 1000);
-        return;
-      }
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error("[telegram/claude] send failed:", msg);
-    }
-  });
-  sendQueues.set(topicId, next);
-  return next;
+  );
 }
 
 function sleep(ms: number): Promise<void> {
@@ -381,6 +401,10 @@ function renderEntry(entry: TranscriptEntry): string | null {
 }
 
 export interface StartTranscriptOpts {
+  /** TerminalX/tmux session that owns this transcript. */
+  sessionId?: string;
+  /** Creation time distinguishes reused tmux session names. */
+  sessionCreatedAtMs?: number;
   /** tmux pane cwd — used to narrow JSONL search to one project dir. */
   cwd?: string;
   /** Unix ms for either tmux session creation or the Telegram prompt send. */
@@ -408,7 +432,7 @@ export function startClaudeTranscript(
   chatId: number,
   topicId: number,
   opts: StartTranscriptOpts = {}
-): { stop: () => void; jsonl: string } | null {
+): { stop: () => void; jsonl: string; transcriptSessionId: string } | null {
   // If this topic already has a watcher, don't double-start — caller
   // should have stopped it first if they meant to swap.
   if (watchers.has(topicId)) return null;
@@ -440,6 +464,7 @@ export function startClaudeTranscript(
   if (!match) return null;
 
   const jsonl = match.path;
+  const transcriptSessionId = path.basename(jsonl, path.extname(jsonl));
 
   let offset: number;
   if (opts.initialOffset && opts.initialOffset > 0) {
@@ -467,8 +492,12 @@ export function startClaudeTranscript(
       fs.readSync(fd, buf, 0, buf.length, offset);
       fs.closeSync(fd);
       offset = stat.size;
-      const lines = buf.toString("utf-8").split("\n").filter(Boolean);
+      const lines = buf.toString("utf-8").split("\n");
+      let lineOffset = offset - buf.length;
       for (const line of lines) {
+        const sourceRef = `${jsonl}:${lineOffset}`;
+        lineOffset += Buffer.byteLength(line, "utf-8") + 1;
+        if (!line) continue;
         let entry: TranscriptEntry;
         try {
           entry = JSON.parse(line) as TranscriptEntry;
@@ -477,7 +506,18 @@ export function startClaudeTranscript(
         }
         const raw = renderEntry(entry);
         if (!raw) continue;
-        await enqueueSend(bot, chatId, topicId, raw, opts.cwd);
+        await enqueueSend(
+          bot,
+          chatId,
+          topicId,
+          raw,
+          opts.cwd,
+          sourceRef,
+          jsonl,
+          opts.sessionId,
+          opts.sessionCreatedAtMs,
+          transcriptSessionId
+        );
       }
     } catch (err) {
       console.error("[telegram/claude] flush failed", err);
@@ -493,6 +533,7 @@ export function startClaudeTranscript(
   void flush();
   return {
     jsonl,
+    transcriptSessionId,
     stop: () => {
       void watcher.close();
       watchers.delete(topicId);

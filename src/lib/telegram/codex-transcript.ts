@@ -6,6 +6,7 @@ import { watch, FSWatcher } from "chokidar";
 import { markdownToTelegramV2, splitForTelegram } from "./render";
 import { listTopics } from "./state";
 import { sendReferencedAttachments } from "./attachments";
+import { withTelegramMessageAuditSource } from "./message-audit";
 
 interface SessionMetaEntry {
   timestamp?: string;
@@ -41,6 +42,7 @@ interface JsonlCandidate {
   mtimeMs: number;
   sessionStartedMs?: number;
   cwd?: string;
+  transcriptSessionId?: string;
 }
 
 interface JsonlMatch {
@@ -70,57 +72,76 @@ async function enqueueSend(
   chatId: number,
   topicId: number,
   raw: string,
-  baseDir?: string
+  baseDir?: string,
+  sourceRef?: string,
+  transcriptPath?: string,
+  sessionId?: string,
+  sessionCreatedAtMs?: number,
+  transcriptSessionId?: string
 ): Promise<void> {
-  const prev = sendQueues.get(topicId) ?? Promise.resolve();
-  const next = prev.then(async () => {
-    const send = async (text: string, parseMode: "MarkdownV2" | undefined) => {
-      const cool = cooldownUntil.get(topicId) ?? 0;
-      const waitMs = Math.max(0, cool - Date.now());
-      if (waitMs > 0) await sleep(waitMs);
-      await bot.api.sendMessage(chatId, text, {
-        message_thread_id: topicId,
-        parse_mode: parseMode,
+  return withTelegramMessageAuditSource(
+    {
+      source: "codex-transcript",
+      sourceRef,
+      sessionId,
+      sessionCreatedAtMs,
+      expectedChatId: chatId,
+      expectedTopicId: topicId,
+      transcriptSessionId,
+      transcriptPath,
+    },
+    async () => {
+      const prev = sendQueues.get(topicId) ?? Promise.resolve();
+      const next = prev.then(async () => {
+        const send = async (text: string, parseMode: "MarkdownV2" | undefined) => {
+          const cool = cooldownUntil.get(topicId) ?? 0;
+          const waitMs = Math.max(0, cool - Date.now());
+          if (waitMs > 0) await sleep(waitMs);
+          await bot.api.sendMessage(chatId, text, {
+            message_thread_id: topicId,
+            parse_mode: parseMode,
+          });
+          await sleep(MIN_GAP_MS);
+        };
+        // Formatted first; if Telegram rejects the entities (a converter gap),
+        // fall back to the raw text — losing styling is fine, losing the
+        // message is not.
+        try {
+          for (const chunk of splitForTelegram(markdownToTelegramV2(raw), 3900)) {
+            await send(chunk, "MarkdownV2");
+          }
+          await sendReferencedAttachments(bot, chatId, topicId, raw, { baseDir });
+          return;
+        } catch (err) {
+          const e = err as { error_code?: number; parameters?: { retry_after?: number } };
+          if (e.error_code === 429) {
+            const retry = e.parameters?.retry_after ?? 30;
+            cooldownUntil.set(topicId, Date.now() + (retry + 1) * 1000);
+            return;
+          }
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error("[telegram/codex] formatted send failed, retrying plain:", msg);
+        }
+        try {
+          for (const chunk of chunkText(raw, 3900)) {
+            await send(chunk, undefined);
+          }
+          await sendReferencedAttachments(bot, chatId, topicId, raw, { baseDir });
+        } catch (err) {
+          const e = err as { error_code?: number; parameters?: { retry_after?: number } };
+          if (e.error_code === 429) {
+            const retry = e.parameters?.retry_after ?? 30;
+            cooldownUntil.set(topicId, Date.now() + (retry + 1) * 1000);
+            return;
+          }
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error("[telegram/codex] send failed:", msg);
+        }
       });
-      await sleep(MIN_GAP_MS);
-    };
-    // Formatted first; if Telegram rejects the entities (a converter gap),
-    // fall back to the raw text — losing styling is fine, losing the
-    // message is not.
-    try {
-      for (const chunk of splitForTelegram(markdownToTelegramV2(raw), 3900)) {
-        await send(chunk, "MarkdownV2");
-      }
-      await sendReferencedAttachments(bot, chatId, topicId, raw, { baseDir });
-      return;
-    } catch (err) {
-      const e = err as { error_code?: number; parameters?: { retry_after?: number } };
-      if (e.error_code === 429) {
-        const retry = e.parameters?.retry_after ?? 30;
-        cooldownUntil.set(topicId, Date.now() + (retry + 1) * 1000);
-        return;
-      }
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error("[telegram/codex] formatted send failed, retrying plain:", msg);
+      sendQueues.set(topicId, next);
+      await next;
     }
-    try {
-      for (const chunk of chunkText(raw, 3900)) {
-        await send(chunk, undefined);
-      }
-      await sendReferencedAttachments(bot, chatId, topicId, raw, { baseDir });
-    } catch (err) {
-      const e = err as { error_code?: number; parameters?: { retry_after?: number } };
-      if (e.error_code === 429) {
-        const retry = e.parameters?.retry_after ?? 30;
-        cooldownUntil.set(topicId, Date.now() + (retry + 1) * 1000);
-        return;
-      }
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error("[telegram/codex] send failed:", msg);
-    }
-  });
-  sendQueues.set(topicId, next);
-  return next;
+  );
 }
 
 function chunkText(text: string, maxLen: number): string[] {
@@ -170,7 +191,9 @@ function timestampMs(entry: { timestamp?: string }): number | undefined {
   return Number.isFinite(ms) ? ms : undefined;
 }
 
-function readMeta(jsonl: string): Pick<JsonlCandidate, "cwd" | "sessionStartedMs"> {
+function readMeta(
+  jsonl: string
+): Pick<JsonlCandidate, "cwd" | "sessionStartedMs" | "transcriptSessionId"> {
   try {
     const fd = fs.openSync(jsonl, "r");
     const buf = Buffer.alloc(Math.min(fs.statSync(jsonl).size, 64 * 1024));
@@ -191,6 +214,7 @@ function readMeta(jsonl: string): Pick<JsonlCandidate, "cwd" | "sessionStartedMs
       return {
         cwd: meta?.cwd,
         sessionStartedMs: Number.isFinite(started) ? started : undefined,
+        transcriptSessionId: meta?.id,
       };
     }
   } catch {
@@ -413,6 +437,10 @@ function renderEntry(entry: CodexEntry): string | null {
 }
 
 export interface StartCodexTranscriptOpts {
+  /** TerminalX/tmux session that owns this transcript. */
+  sessionId?: string;
+  /** Creation time distinguishes reused tmux session names. */
+  sessionCreatedAtMs?: number;
   cwd?: string;
   sinceMs?: number;
   promptText?: string;
@@ -426,7 +454,7 @@ export function startCodexTranscript(
   chatId: number,
   topicId: number,
   opts: StartCodexTranscriptOpts = {}
-): { stop: () => void; jsonl: string } | null {
+): { stop: () => void; jsonl: string; transcriptSessionId?: string } | null {
   if (watchers.has(topicId)) return null;
 
   let match: JsonlMatch | null = null;
@@ -454,6 +482,7 @@ export function startCodexTranscript(
   if (!match) return null;
 
   const jsonl = match.path;
+  const transcriptSessionId = readMeta(jsonl).transcriptSessionId;
   let offset: number;
   if (opts.initialOffset && opts.initialOffset > 0) {
     offset = opts.initialOffset;
@@ -477,8 +506,12 @@ export function startCodexTranscript(
       fs.readSync(fd, buf, 0, buf.length, offset);
       fs.closeSync(fd);
       offset = stat.size;
-      const lines = buf.toString("utf-8").split("\n").filter(Boolean);
+      const lines = buf.toString("utf-8").split("\n");
+      let lineOffset = offset - buf.length;
       for (const line of lines) {
+        const sourceRef = `${jsonl}:${lineOffset}`;
+        lineOffset += Buffer.byteLength(line, "utf-8") + 1;
+        if (!line) continue;
         let entry: CodexEntry;
         try {
           entry = JSON.parse(line) as CodexEntry;
@@ -487,7 +520,18 @@ export function startCodexTranscript(
         }
         const text = renderEntry(entry);
         if (!text) continue;
-        await enqueueSend(bot, chatId, topicId, text, opts.cwd);
+        await enqueueSend(
+          bot,
+          chatId,
+          topicId,
+          text,
+          opts.cwd,
+          sourceRef,
+          jsonl,
+          opts.sessionId,
+          opts.sessionCreatedAtMs,
+          transcriptSessionId
+        );
       }
     } catch (err) {
       console.error("[telegram/codex] flush failed", err);
@@ -502,6 +546,7 @@ export function startCodexTranscript(
   void flush();
   return {
     jsonl,
+    transcriptSessionId,
     stop: () => {
       void watcher.close();
       watchers.delete(topicId);
