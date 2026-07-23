@@ -25,6 +25,7 @@ function writeCodexJsonl(opts: {
   promptAt?: string;
   reply?: string;
   replyAt?: string;
+  transcriptSessionId?: string;
 }): string {
   const dir = sessionsDir();
   fs.mkdirSync(dir, { recursive: true });
@@ -34,7 +35,7 @@ function writeCodexJsonl(opts: {
       timestamp: opts.sessionStartedAt,
       type: "session_meta",
       payload: {
-        id: opts.name.replace(/\.jsonl$/, ""),
+        id: opts.transcriptSessionId ?? opts.name.replace(/\.jsonl$/, ""),
         timestamp: opts.sessionStartedAt,
         cwd: opts.cwd,
       },
@@ -190,6 +191,7 @@ describe("telegram Codex transcript routing", () => {
     const jsonl = writeCodexJsonl({
       name: "rollout-web.jsonl",
       cwd,
+      transcriptSessionId: "018f5e38-d42a-7abc-9234-123456789abc",
       sessionStartedAt: "2026-04-27T18:00:05.000Z",
       reply: "web response",
       replyAt: "2026-04-27T18:00:12.000Z",
@@ -214,6 +216,7 @@ describe("telegram Codex transcript routing", () => {
     });
 
     expect(started?.jsonl).toBe(jsonl);
+    expect(started?.transcriptSessionId).toBe("018f5e38-d42a-7abc-9234-123456789abc");
     await vi.waitFor(() =>
       expect(bot.api.sendMessage).toHaveBeenCalledWith(
         1,

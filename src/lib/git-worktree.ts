@@ -5,7 +5,9 @@ import { execFileSync } from "child_process";
 import { assertNotSensitivePath, getTerminusRoot, resolveSafePath } from "./file-service";
 
 const GIT_TIMEOUT_MS = 5000;
+const GIT_REFRESH_TIMEOUT_MS = 60000;
 const GIT_WORKTREE_TIMEOUT_MS = 20000;
+const WORKTREE_BASE_BRANCH = "main";
 
 export interface GitDirectoryInfo {
   isRepo: boolean;
@@ -100,6 +102,143 @@ function branchExists(repoRoot: string, branch: string): boolean {
   } catch {
     return false;
   }
+}
+
+function refExists(repoRoot: string, ref: string): boolean {
+  try {
+    git(["-C", repoRoot, "show-ref", "--verify", "--quiet", ref]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function worktreePathForBranch(repoRoot: string, branch: string): string | undefined {
+  const raw = git(["-C", repoRoot, "worktree", "list", "--porcelain"]);
+  let currentPath: string | undefined;
+  for (const line of raw.split("\n")) {
+    if (line.startsWith("worktree ")) {
+      currentPath = line.slice("worktree ".length);
+      continue;
+    }
+    if (line === `branch refs/heads/${branch}`) {
+      return currentPath;
+    }
+    if (line === "") {
+      currentPath = undefined;
+    }
+  }
+  return undefined;
+}
+
+function assertCleanGitWorktree(repoRoot: string, label: string): void {
+  const status = git(["-C", repoRoot, "status", "--porcelain"]);
+  if (status) {
+    throw new Error(
+      `${label} has uncommitted changes; commit or stash them before creating a worktree`
+    );
+  }
+}
+
+function hasUpstream(repoRoot: string): boolean {
+  try {
+    git(["-C", repoRoot, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isAncestor(repoRoot: string, ancestor: string, descendant: string): boolean {
+  try {
+    git(["-C", repoRoot, "merge-base", "--is-ancestor", ancestor, descendant]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function upstreamForMain(repoRoot: string): string | undefined {
+  if (branchExists(repoRoot, WORKTREE_BASE_BRANCH)) {
+    try {
+      return git([
+        "-C",
+        repoRoot,
+        "rev-parse",
+        "--abbrev-ref",
+        "--symbolic-full-name",
+        `${WORKTREE_BASE_BRANCH}@{upstream}`,
+      ]);
+    } catch {
+      // Fall through to the conventional origin/main tracking ref.
+    }
+  }
+
+  const originMain = `origin/${WORKTREE_BASE_BRANCH}`;
+  return refExists(repoRoot, `refs/remotes/${originMain}`) ? originMain : undefined;
+}
+
+/**
+ * Fast-forward the local main ref without checking it out. This preserves the
+ * user's selected branch (and any unrelated work in that checkout) while
+ * giving `git worktree add ... main` the same refreshed base a pull would.
+ */
+function refreshUnattachedMainRef(repoRoot: string): void {
+  const upstream = upstreamForMain(repoRoot);
+
+  if (!branchExists(repoRoot, WORKTREE_BASE_BRANCH)) {
+    if (!upstream) throw new Error(`Branch "${WORKTREE_BASE_BRANCH}" does not exist`);
+    git(["-C", repoRoot, "branch", WORKTREE_BASE_BRANCH, upstream], GIT_REFRESH_TIMEOUT_MS);
+    return;
+  }
+
+  // Local-only repositories have no pull target; their existing main ref is
+  // already the only available source of truth.
+  if (!upstream) return;
+
+  if (isAncestor(repoRoot, WORKTREE_BASE_BRANCH, upstream)) {
+    const previous = git(["-C", repoRoot, "rev-parse", WORKTREE_BASE_BRANCH]);
+    const next = git(["-C", repoRoot, "rev-parse", upstream]);
+    git(
+      ["-C", repoRoot, "update-ref", `refs/heads/${WORKTREE_BASE_BRANCH}`, next, previous],
+      GIT_REFRESH_TIMEOUT_MS
+    );
+    return;
+  }
+
+  // A local main ahead of its upstream is already at least as current as the
+  // remote. Divergence, however, cannot satisfy the required --ff-only pull.
+  if (isAncestor(repoRoot, upstream, WORKTREE_BASE_BRANCH)) return;
+  throw new Error(`${WORKTREE_BASE_BRANCH} and ${upstream} have diverged; cannot fast-forward`);
+}
+
+function pullLatestMain(repoRoot: string): void {
+  if (hasUpstream(repoRoot)) {
+    git(["-C", repoRoot, "pull", "--ff-only"], GIT_REFRESH_TIMEOUT_MS);
+    return;
+  }
+
+  if (refExists(repoRoot, `refs/remotes/origin/${WORKTREE_BASE_BRANCH}`)) {
+    git(
+      ["-C", repoRoot, "pull", "--ff-only", "origin", WORKTREE_BASE_BRANCH],
+      GIT_REFRESH_TIMEOUT_MS
+    );
+  }
+}
+
+function refreshMainBeforeWorktree(repoRoot: string): void {
+  git(["-C", repoRoot, "fetch", "--all", "--prune"], GIT_REFRESH_TIMEOUT_MS);
+
+  const mainWorktree = worktreePathForBranch(repoRoot, WORKTREE_BASE_BRANCH);
+  if (mainWorktree) {
+    const safeMainWorktree = resolveSafePath(mainWorktree);
+    assertNotSensitivePath(safeMainWorktree);
+    assertCleanGitWorktree(safeMainWorktree, "Main checkout");
+    pullLatestMain(safeMainWorktree);
+    return;
+  }
+
+  refreshUnattachedMainRef(repoRoot);
 }
 
 export function getGitDirectoryInfo(directory: string): GitDirectoryInfo {
@@ -284,6 +423,12 @@ export function createGitWorktreeForSession(
     throw new Error("Selected directory is outside the Git repository");
   }
 
+  try {
+    refreshMainBeforeWorktree(info.root);
+  } catch (err) {
+    throw new Error(`Failed to refresh main before creating Git worktree: ${gitErrorMessage(err)}`);
+  }
+
   const baseDir = worktreesBaseDir();
   const repoName = info.repoName || path.basename(info.root);
   const worktreeName = `${repoName}-${repoHash(info.root)}-${branchPathSlug(branch)}`;
@@ -303,7 +448,10 @@ export function createGitWorktreeForSession(
   }
 
   try {
-    git(["-C", info.root, "worktree", "add", "-b", branch, worktreePath], GIT_WORKTREE_TIMEOUT_MS);
+    git(
+      ["-C", info.root, "worktree", "add", "-b", branch, worktreePath, WORKTREE_BASE_BRANCH],
+      GIT_WORKTREE_TIMEOUT_MS
+    );
   } catch (err) {
     throw new Error(`Failed to create Git worktree: ${gitErrorMessage(err)}`);
   }

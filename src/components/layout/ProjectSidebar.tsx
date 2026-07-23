@@ -102,16 +102,21 @@ function StandaloneSessionRow({
 
 function StandaloneSessionsSection({
   sessions,
+  representedSessionNames,
   isLoading,
   activeSession,
   onOpen,
 }: {
   sessions: TmuxSession[];
+  representedSessionNames: ReadonlySet<string>;
   isLoading: boolean;
   activeSession: string | null;
   onOpen: (sessionName: string) => void;
 }) {
-  const standalone = sessions.filter((session) => !session.worktree);
+  // A worktree is grouped only when its repo has a registered project. Keep
+  // orphaned/legacy worktree sessions in this fallback list so every live
+  // session appears in the sidebar exactly once.
+  const standalone = sessions.filter((session) => !representedSessionNames.has(session.name));
 
   if (isLoading && standalone.length === 0) {
     return (
@@ -567,8 +572,25 @@ export function ProjectSidebar({ activeSession }: { activeSession: string | null
     setWorkspaceCollapsed,
     archiveWorkspace,
     restoreWorkspace,
+    refresh: refreshProjects,
   } = useProjects();
-  const { sessions, isLoading: sessionsLoading } = useSessions();
+  const {
+    sessions,
+    isLoading: sessionsLoading,
+    hasLoadedSuccessfully,
+    membershipVersion,
+  } = useSessions();
+  const representedSessionNames = new Set(
+    projects.flatMap((project) => project.workspaces.map((workspace) => workspace.sessionName))
+  );
+
+  // Project workspaces are derived from session/worktree metadata. Refresh the
+  // derived project view only when that membership changes; ordinary session
+  // revalidations do not fan out into another projects request.
+  useEffect(() => {
+    if (!hasLoadedSuccessfully) return;
+    void refreshProjects();
+  }, [hasLoadedSuccessfully, membershipVersion, refreshProjects]);
 
   // The review-panel Archive button (ReviewStatusBar) dispatches this event for
   // the CURRENT workspace; the sidebar owns the archive flow (#9), so it listens
@@ -630,6 +652,7 @@ export function ProjectSidebar({ activeSession }: { activeSession: string | null
 
       <StandaloneSessionsSection
         sessions={sessions}
+        representedSessionNames={representedSessionNames}
         isLoading={sessionsLoading}
         activeSession={activeSession}
         onOpen={openWorkspace}

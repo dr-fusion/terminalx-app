@@ -16,6 +16,7 @@ import { ProjectSidebar } from "./ProjectSidebar";
 import { ReviewPanel } from "@/components/review/ReviewPanel";
 import { CommandPalette } from "./CommandPalette";
 import { useOpenTabs } from "@/hooks/useOpenTabs";
+import { useSessions } from "@/hooks/useSessions";
 
 const SIDEBAR_LINKS = [
   { href: "/playground", label: "Playground", icon: Terminal },
@@ -134,7 +135,17 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const [hostname, setHostname] = useState("…");
   const params = useParams();
   const path = usePathname();
-  const { tabs } = useOpenTabs();
+  const { tabs, reconcileTabs } = useOpenTabs();
+  const { sessionNames, hasLoadedSuccessfully } = useSessions();
+
+  // The sessions API is authoritative. Persisted tabs are view state only and
+  // must never resurrect a session that no longer exists. Do not prune on a
+  // failed/unfinished request: a successful empty response is meaningfully
+  // different from not knowing the server state yet.
+  useEffect(() => {
+    if (!hasLoadedSuccessfully) return;
+    reconcileTabs(sessionNames);
+  }, [hasLoadedSuccessfully, reconcileTabs, sessionNames]);
 
   useEffect(() => {
     let cancelled = false;

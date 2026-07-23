@@ -7,6 +7,7 @@ import { watch, FSWatcher } from "chokidar";
 import { markdownToTelegramV2, splitForTelegram } from "./render";
 import { getTopic, listTopics, patchTopic, type TelegramSentMessageHash } from "./state";
 import { sendReferencedAttachments } from "./attachments";
+import { withTelegramMessageAuditSource } from "./message-audit";
 
 interface SessionMetaEntry {
   timestamp?: string;
@@ -42,6 +43,7 @@ interface JsonlCandidate {
   mtimeMs: number;
   sessionStartedMs?: number;
   cwd?: string;
+  transcriptSessionId?: string;
 }
 
 interface JsonlMatch {
@@ -105,62 +107,81 @@ async function enqueueSend(
   chatId: number,
   topicId: number,
   raw: string,
-  baseDir?: string
+  baseDir?: string,
+  sourceRef?: string,
+  transcriptPath?: string,
+  sessionId?: string,
+  sessionCreatedAtMs?: number,
+  transcriptSessionId?: string
 ): Promise<boolean> {
-  const prev = sendQueues.get(topicId) ?? Promise.resolve(true);
-  const next = prev
-    .catch(() => false)
-    .then(async () => {
-      const send = async (text: string, parseMode: "MarkdownV2" | undefined) => {
-        const cool = cooldownUntil.get(topicId) ?? 0;
-        const nextAllowed = Math.max(cool, (lastSendAt.get(topicId) ?? 0) + MIN_GAP_MS);
-        const waitMs = Math.max(0, nextAllowed - Date.now());
-        if (waitMs > 0) await sleep(waitMs);
-        await bot.api.sendMessage(chatId, text, {
-          message_thread_id: topicId,
-          parse_mode: parseMode,
+  return withTelegramMessageAuditSource(
+    {
+      source: "codex-transcript",
+      sourceRef,
+      sessionId,
+      sessionCreatedAtMs,
+      expectedChatId: chatId,
+      expectedTopicId: topicId,
+      transcriptSessionId,
+      transcriptPath,
+    },
+    async () => {
+      const prev = sendQueues.get(topicId) ?? Promise.resolve(true);
+      const next = prev
+        .catch(() => false)
+        .then(async () => {
+          const send = async (text: string, parseMode: "MarkdownV2" | undefined) => {
+            const cool = cooldownUntil.get(topicId) ?? 0;
+            const nextAllowed = Math.max(cool, (lastSendAt.get(topicId) ?? 0) + MIN_GAP_MS);
+            const waitMs = Math.max(0, nextAllowed - Date.now());
+            if (waitMs > 0) await sleep(waitMs);
+            await bot.api.sendMessage(chatId, text, {
+              message_thread_id: topicId,
+              parse_mode: parseMode,
+            });
+            lastSendAt.set(topicId, Date.now());
+          };
+          // Formatted first; if Telegram rejects the entities (a converter gap),
+          // fall back to the raw text — losing styling is fine, losing the
+          // message is not.
+          try {
+            for (const chunk of splitForTelegram(markdownToTelegramV2(raw), 3900)) {
+              await send(chunk, "MarkdownV2");
+            }
+            await sendReferencedAttachments(bot, chatId, topicId, raw, { baseDir });
+            return true;
+          } catch (err) {
+            const e = err as { error_code?: number; parameters?: { retry_after?: number } };
+            if (e.error_code === 429) {
+              const retry = e.parameters?.retry_after ?? 30;
+              cooldownUntil.set(topicId, Date.now() + (retry + 1) * 1000);
+              return false;
+            }
+            const msg = err instanceof Error ? err.message : String(err);
+            console.error("[telegram/codex] formatted send failed, retrying plain:", msg);
+          }
+          try {
+            for (const chunk of chunkText(raw, 3900)) {
+              await send(chunk, undefined);
+            }
+            await sendReferencedAttachments(bot, chatId, topicId, raw, { baseDir });
+            return true;
+          } catch (err) {
+            const e = err as { error_code?: number; parameters?: { retry_after?: number } };
+            if (e.error_code === 429) {
+              const retry = e.parameters?.retry_after ?? 30;
+              cooldownUntil.set(topicId, Date.now() + (retry + 1) * 1000);
+              return false;
+            }
+            const msg = err instanceof Error ? err.message : String(err);
+            console.error("[telegram/codex] send failed:", msg);
+            return false;
+          }
         });
-        lastSendAt.set(topicId, Date.now());
-      };
-      // Formatted first; if Telegram rejects the entities (a converter gap),
-      // fall back to the raw text — losing styling is fine, losing the
-      // message is not.
-      try {
-        for (const chunk of splitForTelegram(markdownToTelegramV2(raw), 3900)) {
-          await send(chunk, "MarkdownV2");
-        }
-        await sendReferencedAttachments(bot, chatId, topicId, raw, { baseDir });
-        return true;
-      } catch (err) {
-        const e = err as { error_code?: number; parameters?: { retry_after?: number } };
-        if (e.error_code === 429) {
-          const retry = e.parameters?.retry_after ?? 30;
-          cooldownUntil.set(topicId, Date.now() + (retry + 1) * 1000);
-          return false;
-        }
-        const msg = err instanceof Error ? err.message : String(err);
-        console.error("[telegram/codex] formatted send failed, retrying plain:", msg);
-      }
-      try {
-        for (const chunk of chunkText(raw, 3900)) {
-          await send(chunk, undefined);
-        }
-        await sendReferencedAttachments(bot, chatId, topicId, raw, { baseDir });
-        return true;
-      } catch (err) {
-        const e = err as { error_code?: number; parameters?: { retry_after?: number } };
-        if (e.error_code === 429) {
-          const retry = e.parameters?.retry_after ?? 30;
-          cooldownUntil.set(topicId, Date.now() + (retry + 1) * 1000);
-          return false;
-        }
-        const msg = err instanceof Error ? err.message : String(err);
-        console.error("[telegram/codex] send failed:", msg);
-        return false;
-      }
-    });
-  sendQueues.set(topicId, next);
-  return next;
+      sendQueues.set(topicId, next);
+      return next;
+    }
+  );
 }
 
 function chunkText(text: string, maxLen: number): string[] {
@@ -210,7 +231,9 @@ function timestampMs(entry: { timestamp?: string }): number | undefined {
   return Number.isFinite(ms) ? ms : undefined;
 }
 
-function readMeta(jsonl: string): Pick<JsonlCandidate, "cwd" | "sessionStartedMs"> {
+function readMeta(
+  jsonl: string
+): Pick<JsonlCandidate, "cwd" | "sessionStartedMs" | "transcriptSessionId"> {
   try {
     const fd = fs.openSync(jsonl, "r");
     const buf = Buffer.alloc(Math.min(fs.statSync(jsonl).size, 64 * 1024));
@@ -231,6 +254,7 @@ function readMeta(jsonl: string): Pick<JsonlCandidate, "cwd" | "sessionStartedMs
       return {
         cwd: meta?.cwd,
         sessionStartedMs: Number.isFinite(started) ? started : undefined,
+        transcriptSessionId: meta?.id,
       };
     }
   } catch {
@@ -457,6 +481,10 @@ function renderEntry(entry: CodexEntry): string | null {
 }
 
 export interface StartCodexTranscriptOpts {
+  /** TerminalX/tmux session that owns this transcript. */
+  sessionId?: string;
+  /** Creation time distinguishes reused tmux session names. */
+  sessionCreatedAtMs?: number;
   cwd?: string;
   sinceMs?: number;
   promptText?: string;
@@ -470,7 +498,7 @@ export function startCodexTranscript(
   chatId: number,
   topicId: number,
   opts: StartCodexTranscriptOpts = {}
-): { stop: () => void; jsonl: string } | null {
+): { stop: () => void; jsonl: string; transcriptSessionId?: string } | null {
   if (watchers.has(topicId)) return null;
 
   let match: JsonlMatch | null = null;
@@ -498,6 +526,7 @@ export function startCodexTranscript(
   if (!match) return null;
 
   const jsonl = match.path;
+  const transcriptSessionId = readMeta(jsonl).transcriptSessionId;
   let offset: number;
   if (typeof opts.initialOffset === "number" && opts.initialOffset >= 0) {
     offset = opts.initialOffset;
@@ -588,6 +617,7 @@ export function startCodexTranscript(
       let lineOffset = startOffset;
       const rawLines = buf.toString("utf-8").split("\n");
       for (const line of rawLines) {
+        const sourceRef = `${jsonl}:${lineOffset}`;
         const nextOffset = lineOffset + Buffer.byteLength(line + "\n");
         lineOffset = nextOffset;
         if (!line) continue;
@@ -608,7 +638,18 @@ export function startCodexTranscript(
           continue;
         }
         markHashInFlight(topicId, hash);
-        const sent = await enqueueSend(bot, chatId, topicId, text, opts.cwd);
+        const sent = await enqueueSend(
+          bot,
+          chatId,
+          topicId,
+          text,
+          opts.cwd,
+          sourceRef,
+          jsonl,
+          opts.sessionId,
+          opts.sessionCreatedAtMs,
+          transcriptSessionId
+        );
         if (!sent) {
           unmarkHashInFlight(topicId, hash);
           persistFailure(nextOffset);
@@ -629,6 +670,7 @@ export function startCodexTranscript(
   void flush();
   return {
     jsonl,
+    transcriptSessionId,
     stop: () => {
       void watcher.close();
       watchers.delete(topicId);
@@ -642,6 +684,7 @@ export function stopCodexTranscript(topicId: number): void {
   if (!w) return;
   void w.watcher.close();
   watchers.delete(topicId);
+  inFlightHashes.delete(topicId);
 }
 
 export function isCodexTranscriptRunning(topicId: number): boolean {

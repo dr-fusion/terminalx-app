@@ -1,10 +1,11 @@
 "use client";
 
-import { useCallback, useEffect } from "react";
+import { useCallback, useEffect, useMemo } from "react";
 import { useRouter } from "next/navigation";
 import { Plus, X } from "lucide-react";
 import dynamic from "next/dynamic";
 import { useOpenTabs } from "@/hooks/useOpenTabs";
+import { useSessions } from "@/hooks/useSessions";
 
 const TerminalView = dynamic(
   () => import("@/components/terminal/TerminalView").then((m) => m.TerminalView),
@@ -15,28 +16,49 @@ interface WorkspaceViewProps {
   activeSession: string | null;
 }
 
+function firstLiveTab(
+  candidates: string[],
+  liveSessionIds: ReadonlySet<string>,
+  excluded?: string
+): string | undefined {
+  return candidates.find((tab) => tab !== excluded && liveSessionIds.has(tab));
+}
+
 export function WorkspaceView({ activeSession }: WorkspaceViewProps) {
   const router = useRouter();
-  const { tabs, openTab, closeTab } = useOpenTabs();
+  const { tabs, openTab, closeTab, reconcileTabs } = useOpenTabs();
+  const { sessionNames, hasLoadedSuccessfully } = useSessions();
+  const liveSessionIds = useMemo(() => new Set(sessionNames), [sessionNames]);
 
   useEffect(() => {
-    if (activeSession) openTab(activeSession);
-  }, [activeSession, openTab]);
+    if (!activeSession) return;
+    if (liveSessionIds.has(activeSession)) {
+      openTab(activeSession);
+      return;
+    }
+    if (!hasLoadedSuccessfully) return;
+
+    // A stale deep link or browser-history entry must not recreate a ghost
+    // tab. Replace it so Back does not immediately revive the dead URL.
+    const remaining = reconcileTabs(liveSessionIds);
+    const fallback = firstLiveTab(remaining, liveSessionIds);
+    router.replace(fallback ? `/workspace/${encodeURIComponent(fallback)}` : "/dashboard");
+  }, [activeSession, hasLoadedSuccessfully, liveSessionIds, openTab, reconcileTabs, router]);
 
   const handleSessionEnded = useCallback(
     (sessionId: string) => {
       window.dispatchEvent(new CustomEvent("terminalx:session-ended", { detail: { sessionId } }));
-      closeTab(sessionId);
+      const remainingTabs = closeTab(sessionId);
       if (sessionId === activeSession) {
-        const remaining = tabs.filter((t) => t !== sessionId);
-        if (remaining.length > 0) {
-          router.push(`/workspace/${encodeURIComponent(remaining[0]!)}`);
+        const fallback = firstLiveTab(remainingTabs, liveSessionIds, sessionId);
+        if (fallback) {
+          router.push(`/workspace/${encodeURIComponent(fallback)}`);
         } else {
           router.push("/dashboard");
         }
       }
     },
-    [activeSession, tabs, closeTab, router]
+    [activeSession, closeTab, liveSessionIds, router]
   );
 
   const selectTab = useCallback(
@@ -46,18 +68,28 @@ export function WorkspaceView({ activeSession }: WorkspaceViewProps) {
 
   const handleCloseTab = useCallback(
     (t: string) => {
-      closeTab(t);
+      const remainingTabs = closeTab(t);
       if (t === activeSession) {
-        const remaining = tabs.filter((x) => x !== t);
-        if (remaining.length > 0) {
-          router.push(`/workspace/${encodeURIComponent(remaining[0]!)}`);
+        const fallback = firstLiveTab(remainingTabs, liveSessionIds);
+        if (fallback) {
+          router.push(`/workspace/${encodeURIComponent(fallback)}`);
         } else {
           router.push("/dashboard");
         }
       }
     },
-    [activeSession, tabs, closeTab, router]
+    [activeSession, closeTab, liveSessionIds, router]
   );
+
+  const activeSessionExists = activeSession ? liveSessionIds.has(activeSession) : false;
+
+  if (activeSession && hasLoadedSuccessfully && !activeSessionExists) {
+    return (
+      <div className="flex h-full items-center justify-center text-[13px] text-[#6b7569]">
+        session no longer exists; returning to a live workspace…
+      </div>
+    );
+  }
 
   if (!activeSession) {
     return (
@@ -86,6 +118,8 @@ export function WorkspaceView({ activeSession }: WorkspaceViewProps) {
             return (
               <button
                 key={t}
+                data-testid="workspace-tab"
+                data-session={t}
                 onClick={() => selectTab(t)}
                 className={`group relative flex items-center gap-1.5 px-3 h-8 text-[11px]
                   border-r border-[#1a1d24] transition-colors whitespace-nowrap ${

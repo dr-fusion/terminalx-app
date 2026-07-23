@@ -29,9 +29,13 @@ export interface TelegramSentMessageHash {
 export interface TopicBinding {
   topicId: number;
   sessionName: string;
+  /** tmux creation time; together with sessionName this identifies one incarnation. */
+  sessionCreatedAtMs?: number;
   kind: SessionKind;
   cwd: string;
   jsonlPath?: string;
+  /** Native Claude/Codex transcript session id (not the tmux session name). */
+  transcriptSessionId?: string;
   jsonlOffset?: number;
   telegramDelivery?: TelegramDeliveryState;
   /** Bounded dedupe cache for transcript messages already accepted by Telegram. */
@@ -47,6 +51,45 @@ export interface TopicBinding {
   viewMode?: ViewMode;
   /** Unix ms when the backing tmux session ended; topic is kept for cleanup. */
   endedAtMs?: number;
+}
+
+/**
+ * Build the persisted reset required when tmux reuses a session name for a
+ * different process incarnation. Transcript and pinned-message state belongs
+ * to the old process and must never be carried across that boundary.
+ */
+export function topicSessionIncarnationPatch(
+  binding: TopicBinding,
+  currentSessionCreatedAtMs: number | null | undefined
+): { changed: boolean; patch: Partial<TopicBinding> } {
+  if (currentSessionCreatedAtMs === null || currentSessionCreatedAtMs === undefined) {
+    return { changed: false, patch: {} };
+  }
+  if (
+    binding.sessionCreatedAtMs === undefined ||
+    binding.sessionCreatedAtMs === currentSessionCreatedAtMs
+  ) {
+    return {
+      changed: false,
+      patch: { sessionCreatedAtMs: currentSessionCreatedAtMs },
+    };
+  }
+  return {
+    changed: true,
+    patch: {
+      sessionCreatedAtMs: currentSessionCreatedAtMs,
+      jsonlPath: undefined,
+      transcriptSessionId: undefined,
+      jsonlOffset: undefined,
+      telegramDelivery: undefined,
+      telegramSentMessageHashes: undefined,
+      pendingPrompt: undefined,
+      lastPromptAtMs: undefined,
+      pinnedMsgId: undefined,
+      tuiHintedAtMs: undefined,
+      endedAtMs: undefined,
+    },
+  };
 }
 
 interface StateFile {

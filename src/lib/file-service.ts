@@ -41,6 +41,17 @@ export function isSensitivePath(filePath: string): boolean {
 
   const root = getTerminusRoot();
   const resolved = path.resolve(filePath);
+  const telegramAuditDb = path.resolve(
+    process.env.TERMINALX_TELEGRAM_MESSAGE_DB_PATH ??
+      path.join(process.cwd(), "data", "telegram-messages.sqlite")
+  );
+  if (
+    resolved === telegramAuditDb ||
+    resolved === `${telegramAuditDb}-wal` ||
+    resolved === `${telegramAuditDb}-shm`
+  ) {
+    return true;
+  }
   const rel = path.relative(root, resolved);
   if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) return false;
 

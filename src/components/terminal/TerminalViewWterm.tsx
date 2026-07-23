@@ -45,7 +45,7 @@ export function TerminalViewWterm({
   const reconnectAttemptRef = useRef(0);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const intentionalCloseRef = useRef(false);
-  const dimsRef = useRef<{ cols: number; rows: number }>({ cols: 80, rows: 24 });
+  const dimsRef = useRef<{ cols: number; rows: number } | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [uploadStatus, setUploadStatus] = useState<string | null>(null);
   const [hasSelection, setHasSelection] = useState(false);
@@ -55,26 +55,52 @@ export function TerminalViewWterm({
   const connectRef = useRef<(() => void) | null>(null);
   const selectedTextRef = useRef("");
 
+  // Keep callback identity changes from rebuilding the WebSocket. Parent state
+  // changes (for example, adding or closing tabs) should not reattach tmux.
+  const onDisconnectRef = useRef(onDisconnect);
+  const onReconnectRef = useRef(onReconnect);
+  const onSessionEndedRef = useRef(onSessionEnded);
+  useEffect(() => {
+    onDisconnectRef.current = onDisconnect;
+    onReconnectRef.current = onReconnect;
+    onSessionEndedRef.current = onSessionEnded;
+  }, [onDisconnect, onReconnect, onSessionEnded]);
+
   const connect = useCallback(() => {
+    const dimensions = dimsRef.current;
+    if (intentionalCloseRef.current || !dimensions || wsRef.current) return;
+
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const wsUrl = `${protocol}//${window.location.host}/ws/terminal/${encodeURIComponent(sessionId)}`;
+    const query = new URLSearchParams({
+      cols: String(dimensions.cols),
+      rows: String(dimensions.rows),
+    });
+    const wsUrl = `${protocol}//${window.location.host}/ws/terminal/${encodeURIComponent(sessionId)}?${query}`;
     const ws = new WebSocket(wsUrl);
     ws.binaryType = "arraybuffer";
     wsRef.current = ws;
 
     ws.onopen = () => {
+      if (wsRef.current !== ws) {
+        ws.close();
+        return;
+      }
+
       reconnectAttemptRef.current = 0;
-      onReconnect?.();
+      onReconnectRef.current?.();
+      const currentDimensions = dimsRef.current;
+      if (!currentDimensions) return;
       ws.send(
         JSON.stringify({
           type: "resize",
-          cols: dimsRef.current.cols,
-          rows: dimsRef.current.rows,
+          cols: currentDimensions.cols,
+          rows: currentDimensions.rows,
         })
       );
     };
 
     ws.onmessage = (event) => {
+      if (wsRef.current !== ws) return;
       const term = termRef.current;
       if (!term) return;
       if (event.data instanceof ArrayBuffer) {
@@ -104,7 +130,7 @@ export function TerminalViewWterm({
               // Shell exited / tmux session killed from inside the terminal.
               // Suppress reconnect so we don't spawn a new session.
               intentionalCloseRef.current = true;
-              onSessionEnded?.(sessionId);
+              onSessionEndedRef.current?.(sessionId);
               return;
             }
           } catch {
@@ -116,17 +142,25 @@ export function TerminalViewWterm({
     };
 
     ws.onclose = () => {
-      onDisconnect?.();
+      if (wsRef.current !== ws) return;
+      wsRef.current = null;
+      onDisconnectRef.current?.();
+
       if (!intentionalCloseRef.current) {
         const attempt = reconnectAttemptRef.current;
         const delay = Math.min(1000 * Math.pow(2, attempt), 30000);
         reconnectAttemptRef.current = attempt + 1;
-        reconnectTimerRef.current = setTimeout(() => connectRef.current?.(), delay);
+        reconnectTimerRef.current = setTimeout(() => {
+          reconnectTimerRef.current = null;
+          connectRef.current?.();
+        }, delay);
       }
     };
 
-    ws.onerror = () => ws.close();
-  }, [sessionId, onDisconnect, onReconnect, onSessionEnded]);
+    ws.onerror = () => {
+      if (wsRef.current === ws) ws.close();
+    };
+  }, [sessionId]);
 
   useEffect(() => {
     connectRef.current = connect;
@@ -134,12 +168,18 @@ export function TerminalViewWterm({
 
   useEffect(() => {
     intentionalCloseRef.current = false;
-    connect();
+    reconnectAttemptRef.current = 0;
+    if (dimsRef.current) connect();
+
     return () => {
       intentionalCloseRef.current = true;
-      if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
-      wsRef.current?.close();
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
+      const ws = wsRef.current;
       wsRef.current = null;
+      ws?.close();
     };
   }, [connect]);
 
@@ -160,8 +200,13 @@ export function TerminalViewWterm({
 
   const handleResize = useCallback((cols: number, rows: number) => {
     dimsRef.current = { cols, rows };
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ type: "resize", cols, rows }));
+    const ws = wsRef.current;
+    if (ws?.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "resize", cols, rows }));
+    } else if (!ws && reconnectAttemptRef.current === 0 && !intentionalCloseRef.current) {
+      // autoResize has now measured the rendered terminal. This is the first
+      // safe point to attach tmux without briefly forcing it to 80x24.
+      connectRef.current?.();
     }
   }, []);
 
@@ -323,6 +368,8 @@ export function TerminalViewWterm({
     >
       <Terminal
         ref={termRef}
+        cols={1}
+        rows={1}
         autoResize
         wasmUrl="/wterm.wasm"
         onData={handleData}

@@ -7,6 +7,7 @@ import { watch, FSWatcher } from "chokidar";
 import { markdownToTelegramV2, splitForTelegram } from "./render";
 import { getTopic, listTopics, patchTopic, type TelegramSentMessageHash } from "./state";
 import { sendReferencedAttachments } from "./attachments";
+import { withTelegramMessageAuditSource } from "./message-audit";
 
 interface AssistantEntry {
   type: "assistant";
@@ -62,62 +63,81 @@ async function enqueueSend(
   chatId: number,
   topicId: number,
   raw: string,
-  baseDir?: string
+  baseDir?: string,
+  sourceRef?: string,
+  transcriptPath?: string,
+  sessionId?: string,
+  sessionCreatedAtMs?: number,
+  transcriptSessionId?: string
 ): Promise<boolean> {
-  const prev = sendQueues.get(topicId) ?? Promise.resolve(true);
-  const next = prev
-    .catch(() => false)
-    .then(async () => {
-      const send = async (text: string, parseMode: "MarkdownV2" | undefined) => {
-        const cool = cooldownUntil.get(topicId) ?? 0;
-        const nextAllowed = Math.max(cool, (lastSendAt.get(topicId) ?? 0) + MIN_GAP_MS);
-        const waitMs = Math.max(0, nextAllowed - Date.now());
-        if (waitMs > 0) await sleep(waitMs);
-        await bot.api.sendMessage(chatId, text, {
-          message_thread_id: topicId,
-          parse_mode: parseMode,
+  return withTelegramMessageAuditSource(
+    {
+      source: "claude-transcript",
+      sourceRef,
+      sessionId,
+      sessionCreatedAtMs,
+      expectedChatId: chatId,
+      expectedTopicId: topicId,
+      transcriptSessionId,
+      transcriptPath,
+    },
+    async () => {
+      const prev = sendQueues.get(topicId) ?? Promise.resolve(true);
+      const next = prev
+        .catch(() => false)
+        .then(async () => {
+          const send = async (text: string, parseMode: "MarkdownV2" | undefined) => {
+            const cool = cooldownUntil.get(topicId) ?? 0;
+            const nextAllowed = Math.max(cool, (lastSendAt.get(topicId) ?? 0) + MIN_GAP_MS);
+            const waitMs = Math.max(0, nextAllowed - Date.now());
+            if (waitMs > 0) await sleep(waitMs);
+            await bot.api.sendMessage(chatId, text, {
+              message_thread_id: topicId,
+              parse_mode: parseMode,
+            });
+            lastSendAt.set(topicId, Date.now());
+          };
+          // Formatted first; if Telegram rejects the entities (a converter gap),
+          // fall back to the raw text — losing styling is fine, losing the
+          // message is not.
+          try {
+            for (const chunk of splitForTelegram(markdownToTelegramV2(raw), 4000)) {
+              await send(chunk, "MarkdownV2");
+            }
+            await sendReferencedAttachments(bot, chatId, topicId, raw, { baseDir });
+            return true;
+          } catch (err) {
+            const e = err as { error_code?: number; parameters?: { retry_after?: number } };
+            if (e.error_code === 429) {
+              const retry = e.parameters?.retry_after ?? 30;
+              cooldownUntil.set(topicId, Date.now() + (retry + 1) * 1000);
+              return false;
+            }
+            const msg = err instanceof Error ? err.message : String(err);
+            console.error("[telegram/claude] formatted send failed, retrying plain:", msg);
+          }
+          try {
+            for (const chunk of splitForTelegram(raw, 4000)) {
+              await send(chunk, undefined);
+            }
+            await sendReferencedAttachments(bot, chatId, topicId, raw, { baseDir });
+            return true;
+          } catch (err) {
+            const e = err as { error_code?: number; parameters?: { retry_after?: number } };
+            if (e.error_code === 429) {
+              const retry = e.parameters?.retry_after ?? 30;
+              cooldownUntil.set(topicId, Date.now() + (retry + 1) * 1000);
+              return false;
+            }
+            const msg = err instanceof Error ? err.message : String(err);
+            console.error("[telegram/claude] send failed:", msg);
+            return false;
+          }
         });
-        lastSendAt.set(topicId, Date.now());
-      };
-      // Formatted first; if Telegram rejects the entities (a converter gap),
-      // fall back to the raw text — losing styling is fine, losing the
-      // message is not.
-      try {
-        for (const chunk of splitForTelegram(markdownToTelegramV2(raw), 4000)) {
-          await send(chunk, "MarkdownV2");
-        }
-        await sendReferencedAttachments(bot, chatId, topicId, raw, { baseDir });
-        return true;
-      } catch (err) {
-        const e = err as { error_code?: number; parameters?: { retry_after?: number } };
-        if (e.error_code === 429) {
-          const retry = e.parameters?.retry_after ?? 30;
-          cooldownUntil.set(topicId, Date.now() + (retry + 1) * 1000);
-          return false;
-        }
-        const msg = err instanceof Error ? err.message : String(err);
-        console.error("[telegram/claude] formatted send failed, retrying plain:", msg);
-      }
-      try {
-        for (const chunk of splitForTelegram(raw, 4000)) {
-          await send(chunk, undefined);
-        }
-        await sendReferencedAttachments(bot, chatId, topicId, raw, { baseDir });
-        return true;
-      } catch (err) {
-        const e = err as { error_code?: number; parameters?: { retry_after?: number } };
-        if (e.error_code === 429) {
-          const retry = e.parameters?.retry_after ?? 30;
-          cooldownUntil.set(topicId, Date.now() + (retry + 1) * 1000);
-          return false;
-        }
-        const msg = err instanceof Error ? err.message : String(err);
-        console.error("[telegram/claude] send failed:", msg);
-        return false;
-      }
-    });
-  sendQueues.set(topicId, next);
-  return next;
+      sendQueues.set(topicId, next);
+      return next;
+    }
+  );
 }
 
 function sleep(ms: number): Promise<void> {
@@ -419,6 +439,10 @@ function renderEntry(entry: TranscriptEntry): string | null {
 }
 
 export interface StartTranscriptOpts {
+  /** TerminalX/tmux session that owns this transcript. */
+  sessionId?: string;
+  /** Creation time distinguishes reused tmux session names. */
+  sessionCreatedAtMs?: number;
   /** tmux pane cwd — used to narrow JSONL search to one project dir. */
   cwd?: string;
   /** Unix ms for either tmux session creation or the Telegram prompt send. */
@@ -446,7 +470,7 @@ export function startClaudeTranscript(
   chatId: number,
   topicId: number,
   opts: StartTranscriptOpts = {}
-): { stop: () => void; jsonl: string } | null {
+): { stop: () => void; jsonl: string; transcriptSessionId: string } | null {
   // If this topic already has a watcher, don't double-start — caller
   // should have stopped it first if they meant to swap.
   if (watchers.has(topicId)) return null;
@@ -478,6 +502,7 @@ export function startClaudeTranscript(
   if (!match) return null;
 
   const jsonl = match.path;
+  const transcriptSessionId = path.basename(jsonl, path.extname(jsonl));
 
   let offset: number;
   if (typeof opts.initialOffset === "number" && opts.initialOffset >= 0) {
@@ -572,6 +597,7 @@ export function startClaudeTranscript(
       let lineOffset = startOffset;
       const rawLines = buf.toString("utf-8").split("\n");
       for (const line of rawLines) {
+        const sourceRef = `${jsonl}:${lineOffset}`;
         const nextOffset = lineOffset + Buffer.byteLength(line + "\n");
         lineOffset = nextOffset;
         if (!line) continue;
@@ -592,7 +618,18 @@ export function startClaudeTranscript(
           continue;
         }
         markHashInFlight(topicId, hash);
-        const sent = await enqueueSend(bot, chatId, topicId, raw, opts.cwd);
+        const sent = await enqueueSend(
+          bot,
+          chatId,
+          topicId,
+          raw,
+          opts.cwd,
+          sourceRef,
+          jsonl,
+          opts.sessionId,
+          opts.sessionCreatedAtMs,
+          transcriptSessionId
+        );
         if (!sent) {
           unmarkHashInFlight(topicId, hash);
           persistFailure(nextOffset);
@@ -614,6 +651,7 @@ export function startClaudeTranscript(
   void flush();
   return {
     jsonl,
+    transcriptSessionId,
     stop: () => {
       void watcher.close();
       watchers.delete(topicId);
@@ -710,6 +748,7 @@ export function stopClaudeTranscript(topicId: number): void {
   if (!w) return;
   void w.watcher.close();
   watchers.delete(topicId);
+  inFlightHashes.delete(topicId);
 }
 
 /** Idempotent — start the watcher only if one isn't already running. */

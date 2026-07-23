@@ -201,8 +201,15 @@ function SessionRow({
 export function DashboardView() {
   const router = useRouter();
   const searchParams = useSearchParams();
-  const { sessions, isLoading, createSession, killSession, setTelegramViewMode, refresh } =
-    useSessions();
+  const {
+    sessions,
+    isLoading,
+    error: sessionError,
+    createSession,
+    killSession,
+    setTelegramViewMode,
+    refresh,
+  } = useSessions();
   const [showDialog, setShowDialog] = useState(false);
   const [name, setName] = useState("");
   const [kind, setKind] = useState<SessionKind>("bash");
@@ -850,7 +857,15 @@ export function DashboardView() {
               </label>
             )}
 
-            {createError && <p className="text-[11px] text-[#ff5c5c] mt-2">{createError}</p>}
+            {(createError || sessionError) && (
+              <p
+                className="text-[11px] text-[#ff5c5c] mt-2"
+                role="alert"
+                data-testid="session-create-error"
+              >
+                {createError || sessionError}
+              </p>
+            )}
 
             <button
               onClick={handleCreate}

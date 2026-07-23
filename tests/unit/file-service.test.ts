@@ -10,6 +10,11 @@ const TEST_ROOT = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "termina
 
 beforeAll(() => {
   process.env.TERMINUS_ROOT = TEST_ROOT;
+  process.env.TERMINALX_TELEGRAM_MESSAGE_DB_PATH = path.join(
+    TEST_ROOT,
+    "data",
+    "telegram-audit.sqlite"
+  );
 
   // Create test fixtures
   fs.mkdirSync(path.join(TEST_ROOT, "subdir"), { recursive: true });
@@ -18,6 +23,7 @@ beforeAll(() => {
   fs.writeFileSync(path.join(TEST_ROOT, "subdir", "nested.txt"), "nested content");
   fs.mkdirSync(path.join(TEST_ROOT, "data"), { recursive: true });
   fs.writeFileSync(path.join(TEST_ROOT, "data", "users.json"), "[]");
+  fs.writeFileSync(path.join(TEST_ROOT, "data", "telegram-audit.sqlite"), "private messages");
   fs.writeFileSync(
     path.join(TEST_ROOT, "large.txt"),
     "x".repeat(2 * 1024 * 1024) // 2MB file
@@ -28,6 +34,7 @@ afterAll(() => {
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
   delete process.env.TERMINUS_ROOT;
   delete process.env.TERMINALX_ALLOW_SENSITIVE_FILE_ACCESS;
+  delete process.env.TERMINALX_TELEGRAM_MESSAGE_DB_PATH;
 });
 
 describe("resolveSafePath", () => {
@@ -120,6 +127,7 @@ describe("readFile", () => {
   it("rejects sensitive files", () => {
     expect(() => readFile(".env")).toThrow("sensitive path");
     expect(() => readFile("data/users.json")).toThrow("sensitive path");
+    expect(() => readFile("data/telegram-audit.sqlite")).toThrow("sensitive path");
   });
 
   it("throws for directory", () => {

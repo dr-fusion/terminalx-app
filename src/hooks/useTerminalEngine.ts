@@ -13,10 +13,12 @@ function read(): TerminalEngine {
 }
 
 export function useTerminalEngine() {
-  const [engine, setEngineState] = useState<TerminalEngine>(DEFAULT);
+  // TerminalView is client-only, so read the persisted engine on its first
+  // render. Starting with xterm and switching in an effect briefly attaches
+  // the wrong renderer (and therefore an extra tmux client) for wterm users.
+  const [engine, setEngineState] = useState<TerminalEngine>(read);
 
   useEffect(() => {
-    setEngineState(read());
     const onStorage = (e: StorageEvent) => {
       if (e.key === KEY) setEngineState(read());
     };

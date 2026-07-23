@@ -71,7 +71,7 @@ describeGit("POST /api/sessions/[name]/archive + /restore (issue #9)", () => {
 
     repoDir = path.join(cwd, "repo");
     fs.mkdirSync(repoDir, { recursive: true });
-    git(cwd, ["init", repoDir]);
+    git(cwd, ["init", "-b", "main", repoDir]);
     git(repoDir, ["config", "user.email", "terminalx@example.test"]);
     git(repoDir, ["config", "user.name", "TerminalX Test"]);
     fs.writeFileSync(path.join(repoDir, "README.md"), "hi\n");

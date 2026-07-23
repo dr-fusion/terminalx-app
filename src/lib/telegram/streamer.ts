@@ -12,7 +12,14 @@ import {
 import { renderScreen, stripAnsi, asCodeBlock } from "./render";
 import { extractSelectionPrompt } from "./selection-prompt";
 import { attachedKeyboard } from "./keyboard";
-import { getTopic, listTopics, patchTopic, getForumChatId, type ViewMode } from "./state";
+import {
+  getTopic,
+  listTopics,
+  patchTopic,
+  getForumChatId,
+  topicSessionIncarnationPatch,
+  type ViewMode,
+} from "./state";
 import {
   startClaudeTranscript,
   isClaudeTranscriptRunning,
@@ -20,7 +27,12 @@ import {
   findLiveReplacementJsonl,
   bindingIsForeignToPane,
 } from "./claude-transcript";
-import { startCodexTranscript, isCodexTranscriptRunning } from "./codex-transcript";
+import {
+  startCodexTranscript,
+  isCodexTranscriptRunning,
+  stopCodexTranscript,
+} from "./codex-transcript";
+import { withTelegramMessageAuditSource } from "./message-audit";
 
 const FLUSH_INTERVAL_MS = 5000;
 const CODEX_INPUT_SETTLE_MS = 200;
@@ -137,14 +149,40 @@ async function renderAndFlush(bot: Bot, topicId: number): Promise<void> {
   const chatId = getForumChatId();
   if (!binding || !chatId) return;
 
+  const incarnation = topicSessionIncarnationPatch(
+    binding,
+    getSessionCreatedMs(binding.sessionName)
+  );
+  if (incarnation.changed) {
+    stopClaudeTranscript(topicId);
+    stopCodexTranscript(topicId);
+    await patchTopic(topicId, incarnation.patch);
+    resetStreamerSessionState(topicId);
+    return;
+  }
+
   // Detach if the tmux session vanished (user typed `exit`, or it crashed).
   if (!hasSession(binding.sessionName)) {
     await stopStreamer(topicId);
-    await patchTopic(topicId, { endedAtMs: Date.now() });
+    const endedAtMs = Date.now();
+    const sessionCreatedAtMs =
+      binding.sessionCreatedAtMs ?? getSessionCreatedMs(binding.sessionName) ?? undefined;
+    await patchTopic(topicId, { endedAtMs });
     try {
-      await bot.api.sendMessage(chatId, "session ended. send /delete to remove this topic.", {
-        message_thread_id: topicId,
-      });
+      await withTelegramMessageAuditSource(
+        {
+          source: "terminal-streamer",
+          sourceRef: `tmux:${binding.sessionName}:${sessionCreatedAtMs ?? "unknown"}:ended:${endedAtMs}`,
+          sessionId: binding.sessionName,
+          sessionCreatedAtMs,
+          expectedChatId: chatId,
+          expectedTopicId: topicId,
+        },
+        () =>
+          bot.api.sendMessage(chatId, "session ended. send /delete to remove this topic.", {
+            message_thread_id: topicId,
+          })
+      );
     } catch {
       // ignore — topic may already be gone
     }
@@ -159,11 +197,26 @@ async function renderAndFlush(bot: Bot, topicId: number): Promise<void> {
     if (mode === "off") {
       return;
     }
-    if (mode === "chat") {
-      await flushChat(bot, chatId, topicId, binding.sessionName, ansi, rt);
-    } else {
-      await flushScreen(bot, chatId, topicId, binding.pinnedMsgId, ansi, rt);
-    }
+    const sessionCreatedAtMs =
+      binding.sessionCreatedAtMs ?? getSessionCreatedMs(binding.sessionName) ?? undefined;
+    const flushStartedAtMs = Date.now();
+    await withTelegramMessageAuditSource(
+      {
+        source: "terminal-streamer",
+        sourceRef: `tmux:${binding.sessionName}:${sessionCreatedAtMs ?? "unknown"}:flush:${flushStartedAtMs}`,
+        sessionId: binding.sessionName,
+        sessionCreatedAtMs,
+        expectedChatId: chatId,
+        expectedTopicId: topicId,
+      },
+      async () => {
+        if (mode === "chat") {
+          await flushChat(bot, chatId, topicId, binding.sessionName, ansi, rt);
+        } else {
+          await flushScreen(bot, chatId, topicId, binding.pinnedMsgId, ansi, rt);
+        }
+      }
+    );
     rt.lastFlushAt = Date.now();
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -318,6 +371,9 @@ async function flushChat(
           ? (getSessionCreatedMs(sessionName) ?? Date.now())
           : (rt.claudeDetectedAtMs ?? Date.now()));
       const started = startClaudeTranscript(bot, chatId, topicId, {
+        sessionId: sessionName,
+        sessionCreatedAtMs:
+          binding?.sessionCreatedAtMs ?? getSessionCreatedMs(sessionName) ?? undefined,
         cwd: binding?.cwd,
         sinceMs,
         promptText: binding?.pendingPrompt,
@@ -330,6 +386,7 @@ async function flushChat(
       if (started) {
         await patchTopic(topicId, {
           jsonlPath: started.jsonl,
+          transcriptSessionId: started.transcriptSessionId,
           ...(liveReplacement ? { jsonlOffset: undefined } : {}),
           pendingPrompt: undefined,
           lastPromptAtMs: undefined,
@@ -340,6 +397,9 @@ async function flushChat(
     if (isCodexCli && !isCodexTranscriptRunning(topicId)) {
       const sinceMs = binding?.lastPromptAtMs ?? Date.now();
       const started = startCodexTranscript(bot, chatId, topicId, {
+        sessionId: sessionName,
+        sessionCreatedAtMs:
+          binding?.sessionCreatedAtMs ?? getSessionCreatedMs(sessionName) ?? undefined,
         cwd: binding?.cwd,
         sinceMs,
         promptText: binding?.pendingPrompt,
@@ -350,6 +410,7 @@ async function flushChat(
       if (started) {
         await patchTopic(topicId, {
           jsonlPath: started.jsonl,
+          transcriptSessionId: started.transcriptSessionId,
           pendingPrompt: undefined,
           lastPromptAtMs: undefined,
         });
@@ -454,6 +515,19 @@ export function startStreamer(bot: Bot, topicId: number): void {
 export function resetChatBaseline(topicId: number): void {
   const rt = runtimes.get(topicId);
   if (rt) rt.lastSentText = "";
+}
+
+/** Drop every cached observation that belongs to the prior tmux incarnation. */
+export function resetStreamerSessionState(topicId: number): void {
+  const rt = runtimes.get(topicId);
+  if (!rt) return;
+  rt.lastRendered = "";
+  rt.lastSentText = "";
+  rt.lastFlushAt = 0;
+  rt.tuiHinted = false;
+  rt.claudeDetectedAtMs = undefined;
+  rt.lastPromptSignature = undefined;
+  rt.lastForcedRendered = undefined;
 }
 
 /** Force a flush now (used by `/snap` and after key/scroll input). */
