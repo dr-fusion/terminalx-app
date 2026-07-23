@@ -1,5 +1,20 @@
 # Corrections — custom-providers design set
 
+## 2026-07-23 LocalTmux permission-safety correction
+
+The implemented LocalTmux launcher no longer exposes or consumes
+`dangerouslySkipPermissions`, and Codex no longer has a default `--yolo`
+argument. `POST /api/sessions` rejects the legacy field when it is `true` before
+any side effect. This correction supersedes every skip-permissions UI, payload,
+`optionFlags`, and command example in the June design documents.
+
+This is intentionally a product-launch claim, not a process-isolation claim.
+LocalTmux launches the bare trusted local CLI (plus validated model/plan
+arguments), so user and Project CLI configuration remains local operator
+authority. Existing tmux processes also retain their original arguments and
+must be stopped and recreated after upgrading. A future hosted bypass mode must
+be a separate, explicitly confirmed mode inside a verified isolated Sandbox.
+
 **Date:** 2026-06-25
 **Backs:** GitHub issue #4
 **Authoritative source:** the Conductor screenshots (Harnesses page, OpenCode tab, Providers picker modal) and the real TerminalX repo (`src/lib/ai-sessions.ts`, `src/app/api/sessions/route.ts`, `src/components/dashboard/DashboardView.tsx`, `src/components/settings/SettingsView.tsx`).

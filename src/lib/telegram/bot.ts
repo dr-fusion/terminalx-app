@@ -219,19 +219,18 @@ function sessionQuotaReached(): number | null {
     : null;
 }
 
-function fullAccessCommand(kind: SessionKind, cwd: string, env: Record<string, string> = {}) {
+function localSessionCommand(kind: SessionKind, cwd: string, env: Record<string, string> = {}) {
   const sessionModel = resolveSessionModelSettings(cwd);
   const modelOpts = modelOptionsForKind(kind, {
     modelId: sessionModel.modelExplicit ? sessionModel.modelId : undefined,
     planMode: sessionModel.planMode,
   });
-  const base = commandForKind(kind, {
-    dangerouslySkipPermissions: true,
-    ...modelOpts,
-  });
+  const launchedModelId = modelOpts.model ? `${kind}:${modelOpts.model}` : undefined;
+  const base = commandForKind(kind, modelOpts);
   return {
     command: withWorkspaceEnv(base ?? "exec bash -l", env),
     sessionModel,
+    launchedModelId,
     persistModelMeta: getHarness(kind)?.command.bin != null,
   };
 }
@@ -591,7 +590,7 @@ async function createNewSessionFromInput(
     return;
   }
   const cwd = process.env.TERMINUS_ROOT || process.env.HOME || "/";
-  const { command: cmd } = fullAccessCommand(kind, cwd);
+  const { command: cmd } = localSessionCommand(kind, cwd);
   try {
     createSession(scoped, cmd ?? undefined, cwd);
     await saveMeta({ name: scoped, kind, createdAt: new Date().toISOString(), managed: true });
@@ -713,7 +712,7 @@ async function createWorktreeSessionFromInput(
   }
 
   const wsEnv = { TERMINALX_PORT: String(port), ...wsConfig.env };
-  const { command, sessionModel, persistModelMeta } = fullAccessCommand(
+  const { command, sessionModel, launchedModelId, persistModelMeta } = localSessionCommand(
     parsed.kind,
     created.repoRoot,
     wsEnv
@@ -739,7 +738,7 @@ async function createWorktreeSessionFromInput(
       setup: wsConfig.setup ? { status: willRunSetup ? "pending" : "skipped" } : undefined,
       ...(persistModelMeta
         ? {
-            modelId: sessionModel.modelId,
+            modelId: launchedModelId,
             effort: sessionModel.effort,
             personality: sessionModel.personality,
             planMode: sessionModel.planMode,

@@ -26,20 +26,8 @@ describe("commandForHarness", () => {
     expect(commandForHarness("claude")).toBe(legacyWrapper("claude"));
   });
 
-  it("runs codex with --yolo by default", () => {
-    expect(commandForHarness("codex")).toBe(legacyWrapper("codex", ["--yolo"]));
-  });
-
-  it("appends --dangerously-skip-permissions to claude when opted in (byte-identical)", () => {
-    expect(commandForHarness("claude", { dangerouslySkipPermissions: true })).toBe(
-      legacyWrapper("claude", ["--dangerously-skip-permissions"])
-    );
-  });
-
-  it("ignores dangerouslySkipPermissions for codex (flag not declared)", () => {
-    const cmd = commandForHarness("codex", { dangerouslySkipPermissions: true });
-    expect(cmd).toBe(legacyWrapper("codex", ["--yolo"]));
-    expect(cmd).not.toContain("--dangerously-skip-permissions");
+  it("runs codex without --yolo", () => {
+    expect(commandForHarness("codex")).toBe(legacyWrapper("codex"));
   });
 
   it("wraps the new cursor harness with the cursor-agent binary", () => {
@@ -59,7 +47,7 @@ describe("commandForHarness", () => {
 
     it("appends the codex model flag (-m) when a model is set", () => {
       const cmd = commandForHarness("codex", { model: "gpt-5-codex" });
-      expect(cmd).toBe(legacyWrapper("codex", ["--yolo", "-m", "gpt-5-codex"]));
+      expect(cmd).toBe(legacyWrapper("codex", ["-m", "gpt-5-codex"]));
     });
 
     it("appends the opencode model flag when a model is set", () => {
@@ -67,20 +55,42 @@ describe("commandForHarness", () => {
       expect(cmd).toBe(legacyWrapper("opencode", ["--model", "anthropic/claude-sonnet"]));
     });
 
+    it("preserves safe provider/model slug punctuation", () => {
+      const model = "anthropic/claude:sonnet.4@2026_07+beta-1";
+      expect(commandForHarness("opencode", { model })).toBe(
+        legacyWrapper("opencode", ["--model", model])
+      );
+    });
+
+    it("omits a model value that tries to enable Codex yolo mode", () => {
+      expect(commandForHarness("codex", { model: "gpt-5 --yolo" })).toBe(legacyWrapper("codex"));
+    });
+
+    it("omits a model value that tries to skip Claude permissions", () => {
+      const cmd = commandForHarness("claude", {
+        model: "sonnet --dangerously-skip-permissions",
+      });
+      expect(cmd).toBe(legacyWrapper("claude"));
+      expect(cmd).not.toContain("--dangerously-skip-permissions");
+    });
+
+    it.each(["gpt-5;touch-pwned", "gpt-5$(touch-pwned)", "gpt-5'\\'';touch-pwned", "gpt-5\n"])(
+      "omits a model value containing shell syntax: %s",
+      (model) => {
+        expect(commandForHarness("codex", { model })).toBe(legacyWrapper("codex"));
+      }
+    );
+
+    it("omits a leading-option model value", () => {
+      expect(commandForHarness("claude", { model: "--dangerously-skip-permissions" })).toBe(
+        legacyWrapper("claude")
+      );
+    });
+
     it("leaves the command unchanged when no model is set (back-compat)", () => {
       expect(commandForHarness("claude")).toBe(legacyWrapper("claude"));
       expect(commandForHarness("claude", { model: undefined })).toBe(legacyWrapper("claude"));
       expect(commandForHarness("claude", { model: "" })).toBe(legacyWrapper("claude"));
-    });
-
-    it("combines the model flag with --dangerously-skip-permissions for claude", () => {
-      const cmd = commandForHarness("claude", {
-        model: "sonnet-4-8",
-        dangerouslySkipPermissions: true,
-      });
-      expect(cmd).toBe(
-        legacyWrapper("claude", ["--dangerously-skip-permissions", "--model", "sonnet-4-8"])
-      );
     });
 
     it("ignores a model for bash (no binary, no flag)", () => {
@@ -100,9 +110,7 @@ describe("commandForHarness", () => {
     });
 
     it("does not append a plan-mode flag for harnesses that do not support it", () => {
-      expect(commandForHarness("codex", { planMode: true })).toBe(
-        legacyWrapper("codex", ["--yolo"])
-      );
+      expect(commandForHarness("codex", { planMode: true })).toBe(legacyWrapper("codex"));
     });
   });
 
@@ -122,6 +130,19 @@ describe("commandForHarness", () => {
       process.env.TERMINALX_OPENCODE_BIN = "   ";
       expect(commandForHarness("opencode")).toBe(legacyWrapper("opencode"));
     });
+
+    it.each([
+      "/opt/oc/opencode --model attacker/model",
+      "/opt/oc/opencode;touch-pwned",
+      "$(touch-pwned)",
+      "--help",
+      "/opt/oc/opencode\n",
+    ])("falls back to the bundled bin for an unsafe override: %s", (override) => {
+      process.env.TERMINALX_OPENCODE_BIN = override;
+      const cmd = commandForHarness("opencode");
+      expect(cmd).toBe(legacyWrapper("opencode"));
+      expect(cmd).not.toContain(override);
+    });
   });
 });
 
@@ -134,7 +155,7 @@ describe("ai-sessions back-compat shim", () => {
     const { commandForKind, isValidKind } = await import("@/lib/ai-sessions");
     expect(commandForKind("bash")).toBeNull();
     expect(commandForKind("claude")).toBe(legacyWrapper("claude"));
-    expect(commandForKind("codex")).toBe(legacyWrapper("codex", ["--yolo"]));
+    expect(commandForKind("codex")).toBe(legacyWrapper("codex"));
     expect(isValidKind("bash")).toBe(true);
     expect(isValidKind("claude")).toBe(true);
     expect(isValidKind("codex")).toBe(true);

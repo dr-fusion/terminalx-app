@@ -28,7 +28,6 @@ export const HARNESSES: HarnessDescriptor[] = [
     docsUrl: "https://docs.claude.com/claude-code",
     command: {
       bin: "claude",
-      optionFlags: [{ when: "dangerouslySkipPermissions", flag: "--dangerously-skip-permissions" }],
       // Issue #11: `claude --model <id>` selects the model; plan mode maps to the
       // permission-mode flag. Data-driven so the route never special-cases claude.
       modelFlag: "--model",
@@ -40,9 +39,10 @@ export const HARNESSES: HarnessDescriptor[] = [
     label: "Codex",
     color: "#5ccfe6",
     auth: "cli",
-    // Codex sessions run in yolo mode by default; model selection still uses
-    // `-m <id>` when an explicit Codex model is configured.
-    command: { bin: "codex", baseArgs: ["--yolo"], modelFlag: "-m" },
+    // Terminal X does not request Codex YOLO for LocalTmux. The trusted local
+    // operator remains responsible for user/project Codex configuration.
+    // Model selection still uses `-m <id>` when explicitly configured.
+    command: { bin: "codex", modelFlag: "-m" },
   },
   {
     id: "cursor",

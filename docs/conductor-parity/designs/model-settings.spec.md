@@ -7,6 +7,11 @@
 provider/model registry; Extended Providers (`designs/extended-session-types.spec.md`,
 issue #8) for the model catalog used to populate dropdowns.
 
+> **Safety correction (2026-07-23):** LocalTmux no longer offers a
+> skip-permissions control or request field and does not add Codex `--yolo`.
+> References below describe the earlier implementation and are superseded by
+> `custom-providers/00-corrections.md`.
+
 ## Overview
 
 This spec defines a **Models** settings page (and the surrounding **Settings shell**) for

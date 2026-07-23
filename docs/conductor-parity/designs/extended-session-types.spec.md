@@ -11,6 +11,11 @@ and `commandForHarness` in `src/lib/harnesses/`). This spec does NOT redefine th
 adds the **OpenCode Providers picker UI**, the **per-provider OpenCode config** it writes, and
 the **dashboard/session wiring** for harness selection on top of it.
 
+> **Safety correction (2026-07-23):** LocalTmux no longer accepts or emits a
+> permission-bypass option, and Codex no longer starts with `--yolo`. Older
+> request/command examples below are retained as design history and superseded
+> by `custom-providers/00-corrections.md`.
+
 > **Note (v3.0):** Earlier drafts of this spec assumed an `AIProvider` interface, a
 > `providerRegistry`, a `data/provider-credentials/credentials.json` vault, and a "CLI-wrap vs
 > HTTP" execution model in which TerminalX ran a `terminalx-chat` client that spoke HTTP to

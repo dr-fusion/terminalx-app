@@ -33,22 +33,8 @@ describe("commandForKind", () => {
   it("wraps codex similarly", () => {
     const cmd = commandForKind("codex");
     expect(cmd).toBeTruthy();
-    expect(cmd).toContain("codex --yolo");
+    expect(cmd).toContain("codex");
+    expect(cmd).not.toContain("--yolo");
     expect(cmd).toContain("exec bash -l");
-  });
-
-  it("appends --dangerously-skip-permissions to claude when opted in", () => {
-    const cmd = commandForKind("claude", { dangerouslySkipPermissions: true });
-    expect(cmd).toContain("claude --dangerously-skip-permissions");
-  });
-
-  it("ignores dangerouslySkipPermissions for codex", () => {
-    const cmd = commandForKind("codex", { dangerouslySkipPermissions: true });
-    expect(cmd).not.toContain("--dangerously-skip-permissions");
-    expect(cmd).toContain("codex --yolo");
-  });
-
-  it("ignores dangerouslySkipPermissions for bash", () => {
-    expect(commandForKind("bash", { dangerouslySkipPermissions: true })).toBeNull();
   });
 });

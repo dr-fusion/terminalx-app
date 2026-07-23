@@ -3,7 +3,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import {
-  AlertTriangle,
   Bot,
   Boxes,
   ChevronUp,
@@ -75,14 +74,6 @@ function parentDirectory(path: string, root: string): string {
 
 function defaultBranchName(sessionName: string): string {
   return sessionName ? `feature/${sessionName}` : "feature/";
-}
-
-// Issue #4: data-driven check — does this harness expose the
-// dangerouslySkipPermissions option flag? (replaces the literal kind==="claude").
-function harnessSupportsSkipPermissions(kind: SessionKind): boolean {
-  return Boolean(
-    getHarness(kind)?.command.optionFlags?.some((f) => f.when === "dangerouslySkipPermissions")
-  );
 }
 
 function branchLooksValid(branch: string): boolean {
@@ -213,7 +204,6 @@ export function DashboardView() {
   const [showDialog, setShowDialog] = useState(false);
   const [name, setName] = useState("");
   const [kind, setKind] = useState<SessionKind>("bash");
-  const [skipPermissions, setSkipPermissions] = useState(false);
   const [directoryPath, setDirectoryPath] = useState(".");
   const [directoryRoot, setDirectoryRoot] = useState("");
   const [directoryInput, setDirectoryInput] = useState(".");
@@ -307,7 +297,6 @@ export function DashboardView() {
       const dir = scopeDirectory && scopeDirectory.trim() ? scopeDirectory.trim() : ".";
       setName("");
       setKind("bash");
-      setSkipPermissions(false);
       setDirectoryPath(dir);
       setDirectoryRoot("");
       setDirectoryInput(dir);
@@ -373,9 +362,6 @@ export function DashboardView() {
             .filter(Boolean)
         : [];
     const session = await createSession(n, kind, {
-      dangerouslySkipPermissions: harnessSupportsSkipPermissions(kind)
-        ? skipPermissions
-        : undefined,
       cwd: directoryPath,
       worktree: createWorktree
         ? { create: true, branch, symlinkPaths: symlinkShared ? sharedPaths : undefined }
@@ -390,7 +376,6 @@ export function DashboardView() {
   }, [
     preview,
     kind,
-    skipPermissions,
     directoryPath,
     directoryError,
     createWorktree,
@@ -825,36 +810,6 @@ export function DashboardView() {
                   </div>
                 )}
               </div>
-            )}
-
-            {harnessSupportsSkipPermissions(kind) && (
-              <label
-                data-testid="session-skip-permissions"
-                className={`mt-3 flex items-start gap-2 px-2 py-1.5 rounded border cursor-pointer transition-colors ${
-                  skipPermissions
-                    ? "bg-[#ff5c5c]/10 border-[#ff5c5c]/50"
-                    : "bg-[#07080c] border-[#1a1d24] hover:border-[#ff5c5c]/40"
-                }`}
-              >
-                <input
-                  type="checkbox"
-                  checked={skipPermissions}
-                  onChange={(e) => setSkipPermissions(e.target.checked)}
-                  className="mt-0.5 accent-[#ff5c5c] cursor-pointer"
-                />
-                <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-1 text-[11px] font-medium text-[#ff5c5c]">
-                    <AlertTriangle size={11} /> dangerously skip permissions
-                  </div>
-                  <p className="text-[10px] text-[#6b7569] mt-0.5 leading-tight">
-                    passes{" "}
-                    <code className="text-[#e6f0e4] bg-transparent border-0 px-0">
-                      --dangerously-skip-permissions
-                    </code>
-                    . sandbox only.
-                  </p>
-                </div>
-              </label>
             )}
 
             {(createError || sessionError) && (

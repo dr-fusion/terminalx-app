@@ -77,6 +77,19 @@ describe("probeHarness", () => {
     expect(s.authMethod).toBe("none");
   });
 
+  it("does not interpolate an unsafe OpenCode executable override into the status shell", () => {
+    process.env.TERMINALX_OPENCODE_BIN = "/opt/opencode;touch-pwned";
+    execFileSync
+      .mockImplementationOnce(() => "/usr/local/bin/opencode\n")
+      .mockImplementationOnce(() => "1.17.7\n");
+
+    const s = probeHarness("opencode");
+
+    expect(s.installed).toBe(true);
+    expect(execFileSync.mock.calls[0]?.[1]).toEqual(["-lc", "command -v opencode"]);
+    expect(s.loginCommand).toBeUndefined();
+  });
+
   it("never throws into the request path even if shellouts blow up", () => {
     execFileSync.mockImplementation(() => {
       throw new Error("boom");

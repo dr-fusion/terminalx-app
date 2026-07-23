@@ -146,11 +146,11 @@ test.describe("new-session harness selector", () => {
     await expect(page.getByTestId("session-harness-cursor")).toBeVisible();
     await expect(page.getByTestId("session-harness-opencode")).toContainText("OpenCode");
 
-    // Picking claude reveals the data-driven skip-permissions option.
+    // LocalTmux sessions never expose skip-permissions controls, regardless of
+    // which local harness is selected.
     await page.getByTestId("session-harness-claude").click();
-    await expect(page.getByTestId("session-skip-permissions")).toBeVisible();
+    await expect(page.getByTestId("session-skip-permissions")).toHaveCount(0);
 
-    // Picking codex hides it (codex declares no skip-permissions flag).
     await page.getByTestId("session-harness-codex").click();
     await expect(page.getByTestId("session-skip-permissions")).toHaveCount(0);
   });

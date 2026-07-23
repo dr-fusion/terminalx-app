@@ -135,6 +135,15 @@ export async function POST(req: NextRequest) {
 
   try {
     const body = await req.json();
+    if (body?.dangerouslySkipPermissions === true) {
+      return NextResponse.json(
+        {
+          error:
+            "LocalTmux sessions cannot skip harness permissions; dangerouslySkipPermissions is not allowed",
+        },
+        { status: 400 }
+      );
+    }
     // `skipSetup` (feature #5): let the dashboard create without auto-running setup.
     const { name, kind, cwd, worktree, skipSetup } = body;
 
@@ -236,8 +245,8 @@ export async function POST(req: NextRequest) {
     // user < repo) and thread the chosen model + plan mode into the harness
     // command. modelOptionsForKind drops the model when its harness prefix does
     // not match the session kind, so a Codex default never reaches `claude`.
-    // Existing behavior is preserved: with no model set (or a non-matching
-    // harness) commandForKind emits the byte-identical legacy command.
+    // With no model set (or a non-matching harness), commandForKind omits the
+    // model argument and keeps the standard LocalTmux lifecycle wrapper.
     const sessionModel = resolveSessionModelSettings(wsRepoRoot);
     const modelOpts = modelOptionsForKind(sessionKind, {
       // Only pass an explicit model: a bare registry default lets the CLI pick
@@ -245,10 +254,8 @@ export async function POST(req: NextRequest) {
       modelId: sessionModel.modelExplicit ? sessionModel.modelId : undefined,
       planMode: sessionModel.planMode,
     });
-    const baseCommand = commandForKind(sessionKind, {
-      dangerouslySkipPermissions: true,
-      ...modelOpts,
-    });
+    const launchedModelId = modelOpts.model ? `${sessionKind}:${modelOpts.model}` : undefined;
+    const baseCommand = commandForKind(sessionKind, modelOpts);
     // Persist the resolved Models settings only for harnesses that drive a model
     // (those with a binary). bash has no model so its records stay legacy-clean.
     const persistModelMeta = getHarness(sessionKind)?.command.bin != null;
@@ -287,13 +294,12 @@ export async function POST(req: NextRequest) {
         : undefined,
       port,
       setup: wsConfig.setup ? { status: willRunSetup ? "pending" : "skipped" } : undefined,
-      // Feature #11: persist the resolved Models settings on the AI session so
-      // the UI can show what launched + a later relaunch is reproducible. Only
-      // recorded for model-bearing harnesses (bash has no model) — keeps legacy
-      // bash records byte-identical.
+      // Feature #11: persist only the validated model actually passed to the
+      // harness. Invalid, implicit, or provider-mismatched settings must not be
+      // recorded as though they launched. Bash remains legacy-clean.
       ...(persistModelMeta
         ? {
-            modelId: sessionModel.modelId,
+            modelId: launchedModelId,
             effort: sessionModel.effort,
             personality: sessionModel.personality,
             planMode: sessionModel.planMode,
