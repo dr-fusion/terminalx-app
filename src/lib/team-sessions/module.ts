@@ -210,6 +210,33 @@ class SqliteTeamSessions implements TeamSessions {
     return readSnapshot();
   }
 
+  performTerminalMutation(query: SessionTerminalAuthorizationQuery, mutation: () => void): void {
+    this.assertOpen();
+    if (!query || typeof query !== "object" || typeof mutation !== "function") {
+      throw new TeamSessionError("invalid-command", "Invalid terminal mutation");
+    }
+    validateQueryActor(query.actor);
+    if (query.actor.kind !== "human") deny();
+    if (query.schemaVersion !== TEAM_SESSION_SCHEMA_VERSION) {
+      throw new TeamSessionError("invalid-command", "Unsupported query schema version");
+    }
+    validateQuery(query);
+    if (query.action === "observe") {
+      throw new TeamSessionError("invalid-command", "Observe is not a terminal mutation");
+    }
+
+    const apply = this.db.transaction(() => {
+      if (!this.terminalAuthorization(query).allowed) deny();
+      // The gateway is a trusted in-process adapter. Requiring an actual
+      // undefined result catches an accidentally async effect whose
+      // continuation would otherwise escape this authorization transaction.
+      if (mutation() !== undefined) {
+        throw new TeamSessionError("invalid-command", "Terminal mutation must be synchronous");
+      }
+    });
+    apply.immediate();
+  }
+
   async *follow(options: FollowSessionOptions): AsyncIterable<SessionEvent> {
     this.assertOpen();
     validateQueryActor(options.actor);
@@ -699,7 +726,10 @@ class SqliteTeamSessions implements TeamSessions {
     if (!membership || membership.role === "guest") deny();
     if (!this.activeProjectAccess(command.projectId, command.actor.userId)) deny();
 
-    const sessionId = command.sessionId || this.nextId("session");
+    const sessionId = requiredCanonicalSessionId(
+      command.sessionId ?? this.nextId("session"),
+      "Session id"
+    );
     const name = requiredText(command.name, "Session name", 160);
     const tmuxName = command.tmuxName;
     const policy = command.steeringPolicy ?? "single";
@@ -2311,7 +2341,79 @@ class SqliteTeamSessions implements TeamSessions {
             }
           : parsed.data,
     };
-    return this.projectCommandResultForActor(replay, command.actor);
+    return this.projectReplayResultForActor(replay, command);
+  }
+
+  private projectReplayResultForActor(
+    commandResult: CommandResult,
+    command: SessionCommand
+  ): CommandResult {
+    if (command.actor.kind === "system") return commandResult;
+    if (!this.hasCurrentReplayVisibility(command, commandResult, command.actor.userId)) {
+      return {
+        ...commandResult,
+        data: { receiptUnavailable: true },
+        events: [],
+      };
+    }
+    return this.projectCommandResultForActor(commandResult, command.actor);
+  }
+
+  private hasCurrentReplayVisibility(
+    command: SessionCommand,
+    commandResult: CommandResult,
+    actorUserId: string
+  ): boolean {
+    switch (command.type) {
+      case "team.create": {
+        const teamId = command.teamId ?? replayIdentifier(commandResult.data.teamId);
+        return teamId !== undefined && this.hasTeamVisibility(teamId, actorUserId);
+      }
+      case "team.membership.grant":
+      case "team.membership.revoke":
+        return this.hasTeamVisibility(command.teamId, actorUserId);
+      case "project.create": {
+        const projectId = command.projectId ?? replayIdentifier(commandResult.data.projectId);
+        return projectId !== undefined && this.hasProjectVisibility(projectId, actorUserId);
+      }
+      case "project.access.grant":
+      case "project.access.revoke":
+        return this.hasProjectVisibility(command.projectId, actorUserId);
+      case "session.start": {
+        const sessionId = command.sessionId ?? replayIdentifier(commandResult.data.sessionId);
+        return sessionId !== undefined && this.hasSessionAccess(sessionId, actorUserId);
+      }
+      case "session.invitation.redeem": {
+        const sessionId = replayIdentifier(commandResult.data.sessionId);
+        const invitationId = replayIdentifier(commandResult.data.invitationId);
+        return (
+          sessionId !== undefined &&
+          invitationId !== undefined &&
+          this.hasRedeemedInvitationReceiptVisibility(sessionId, invitationId, actorUserId)
+        );
+      }
+      case "session.invitation.create":
+      case "session.invitation.revoke":
+      case "session.join":
+      case "session.share.create":
+      case "session.share.revoke":
+      case "session.participant.grant":
+      case "session.participant.revoke":
+      case "session.responsibility.grant":
+      case "session.responsibility.revoke":
+      case "session.control.transfer":
+      case "session.control.release":
+      case "session.assignee.claim":
+      case "session.handoff.offer":
+      case "session.handoff.accept":
+      case "session.handoff.cancel":
+        return this.hasSessionAccess(command.sessionId, actorUserId);
+      case "runtime.outbox.acknowledge":
+      case "runtime.outbox.fail":
+        // Runtime commands are system-only. Keep this branch fail-closed if
+        // the command envelope rules ever change without updating replay.
+        return false;
+    }
   }
 
   private projectCommandResultForActor(
@@ -2918,6 +3020,36 @@ class SqliteTeamSessions implements TeamSessions {
     );
   }
 
+  private hasTeamVisibility(teamId: string, userId: string): boolean {
+    return Boolean(this.activeMembership(teamId, userId));
+  }
+
+  private hasRedeemedInvitationReceiptVisibility(
+    sessionId: string,
+    invitationId: string,
+    userId: string
+  ): boolean {
+    const invitation = this.db
+      .prepare(
+        `SELECT i.team_id FROM session_invitations i
+         WHERE i.id = ? AND i.session_id = ? AND i.status = 'redeemed'
+           AND i.redeemed_by_user_id = ?`
+      )
+      .get(invitationId, sessionId, userId) as SqlRow | undefined;
+    return Boolean(invitation && this.activeMembership(invitation.team_id as string, userId));
+  }
+
+  private hasProjectVisibility(projectId: string, userId: string): boolean {
+    const project = this.db.prepare("SELECT team_id FROM projects WHERE id = ?").get(projectId) as
+      | SqlRow
+      | undefined;
+    if (!project) return false;
+    const membership = this.activeMembership(project.team_id as string, userId);
+    if (!membership || membership.role === "guest") return false;
+    if (membership.role === "owner" || membership.role === "admin") return true;
+    return Boolean(this.activeProjectAccess(projectId, userId));
+  }
+
   private hasUnderlyingSessionAccess(sessionId: string, userId: string): boolean {
     const session = this.sessionRow(sessionId);
     if (!session) return false;
@@ -3487,6 +3619,10 @@ function sanitizeResultForPersistence(value: CommandResult): CommandResult {
   return { ...value, data: safeData };
 }
 
+function replayIdentifier(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
 function commandAuditPayload(command: SessionCommand): Record<string, unknown> {
   if (command.type === "session.invitation.redeem") {
     const { actor: _actor, idempotency: _idempotency, token, ...safePayload } = command;
@@ -3554,7 +3690,9 @@ function validateCommandPayload(command: SessionCommand): void {
     case "session.start":
       requiredIdentifier(command.teamId, "Team id");
       requiredIdentifier(command.projectId, "Project id");
-      if (command.sessionId !== undefined) requiredIdentifier(command.sessionId, "Session id");
+      if (command.sessionId !== undefined) {
+        requiredCanonicalSessionId(command.sessionId, "Session id");
+      }
       requiredText(command.name, "Session name", 160);
       if (!isValidTmuxSessionName(command.tmuxName)) {
         throw new TeamSessionError("invalid-command", "tmux name is invalid");
@@ -3765,6 +3903,14 @@ function requiredText(value: unknown, label: string, maxLength: number): string 
 function requiredIdentifier(value: unknown, label: string): string {
   const identifier = requiredText(value, label, 300);
   if (identifier !== value) {
+    throw new TeamSessionError("invalid-command", `${label} is invalid`);
+  }
+  return identifier;
+}
+
+function requiredCanonicalSessionId(value: unknown, label: string): string {
+  const identifier = requiredIdentifier(value, label);
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(identifier)) {
     throw new TeamSessionError("invalid-command", `${label} is invalid`);
   }
   return identifier;

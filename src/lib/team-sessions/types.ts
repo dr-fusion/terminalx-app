@@ -81,6 +81,7 @@ export type SessionCommand =
       type: "session.start";
       teamId: string;
       projectId: string;
+      /** Canonical lowercase RFC 4122 UUID v4 when supplied. */
       sessionId?: string;
       name: string;
       tmuxName: string;
@@ -510,6 +511,13 @@ export interface TeamSessions {
   inspect(query: SessionAdmissionQuery): Promise<SessionAdmissionView>;
   inspect(query: TeamAccessQuery): Promise<TeamAccessView>;
   inspect(query: ProjectAccessQuery): Promise<ProjectAccessView>;
+  /**
+   * Hold an immediate SQLite transaction across the final authorization read
+   * and one synchronous terminal effect. This gives control transfers and
+   * terminal mutations a single total order, including across processes that
+   * share the canonical database.
+   */
+  performTerminalMutation(query: SessionTerminalAuthorizationQuery, mutation: () => void): void;
   follow(options: FollowSessionOptions): AsyncIterable<SessionEvent>;
   claimRuntimeOutbox(options: RuntimeOutboxClaimOptions): Promise<RuntimeOutboxDelivery[]>;
   close(): void;

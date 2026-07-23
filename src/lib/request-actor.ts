@@ -34,8 +34,16 @@ function bearerToken(headers: RequestHeaders): string | undefined {
 export async function resolveRequestActor(headers: RequestHeaders): Promise<RequestActor | null> {
   const authMode = getAuthMode();
   if (authMode === "none") {
-    // Production startup rejects `none`; retain the legacy development actor
-    // so tests and explicitly unsupported local setups remain deterministic.
+    // This module is also used by standalone Next.js route handlers, which do
+    // not necessarily pass through the custom server's startup validation.
+    // Require both explicit values here so an invalid auth-mode typo cannot
+    // silently become an unauthenticated Team Session actor.
+    if (
+      process.env.TERMINALX_AUTH_MODE !== "none" ||
+      process.env.TERMINALX_ALLOW_AUTH_NONE !== "true"
+    ) {
+      return null;
+    }
     return {
       kind: "human",
       userId: "single-user",

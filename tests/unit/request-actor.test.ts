@@ -35,6 +35,8 @@ describe("resolveRequestActor", () => {
   beforeEach(() => {
     mocks.authMode = "local";
     mocks.verifyJwt.mockReset();
+    delete process.env.TERMINALX_AUTH_MODE;
+    delete process.env.TERMINALX_ALLOW_AUTH_NONE;
   });
 
   it("does not trust middleware identity headers without a current credential", async () => {
@@ -106,8 +108,19 @@ describe("resolveRequestActor", () => {
     expect(mocks.verifyJwt).not.toHaveBeenCalled();
   });
 
-  it("retains the unsupported auth-none development actor without trusting headers", async () => {
+  it("fails closed when auth-none lacks the separate explicit opt-in", async () => {
     mocks.authMode = "none";
+
+    const actor = await resolveRequestActor(headers({ "x-user-id": "spoofed" }));
+
+    expect(actor).toBeNull();
+    expect(mocks.verifyJwt).not.toHaveBeenCalled();
+  });
+
+  it("retains the explicit auth-none development actor without trusting headers", async () => {
+    mocks.authMode = "none";
+    process.env.TERMINALX_AUTH_MODE = "none";
+    process.env.TERMINALX_ALLOW_AUTH_NONE = "true";
 
     const actor = await resolveRequestActor(headers({ "x-user-id": "spoofed" }));
 
