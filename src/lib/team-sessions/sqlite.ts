@@ -2,8 +2,71 @@ import * as fs from "fs";
 import * as path from "path";
 import Database from "better-sqlite3";
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 const APPLICATION_ID = 0x54585331; // "TXS1"
+
+const CONVERSATION_SCHEMA = `
+CREATE TABLE conversation_identities (
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE RESTRICT,
+  kind TEXT NOT NULL CHECK (kind IN ('comment', 'suggestion', 'resolution', 'directive')),
+  created_sequence INTEGER CHECK (created_sequence IS NULL OR created_sequence >= 1),
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  UNIQUE (id, session_id),
+  UNIQUE (session_id, created_sequence),
+  FOREIGN KEY (session_id, created_sequence)
+    REFERENCES session_events(session_id, sequence) ON DELETE RESTRICT
+) STRICT;
+
+CREATE INDEX conversation_identities_by_session_kind
+  ON conversation_identities(session_id, kind, created_sequence);
+
+CREATE TABLE conversation_suggestion_resolutions (
+  suggestion_id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  resolution_id TEXT NOT NULL UNIQUE,
+  resolution_sequence INTEGER NOT NULL CHECK (resolution_sequence >= 1),
+  suggestion_version INTEGER NOT NULL CHECK (suggestion_version = 2),
+  decision TEXT NOT NULL CHECK (decision IN ('accept', 'accept-edited', 'reject')),
+  directive_id TEXT,
+  FOREIGN KEY (suggestion_id, session_id)
+    REFERENCES conversation_identities(id, session_id) ON DELETE RESTRICT,
+  FOREIGN KEY (resolution_id, session_id)
+    REFERENCES conversation_identities(id, session_id) ON DELETE RESTRICT,
+  FOREIGN KEY (directive_id, session_id)
+    REFERENCES conversation_identities(id, session_id) ON DELETE RESTRICT
+    DEFERRABLE INITIALLY DEFERRED,
+  FOREIGN KEY (session_id, resolution_sequence)
+    REFERENCES session_events(session_id, sequence) ON DELETE RESTRICT
+) STRICT;
+
+CREATE TABLE conversation_directives (
+  directive_id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  author_user_id TEXT NOT NULL,
+  queue_sequence INTEGER NOT NULL CHECK (queue_sequence >= 1),
+  status TEXT NOT NULL CHECK (status IN ('queued', 'cancelled', 'dispatched')),
+  terminal_sequence INTEGER CHECK (terminal_sequence IS NULL OR terminal_sequence >= 1),
+  CHECK (
+    (status = 'queued' AND terminal_sequence IS NULL) OR
+    (status IN ('cancelled', 'dispatched') AND terminal_sequence IS NOT NULL)
+  ),
+  UNIQUE (session_id, queue_sequence),
+  UNIQUE (session_id, terminal_sequence),
+  FOREIGN KEY (directive_id, session_id)
+    REFERENCES conversation_identities(id, session_id) ON DELETE RESTRICT,
+  FOREIGN KEY (session_id, queue_sequence)
+    REFERENCES session_events(session_id, sequence) ON DELETE RESTRICT,
+  FOREIGN KEY (session_id, terminal_sequence)
+    REFERENCES session_events(session_id, sequence) ON DELETE RESTRICT
+) STRICT;
+
+CREATE INDEX conversation_directives_by_author_status
+  ON conversation_directives(author_user_id, status, queue_sequence);
+
+CREATE INDEX conversation_directives_by_session_status
+  ON conversation_directives(session_id, status, queue_sequence);
+`;
 
 const SCHEMA = `
 CREATE TABLE teams (
@@ -189,6 +252,8 @@ CREATE TABLE session_events (
   PRIMARY KEY (session_id, sequence)
 ) STRICT;
 
+${CONVERSATION_SCHEMA}
+
 CREATE TABLE kernel_state (
   singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
   next_accepted_sequence INTEGER NOT NULL CHECK (next_accepted_sequence >= 1)
@@ -290,13 +355,18 @@ export function openTeamSessionDatabase(
         db.pragma(`user_version = ${SCHEMA_VERSION}`);
         return;
       }
+      if (applicationId !== APPLICATION_ID) {
+        throw new Error("File is not a recognized Team Session database");
+      }
+      if (currentVersion === 1) {
+        migrateConversationSchemaV2(db);
+        db.pragma(`user_version = ${SCHEMA_VERSION}`);
+        return;
+      }
       if (currentVersion !== SCHEMA_VERSION) {
         throw new Error(
           `Unsupported Team Session database schema ${currentVersion}; expected ${SCHEMA_VERSION}`
         );
-      }
-      if (applicationId !== APPLICATION_ID) {
-        throw new Error("File is not a recognized Team Session database");
       }
     });
     initializeOrVerify.immediate();
@@ -339,6 +409,188 @@ export function openTeamSessionDatabase(
       secureDatabaseFiles(filename);
     },
   };
+}
+
+interface ConversationMigrationEvent {
+  session_id: string;
+  sequence: number;
+  type: string;
+  occurred_at_ms: number;
+  actor_user_id: string;
+  payload_json: string;
+}
+
+function migrateConversationSchemaV2(db: Database.Database): void {
+  db.exec(CONVERSATION_SCHEMA);
+  const events = db
+    .prepare(
+      `SELECT session_id, sequence, type, occurred_at_ms, actor_user_id, payload_json
+       FROM session_events
+       WHERE type IN (
+         'comment.added', 'suggestion.added', 'suggestion.resolved',
+         'directive.queued', 'directive.cancelled', 'directive.dispatched'
+       )
+       ORDER BY session_id ASC, sequence ASC`
+    )
+    .all() as ConversationMigrationEvent[];
+  const insertIdentity = db.prepare(
+    `INSERT INTO conversation_identities
+       (id, session_id, kind, created_sequence, created_at_ms)
+     VALUES (?, ?, ?, ?, ?)`
+  );
+  const insertResolution = db.prepare(
+    `INSERT INTO conversation_suggestion_resolutions
+       (suggestion_id, session_id, resolution_id, resolution_sequence,
+        suggestion_version, decision, directive_id)
+     VALUES (?, ?, ?, ?, 2, ?, ?)`
+  );
+  const insertDirective = db.prepare(
+    `INSERT INTO conversation_directives
+       (directive_id, session_id, author_user_id, queue_sequence, status, terminal_sequence)
+     VALUES (?, ?, ?, ?, 'queued', NULL)`
+  );
+  const closeDirective = db.prepare(
+    `UPDATE conversation_directives
+     SET status = ?, terminal_sequence = ?
+     WHERE directive_id = ? AND session_id = ? AND status = 'queued'`
+  );
+
+  for (const event of events) {
+    const payload = parseMigrationPayload(event);
+    switch (event.type) {
+      case "comment.added":
+        insertIdentity.run(
+          migrationIdentifier(payload, "commentId", event),
+          event.session_id,
+          "comment",
+          event.sequence,
+          event.occurred_at_ms
+        );
+        break;
+      case "suggestion.added":
+        insertIdentity.run(
+          migrationIdentifier(payload, "suggestionId", event),
+          event.session_id,
+          "suggestion",
+          event.sequence,
+          event.occurred_at_ms
+        );
+        break;
+      case "suggestion.resolved": {
+        const suggestionId = migrationIdentifier(payload, "suggestionId", event);
+        const resolutionId = migrationIdentifier(payload, "resolutionId", event);
+        const decision = migrationDecision(payload.resolution, event);
+        const directiveId =
+          decision === "reject" ? null : migrationIdentifier(payload, "directiveId", event);
+        if (decision === "reject" && payload.directiveId !== undefined) {
+          throw migrationError(event, "rejected Suggestion unexpectedly references a Directive");
+        }
+        insertIdentity.run(
+          resolutionId,
+          event.session_id,
+          "resolution",
+          event.sequence,
+          event.occurred_at_ms
+        );
+        insertResolution.run(
+          suggestionId,
+          event.session_id,
+          resolutionId,
+          event.sequence,
+          decision,
+          directiveId
+        );
+        break;
+      }
+      case "directive.queued": {
+        const directiveId = migrationIdentifier(payload, "directiveId", event);
+        if (payload.status !== "queued") {
+          throw migrationError(event, "Directive queue status is invalid");
+        }
+        insertIdentity.run(
+          directiveId,
+          event.session_id,
+          "directive",
+          event.sequence,
+          event.occurred_at_ms
+        );
+        insertDirective.run(directiveId, event.session_id, event.actor_user_id, event.sequence);
+        break;
+      }
+      case "directive.cancelled":
+      case "directive.dispatched": {
+        const directiveId = migrationIdentifier(payload, "directiveId", event);
+        const status = event.type === "directive.cancelled" ? "cancelled" : "dispatched";
+        const updated = closeDirective.run(status, event.sequence, directiveId, event.session_id);
+        if (updated.changes !== 1) {
+          throw migrationError(event, "Directive terminal state has no unique queued predecessor");
+        }
+        break;
+      }
+    }
+  }
+
+  const overAuthorLimit = db
+    .prepare(
+      `SELECT author_user_id, COUNT(*) AS count
+       FROM conversation_directives WHERE status = 'queued'
+       GROUP BY author_user_id HAVING COUNT(*) > 64 LIMIT 1`
+    )
+    .get() as { author_user_id: string; count: number } | undefined;
+  if (overAuthorLimit) {
+    throw new Error(
+      `Cannot migrate: User ${overAuthorLimit.author_user_id} has ${overAuthorLimit.count} queued Directives`
+    );
+  }
+  const overSessionLimit = db
+    .prepare(
+      `SELECT session_id, COUNT(*) AS count
+       FROM conversation_directives WHERE status = 'queued'
+       GROUP BY session_id HAVING COUNT(*) > 256 LIMIT 1`
+    )
+    .get() as { session_id: string; count: number } | undefined;
+  if (overSessionLimit) {
+    throw new Error(
+      `Cannot migrate: Session ${overSessionLimit.session_id} has ${overSessionLimit.count} queued Directives`
+    );
+  }
+}
+
+function parseMigrationPayload(event: ConversationMigrationEvent): Record<string, unknown> {
+  try {
+    const value = JSON.parse(event.payload_json) as unknown;
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new Error("not an object");
+    }
+    return value as Record<string, unknown>;
+  } catch {
+    throw migrationError(event, "event payload is invalid");
+  }
+}
+
+function migrationIdentifier(
+  payload: Record<string, unknown>,
+  key: string,
+  event: ConversationMigrationEvent
+): string {
+  const value = payload[key];
+  if (typeof value !== "string" || !value || value.length > 300) {
+    throw migrationError(event, `${key} is invalid`);
+  }
+  return value;
+}
+
+function migrationDecision(value: unknown, event: ConversationMigrationEvent): string {
+  if (value !== "accept" && value !== "accept-edited" && value !== "reject") {
+    throw migrationError(event, "Suggestion resolution is invalid");
+  }
+  return value;
+}
+
+function migrationError(event: ConversationMigrationEvent, detail: string): Error {
+  return new Error(
+    `Cannot migrate Team Session ${event.session_id} event ${event.sequence}: ${detail}`
+  );
 }
 
 function secureDatabaseFiles(filename: string | undefined): void {

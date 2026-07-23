@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { resolveRequestActor, type RequestActor } from "../request-actor";
 import { getPublicUrl, isReadOnlyMode, trustProxyHeaders } from "../security-config";
 import { isValidTmuxSessionName } from "../tmux";
+import { projectPublicSessionEvent } from "./public-event";
 import { getTeamSessions } from "./service";
 import {
   TEAM_SESSION_SCHEMA_VERSION,
@@ -9,11 +10,13 @@ import {
   type ActorContext,
   type ProjectAccessView,
   type SessionAdmissionView,
+  type SessionDetailView,
   type SessionCommand,
   type SessionEvent,
-  type SessionView,
+  type SessionInboxItemView,
   type TeamAccessView,
   type TeamSessions,
+  type WorkspaceDiscoveryView,
 } from "./index";
 
 const DEFAULT_MAX_BODY_BYTES = 64 * 1024;
@@ -81,6 +84,17 @@ const HUMAN_COMMAND_FIELDS = {
   ],
   "session.handoff.accept": ["sessionId", "handoffId", "expectedHandoffVersion"],
   "session.handoff.cancel": ["sessionId", "handoffId", "expectedHandoffVersion"],
+  "comment.add": ["sessionId", "body"],
+  "suggestion.add": ["sessionId", "body"],
+  "suggestion.resolve": [
+    "sessionId",
+    "suggestionId",
+    "resolution",
+    "expectedSuggestionVersion",
+    "expectedSteeringRevision",
+    "editedBody",
+  ],
+  "directive.enqueue": ["sessionId", "body", "expectedSteeringRevision"],
 } as const satisfies Record<HumanCommandType, readonly string[]>;
 
 const RESPONSE_HEADERS = {
@@ -478,6 +492,21 @@ function assertHumanCommandShape(body: Record<string, unknown>): void {
   if (type === "session.handoff.offer" && body.briefing !== undefined) {
     assertHandoffBriefingShape(body.briefing);
   }
+  if (type === "suggestion.resolve") {
+    assertSuggestionResolutionShape(body);
+  }
+}
+
+function assertSuggestionResolutionShape(body: Record<string, unknown>): void {
+  if (body.resolution === "accept-edited") {
+    if (typeof body.editedBody === "string") return;
+    throw new HttpProblem(400, "invalid-request", "Invalid request");
+  }
+  if (body.resolution === "accept" || body.resolution === "reject") {
+    if (!Object.hasOwn(body, "editedBody")) return;
+    throw new HttpProblem(400, "invalid-request", "Invalid request");
+  }
+  throw new HttpProblem(400, "invalid-request", "Invalid request");
 }
 
 function assertHandoffBriefingShape(value: unknown): void {
@@ -587,7 +616,12 @@ export async function handleTeamSessionCommand(
       },
     } as unknown as SessionCommand;
     const result = await sessions(dependencies).dispatch(command);
-    return jsonResponse({ result });
+    return jsonResponse({
+      result: {
+        ...result,
+        events: result.events.map(projectPublicSessionEvent),
+      },
+    });
   });
 }
 
@@ -599,9 +633,9 @@ export async function handleSessionList(
     const actor = await requireActor(request, dependencies);
     const rawTeamId = singleSearchParam(request, "teamId");
     const teamId = rawTeamId === undefined ? undefined : requireIdentifier(rawTeamId, "Team id");
-    const visibleSessions: SessionView[] = await sessions(dependencies).inspect({
+    const visibleSessions: SessionInboxItemView[] = await sessions(dependencies).inspect({
       schemaVersion: TEAM_SESSION_SCHEMA_VERSION,
-      type: "session.list",
+      type: "session.inbox",
       actor,
       teamId,
     });
@@ -616,9 +650,9 @@ export async function handleSessionGet(
 ): Promise<Response> {
   return withHttpErrors(dependencies, async () => {
     const actor = await requireActor(request, dependencies);
-    const visibleSession: SessionView | null = await sessions(dependencies).inspect({
+    const visibleSession: SessionDetailView | null = await sessions(dependencies).inspect({
       schemaVersion: TEAM_SESSION_SCHEMA_VERSION,
-      type: "session.get",
+      type: "session.detail",
       actor,
       sessionId: requireIdentifier(sessionId, "Session id"),
     });
@@ -626,6 +660,21 @@ export async function handleSessionGet(
       throw new HttpProblem(404, "resource-unavailable", "Resource is unavailable");
     }
     return jsonResponse({ session: visibleSession });
+  });
+}
+
+export async function handleWorkspaceDiscovery(
+  request: Request,
+  dependencies: TeamSessionHttpDependencies = {}
+): Promise<Response> {
+  return withHttpErrors(dependencies, async () => {
+    const actor = await requireActor(request, dependencies);
+    const discovery: WorkspaceDiscoveryView = await sessions(dependencies).inspect({
+      schemaVersion: TEAM_SESSION_SCHEMA_VERSION,
+      type: "workspace.discovery",
+      actor,
+    });
+    return jsonResponse({ discovery });
   });
 }
 
@@ -649,7 +698,7 @@ export async function handleSessionEvents(
       afterSequence,
       limit,
     });
-    return jsonResponse({ events });
+    return jsonResponse({ events: events.map(projectPublicSessionEvent) });
   });
 }
 
