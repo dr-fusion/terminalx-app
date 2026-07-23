@@ -16,6 +16,7 @@ function initials(name: string): string {
 }
 
 function sectionForPath(path: string): string {
+  if (path.startsWith("/team-sessions")) return "team sessions";
   if (path.startsWith("/workspace")) return "workspace";
   if (path.startsWith("/settings")) return "settings";
   if (path.startsWith("/admin")) return "admin";

@@ -662,6 +662,16 @@ describe("Team Session kernel", () => {
     await expect(getSession(SESSION_ID, BOB)).resolves.toBeNull();
 
     await grantProjectAccess(BOB);
+    await revokeProjectAccess(BOB);
+    await expect(admission()).resolves.toMatchObject({
+      accessCandidates: [
+        expect.objectContaining({
+          userId: BOB.userId,
+          expectedProjectAccessVersion: 2,
+        }),
+      ],
+    });
+    await grantProjectAccess(BOB);
     await expect(getSession(SESSION_ID, BOB)).resolves.toBeNull();
 
     await dispatch(
@@ -699,16 +709,36 @@ describe("Team Session kernel", () => {
     expect((await projectAccess()).access.some((entry) => entry.userId === BOB.userId)).toBe(false);
   });
 
-  it("provides versioned Team, Project, and Session-admission projections only to their administrators", async () => {
+  it("provides minimized actor-scoped Session admission data to authorized managers", async () => {
     await bootstrap();
     const invitation = await createInvitation("member");
     await redeemInvitation(invitation, BOB);
+
+    await expect(admission()).resolves.toMatchObject({
+      sessionId: SESSION_ID,
+      capabilities: {
+        canRevokeInvitations: true,
+        canGrantGuestShare: true,
+        canGrantProjectAccess: true,
+      },
+      activeInvitations: [],
+      accessCandidates: [
+        {
+          invitationId: invitation.invitationId,
+          userId: BOB.userId,
+          displayName: BOB.displayName,
+          membershipRole: "member",
+          requiredGrant: "project-access",
+          expectedProjectAccessVersion: 0,
+        },
+      ],
+    });
+
     await grantProjectAccess(BOB);
     await dispatch(
       { type: "session.join", sessionId: SESSION_ID, invitationId: invitation.invitationId },
       BOB
     );
-
     await expect(teamAccess()).resolves.toMatchObject({
       teamId: TEAM_ID,
       memberships: expect.arrayContaining([
@@ -723,19 +753,97 @@ describe("Team Session kernel", () => {
         expect.objectContaining({ userId: BOB.userId, version: 1 }),
       ]),
     });
+    const activeInvitation = await createInvitation("guest");
     const sessionAdmission = await admission();
-    expect(sessionAdmission.invitations).toEqual([
-      expect.objectContaining({
-        invitationId: invitation.invitationId,
-        status: "redeemed",
-        version: 2,
-      }),
+    expect(sessionAdmission.activeInvitations).toEqual([
+      {
+        invitationId: activeInvitation.invitationId,
+        membershipRole: "guest",
+        version: 1,
+        expiresAtMs: nowMs + 60_000,
+      },
     ]);
+    expect(sessionAdmission.accessCandidates).toEqual([]);
     expect(JSON.stringify(sessionAdmission)).not.toContain(invitation.token);
+    expect(sessionAdmission).not.toHaveProperty("teamId");
+    expect(sessionAdmission).not.toHaveProperty("projectId");
+    expect(sessionAdmission).not.toHaveProperty("invitations");
 
     await expect(teamAccess(BOB)).rejects.toMatchObject({ code: "not-authorized" });
     await expect(projectAccess(BOB)).rejects.toMatchObject({ code: "not-authorized" });
     await expect(admission(BOB)).rejects.toMatchObject({ code: "not-authorized" });
+  });
+
+  it("lets a non-admin Session manager see grant candidates without overstating Project authority", async () => {
+    await bootstrap();
+    await admitMember(BOB);
+    const beforeSupervisor = await requireSession();
+    const bobParticipant = requireParticipant(beforeSupervisor, BOB.userId);
+    await dispatch({
+      type: "session.responsibility.grant",
+      sessionId: SESSION_ID,
+      userId: BOB.userId,
+      responsibility: "supervisor",
+      expectedSupervisionRevision: beforeSupervisor.supervisionRevision,
+      expectedParticipantVersion: bobParticipant.version,
+    });
+
+    const guestInvitation = await createInvitation("guest");
+    await redeemInvitation(guestInvitation, CAROL);
+    const memberInvitation = await createInvitation("member");
+    await redeemInvitation(memberInvitation, DAVE);
+    await createInvitation("guest");
+
+    const managerAdmission = await admission(BOB);
+    expect(managerAdmission.capabilities).toEqual({
+      canRevokeInvitations: false,
+      canGrantGuestShare: true,
+      canGrantProjectAccess: false,
+    });
+    expect(managerAdmission.activeInvitations).toEqual([]);
+    expect(managerAdmission.accessCandidates).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          userId: CAROL.userId,
+          membershipRole: "guest",
+          requiredGrant: "session-share",
+        }),
+        expect.objectContaining({
+          userId: DAVE.userId,
+          membershipRole: "member",
+          requiredGrant: "project-access",
+          expectedProjectAccessVersion: 0,
+        }),
+      ])
+    );
+
+    await expect(grantProjectAccess(DAVE, "contributor", BOB)).rejects.toMatchObject({
+      code: "not-authorized",
+    });
+    await expect(createShare(CAROL, BOB)).resolves.toMatchObject({ accepted: true });
+    expect((await admission(BOB)).accessCandidates.map((candidate) => candidate.userId)).toEqual([
+      DAVE.userId,
+    ]);
+  });
+
+  it("lets a participating Team admin inspect invitations without exposing manager candidates", async () => {
+    await bootstrap();
+    await admitMember(BOB);
+    await grantMembership(BOB, "admin");
+    const activeInvitation = await createInvitation("member");
+    const pendingGuest = await createInvitation("guest");
+    await redeemInvitation(pendingGuest, CAROL);
+
+    const administratorAdmission = await admission(BOB);
+    expect(administratorAdmission.capabilities).toEqual({
+      canRevokeInvitations: true,
+      canGrantGuestShare: false,
+      canGrantProjectAccess: false,
+    });
+    expect(administratorAdmission.activeInvitations).toEqual([
+      expect.objectContaining({ invitationId: activeInvitation.invitationId }),
+    ]);
+    expect(administratorAdmission.accessCandidates).toEqual([]);
   });
 
   it("never returns an invitation secret on idempotent replay and keeps acceptedSequence monotonic", async () => {
@@ -1665,7 +1773,7 @@ describe("Team Session kernel", () => {
 
     const revoked = await createInvitation("guest");
     const projection = await admission();
-    const revokedProjection = projection.invitations.find(
+    const revokedProjection = projection.activeInvitations.find(
       (invitation) => invitation.invitationId === revoked.invitationId
     );
     if (!revokedProjection) throw new Error("Expected Invitation projection");

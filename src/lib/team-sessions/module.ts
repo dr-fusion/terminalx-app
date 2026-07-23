@@ -3626,13 +3626,95 @@ class SqliteTeamSessions implements TeamSessions {
 
   private projectSessionAdmission(sessionId: string, actorUserId: string): SessionAdmissionView {
     const session = this.requireSession(sessionId);
-    this.requireTeamAdministrator(session.team_id as string, actorUserId);
+    const teamId = session.team_id as string;
+    const projectId = session.project_id as string;
+    if (!this.hasSessionAccess(sessionId, actorUserId)) deny();
+    const membership = this.activeMembership(teamId, actorUserId);
+    if (!membership) deny();
+    const sessionManager = this.isSessionManager(sessionId, actorUserId);
+    const teamAdministrator = membership.role === "owner" || membership.role === "admin";
+    if (!sessionManager && !teamAdministrator) deny();
+    const actorProjectAccess = this.activeProjectAccess(projectId, actorUserId);
+    const canGrantProjectAccess =
+      sessionManager && (teamAdministrator || actorProjectAccess?.role === "maintainer");
+
+    const activeInvitations = teamAdministrator
+      ? (
+          this.db
+            .prepare(
+              `SELECT id, membership_role, version, expires_at_ms
+               FROM session_invitations
+               WHERE session_id = ? AND status = 'active'
+               ORDER BY created_at_ms ASC, id ASC`
+            )
+            .all(sessionId) as SqlRow[]
+        ).map((row) => ({
+          invitationId: row.id as string,
+          membershipRole: row.membership_role as "member" | "guest",
+          version: row.version as number,
+          expiresAtMs: row.expires_at_ms as number,
+        }))
+      : [];
+
+    const candidateUsers = new Set<string>();
+    const accessCandidates: SessionAdmissionView["accessCandidates"] = [];
+    const redeemedInvitations = sessionManager
+      ? (this.db
+          .prepare(
+            `SELECT id, membership_role, redeemed_by_user_id
+             FROM session_invitations
+             WHERE session_id = ? AND status = 'redeemed'
+             ORDER BY redeemed_at_ms DESC, id DESC`
+          )
+          .all(sessionId) as SqlRow[])
+      : [];
+    for (const invitation of redeemedInvitations) {
+      const userId = invitation.redeemed_by_user_id as string | null;
+      if (!userId || candidateUsers.has(userId)) continue;
+      const targetMembership = this.activeMembership(teamId, userId);
+      const membershipRole = invitation.membership_role as "member" | "guest";
+      if (
+        !targetMembership ||
+        (targetMembership.role === "guest") !== (membershipRole === "guest")
+      ) {
+        continue;
+      }
+      // Once the underlying grant exists, the invitee can join without any
+      // further private admission metadata being exposed to a manager.
+      if (this.hasUnderlyingSessionAccess(sessionId, userId)) continue;
+      candidateUsers.add(userId);
+      const common = {
+        invitationId: invitation.id as string,
+        userId,
+        displayName: this.latestActorDisplayName(userId),
+      };
+      if (membershipRole === "guest") {
+        accessCandidates.push({
+          ...common,
+          membershipRole,
+          requiredGrant: "session-share",
+        });
+      } else {
+        accessCandidates.push({
+          ...common,
+          membershipRole,
+          requiredGrant: "project-access",
+          expectedProjectAccessVersion:
+            (this.projectAccess(projectId, userId)?.version as number | undefined) ?? 0,
+        });
+      }
+    }
+
     return {
       sessionId,
-      teamId: session.team_id as string,
-      projectId: session.project_id as string,
       accessRevision: session.access_revision as number,
-      invitations: this.projectInvitations(sessionId),
+      capabilities: {
+        canRevokeInvitations: teamAdministrator,
+        canGrantGuestShare: sessionManager && session.status !== "ended",
+        canGrantProjectAccess,
+      },
+      activeInvitations,
+      accessCandidates,
     };
   }
 

@@ -396,10 +396,35 @@ export interface SessionInvitationView {
 
 export interface SessionAdmissionView {
   sessionId: string;
-  teamId: string;
-  projectId: string;
   accessRevision: number;
-  invitations: SessionInvitationView[];
+  capabilities: {
+    canRevokeInvitations: boolean;
+    canGrantGuestShare: boolean;
+    canGrantProjectAccess: boolean;
+  };
+  activeInvitations: Array<{
+    invitationId: string;
+    membershipRole: "member" | "guest";
+    version: number;
+    expiresAtMs: number;
+  }>;
+  accessCandidates: Array<
+    | {
+        invitationId: string;
+        userId: string;
+        displayName: string;
+        membershipRole: "guest";
+        requiredGrant: "session-share";
+      }
+    | {
+        invitationId: string;
+        userId: string;
+        displayName: string;
+        membershipRole: "member";
+        requiredGrant: "project-access";
+        expectedProjectAccessVersion: number;
+      }
+  >;
 }
 
 export interface SessionHandoffView {

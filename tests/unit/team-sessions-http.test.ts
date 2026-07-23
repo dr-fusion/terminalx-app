@@ -264,7 +264,7 @@ describe("Team Session HTTP adapter", () => {
     );
     expect(accepted.status).toBe(200);
     const acceptedBody = await responseBody(accepted);
-    expect(acceptedBody.result).toMatchObject({ acceptedSequence: 1 });
+    expect(acceptedBody.result).not.toHaveProperty("acceptedSequence");
     const createdTeamId = (acceptedBody.result as { data: { teamId: string } }).data.teamId;
 
     const projection = await handleTeamAccess(
@@ -400,35 +400,51 @@ describe("Team Session HTTP adapter", () => {
     expect(dispatched[5]).not.toHaveProperty("directiveId");
   });
 
-  it("projects command response events without changing intentional one-time result data", async () => {
+  it("projects response events and exposes only the intentional one-time invitation token", async () => {
     const sourceEvent: SessionEvent = {
       schemaVersion: TEAM_SESSION_SCHEMA_VERSION,
       eventId: "event-command-response",
       sessionId: CALLER_SESSION_ID,
       sequence: 7,
-      type: "session.invitation.created",
+      type: "comment.added",
       occurredAtMs: 2_000_000_000_000,
       actor: { kind: "human", userId: ALICE.userId, displayName: ALICE.displayName },
       source: { scope: "private:adapter", key: "private-idempotency-key" },
       payload: {
-        invitationId: "invitation-1",
+        commentId: "comment-1",
+        body: "A visible comment",
         apiToken: "must-not-leak-from-event",
       },
     };
     const commandSessions = {
-      dispatch: async () => ({
+      dispatch: async (command: SessionCommand) => ({
         accepted: true,
         acceptedSequence: 7,
-        commandType: "comment.add",
+        commandType: command.type,
         replayed: false,
-        data: { invitationToken: "intentional-one-time-token" },
+        data: {
+          invitationId: "invitation-1",
+          sessionId: CALLER_SESSION_ID,
+          invitationToken: "intentional-one-time-token",
+          invitationVersion: 1,
+          accessRevision: 2,
+          runtimeOutboxId: "must-not-leak-from-result-data",
+          internalCredential: "must-not-leak-from-result-data",
+        },
         events: [sourceEvent],
+        internalDiagnostics: "must-not-leak-from-result-envelope",
       }),
     } as unknown as TeamSessions;
 
     const response = await handleTeamSessionCommand(
       commandRequest(
-        { type: "comment.add", sessionId: CALLER_SESSION_ID, body: "A comment" },
+        {
+          type: "session.invitation.create",
+          sessionId: CALLER_SESSION_ID,
+          membershipRole: "guest",
+          expiresAtMs: 2_000_000_060_000,
+          expectedAccessRevision: 1,
+        },
         "project-command-events"
       ),
       { ...dependencies, teamSessions: commandSessions }
@@ -438,15 +454,164 @@ describe("Team Session HTTP adapter", () => {
     const [event] = result.events as Array<Record<string, unknown>>;
 
     expect(response.status).toBe(200);
-    expect(result.data).toEqual({ invitationToken: "intentional-one-time-token" });
+    expect(result.data).toEqual({
+      invitationId: "invitation-1",
+      sessionId: CALLER_SESSION_ID,
+      invitationToken: "intentional-one-time-token",
+      invitationVersion: 1,
+      accessRevision: 2,
+    });
+    expect(result).not.toHaveProperty("internalDiagnostics");
+    expect(JSON.stringify(result)).not.toContain("must-not-leak-from-result");
     expect(event).toMatchObject({
       eventId: sourceEvent.eventId,
       actor: sourceEvent.actor,
       sourceAdapter: "internal",
-      payload: { invitationId: "invitation-1", apiToken: "[redacted]" },
+      payload: { commentId: "comment-1", body: "A visible comment" },
     });
+    expect(event?.payload).not.toHaveProperty("apiToken");
     expect(event).not.toHaveProperty("source");
     expect(sourceEvent.payload.apiToken).toBe("must-not-leak-from-event");
+  });
+
+  it("keeps runtime and unknown kernel receipt fields behind the HTTP boundary", async () => {
+    const commandSessions = {
+      dispatch: async (command: SessionCommand) => ({
+        accepted: true,
+        acceptedSequence: 8,
+        commandType: command.type,
+        replayed: false,
+        data: {
+          sessionId: CALLER_SESSION_ID,
+          runtimeOutboxId: "outbox-private",
+          tmuxName: "tmux-private",
+          runtimeLease: { workerId: "worker-private" },
+          privateKey: "private-key-material",
+        },
+        events: [],
+      }),
+    } as unknown as TeamSessions;
+
+    const response = await handleTeamSessionCommand(
+      commandRequest(
+        {
+          type: "session.start",
+          teamId: CALLER_TEAM_ID,
+          projectId: CALLER_PROJECT_ID,
+          name: "Boundary test",
+          steeringPolicy: "single",
+        },
+        "project-session-start-receipt"
+      ),
+      { ...dependencies, teamSessions: commandSessions }
+    );
+    const result = (await responseBody(response)).result as {
+      data: Record<string, unknown>;
+    };
+
+    expect(response.status).toBe(200);
+    expect(result.data).toEqual({ sessionId: CALLER_SESSION_ID });
+    expect(JSON.stringify(result)).not.toMatch(
+      /runtimeOutboxId|tmux-private|worker-private|private-key/
+    );
+  });
+
+  it("fails closed when an allowlisted receipt field is not a finite scalar", async () => {
+    const malformedValues: unknown[] = [
+      { token: "nested-secret" },
+      ["array-secret"],
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      Number.NEGATIVE_INFINITY,
+    ];
+    const reportedErrors: string[] = [];
+
+    for (const [index, malformedValue] of malformedValues.entries()) {
+      const commandSessions = {
+        dispatch: async (command: SessionCommand) => ({
+          accepted: true,
+          acceptedSequence: 9 + index,
+          commandType: command.type,
+          replayed: false,
+          data: { sessionId: malformedValue },
+          events: [],
+        }),
+      } as unknown as TeamSessions;
+      const response = await handleTeamSessionCommand(
+        commandRequest(
+          {
+            type: "session.start",
+            teamId: CALLER_TEAM_ID,
+            projectId: CALLER_PROJECT_ID,
+            name: "Malformed receipt test",
+            steeringPolicy: "single",
+          },
+          `malformed-session-start-receipt-${index}`
+        ),
+        {
+          ...dependencies,
+          teamSessions: commandSessions,
+          reportInternalError: (errorName) => reportedErrors.push(errorName),
+        }
+      );
+      const body = await responseBody(response);
+
+      expect(response.status).toBe(500);
+      expect(body).toEqual({
+        error: { code: "internal-error", message: "Internal server error" },
+      });
+      expect(JSON.stringify(body)).not.toMatch(/nested-secret|array-secret/);
+    }
+
+    expect(reportedErrors).toEqual(malformedValues.map(() => "InternalError"));
+  });
+
+  it("never returns an invitation token from a replayed command receipt", async () => {
+    const commandSessions = {
+      dispatch: async (command: SessionCommand) => ({
+        accepted: true,
+        acceptedSequence: 9,
+        commandType: command.type,
+        replayed: true,
+        data: {
+          invitationId: "invitation-1",
+          sessionId: CALLER_SESSION_ID,
+          invitationToken: "must-not-replay",
+          invitationVersion: 1,
+          accessRevision: 2,
+          invitationTokenUnavailable: true,
+          recoveryAction: "revoke-and-reissue",
+          runtimeOutboxId: "also-private",
+        },
+        events: [],
+      }),
+    } as unknown as TeamSessions;
+
+    const response = await handleTeamSessionCommand(
+      commandRequest(
+        {
+          type: "session.invitation.create",
+          sessionId: CALLER_SESSION_ID,
+          membershipRole: "guest",
+          expiresAtMs: 2_000_000_060_000,
+          expectedAccessRevision: 1,
+        },
+        "project-invitation-replay-receipt"
+      ),
+      { ...dependencies, teamSessions: commandSessions }
+    );
+
+    expect(response.status).toBe(200);
+    expect(
+      ((await responseBody(response)).result as { data: Record<string, unknown> }).data
+    ).toEqual({
+      invitationId: "invitation-1",
+      sessionId: CALLER_SESSION_ID,
+      invitationVersion: 1,
+      accessRevision: 2,
+      invitationTokenUnavailable: true,
+      recoveryAction: "revoke-and-reissue",
+    });
   });
 
   it("rejects client conversation IDs, source data, and invalid suggestion resolution edits", async () => {
@@ -957,7 +1122,7 @@ describe("Team Session HTTP adapter", () => {
     }
   });
 
-  it("returns the bounded redacted public event projection over HTTP", async () => {
+  it("returns only the explicit conversation payload projection over HTTP", async () => {
     let deep: unknown = { visible: "too-deep" };
     for (let index = 0; index < 18; index += 1) deep = { nested: deep };
     const many = Object.fromEntries(
@@ -968,12 +1133,17 @@ describe("Team Session HTTP adapter", () => {
       eventId: "event-public-projection",
       sessionId: CALLER_SESSION_ID,
       sequence: 42,
-      type: "session.test-event",
+      type: "suggestion.added",
       occurredAtMs: 2_000_000_000_000,
       actor: { kind: "human", userId: ALICE.userId, displayName: ALICE.displayName },
       source: { scope: "private:adapter", key: "private-idempotency-key" },
       payload: {
+        suggestionId: "suggestion-public",
+        suggestionVersion: 3,
+        body: "Review the parser boundary",
         visible: "ok",
+        invitationId: "private-invitation-id",
+        accessRevision: 99,
         apiToken: "must-not-leak",
         apiKey: "must-not-leak",
         encryptionKey: "must-not-leak",
@@ -1021,20 +1191,20 @@ describe("Team Session HTTP adapter", () => {
       actor: sourceEvent.actor,
       sourceAdapter: "internal",
       payload: {
-        visible: "ok",
-        apiToken: "[redacted]",
-        apiKey: "[redacted]",
-        encryptionKey: "[redacted]",
-        mnemonic: "[redacted]",
-        recoveryPhrase: "[redacted]",
-        authorization: "[redacted]",
-        nested: [{ privateKey: "[redacted]", safe: true }],
-        runtimeAuthorizationGeneration: 12,
+        suggestionId: "suggestion-public",
+        suggestionVersion: 3,
+        body: "Review the parser boundary",
       },
     });
     expect(event).not.toHaveProperty("source");
-    expect(JSON.stringify(payload.deep)).toContain("[redacted]");
-    expect(Object.keys(payload.many as Record<string, unknown>).length).toBeLessThan(1_100);
+    expect(payload).toEqual({
+      suggestionId: "suggestion-public",
+      suggestionVersion: 3,
+      body: "Review the parser boundary",
+    });
+    expect(JSON.stringify(event)).not.toContain("private-invitation-id");
+    expect(JSON.stringify(event)).not.toContain("must-not-leak");
+    expect(JSON.stringify(event)).not.toContain("accessRevision");
     expect(sourceEvent.payload).toMatchObject({
       apiToken: "must-not-leak",
       nested: [{ privateKey: "must-not-leak" }],

@@ -97,6 +97,116 @@ const HUMAN_COMMAND_FIELDS = {
   "directive.enqueue": ["sessionId", "body", "expectedSteeringRevision"],
 } as const satisfies Record<HumanCommandType, readonly string[]>;
 
+/**
+ * Command receipts cross a separate trust boundary from the kernel. Keep this
+ * list independent from the kernel's result shape so a newly-added internal
+ * field is private by default until the HTTP contract deliberately exposes it.
+ */
+const PUBLIC_COMMAND_RESULT_FIELDS = {
+  "team.create": ["teamId"],
+  "project.create": ["projectId", "teamId"],
+  "team.membership.grant": ["teamId", "userId", "role", "membershipVersion", "previousRole"],
+  "project.access.grant": ["projectId", "userId", "role", "accessVersion"],
+  "project.access.revoke": ["projectId", "userId"],
+  "team.membership.revoke": ["teamId", "userId"],
+  "session.start": ["sessionId"],
+  "session.invitation.create": [
+    "invitationId",
+    "sessionId",
+    "invitationToken",
+    "invitationVersion",
+    "accessRevision",
+    "invitationTokenUnavailable",
+    "recoveryAction",
+  ],
+  "session.invitation.revoke": ["invitationId", "invitationVersion", "accessRevision"],
+  "session.invitation.redeem": [
+    "invitationId",
+    "invitationVersion",
+    "teamId",
+    "sessionId",
+    "membershipRole",
+    "projectAccessGranted",
+    "sessionShareGranted",
+    "participantGranted",
+    "accessRevision",
+  ],
+  "session.join": ["sessionId", "participantId", "participantVersion", "accessRevision"],
+  "session.share.create": ["sessionId", "userId", "shareVersion", "accessRevision"],
+  "session.share.revoke": ["sessionId", "userId", "shareVersion", "accessRevision"],
+  "session.participant.grant": [
+    "sessionId",
+    "participantId",
+    "participantVersion",
+    "accessRevision",
+  ],
+  "session.participant.revoke": ["sessionId", "userId", "participantVersion", "accessRevision"],
+  "session.responsibility.grant": [
+    "sessionId",
+    "userId",
+    "supervisionRevision",
+    "steeringRevision",
+  ],
+  "session.responsibility.revoke": [
+    "sessionId",
+    "userId",
+    "supervisionRevision",
+    "steeringRevision",
+    "controlRevision",
+    "controlEpoch",
+  ],
+  "session.control.transfer": [
+    "sessionId",
+    "controllerUserId",
+    "steeringRevision",
+    "controlRevision",
+    "controlEpoch",
+  ],
+  "session.control.release": ["sessionId", "steeringRevision", "controlRevision", "controlEpoch"],
+  "session.assignee.claim": [
+    "sessionId",
+    "assigneeUserId",
+    "assigneeRevision",
+    "supervisionRevision",
+    "runtimeAuthorizationGeneration",
+    "runtimeAuthorizationState",
+  ],
+  "session.handoff.offer": ["sessionId", "handoffId", "handoffVersion", "expiresAtMs"],
+  "session.handoff.accept": [
+    "sessionId",
+    "handoffId",
+    "handoffVersion",
+    "handoffAccepted",
+    "reason",
+    "assigneeUserId",
+    "assigneeRevision",
+    "supervisionRevision",
+    "steeringRevision",
+    "controlRevision",
+    "controlEpoch",
+  ],
+  "session.handoff.cancel": ["sessionId", "handoffId", "handoffVersion", "reason"],
+  "comment.add": ["sessionId", "commentId", "sequence"],
+  "suggestion.add": ["sessionId", "suggestionId", "suggestionVersion", "sequence"],
+  "suggestion.resolve": [
+    "sessionId",
+    "suggestionId",
+    "suggestionVersion",
+    "resolutionId",
+    "resolution",
+    "directiveId",
+    "directiveStatus",
+    "directiveQueueSequence",
+  ],
+  "directive.enqueue": [
+    "sessionId",
+    "directiveId",
+    "directiveStatus",
+    "queueSequence",
+    "steeringRevision",
+  ],
+} as const satisfies Record<HumanCommandType, readonly string[]>;
+
 const RESPONSE_HEADERS = {
   "Cache-Control": "private, no-store",
   Pragma: "no-cache",
@@ -575,6 +685,46 @@ function singleSearchParam(request: Request, name: string): string | undefined {
   return values[0];
 }
 
+function projectPublicCommandResultData(
+  commandType: HumanCommandType,
+  data: Record<string, unknown>,
+  replayed: boolean
+): Record<string, unknown> {
+  // A replay can become invisible after access is revoked. Do not combine the
+  // marker with stale identifiers or receipt data from the original response.
+  if (Object.hasOwn(data, "receiptUnavailable")) {
+    if (data.receiptUnavailable !== true) throw invalidPublicCommandResult();
+    return { receiptUnavailable: true };
+  }
+
+  const projected: Record<string, unknown> = {};
+  for (const field of PUBLIC_COMMAND_RESULT_FIELDS[commandType]) {
+    // Invitation tokens are the sole secret-shaped receipt value and are only
+    // returned on the successful first response. Kernel replays instead expose
+    // the closed unavailable/recovery markers listed above.
+    if (field === "invitationToken" && replayed) continue;
+    if (!Object.hasOwn(data, field)) continue;
+    const value = data[field];
+    if (!isPublicCommandResultScalar(value)) throw invalidPublicCommandResult();
+    projected[field] = value;
+  }
+  return projected;
+}
+
+function isPublicCommandResultScalar(value: unknown): value is string | number | boolean {
+  return (
+    typeof value === "string" ||
+    typeof value === "boolean" ||
+    (typeof value === "number" && Number.isFinite(value))
+  );
+}
+
+function invalidPublicCommandResult(): Error {
+  // The HTTP error adapter intentionally reports only the closed InternalError
+  // class, never the malformed value or any potentially sensitive nested data.
+  return new Error("Team Session kernel returned invalid public receipt data");
+}
+
 function optionalNonNegativeInteger(
   request: Request,
   name: string,
@@ -616,9 +766,16 @@ export async function handleTeamSessionCommand(
       },
     } as unknown as SessionCommand;
     const result = await sessions(dependencies).dispatch(command);
+    const commandType = body.type as HumanCommandType;
+    if (result.commandType !== commandType) {
+      throw new Error("Team Session kernel returned a mismatched command receipt");
+    }
     return jsonResponse({
       result: {
-        ...result,
+        accepted: result.accepted,
+        commandType,
+        replayed: result.replayed,
+        data: projectPublicCommandResultData(commandType, result.data, result.replayed),
         events: result.events.map(projectPublicSessionEvent),
       },
     });

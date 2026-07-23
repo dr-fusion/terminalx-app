@@ -40,6 +40,10 @@ import { getTelegramConfig, telegramConfigFingerprint } from "../src/lib/telegra
 import { getConfiguredMaxSessions } from "../src/lib/security-config";
 import { assertValidStartupConfiguration } from "../src/lib/startup-validation";
 import { closeTeamSessions, getTeamSessions } from "../src/lib/team-sessions/service";
+import {
+  isMultiplayerTransportEnabled,
+  markMultiplayerTransportAvailable,
+} from "../src/lib/team-sessions/feature";
 import { createTeamSessionTerminalGateway } from "../src/lib/team-session-terminal-gateway";
 import {
   LocalTmuxRuntime,
@@ -89,15 +93,8 @@ const TERMINUS_SCROLLBACK = parseInt(process.env.TERMINUS_SCROLLBACK || "10000",
 const TERMINUS_MAX_SESSIONS = getConfiguredMaxSessions();
 const TERMINUS_READ_ONLY = process.env.TERMINUS_READ_ONLY === "true";
 const TERMINUS_HOST = process.env.TERMINUS_HOST || "127.0.0.1";
-const MULTIPLAYER_ENABLED = parseBooleanFlag("TERMINALX_MULTIPLAYER_ENABLED", false);
-
-function parseBooleanFlag(name: string, fallback: boolean): boolean {
-  const value = process.env[name];
-  if (value === undefined || value === "") return fallback;
-  if (value === "true") return true;
-  if (value === "false") return false;
-  throw new Error(`${name} must be true or false`);
-}
+const MULTIPLAYER_ENABLED = isMultiplayerTransportEnabled();
+markMultiplayerTransportAvailable(MULTIPLAYER_ENABLED);
 
 setMaxSessions(TERMINUS_MAX_SESSIONS);
 // Bump tmux's global history-limit so newly-spawned sessions keep deep

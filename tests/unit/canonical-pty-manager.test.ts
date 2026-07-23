@@ -76,6 +76,8 @@ describe("canonical PTY manager", () => {
         "attach-session",
         "-E",
         "-r",
+        "-f",
+        "ignore-size",
         "-t",
         "=runtime-one:",
       ],
