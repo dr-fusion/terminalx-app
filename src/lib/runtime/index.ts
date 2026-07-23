@@ -1,4 +1,11 @@
 export {
+  DAYTONA_UPSTREAM_BASE_COMMIT,
+  DAYTONA_UPSTREAM_REPOSITORY,
+  resolveDaytonaSourcePin,
+  type DaytonaSourceEnvironment,
+  type DaytonaSourcePin,
+} from "./daytona-source";
+export {
   CANONICAL_TMUX_CONFIG_FILE,
   CANONICAL_TMUX_SOCKET_NAME_ENV,
   DEFAULT_CANONICAL_TMUX_SOCKET_NAME,
@@ -30,3 +37,35 @@ export {
   createRuntimeWriteStateRegistry,
   type RuntimeWriteFence,
 } from "./write-state";
+export {
+  RUNTIME_COMMAND_CAPABILITY,
+  RuntimeAuthorityBindingError,
+  assertRuntimeCommandAuthorityBinding,
+  assertRuntimeRetireAuthorityBinding,
+} from "./runtime-authority";
+export type {
+  AggregateEnforcementProof,
+  ArtifactChunkRef,
+  CheckpointDescriptor,
+  CheckpointReason,
+  FenceAdvance,
+  GrantUsageLedgerSnapshot,
+  ProjectRuntimeCeiling,
+  ResourceProfile,
+  Runtime,
+  RuntimeAuthorizationSnapshot,
+  RuntimeAuthorityEnvelope,
+  RuntimeCapability,
+  RuntimeCommand,
+  RuntimeCursor,
+  RuntimeEvent,
+  RuntimeHandle,
+  RuntimeReceipt,
+  RuntimeRetireAuthorityEnvelope,
+  RuntimeRetireRequest,
+  RuntimeSpec,
+  PlatformSecurityRuntimeAuthorityEnvelope,
+  PlatformSecurityRuntimeCapability,
+  TeamSessionRuntimeAuthorityEnvelope,
+  UsageSnapshot,
+} from "./contracts";

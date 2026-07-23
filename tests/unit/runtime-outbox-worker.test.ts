@@ -76,6 +76,26 @@ function delivery(
   }
 }
 
+function emergencyRetireDelivery(
+  generation = 1
+): Extract<RuntimeOutboxDelivery, { kind: "runtime.session.retire" }> {
+  const base = delivery("runtime.session.retire", generation);
+  if (base.kind !== "runtime.session.retire") throw new Error("Expected retire delivery");
+  return {
+    ...base,
+    payload: {
+      sessionId: SESSION_ID,
+      runtimeAuthorizationGeneration: generation,
+      reason: "emergency-stop",
+      agentRunId: "run-one",
+      runtimeAssignmentId: "assignment-one",
+      runtimeAssignmentGeneration: 1,
+      sandboxId: "sandbox-one",
+      sandboxGeneration: 1,
+    },
+  };
+}
+
 function success(stdout = ""): ExactCommandResult {
   return { ok: true, stdout, stderr: "" };
 }
@@ -110,7 +130,14 @@ function runtimeWith(
   options: {
     log?: string[];
     states?: RuntimeWriteStateUpdate[];
+    ensureState?:
+      | "pending"
+      | "enforced"
+      | "stale"
+      | (() => "pending" | "enforced" | "stale" | Promise<"pending" | "enforced" | "stale">);
+    ensureInputs?: unknown[];
     currentBinding?: boolean;
+    bindingInputs?: unknown[];
   } = {}
 ) {
   const states = options.states ?? [];
@@ -139,7 +166,14 @@ function runtimeWith(
         terminations.push(`${input.reason}:${input.tmuxName}`);
         options.log?.push(`terminate:${input.reason}`);
       },
-      async isCurrentRuntimeBinding() {
+      async runtimeEnsureState(input) {
+        options.ensureInputs?.push(input);
+        return typeof options.ensureState === "function"
+          ? options.ensureState()
+          : (options.ensureState ?? "pending");
+      },
+      async isCurrentRuntimeBinding(input) {
+        options.bindingInputs?.push(input);
         return options.currentBinding ?? true;
       },
     },
@@ -195,6 +229,100 @@ describe("LocalTmuxRuntime", () => {
     expect(create.args).toContain("@terminalx_runtime_authorization_generation");
     expect(create.args).toContain("=canonical-agent:");
     expect(create.args).toEqual(expect.arrayContaining(["prefix", "None", "prefix2", "None"]));
+  });
+
+  it("removes an ensure that becomes stale after a concurrent emergency retirement", async () => {
+    let active = false;
+    let current = true;
+    let releaseCreate: (() => void) | undefined;
+    let markCreateStarted: (() => void) | undefined;
+    const createStarted = new Promise<void>((resolve) => {
+      markCreateStarted = resolve;
+    });
+    const createReleased = new Promise<void>((resolve) => {
+      releaseCreate = resolve;
+    });
+    const requests: ExactCommandRequest[] = [];
+    const executor: ExactCommandExecutor = {
+      async execute(request) {
+        requests.push(request);
+        switch (operation(request.args)) {
+          case "show-options":
+            return active ? success(marker()) : failure("no server running on /tmp/tmux");
+          case "start-server":
+            markCreateStarted?.();
+            await createReleased;
+            active = true;
+            return success();
+          case "list-sessions":
+            return active
+              ? success(`canonical-agent\t1\t${SESSION_ID}\t1\n`)
+              : failure("no server running on /tmp/tmux");
+          case "detach-client":
+            return success();
+          case "kill-session":
+            active = false;
+            return success();
+          default:
+            throw new Error(`Unexpected tmux operation: ${operation(request.args)}`);
+        }
+      },
+    };
+    const { runtime, states, terminations } = runtimeWith(executor, {
+      ensureState: () => (current ? "pending" : "stale"),
+    });
+
+    const applying = runtime.apply(delivery("runtime.session.ensure"));
+    await createStarted;
+    current = false;
+    releaseCreate?.();
+
+    await expect(applying).rejects.toMatchObject({
+      code: "runtime_invalid_state",
+      retryable: false,
+    });
+    expect(active).toBe(false);
+    expect(requests.map((request) => operation(request.args))).toEqual([
+      "show-options",
+      "start-server",
+      "show-options",
+      "list-sessions",
+      "show-options",
+      "list-sessions",
+      "detach-client",
+      "kill-session",
+    ]);
+    expect(states.at(-1)).toEqual({
+      sessionId: SESSION_ID,
+      runtimeAuthorizationGeneration: 1,
+      state: "retired",
+    });
+    expect(terminations).toEqual(["retire:canonical-agent"]);
+  });
+
+  it("preserves an exact Session already enforced by a newer ensure attempt", async () => {
+    const executor = new ScriptedExecutor([
+      success(marker()),
+      success(`canonical-agent\t1\t${SESSION_ID}\t1\n`),
+    ]);
+    let inspection = 0;
+    const { runtime, states, terminations } = runtimeWith(executor, {
+      ensureState: () => (++inspection === 1 ? "pending" : "enforced"),
+    });
+
+    await expect(runtime.apply(delivery("runtime.session.ensure"))).resolves.toBeUndefined();
+
+    expect(executor.requests.map((request) => operation(request.args))).toEqual([
+      "show-options",
+      "list-sessions",
+    ]);
+    expect(executor.requests.some((request) => request.args.includes("kill-session"))).toBe(false);
+    expect(terminations).toEqual([]);
+    expect(states.at(-1)).toEqual({
+      sessionId: SESSION_ID,
+      runtimeAuthorizationGeneration: 1,
+      state: "active",
+    });
   });
 
   it("is idempotent for its exact binding and refuses an unmanaged name collision", async () => {
@@ -271,13 +399,12 @@ describe("LocalTmuxRuntime", () => {
     ]);
   });
 
-  it("fails a stale retire closed before any tmux or PTY effect", async () => {
+  it("fails a stale emergency-retire binding before any tmux or PTY effect", async () => {
     const executor = new ScriptedExecutor([]);
     const { runtime, states, terminations } = runtimeWith(executor, {
       currentBinding: false,
     });
-
-    await expect(runtime.apply(delivery("runtime.session.retire", 1))).rejects.toMatchObject({
+    await expect(runtime.apply(emergencyRetireDelivery())).rejects.toMatchObject({
       code: "runtime_invalid_state",
       retryable: false,
     });
@@ -286,28 +413,52 @@ describe("LocalTmuxRuntime", () => {
     expect(terminations).toEqual([]);
   });
 
-  it("retires only an exact current canonical generation", async () => {
+  it("keeps non-emergency retirement closed until it carries an exact Runtime identity", async () => {
+    const executor = new ScriptedExecutor([]);
+    const bindingInputs: unknown[] = [];
+    const { runtime, states, terminations } = runtimeWith(executor, { bindingInputs });
+
+    await expect(runtime.apply(delivery("runtime.session.retire", 2))).rejects.toMatchObject({
+      code: "runtime_invalid_state",
+      retryable: false,
+    });
+
+    expect(bindingInputs).toEqual([]);
+    expect(executor.requests).toEqual([]);
+    expect(states).toEqual([]);
+    expect(terminations).toEqual([]);
+  });
+
+  it("emergency retirement kills the exact bound Session despite a stale subordinate generation", async () => {
     const executor = new ScriptedExecutor([
       success(marker()),
-      success(`canonical-agent\t1\t${SESSION_ID}\t2\n`),
+      success(`canonical-agent\t1\t${SESSION_ID}\t1\n`),
       success(),
       success(),
     ]);
-    const { runtime, states, terminations } = runtimeWith(executor);
+    const bindingInputs: unknown[] = [];
+    const { runtime, states } = runtimeWith(executor, { bindingInputs });
+    await runtime.apply(emergencyRetireDelivery(2));
 
-    await runtime.apply(delivery("runtime.session.retire", 2));
-
-    expect(states.at(-1)?.state).toBe("retired");
-    expect(terminations).toEqual(["retire:canonical-agent"]);
-    expect(executor.requests.at(-1)?.args).toEqual([
-      "-L",
-      getCanonicalTmuxSocketName(SESSION_ID, {}),
-      "-f",
-      "/dev/null",
-      "kill-session",
-      "-t",
-      "=canonical-agent:",
+    expect(bindingInputs).toEqual([
+      {
+        sessionId: SESSION_ID,
+        runtimeAuthorizationGeneration: 2,
+        emergencyStop: {
+          agentRunId: "run-one",
+          runtimeAssignmentId: "assignment-one",
+          runtimeAssignmentGeneration: 1,
+          sandboxId: "sandbox-one",
+          sandboxGeneration: 1,
+        },
+      },
     ]);
+    expect(states.at(-1)).toEqual({
+      sessionId: SESSION_ID,
+      runtimeAuthorizationGeneration: 2,
+      state: "retired",
+    });
+    expect(executor.requests.at(-1)?.args).toContain("kill-session");
   });
 
   it("rejects unbounded command timeouts", () => {
@@ -318,6 +469,9 @@ describe("LocalTmuxRuntime", () => {
           fenceCallbacks: {
             updateWriteState() {},
             async terminateCanonicalPtys() {},
+            async runtimeEnsureState() {
+              return "pending";
+            },
             async isCurrentRuntimeBinding() {
               return true;
             },
@@ -401,7 +555,7 @@ describe("LocalTmuxRuntime", () => {
     const executor = new ScriptedExecutor([failure("no server running on /tmp/tmux")]);
     const { runtime, states, terminations } = runtimeWith(executor);
 
-    await runtime.apply(delivery("runtime.session.retire", 2));
+    await runtime.apply(emergencyRetireDelivery(2));
 
     expect(states).toEqual([
       {
@@ -410,6 +564,20 @@ describe("LocalTmuxRuntime", () => {
         state: "retired",
       },
     ]);
+    expect(terminations).toEqual([]);
+  });
+
+  it("does not treat a permission-denied socket connection as completed retirement", async () => {
+    const executor = new ScriptedExecutor([
+      failure("error connecting to /tmp/tmux/terminalx (Permission denied)"),
+    ]);
+    const { runtime, states, terminations } = runtimeWith(executor);
+
+    await expect(runtime.apply(emergencyRetireDelivery(2))).rejects.toMatchObject({
+      code: "runtime_permission_denied",
+      retryable: false,
+    });
+    expect(states).toEqual([]);
     expect(terminations).toEqual([]);
   });
 });

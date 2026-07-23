@@ -43,6 +43,7 @@ export interface TeamSessionViewerBasis {
   controlRevision: number;
   controlEpoch: number;
   runtimeAuthorizationGeneration: number;
+  runStateRevision: number;
   latestSequence: number;
 }
 
@@ -133,6 +134,260 @@ export interface TeamSessionDetail extends TeamSessionInboxItem {
   shares: TeamSessionShare[];
   /** Open Handoffs are scoped to Session managers and relevant participants. */
   openHandoffs: TeamSessionOpenHandoff[];
+}
+
+export type TeamSessionRunStartReason =
+  | "available"
+  | "not-session-manager"
+  | "session-not-active"
+  | "runtime-not-ready"
+  | "mutable-run-exists"
+  | "run-mutations-unavailable";
+
+export interface TeamSessionRunStartAvailability {
+  available: boolean;
+  reason: TeamSessionRunStartReason;
+}
+
+export interface TeamSessionRunCapabilities {
+  startRun: boolean;
+  reviseRunPolicy: boolean;
+  pauseRun: boolean;
+  resumeRun: boolean;
+  stopRun: boolean;
+  emergencyStopRun: boolean;
+  editGoals: boolean;
+  reviewGoalEvidence: boolean;
+  resolveFinalReview: boolean;
+  viewActionCenter: boolean;
+  resolveAttention: boolean;
+  resolveApprovals: boolean;
+  revokeRunGrants: boolean;
+  resolveGrantReviews: boolean;
+}
+
+export type TeamSessionRunLimit<T> = { kind: "unconfigured" } | { kind: "capped"; value: T };
+
+export interface TeamSessionRunMoney {
+  currency: string;
+  minorUnits: number;
+}
+
+export interface TeamSessionRunLimitsSummary {
+  wallClock: TeamSessionRunLimit<{ milliseconds: number }>;
+  modelTokens: TeamSessionRunLimit<number>;
+  modelSpend: TeamSessionRunLimit<TeamSessionRunMoney>;
+  outboundBytes: TeamSessionRunLimit<number>;
+  actionCounts: {
+    local: TeamSessionRunLimit<number>;
+    "scoped-external": TeamSessionRunLimit<number>;
+    protected: TeamSessionRunLimit<number>;
+    forbidden: TeamSessionRunLimit<number>;
+  };
+}
+
+export type TeamSessionAgentRunMode = "supervised" | "autonomous" | "yolo";
+export type TeamSessionAgentRunLifecycle =
+  | "active"
+  | "pausing"
+  | "paused"
+  | "agent-work-finished"
+  | "completed"
+  | "failed"
+  | "stopped"
+  | "emergency-stopped";
+export type TeamSessionRunCompletionPolicy =
+  | "stop-after-directed-work"
+  | "continue-until-all-goals-achieved";
+
+export interface TeamSessionGoalEvidenceSummary {
+  evidenceId: string;
+  status: "proposed" | "validated" | "more-work-requested";
+  createdAtMs: number;
+  reviewedAtMs?: number;
+}
+
+export interface TeamSessionRunGoalView {
+  goalId: string;
+  position: number;
+  title: string;
+  acceptanceCriteria: string[];
+  dependencyGoalIds: string[];
+  version: number;
+  status: "pending" | "in-progress" | "blocked" | "provisionally-achieved" | "validated";
+  evidenceTotalCount: number;
+  evidence: TeamSessionGoalEvidenceSummary[];
+}
+
+export interface TeamSessionAgentRunView {
+  agentRunId: string;
+  lifecycle: TeamSessionAgentRunLifecycle;
+  stateVersion: number;
+  mode: TeamSessionAgentRunMode;
+  completionPolicy: TeamSessionRunCompletionPolicy;
+  runPolicyRevision: number;
+  goalSetRevision: number;
+  finalReviewVersion: number;
+  finalReviewState: "not-ready" | "open" | "accepted";
+  requiresPolicyRebind: boolean;
+  sandboxState:
+    | "provisioning"
+    | "ready"
+    | "checkpointing"
+    | "recovering"
+    | "quarantined"
+    | "retired"
+    | "failed";
+  limitStatus:
+    | "accounting-unavailable"
+    | "within-configured-limits"
+    | "warning-75-percent"
+    | "approaching-90-percent"
+    | "configured-limit-reached";
+  attentionSummary: {
+    openCount: number;
+    blockingCount: number;
+    independentAuthorizedWorkMayContinue: boolean;
+  };
+  policySummary: {
+    mode: TeamSessionAgentRunMode;
+    completionPolicy: TeamSessionRunCompletionPolicy;
+    limits: TeamSessionRunLimitsSummary;
+  };
+  goals: TeamSessionRunGoalView[];
+}
+
+export interface TeamSessionActionEffectSummary {
+  wallClockMilliseconds: number;
+  modelTokens: number;
+  modelSpend: TeamSessionRunMoney;
+  outboundBytes: number;
+  actionCounts: {
+    local: number;
+    "scoped-external": number;
+    protected: number;
+    forbidden: number;
+  };
+}
+
+export type TeamSessionApprovalRequestStatus =
+  | "open"
+  | "approved"
+  | "denied"
+  | "expired"
+  | "superseded";
+export type TeamSessionApprovableActionClass = "scoped-external" | "protected";
+export type TeamSessionEligibleRunGrantUse =
+  | "session_branch_push"
+  | "draft_pull_request_update"
+  | "ephemeral_preview_update"
+  | "same_credential_nonproduction_target";
+
+export interface TeamSessionApprovalView {
+  approvalRequestId: string;
+  version: number;
+  status: TeamSessionApprovalRequestStatus;
+  expiresAtMs: number;
+  displayDigest: string;
+  actionClass: TeamSessionApprovableActionClass;
+  provider: string;
+  operation: string;
+  exactTarget: string;
+  expectedEffect: TeamSessionActionEffectSummary;
+  reason: string;
+  risk: string;
+  allowedResolutions: Array<"approve-once" | "approve-for-run" | "deny">;
+  runApprovalPattern?: {
+    eligibleUse: TeamSessionEligibleRunGrantUse;
+    provider: string;
+    operation: string;
+    targetPattern: string;
+    displayDigest: string;
+  };
+}
+
+export interface TeamSessionAttentionView {
+  attentionRequestId: string;
+  version: number;
+  deadlineAtMs: number;
+  status: "open" | "resolved" | "superseded" | "timed-out";
+  reason: string;
+  risk: string;
+  independentAuthorizedWorkMayContinue: boolean;
+  linkedApproval: boolean;
+  proposal:
+    | { kind: "action-review" }
+    | {
+        kind: "structured-decision";
+        options: Array<{ optionId: string; label: string; description: string }>;
+      };
+  allowedResolutions: Array<"deny-proposed-action" | "supersede-with-directive" | "answer">;
+  answerOptionIds: string[];
+}
+
+export interface TeamSessionGrantView {
+  grantId: string;
+  version: number;
+  status:
+    | "issued"
+    | "enforcement-pending"
+    | "active"
+    | "consumed"
+    | "expired"
+    | "revoked"
+    | "invalidated"
+    | "enforcement-failed";
+  actionClass: TeamSessionApprovableActionClass;
+  provider: string;
+  operation: string;
+  exactTarget: string;
+  scope: "once" | "run";
+  expiresAtMs: number;
+  allowedActions: Array<"revoke">;
+}
+
+export interface TeamSessionGrantCandidateView {
+  grantId: string;
+  actionClass: TeamSessionApprovableActionClass;
+  provider: string;
+  operation: string;
+  exactTarget: string;
+  scope: "once" | "run";
+}
+
+export interface TeamSessionGrantReviewView {
+  grantReviewId: string;
+  version: number;
+  reason:
+    | "policy-revision"
+    | "runtime-assignment"
+    | "sandbox-generation"
+    | "runtime-authorization"
+    | "credential"
+    | "explicit-revocation"
+    | "recovery";
+  status: "open" | "resolved" | "superseded";
+  safeDefault: "revoke-all";
+  deliberatelyRevokedCount: number;
+  reissuableCandidates: TeamSessionGrantCandidateView[];
+  allowedActions: {
+    revokeAll: boolean;
+    reissueCandidateGrantIds: string[];
+  };
+}
+
+/** Actor-scoped Run read model. Never place it on the shared event stream. */
+export interface TeamSessionRunState {
+  sessionId: string;
+  asOfSequence: number;
+  runStateRevision: number;
+  capabilities: TeamSessionRunCapabilities;
+  start: TeamSessionRunStartAvailability;
+  currentRun: TeamSessionAgentRunView | null;
+  attentionRequests: TeamSessionAttentionView[];
+  approvalRequests: TeamSessionApprovalView[];
+  activeGrants: TeamSessionGrantView[];
+  grantReviews: TeamSessionGrantReviewView[];
 }
 
 export interface TeamSessionActiveInvitation {

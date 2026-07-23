@@ -301,6 +301,7 @@ function inboxFixture() {
         controlRevision: 1,
         controlEpoch: 1,
         runtimeAuthorizationGeneration: 1,
+        runStateRevision: 1,
         latestSequence: 3,
       },
       capabilities: Object.fromEntries(

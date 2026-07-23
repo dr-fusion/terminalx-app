@@ -235,11 +235,11 @@ function createMultiplayerServices(): MultiplayerServices {
           includeCurrentGeneration: input.reason === "retire",
         });
       },
-      // No retire-producing human command exists in Phase 1. Until a narrow
-      // authoritative kernel binding query lands, destructive retirement is
-      // deliberately fail-closed rather than inferred from a projection.
-      async isCurrentRuntimeBinding() {
-        return false;
+      async runtimeEnsureState(input) {
+        return teamSessions.runtimeEnsureState(input);
+      },
+      async isCurrentRuntimeBinding(input) {
+        return teamSessions.isCurrentRuntimeBinding(input);
       },
     },
   });

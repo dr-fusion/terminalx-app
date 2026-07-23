@@ -3,6 +3,12 @@ import * as path from "path";
 import type Database from "better-sqlite3";
 import { openTeamSessionDatabase } from "./sqlite";
 import { isValidTmuxSessionName } from "../tmux";
+import { projectPublicSessionRunState } from "./public-run-state";
+import {
+  assertValidRunPolicyCommit,
+  isRunPolicyWidening,
+  validateInitialGoals,
+} from "./run-policy";
 import {
   RUNTIME_OUTBOX_ERROR_CODES,
   TEAM_SESSION_SCHEMA_VERSION,
@@ -17,6 +23,8 @@ import {
   type PublicSessionIdentityView,
   type PublicSessionParticipantView,
   type PublicSessionResponsibilityView,
+  type PublicSessionRunStateQuery,
+  type PublicSessionRunStateView,
   type PublicSessionShareView,
   type RuntimeOutboxClaimOptions,
   type RuntimeOutboxDelivery,
@@ -34,6 +42,8 @@ import {
   type SessionListQuery,
   type SessionParticipantView,
   type SessionResponsibility,
+  type SessionRunStateQuery,
+  type SessionRunStateView,
   type SessionTerminalAuthorizationQuery,
   type SessionView,
   type SessionViewerCapabilities,
@@ -46,6 +56,11 @@ import {
   type WorkspaceDiscoveryQuery,
   type WorkspaceDiscoveryView,
   type WorkspaceProjectView,
+  type AgentRunLifecycle,
+  type GoalDefinition,
+  type GoalEvidence,
+  type GoalItem,
+  type RunPolicyDraft,
 } from "./types";
 
 type SqlValue = string | number | null;
@@ -76,8 +91,31 @@ const DEFAULT_HANDOFF_TTL_MS = 24 * 60 * 60 * 1_000;
 const MAX_CONVERSATION_BODY_BYTES = 16 * 1_024;
 const MAX_PENDING_DIRECTIVES_PER_AUTHOR = 64;
 const MAX_PENDING_DIRECTIVES_PER_SESSION = 256;
+const LOCAL_TMUX_PROJECT_CEILING_REVISION = "local-tmux-ceiling:v1";
+const LOCAL_TMUX_PROJECT_CEILING_DIGEST = sha256(
+  "terminalx:local-tmux:trusted-shared-host:no-yolo:v1"
+);
 
 type ConversationIdentityKind = "comment" | "suggestion" | "resolution" | "directive";
+
+interface MutableGoalItem {
+  goalId: string;
+  position: number;
+  title: string;
+  acceptanceCriteria: string[];
+  dependencyGoalIds: string[];
+  version: number;
+  status: GoalItem["status"];
+}
+
+interface AssigneeLossRunTransition {
+  agentRunId: string;
+  lifecycle: "pausing" | "paused" | "agent-work-finished";
+  stateVersion: number;
+  sandboxState: "recovering" | "quarantined";
+  invalidatedGrantCount: number;
+  runStateRevision: number;
+}
 
 type RuntimeOutboxPayload<K extends RuntimeOutboxKind> = Extract<
   RuntimeOutboxDelivery,
@@ -169,11 +207,13 @@ class SqliteTeamSessions implements TeamSessions {
   inspect(query: WorkspaceDiscoveryQuery): Promise<WorkspaceDiscoveryView>;
   inspect(query: SessionInboxQuery): Promise<SessionInboxItemView[]>;
   inspect(query: SessionDetailQuery): Promise<SessionDetailView | null>;
+  inspect(query: PublicSessionRunStateQuery): Promise<PublicSessionRunStateView | null>;
   inspect(query: SessionEventsQuery): Promise<SessionEvent[]>;
   inspect(query: SessionTerminalAuthorizationQuery): Promise<TerminalAuthorization>;
   inspect(query: SessionAdmissionQuery): Promise<SessionAdmissionView>;
   inspect(query: TeamAccessQuery): Promise<TeamAccessView>;
   inspect(query: ProjectAccessQuery): Promise<ProjectAccessView>;
+  inspect(query: SessionRunStateQuery): Promise<SessionRunStateView | null>;
   async inspect(
     query:
       | SessionGetQuery
@@ -181,11 +221,13 @@ class SqliteTeamSessions implements TeamSessions {
       | WorkspaceDiscoveryQuery
       | SessionInboxQuery
       | SessionDetailQuery
+      | PublicSessionRunStateQuery
       | SessionEventsQuery
       | SessionTerminalAuthorizationQuery
       | SessionAdmissionQuery
       | TeamAccessQuery
       | ProjectAccessQuery
+      | SessionRunStateQuery
   ): Promise<
     | SessionView
     | null
@@ -193,11 +235,13 @@ class SqliteTeamSessions implements TeamSessions {
     | WorkspaceDiscoveryView
     | SessionInboxItemView[]
     | SessionDetailView
+    | PublicSessionRunStateView
     | SessionEvent[]
     | TerminalAuthorization
     | SessionAdmissionView
     | TeamAccessView
     | ProjectAccessView
+    | SessionRunStateView
   > {
     this.assertOpen();
     if (!query || typeof query !== "object") {
@@ -234,6 +278,18 @@ class SqliteTeamSessions implements TeamSessions {
                 this.publicProjectionTime()
               )
             : null;
+        case "session.public-run-state": {
+          if (!this.hasSessionAccess(query.sessionId, query.actor.userId)) return null;
+          const session = this.projectPublicSessionDetail(
+            query.sessionId,
+            query.actor.userId,
+            this.publicProjectionTime()
+          );
+          return projectPublicSessionRunState(
+            session,
+            this.projectSessionRunState(query.sessionId)
+          );
+        }
         case "session.events":
           if (!this.hasSessionAccess(query.sessionId, query.actor.userId)) return [];
           return this.readEvents(
@@ -249,6 +305,10 @@ class SqliteTeamSessions implements TeamSessions {
           return this.projectTeamAccess(query.teamId, query.actor.userId);
         case "project.access":
           return this.projectProjectAccess(query.projectId, query.actor.userId);
+        case "session.run-state":
+          return this.hasSessionAccess(query.sessionId, query.actor.userId)
+            ? this.projectSessionRunState(query.sessionId)
+            : null;
       }
     });
     return readSnapshot();
@@ -386,6 +446,94 @@ class SqliteTeamSessions implements TeamSessions {
     return claim.immediate();
   }
 
+  runtimeEnsureState(input: {
+    sessionId: string;
+    tmuxName: string;
+    runtimeAuthorizationGeneration: number;
+  }): "pending" | "enforced" | "stale" {
+    this.assertOpen();
+    const sessionId = requiredCanonicalSessionId(input?.sessionId, "Session id");
+    const tmuxName = requiredText(input?.tmuxName, "tmux Session name", 160);
+    const generation = requiredRevision(
+      input?.runtimeAuthorizationGeneration,
+      "Runtime Authorization"
+    );
+    const current = this.db
+      .prepare(
+        `SELECT runtime_authorization_state FROM sessions
+         WHERE id = ? AND status = 'active'
+           AND runtime_kind = 'local-tmux' AND isolation = 'trusted-shared-host'
+           AND tmux_name = ? AND runtime_authorization_generation = ?`
+      )
+      .get(sessionId, tmuxName, generation) as SqlRow | undefined;
+    if (current?.runtime_authorization_state === "pending") return "pending";
+    if (current?.runtime_authorization_state === "enforced") return "enforced";
+    return "stale";
+  }
+
+  isCurrentRuntimeBinding(input: {
+    sessionId: string;
+    runtimeAuthorizationGeneration: number;
+    emergencyStop?: {
+      agentRunId: string;
+      runtimeAssignmentId: string;
+      runtimeAssignmentGeneration: number;
+      sandboxId: string;
+      sandboxGeneration: number;
+    };
+  }): boolean {
+    this.assertOpen();
+    const sessionId = requiredIdentifier(input?.sessionId, "Session id");
+    const generation = requiredRevision(
+      input?.runtimeAuthorizationGeneration,
+      "Runtime Authorization"
+    );
+    if (input.emergencyStop) {
+      const emergency = input.emergencyStop;
+      const agentRunId = requiredIdentifier(emergency.agentRunId, "Emergency-stop Agent Run id");
+      const runtimeAssignmentId = requiredIdentifier(
+        emergency.runtimeAssignmentId,
+        "Runtime Assignment id"
+      );
+      const runtimeAssignmentGeneration = requiredRevision(
+        emergency.runtimeAssignmentGeneration,
+        "Runtime Assignment"
+      );
+      const sandboxId = requiredIdentifier(emergency.sandboxId, "Sandbox id");
+      const sandboxGeneration = requiredRevision(emergency.sandboxGeneration, "Sandbox generation");
+      return Boolean(
+        this.db
+          .prepare(
+            `SELECT 1 FROM sessions session
+             JOIN runtime_assignments assignment ON assignment.session_id = session.id
+             JOIN agent_runs run
+               ON run.session_id = session.id AND run.runtime_assignment_id = assignment.id
+             WHERE session.id = ?
+               AND session.runtime_authorization_generation >= ?
+               AND assignment.id = ? AND assignment.generation = ?
+               AND assignment.sandbox_id = ? AND assignment.sandbox_generation = ?
+               AND assignment.status = 'quarantined'
+               AND run.id = ? AND run.lifecycle = 'pausing'
+               AND run.runtime_authorization_generation >= ?`
+          )
+          .get(
+            sessionId,
+            generation,
+            runtimeAssignmentId,
+            runtimeAssignmentGeneration,
+            sandboxId,
+            sandboxGeneration,
+            agentRunId,
+            generation
+          )
+      );
+    }
+    // No non-emergency retire producer exists in Phase 4, and that legacy
+    // payload does not carry an exact Runtime Assignment/Sandbox identity.
+    // Keep it fail closed until the destructive request is fully bound.
+    return false;
+  }
+
   close(): void {
     if (this.closed) return;
     this.closed = true;
@@ -448,6 +596,30 @@ class SqliteTeamSessions implements TeamSessions {
         return this.resolveSuggestion(command, now);
       case "directive.enqueue":
         return this.enqueueDirective(command, now);
+      case "run.start":
+        return this.startAgentRun(command, now);
+      case "run.policy.revise":
+        return this.reviseAgentRunPolicy(command, now);
+      case "run.pause":
+        return this.pauseAgentRun(command, now);
+      case "run.resume":
+        return this.resumeAgentRun(command, now);
+      case "run.stop":
+        return this.stopAgentRun(command, now);
+      case "run.emergency-stop":
+        return this.emergencyStopAgentRun(command, now);
+      case "goal.add":
+        return this.addRunGoal(command, now);
+      case "goal.criteria.strengthen":
+        return this.strengthenRunGoalCriteria(command, now);
+      case "goal.dependency.add":
+        return this.addRunGoalDependency(command, now);
+      case "goal.reorder":
+        return this.reorderRunGoal(command, now);
+      case "goal.evidence.review":
+        return this.reviewRunGoalEvidence(command, now);
+      case "run.final-review.resolve":
+        return this.resolveAgentRunFinalReview(command, now);
       case "runtime.outbox.acknowledge":
         return this.acknowledgeRuntimeOutbox(command, now);
       case "runtime.outbox.fail":
@@ -2368,8 +2540,770 @@ class SqliteTeamSessions implements TeamSessions {
     );
   }
 
+  private startAgentRun(
+    command: Extract<SessionCommand, { type: "run.start" }>,
+    now: number
+  ): CommandResult {
+    const session = this.requireSession(command.sessionId);
+    this.requireSessionManager(command.sessionId, command.actor.userId);
+    if (session.status !== "active") {
+      throw new TeamSessionError("conflict", "Only an active Session can start a Run");
+    }
+    if (session.runtime_authorization_state !== "enforced") {
+      throw new TeamSessionError(
+        "conflict",
+        "Runtime authorization must be enforced before a Run can start"
+      );
+    }
+    assertExpectedRevision(
+      session.run_state_revision as number,
+      command.expectedSessionRevision,
+      "Run state"
+    );
+    if (this.mutableAgentRun(command.sessionId)) {
+      throw new TeamSessionError("conflict", "This Session already has a mutable Run");
+    }
+    validateInitialGoalsOrThrow(command.initialGoals);
+    const assignment = this.ensureCurrentRuntimeAssignment(session, now);
+    this.assertRunPolicyCommit(command.commit, session, assignment);
+    if (command.initialYoloActionGrantId !== undefined && command.commit.policy.mode !== "yolo") {
+      throw new TeamSessionError(
+        "invalid-command",
+        "An initial YOLO Action Grant is valid only for YOLO mode"
+      );
+    }
+
+    const agentRunId = this.nextId("run");
+    const goalSetId = this.nextId("goal-set");
+    const goals: GoalItem[] = command.initialGoals.map((goal) => ({
+      ...goal,
+      acceptanceCriteria: [...goal.acceptanceCriteria],
+      dependencyGoalIds: [...goal.dependencyGoalIds],
+      version: 1,
+      status: "pending",
+    }));
+    this.db
+      .prepare(
+        `INSERT INTO agent_runs
+           (id, session_id, team_id, project_id, runtime_assignment_id, lifecycle,
+            state_version, current_policy_revision, current_goal_set_revision,
+            runtime_authorization_generation, final_review_version,
+            created_by_user_id, created_at_ms, updated_at_ms, terminal_at_ms)
+         VALUES (?, ?, ?, ?, ?, 'active', 1, 1, 1, ?, 1, ?, ?, ?, NULL)`
+      )
+      .run(
+        agentRunId,
+        command.sessionId,
+        session.team_id,
+        session.project_id,
+        assignment.id,
+        assignment.runtime_authorization_generation,
+        command.actor.userId,
+        now,
+        now
+      );
+    const goalSetDigest = this.insertGoalSetSnapshot({
+      agentRunId,
+      goalSetId,
+      revision: 1,
+      goals,
+      now,
+    });
+    this.insertRunPolicyRevision({
+      agentRunId,
+      sessionId: command.sessionId,
+      revision: 1,
+      policy: command.commit.policy,
+      policyDigest: command.commit.policyDigest,
+      goalSetId,
+      goalSetRevision: 1,
+      goalSetDigest,
+      assignment,
+      yoloConfirmationRef: command.commit.yoloConfirmation?.challengeId,
+      now,
+    });
+    const runStateRevision = this.advanceRunStateRevision(command.sessionId);
+    const event = this.appendEvent(command.sessionId, command, now, "run.started", {
+      agentRunId,
+      lifecycle: "active",
+      stateVersion: 1,
+      runPolicyRevision: 1,
+      policyDigest: command.commit.policyDigest,
+      mode: command.commit.policy.mode,
+      completionPolicy: command.commit.policy.completionPolicy.kind,
+      goalSetId,
+      goalSetRevision: 1,
+      goalSetDigest,
+      goalCount: goals.length,
+      runStateRevision,
+    });
+    return result(
+      command,
+      {
+        sessionId: command.sessionId,
+        agentRunId,
+        lifecycle: "active",
+        stateVersion: 1,
+        runPolicyRevision: 1,
+        goalSetRevision: 1,
+        runStateRevision,
+      },
+      [event]
+    );
+  }
+
+  private reviseAgentRunPolicy(
+    command: Extract<SessionCommand, { type: "run.policy.revise" }>,
+    now: number
+  ): CommandResult {
+    const session = this.requireSession(command.sessionId);
+    this.requireSessionManager(command.sessionId, command.actor.userId);
+    const run = this.requireMutableAgentRun(command.sessionId, command.agentRunId);
+    assertExpectedRevision(
+      run.current_policy_revision as number,
+      command.expectedRunPolicyRevision,
+      "Run policy"
+    );
+    const assignment = this.requireRuntimeAssignment(run.runtime_assignment_id as string);
+    if (
+      assignment.session_id !== command.sessionId ||
+      assignment.status !== "ready" ||
+      session.runtime_authorization_state !== "enforced" ||
+      assignment.runtime_authorization_generation !== session.runtime_authorization_generation ||
+      run.runtime_authorization_generation !== session.runtime_authorization_generation
+    ) {
+      throw new TeamSessionError(
+        "conflict",
+        "Run Runtime binding changed; recover or stop the Run before revising policy"
+      );
+    }
+    this.assertRunPolicyCommit(command.commit, session, assignment);
+    const current = this.readRunPolicyDraft(
+      command.agentRunId,
+      run.current_policy_revision as number
+    );
+    const currentSnapshot = this.db
+      .prepare(
+        `SELECT policy_body_digest, runtime_assignment_id, runtime_assignment_generation,
+                sandbox_id, sandbox_generation, runtime_principal_id,
+                runtime_authorization_generation
+         FROM run_policy_revisions WHERE agent_run_id = ? AND revision = ?`
+      )
+      .get(command.agentRunId, run.current_policy_revision) as SqlRow | undefined;
+    if (!currentSnapshot) {
+      throw new TeamSessionError("conflict", "Run policy revision is unavailable");
+    }
+    const bindingChanged = !this.policySnapshotMatchesAssignment(
+      currentSnapshot,
+      assignment,
+      session.runtime_authorization_generation as number
+    );
+    const policyBodyChanged = currentSnapshot.policy_body_digest !== command.commit.policyDigest;
+    if (!bindingChanged && !policyBodyChanged) {
+      throw new TeamSessionError("conflict", "Run policy and Runtime binding are unchanged");
+    }
+    const widening = isRunPolicyWidening(current, command.commit.policy);
+    if (widening) {
+      throw new TeamSessionError(
+        "conflict",
+        "A wider Run policy requires a completed one-shot approval"
+      );
+    }
+    if (command.commit.wideningActionGrantId !== undefined) {
+      throw new TeamSessionError(
+        "invalid-command",
+        "A widening Action Grant is invalid for a tightening policy revision"
+      );
+    }
+    const nextRevision = (run.current_policy_revision as number) + 1;
+    const goalSet = this.currentGoalSetSnapshot(run);
+    this.insertRunPolicyRevision({
+      agentRunId: command.agentRunId,
+      sessionId: command.sessionId,
+      revision: nextRevision,
+      previousRevision: run.current_policy_revision as number,
+      policy: command.commit.policy,
+      policyDigest: command.commit.policyDigest,
+      goalSetId: goalSet.goalSetId,
+      goalSetRevision: goalSet.revision,
+      goalSetDigest: goalSet.digest,
+      assignment,
+      yoloConfirmationRef: command.commit.yoloConfirmation?.challengeId,
+      now,
+    });
+    const updated = this.db
+      .prepare(
+        `UPDATE agent_runs
+         SET current_policy_revision = ?, state_version = state_version + 1, updated_at_ms = ?
+         WHERE id = ? AND session_id = ? AND current_policy_revision = ?
+         RETURNING state_version`
+      )
+      .get(
+        nextRevision,
+        now,
+        command.agentRunId,
+        command.sessionId,
+        command.expectedRunPolicyRevision
+      ) as SqlRow | undefined;
+    if (!updated) throw new TeamSessionError("stale-revision", "Run policy changed concurrently");
+    const invalidatedGrantCount = this.invalidateMutableRunGrants(
+      command.agentRunId,
+      now,
+      "policy-revision"
+    );
+    const runStateRevision = this.advanceRunStateRevision(command.sessionId);
+    const event = this.appendEvent(command.sessionId, command, now, "run.policy.revised", {
+      agentRunId: command.agentRunId,
+      previousRunPolicyRevision: command.expectedRunPolicyRevision,
+      runPolicyRevision: nextRevision,
+      policyDigest: command.commit.policyDigest,
+      transition: bindingChanged
+        ? policyBodyChanged
+          ? "rebind-and-tighten"
+          : "rebind"
+        : "tighten",
+      mode: command.commit.policy.mode,
+      completionPolicy: command.commit.policy.completionPolicy.kind,
+      stateVersion: updated.state_version,
+      invalidatedGrantCount,
+      runStateRevision,
+    });
+    return result(
+      command,
+      {
+        sessionId: command.sessionId,
+        agentRunId: command.agentRunId,
+        runPolicyRevision: nextRevision,
+        stateVersion: updated.state_version,
+        invalidatedGrantCount,
+        runStateRevision,
+      },
+      [event]
+    );
+  }
+
+  private pauseAgentRun(
+    command: Extract<SessionCommand, { type: "run.pause" }>,
+    now: number
+  ): CommandResult {
+    const session = this.requireSession(command.sessionId);
+    this.requireSessionManager(command.sessionId, command.actor.userId);
+    const run = this.requireMutableAgentRun(command.sessionId, command.agentRunId);
+    this.requireReadyRunRuntimeBinding(session, run);
+    assertExpectedVersion(
+      run.state_version as number,
+      command.expectedRunStateVersion,
+      "Run state"
+    );
+    if (run.lifecycle !== "active") {
+      throw new TeamSessionError("conflict", "Only an active Run can be paused");
+    }
+    return this.transitionAgentRunLifecycle(command, run, "paused", now, "run.paused");
+  }
+
+  private resumeAgentRun(
+    command: Extract<SessionCommand, { type: "run.resume" }>,
+    now: number
+  ): CommandResult {
+    const session = this.requireSession(command.sessionId);
+    this.requireSessionManager(command.sessionId, command.actor.userId);
+    const run = this.requireMutableAgentRun(command.sessionId, command.agentRunId);
+    assertExpectedVersion(
+      run.state_version as number,
+      command.expectedRunStateVersion,
+      "Run state"
+    );
+    assertExpectedRevision(
+      run.current_policy_revision as number,
+      command.expectedRunPolicyRevision,
+      "Run policy"
+    );
+    assertExpectedRevision(
+      run.runtime_authorization_generation as number,
+      command.expectedRuntimeAuthorizationGeneration,
+      "Run Runtime Authorization"
+    );
+    if (run.lifecycle !== "paused") {
+      throw new TeamSessionError("conflict", "Only a paused Run can be resumed");
+    }
+    const assignment = this.requireRuntimeAssignment(run.runtime_assignment_id as string);
+    const policySnapshot = this.db
+      .prepare(
+        `SELECT runtime_assignment_id, runtime_assignment_generation,
+                sandbox_id, sandbox_generation, runtime_principal_id,
+                runtime_authorization_generation
+         FROM run_policy_revisions WHERE agent_run_id = ? AND revision = ?`
+      )
+      .get(run.id, run.current_policy_revision) as SqlRow | undefined;
+    if (
+      !policySnapshot ||
+      assignment.status !== "ready" ||
+      !this.policySnapshotMatchesAssignment(
+        policySnapshot,
+        assignment,
+        session.runtime_authorization_generation as number
+      )
+    ) {
+      throw new TeamSessionError(
+        "conflict",
+        "Run policy must be rebound to the enforced Runtime before resuming"
+      );
+    }
+    if (
+      session.status !== "active" ||
+      session.runtime_authorization_state !== "enforced" ||
+      session.runtime_authorization_generation !== run.runtime_authorization_generation ||
+      !this.activeResponsibilityHolder(command.sessionId, "assignee")
+    ) {
+      throw new TeamSessionError(
+        "conflict",
+        "A Run requires an active Session, enforced Runtime, and accountable Assignee"
+      );
+    }
+    return this.transitionAgentRunLifecycle(command, run, "active", now, "run.resumed");
+  }
+
+  private stopAgentRun(
+    command: Extract<SessionCommand, { type: "run.stop" }>,
+    now: number
+  ): CommandResult {
+    const session = this.requireSession(command.sessionId);
+    this.requireSessionManager(command.sessionId, command.actor.userId);
+    const run = this.requireMutableAgentRun(command.sessionId, command.agentRunId);
+    this.requireReadyRunRuntimeBinding(session, run);
+    assertExpectedVersion(
+      run.state_version as number,
+      command.expectedRunStateVersion,
+      "Run state"
+    );
+    if (run.lifecycle === "pausing") {
+      throw new TeamSessionError("conflict", "Emergency-stop enforcement is already in progress");
+    }
+    return this.transitionAgentRunLifecycle(command, run, "stopped", now, "run.stopped");
+  }
+
+  private emergencyStopAgentRun(
+    command: Extract<SessionCommand, { type: "run.emergency-stop" }>,
+    now: number
+  ): CommandResult {
+    const session = this.requireSession(command.sessionId);
+    this.requireSessionManager(command.sessionId, command.actor.userId);
+    const run = this.requireMutableAgentRun(command.sessionId, command.agentRunId);
+    const assignment = this.requireRuntimeAssignment(run.runtime_assignment_id as string);
+    const binding = command.runtimeBinding;
+    if (
+      binding.runtimeAssignmentId !== assignment.id ||
+      binding.runtimeAssignmentGeneration !== assignment.generation ||
+      binding.sandboxId !== assignment.sandbox_id ||
+      binding.sandboxGeneration !== assignment.sandbox_generation
+    ) {
+      throw new TeamSessionError("stale-revision", "Emergency-stop Runtime binding changed");
+    }
+    const controlBefore = session.control_epoch as number;
+    const steeringBefore = session.steering_revision as number;
+    this.advanceControlFence(command.sessionId);
+    const steeringRevision = this.advanceSteeringRevision(command.sessionId);
+    const authorization = this.db
+      .prepare(
+        `UPDATE sessions
+         SET runtime_authorization_generation = runtime_authorization_generation + 1,
+             runtime_authorization_state = 'quarantined'
+         WHERE id = ?
+         RETURNING runtime_authorization_generation`
+      )
+      .get(command.sessionId) as SqlRow | undefined;
+    if (!authorization) deny();
+    this.db
+      .prepare(
+        `UPDATE runtime_assignments
+         SET runtime_authorization_generation = ?, status = 'quarantined'
+         WHERE id = ?`
+      )
+      .run(authorization.runtime_authorization_generation, assignment.id);
+    this.recordRuntimeAuthorizationEpoch(
+      command.sessionId,
+      this.requireRuntimeAssignment(assignment.id as string),
+      authorization.runtime_authorization_generation as number,
+      now
+    );
+    const invalidatedGrantCount = this.invalidateMutableRunGrants(command.agentRunId, now);
+    this.db
+      .prepare(
+        `UPDATE runtime_outbox
+         SET status = 'superseded', lease_owner = NULL, lease_expires_at_ms = NULL,
+             delivered_at_ms = ?
+         WHERE session_id = ? AND status IN ('pending', 'processing', 'failed')`
+      )
+      .run(now, command.sessionId);
+    const transitioned = this.updateAgentRunLifecycle(
+      run,
+      "pausing",
+      now,
+      authorization.runtime_authorization_generation as number
+    );
+    const runStateRevision = this.advanceRunStateRevision(command.sessionId);
+    const control = this.controlProjection(command.sessionId);
+    const event = this.appendEvent(
+      command.sessionId,
+      command,
+      now,
+      "run.emergency-stop.requested",
+      {
+        agentRunId: command.agentRunId,
+        lifecycle: "pausing",
+        stateVersion: transitioned.stateVersion,
+        reason: requiredConversationBody(command.reason, "Emergency-stop reason"),
+        previousControlEpoch: controlBefore,
+        controlEpoch: control.controlEpoch,
+        previousSteeringRevision: steeringBefore,
+        steeringRevision,
+        runtimeAuthorizationGeneration: authorization.runtime_authorization_generation,
+        invalidatedGrantCount,
+        revokeAllRunGrants: true,
+        runStateRevision,
+      }
+    );
+    const retireOutboxId = this.nextId("outbox");
+    const retirePayload: RuntimeOutboxPayload<"runtime.session.retire"> = {
+      sessionId: command.sessionId,
+      runtimeAuthorizationGeneration: authorization.runtime_authorization_generation as number,
+      reason: "emergency-stop",
+      agentRunId: command.agentRunId,
+      runtimeAssignmentId: assignment.id as string,
+      runtimeAssignmentGeneration: assignment.generation as number,
+      sandboxId: assignment.sandbox_id as string,
+      sandboxGeneration: assignment.sandbox_generation as number,
+    };
+    this.db
+      .prepare(
+        `INSERT INTO runtime_outbox
+           (id, session_id, session_sequence, kind, payload_json, status, attempts, created_at_ms)
+         VALUES (?, ?, ?, 'runtime.session.retire', ?, 'pending', 0, ?)`
+      )
+      .run(retireOutboxId, command.sessionId, event.sequence, JSON.stringify(retirePayload), now);
+    return result(
+      command,
+      {
+        sessionId: command.sessionId,
+        agentRunId: command.agentRunId,
+        lifecycle: "pausing",
+        stateVersion: transitioned.stateVersion,
+        controlEpoch: control.controlEpoch,
+        steeringRevision,
+        runtimeAuthorizationGeneration: authorization.runtime_authorization_generation,
+        invalidatedGrantCount,
+        runStateRevision,
+        enforcementPending: true,
+        retireOutboxId,
+      },
+      [event]
+    );
+  }
+
+  private addRunGoal(
+    command: Extract<SessionCommand, { type: "goal.add" }>,
+    now: number
+  ): CommandResult {
+    const session = this.requireRunSteeringAuthority(command.sessionId, command.actor.userId);
+    const run = this.requireMutableAgentRun(command.sessionId, command.agentRunId);
+    this.requireReadyRunRuntimeBinding(session, run);
+    const current = this.currentGoalSetSnapshot(run);
+    assertExpectedRevision(current.revision, command.expectedGoalSetRevision, "Goal Set");
+    if (current.goals.some((goal) => goal.goalId === command.goal.goalId)) {
+      throw new TeamSessionError("conflict", "Goal id is already in this Run");
+    }
+    const position = command.goal.position;
+    if (!Number.isSafeInteger(position) || position < 1 || position > current.goals.length + 1) {
+      throw new TeamSessionError("invalid-command", "New Goal position is invalid");
+    }
+    const goals = current.goals.map(cloneGoalItem);
+    goals.splice(position - 1, 0, {
+      goalId: command.goal.goalId,
+      position: command.goal.position,
+      title: command.goal.title,
+      acceptanceCriteria: [...command.goal.acceptanceCriteria],
+      dependencyGoalIds: [...command.goal.dependencyGoalIds],
+      version: 1,
+      status: "pending",
+    });
+    renumberGoals(goals);
+    validateGoalItemsOrThrow(goals);
+    const directive = this.appendRunDirective(command, now, session, command.directive, {
+      kind: "goal-add",
+      agentRunId: command.agentRunId,
+      goalId: command.goal.goalId,
+    });
+    return this.commitGoalSetMutation(command, run, current, goals, now, directive, {
+      change: "goal-added",
+      goalId: command.goal.goalId,
+    });
+  }
+
+  private strengthenRunGoalCriteria(
+    command: Extract<SessionCommand, { type: "goal.criteria.strengthen" }>,
+    now: number
+  ): CommandResult {
+    const session = this.requireRunSteeringAuthority(command.sessionId, command.actor.userId);
+    const run = this.requireMutableAgentRun(command.sessionId, command.agentRunId);
+    this.requireReadyRunRuntimeBinding(session, run);
+    const current = this.currentGoalSetSnapshot(run);
+    assertExpectedRevision(current.revision, command.expectedGoalSetRevision, "Goal Set");
+    if (!Array.isArray(command.addedCriteria) || command.addedCriteria.length < 1) {
+      throw new TeamSessionError("invalid-command", "At least one stronger criterion is required");
+    }
+    const goals = current.goals.map(cloneGoalItem);
+    const goal = goals.find((candidate) => candidate.goalId === command.goalId);
+    if (!goal) deny();
+    const added = command.addedCriteria.map((criterion) =>
+      requiredText(criterion, "Goal acceptance criterion", 1_000)
+    );
+    if (added.some((criterion) => goal.acceptanceCriteria.includes(criterion))) {
+      throw new TeamSessionError("conflict", "A Goal criterion is already present");
+    }
+    goal.acceptanceCriteria = [...goal.acceptanceCriteria, ...added];
+    goal.version += 1;
+    goal.status = "pending";
+    validateGoalItemsOrThrow(goals);
+    const directive = this.appendRunDirective(command, now, session, command.directive, {
+      kind: "goal-criteria-strengthened",
+      agentRunId: command.agentRunId,
+      goalId: command.goalId,
+    });
+    return this.commitGoalSetMutation(command, run, current, goals, now, directive, {
+      change: "goal-criteria-strengthened",
+      goalId: command.goalId,
+      addedCriteriaCount: added.length,
+    });
+  }
+
+  private addRunGoalDependency(
+    command: Extract<SessionCommand, { type: "goal.dependency.add" }>,
+    now: number
+  ): CommandResult {
+    const session = this.requireRunSteeringAuthority(command.sessionId, command.actor.userId);
+    const run = this.requireMutableAgentRun(command.sessionId, command.agentRunId);
+    this.requireReadyRunRuntimeBinding(session, run);
+    const current = this.currentGoalSetSnapshot(run);
+    assertExpectedRevision(current.revision, command.expectedGoalSetRevision, "Goal Set");
+    const goals = current.goals.map(cloneGoalItem);
+    const goal = goals.find((candidate) => candidate.goalId === command.goalId);
+    const dependency = goals.find((candidate) => candidate.goalId === command.dependencyGoalId);
+    if (!goal || !dependency) deny();
+    if (goal.dependencyGoalIds.includes(dependency.goalId)) {
+      throw new TeamSessionError("conflict", "Goal dependency is already present");
+    }
+    goal.dependencyGoalIds = [...goal.dependencyGoalIds, dependency.goalId];
+    goal.version += 1;
+    goal.status = "pending";
+    validateGoalItemsOrThrow(goals);
+    const directive = this.appendRunDirective(command, now, session, command.directive, {
+      kind: "goal-dependency-added",
+      agentRunId: command.agentRunId,
+      goalId: command.goalId,
+      dependencyGoalId: command.dependencyGoalId,
+    });
+    return this.commitGoalSetMutation(command, run, current, goals, now, directive, {
+      change: "goal-dependency-added",
+      goalId: command.goalId,
+      dependencyGoalId: command.dependencyGoalId,
+    });
+  }
+
+  private reorderRunGoal(
+    command: Extract<SessionCommand, { type: "goal.reorder" }>,
+    now: number
+  ): CommandResult {
+    const session = this.requireRunSteeringAuthority(command.sessionId, command.actor.userId);
+    const run = this.requireMutableAgentRun(command.sessionId, command.agentRunId);
+    this.requireReadyRunRuntimeBinding(session, run);
+    const current = this.currentGoalSetSnapshot(run);
+    assertExpectedRevision(current.revision, command.expectedGoalSetRevision, "Goal Set");
+    if (command.goalId === command.beforeGoalId) {
+      throw new TeamSessionError("invalid-command", "A Goal cannot be ordered before itself");
+    }
+    const goals = current.goals.map(cloneGoalItem);
+    const from = goals.findIndex((goal) => goal.goalId === command.goalId);
+    if (from < 0) deny();
+    const [moved] = goals.splice(from, 1);
+    if (!moved) deny();
+    const destination =
+      command.beforeGoalId === undefined
+        ? goals.length
+        : goals.findIndex((goal) => goal.goalId === command.beforeGoalId);
+    if (destination < 0) deny();
+    goals.splice(destination, 0, moved);
+    renumberGoals(goals);
+    validateGoalItemsOrThrow(goals);
+    const directive = this.appendRunDirective(command, now, session, command.directive, {
+      kind: "goal-reordered",
+      agentRunId: command.agentRunId,
+      goalId: command.goalId,
+      beforeGoalId: command.beforeGoalId ?? null,
+    });
+    return this.commitGoalSetMutation(command, run, current, goals, now, directive, {
+      change: "goal-reordered",
+      goalId: command.goalId,
+      beforeGoalId: command.beforeGoalId ?? null,
+    });
+  }
+
+  private reviewRunGoalEvidence(
+    command: Extract<SessionCommand, { type: "goal.evidence.review" }>,
+    now: number
+  ): CommandResult {
+    const session = this.requireSession(command.sessionId);
+    this.requireRunAssignee(command.sessionId, command.actor.userId);
+    const run = this.requireMutableAgentRun(command.sessionId, command.agentRunId);
+    this.requireReadyRunRuntimeBinding(session, run);
+    const current = this.currentGoalSetSnapshot(run);
+    const goals = current.goals.map(cloneGoalItem);
+    const goal = goals.find((candidate) => candidate.goalId === command.goalId);
+    if (!goal) deny();
+    assertExpectedVersion(goal.version, command.expectedGoalVersion, "Goal");
+    const evidence = this.db
+      .prepare(
+        `SELECT * FROM goal_evidence
+         WHERE agent_run_id = ? AND goal_id = ? AND goal_version = ? AND status = 'proposed'
+         ORDER BY created_at_ms ASC, id ASC`
+      )
+      .all(command.agentRunId, command.goalId, command.expectedGoalVersion) as SqlRow[];
+    if (evidence.length === 0) {
+      throw new TeamSessionError("conflict", "This Goal has no proposed evidence to review");
+    }
+    if (command.disposition === "request-more-work" && command.directive === undefined) {
+      throw new TeamSessionError(
+        "invalid-command",
+        "Requesting more work requires an attributed Directive"
+      );
+    }
+    const evidenceStatus = command.disposition === "validate" ? "validated" : "more-work-requested";
+    this.db
+      .prepare(
+        `UPDATE goal_evidence SET status = ?, reviewed_at_ms = ?
+         WHERE agent_run_id = ? AND goal_id = ? AND goal_version = ? AND status = 'proposed'`
+      )
+      .run(evidenceStatus, now, command.agentRunId, command.goalId, command.expectedGoalVersion);
+    goal.version += 1;
+    goal.status = command.disposition === "validate" ? "validated" : "in-progress";
+    let directive: SessionEvent | undefined;
+    if (command.directive) {
+      directive = this.appendRunDirective(command, now, session, command.directive, {
+        kind: "goal-evidence-review",
+        agentRunId: command.agentRunId,
+        goalId: command.goalId,
+        disposition: command.disposition,
+      });
+    }
+    return this.commitGoalSetMutation(command, run, current, goals, now, directive, {
+      change: "goal-evidence-reviewed",
+      goalId: command.goalId,
+      goalVersion: goal.version,
+      disposition: command.disposition,
+      reviewedEvidenceCount: evidence.length,
+    });
+  }
+
+  private resolveAgentRunFinalReview(
+    command: Extract<SessionCommand, { type: "run.final-review.resolve" }>,
+    now: number
+  ): CommandResult {
+    const session = this.requireSession(command.sessionId);
+    this.requireRunAssignee(command.sessionId, command.actor.userId);
+    const run = this.requireMutableAgentRun(command.sessionId, command.agentRunId);
+    this.requireReadyRunRuntimeBinding(session, run);
+    assertExpectedVersion(
+      run.final_review_version as number,
+      command.expectedFinalReviewVersion,
+      "Final review"
+    );
+    if (run.lifecycle !== "agent-work-finished") {
+      throw new TeamSessionError("conflict", "This Run is not ready for final review");
+    }
+    const goals = this.currentGoalSetSnapshot(run).goals;
+    const events: SessionEvent[] = [];
+    if (command.resolution.kind === "accept-outcome") {
+      if (goals.some((goal) => goal.status !== "validated")) {
+        throw new TeamSessionError("conflict", "Every Goal must be validated before acceptance");
+      }
+      const transitioned = this.updateAgentRunLifecycle(run, "completed", now);
+      const invalidatedGrantCount = this.invalidateMutableRunGrants(command.agentRunId, now);
+      const runStateRevision = this.advanceRunStateRevision(command.sessionId);
+      events.push(
+        this.appendEvent(command.sessionId, command, now, "run.completed", {
+          agentRunId: command.agentRunId,
+          lifecycle: "completed",
+          stateVersion: transitioned.stateVersion,
+          finalReviewVersion: (run.final_review_version as number) + 1,
+          invalidatedGrantCount,
+          runStateRevision,
+        })
+      );
+      this.db
+        .prepare(
+          `UPDATE agent_runs SET final_review_version = final_review_version + 1 WHERE id = ?`
+        )
+        .run(command.agentRunId);
+      return result(
+        command,
+        {
+          sessionId: command.sessionId,
+          agentRunId: command.agentRunId,
+          lifecycle: "completed",
+          stateVersion: transitioned.stateVersion,
+          finalReviewVersion: (run.final_review_version as number) + 1,
+          invalidatedGrantCount,
+          runStateRevision,
+        },
+        events
+      );
+    }
+
+    const directive = this.appendRunDirective(command, now, session, command.resolution.directive, {
+      kind: "final-review-continue",
+      agentRunId: command.agentRunId,
+    });
+    events.push(directive);
+    const updated = this.db
+      .prepare(
+        `UPDATE agent_runs
+         SET lifecycle = 'active', state_version = state_version + 1,
+             final_review_version = final_review_version + 1, updated_at_ms = ?
+         WHERE id = ? AND session_id = ? AND lifecycle = 'agent-work-finished'
+           AND final_review_version = ?
+         RETURNING state_version, final_review_version`
+      )
+      .get(now, command.agentRunId, command.sessionId, command.expectedFinalReviewVersion) as
+      | SqlRow
+      | undefined;
+    if (!updated) throw new TeamSessionError("stale-revision", "Final review changed concurrently");
+    const runStateRevision = this.advanceRunStateRevision(command.sessionId);
+    events.push(
+      this.appendEvent(command.sessionId, command, now, "run.final-review.continued", {
+        agentRunId: command.agentRunId,
+        lifecycle: "active",
+        stateVersion: updated.state_version,
+        finalReviewVersion: updated.final_review_version,
+        directiveId: directive.payload.directiveId,
+        runStateRevision,
+      })
+    );
+    return result(
+      command,
+      {
+        sessionId: command.sessionId,
+        agentRunId: command.agentRunId,
+        lifecycle: "active",
+        stateVersion: updated.state_version,
+        finalReviewVersion: updated.final_review_version,
+        directiveId: directive.payload.directiveId,
+        runStateRevision,
+      },
+      events
+    );
+  }
+
   private appendQueuedDirective(
-    command: Extract<SessionCommand, { type: "directive.enqueue" | "suggestion.resolve" }>,
+    command: SessionCommand & { sessionId: string },
     now: number,
     directiveId: string,
     body: string,
@@ -2534,7 +3468,8 @@ class SqliteTeamSessions implements TeamSessions {
     if (generation > currentGeneration) {
       throw new TeamSessionError("conflict", "Runtime outbox generation is ahead of Session state");
     }
-    const superseded = generation < currentGeneration;
+    const emergencyStopEnforcement = payload.reason === "emergency-stop";
+    const superseded = !emergencyStopEnforcement && generation < currentGeneration;
     const delivered = this.db
       .prepare(
         `UPDATE runtime_outbox
@@ -2569,15 +3504,124 @@ class SqliteTeamSessions implements TeamSessions {
         .run(sessionId, generation);
       enforced = updated.changes === 1;
     }
+    let emergencyStopStateVersion: number | undefined;
+    let runStateRevision: number | undefined;
+    let recoveredRun:
+      | {
+          agentRunId: string;
+          lifecycle: "paused" | "agent-work-finished";
+          stateVersion: number;
+          sandboxState: "ready";
+        }
+      | undefined;
+    if (
+      !superseded &&
+      kind === "runtime.authorization.fence" &&
+      payload.reason === "assignee-loss" &&
+      enforced
+    ) {
+      const recovery = this.db
+        .prepare(
+          `SELECT run.id, run.lifecycle, run.state_version, assignment.id AS assignment_id
+           FROM agent_runs run
+           JOIN runtime_assignments assignment ON assignment.id = run.runtime_assignment_id
+           WHERE run.session_id = ?
+             AND run.runtime_authorization_generation = ?
+             AND run.lifecycle IN ('pausing', 'paused', 'agent-work-finished')
+             AND assignment.session_id = run.session_id
+             AND assignment.runtime_authorization_generation = ?
+             AND assignment.status = 'recovering'
+           ORDER BY run.created_at_ms DESC, run.id DESC LIMIT 1`
+        )
+        .get(sessionId, generation, generation) as SqlRow | undefined;
+      if (recovery) {
+        const assignmentReady = this.db
+          .prepare(
+            `UPDATE runtime_assignments SET status = 'ready'
+             WHERE id = ? AND session_id = ?
+               AND runtime_authorization_generation = ? AND status = 'recovering'`
+          )
+          .run(recovery.assignment_id, sessionId, generation);
+        if (assignmentReady.changes !== 1) {
+          throw new TeamSessionError(
+            "stale-revision",
+            "Run Runtime Assignment recovery changed concurrently"
+          );
+        }
+        let lifecycle = recovery.lifecycle as "paused" | "agent-work-finished";
+        let stateVersion = recovery.state_version as number;
+        if (recovery.lifecycle === "pausing") {
+          const paused = this.db
+            .prepare(
+              `UPDATE agent_runs
+               SET lifecycle = 'paused', state_version = state_version + 1, updated_at_ms = ?
+               WHERE id = ? AND session_id = ? AND state_version = ?
+                 AND runtime_authorization_generation = ? AND lifecycle = 'pausing'
+               RETURNING state_version`
+            )
+            .get(now, recovery.id, sessionId, recovery.state_version, generation) as
+            | SqlRow
+            | undefined;
+          if (!paused) {
+            throw new TeamSessionError("stale-revision", "Run pause changed concurrently");
+          }
+          lifecycle = "paused";
+          stateVersion = paused.state_version as number;
+        }
+        runStateRevision = this.advanceRunStateRevision(sessionId);
+        recoveredRun = {
+          agentRunId: recovery.id as string,
+          lifecycle,
+          stateVersion,
+          sandboxState: "ready",
+        };
+      }
+    }
+    if (!superseded && kind === "runtime.session.retire" && payload.reason === "emergency-stop") {
+      const agentRunId = requiredIdentifier(payload.agentRunId, "Emergency-stop Agent Run id");
+      const stopped = this.db
+        .prepare(
+          `UPDATE agent_runs
+           SET lifecycle = 'emergency-stopped', state_version = state_version + 1,
+               updated_at_ms = ?, terminal_at_ms = ?
+           WHERE id = ? AND session_id = ? AND lifecycle = 'pausing'
+             AND runtime_authorization_generation >= ?
+           RETURNING state_version`
+        )
+        .get(now, now, agentRunId, sessionId, generation) as SqlRow | undefined;
+      if (!stopped) {
+        throw new TeamSessionError("conflict", "Emergency-stop Run state is unavailable");
+      }
+      this.db
+        .prepare(
+          `UPDATE runtime_assignments
+           SET status = 'retired', retired_at_ms = ?
+           WHERE id = ? AND session_id = ? AND status = 'quarantined'`
+        )
+        .run(now, payload.runtimeAssignmentId, sessionId);
+      this.db
+        .prepare(
+          `UPDATE runtime_outbox
+           SET status = 'superseded', lease_owner = NULL, lease_expires_at_ms = NULL,
+               delivered_at_ms = ?
+           WHERE session_id = ? AND session_sequence > ?
+             AND status IN ('pending', 'processing')`
+        )
+        .run(now, sessionId, outbox.session_sequence);
+      emergencyStopStateVersion = stopped.state_version as number;
+      runStateRevision = this.advanceRunStateRevision(sessionId);
+    }
     const eventType = superseded
       ? "runtime.outbox.superseded"
-      : kind === "runtime.session.ensure" && enforced
-        ? "runtime.session.ensured"
-        : kind === "runtime.authorization.fence" && enforced
-          ? "session.runtime-authorization.enforced"
-          : kind === "runtime.session.retire"
-            ? "runtime.session.retired"
-            : "runtime.outbox.delivered";
+      : emergencyStopStateVersion !== undefined
+        ? "run.emergency-stopped"
+        : kind === "runtime.session.ensure" && enforced
+          ? "runtime.session.ensured"
+          : kind === "runtime.authorization.fence" && enforced
+            ? "session.runtime-authorization.enforced"
+            : kind === "runtime.session.retire"
+              ? "runtime.session.retired"
+              : "runtime.outbox.delivered";
     const event = this.appendEvent(sessionId, command, now, eventType, {
       outboxId: command.outboxId,
       kind,
@@ -2586,7 +3630,33 @@ class SqliteTeamSessions implements TeamSessions {
       runtimeAuthorizationGeneration: generation,
       enforced,
       superseded,
+      ...(emergencyStopStateVersion === undefined
+        ? {}
+        : {
+            agentRunId: payload.agentRunId,
+            lifecycle: "emergency-stopped",
+            stateVersion: emergencyStopStateVersion,
+            enforcementAcknowledged: true,
+            runStateRevision,
+          }),
     });
+    const events = [event];
+    if (recoveredRun) {
+      events.push(
+        this.appendEvent(
+          sessionId,
+          command,
+          now,
+          recoveredRun.lifecycle === "paused" ? "run.paused" : "run.runtime-authorization.enforced",
+          {
+            ...recoveredRun,
+            reason: "assignee-loss",
+            runtimeAuthorizationGeneration: generation,
+            runStateRevision,
+          }
+        )
+      );
+    }
     return result(
       command,
       {
@@ -2597,8 +3667,16 @@ class SqliteTeamSessions implements TeamSessions {
         runtimeAuthorizationGeneration: generation,
         enforced,
         superseded,
+        ...(emergencyStopStateVersion === undefined
+          ? {}
+          : {
+              agentRunId: payload.agentRunId,
+              lifecycle: "emergency-stopped",
+              stateVersion: emergencyStopStateVersion,
+              runStateRevision,
+            }),
       },
-      [event]
+      events
     );
   }
 
@@ -2622,7 +3700,7 @@ class SqliteTeamSessions implements TeamSessions {
     if (generation > currentGeneration) {
       throw new TeamSessionError("conflict", "Runtime outbox generation is ahead of Session state");
     }
-    const superseded = generation < currentGeneration;
+    const superseded = payload.reason !== "emergency-stop" && generation < currentGeneration;
     const status = superseded ? "superseded" : command.retryable ? "pending" : "failed";
     const failed = this.db
       .prepare(
@@ -2809,6 +3887,18 @@ class SqliteTeamSessions implements TeamSessions {
       case "suggestion.add":
       case "suggestion.resolve":
       case "directive.enqueue":
+      case "run.start":
+      case "run.policy.revise":
+      case "run.pause":
+      case "run.resume":
+      case "run.stop":
+      case "run.emergency-stop":
+      case "goal.add":
+      case "goal.criteria.strengthen":
+      case "goal.dependency.add":
+      case "goal.reorder":
+      case "goal.evidence.review":
+      case "run.final-review.resolve":
         return this.hasSessionAccess(command.sessionId, actorUserId);
       case "runtime.outbox.acknowledge":
       case "runtime.outbox.fail":
@@ -2959,6 +4049,7 @@ class SqliteTeamSessions implements TeamSessions {
     const assigneeRevision = assignee ? this.advanceAssigneeRevision(sessionId) : undefined;
     let runtimeAuthorizationGeneration: number | undefined;
     let runtimeAuthorizationState: "pending" | "quarantined" | undefined;
+    let runTransition: AssigneeLossRunTransition | undefined;
     if (assignee) {
       const updated = this.db
         .prepare(
@@ -2977,6 +4068,12 @@ class SqliteTeamSessions implements TeamSessions {
       runtimeAuthorizationGeneration = updated.runtime_authorization_generation as number;
       runtimeAuthorizationState = updated.runtime_authorization_state as "pending" | "quarantined";
       this.advanceControlFence(sessionId);
+      runTransition = this.beginRunRecoveryAfterAssigneeLoss(
+        sessionId,
+        runtimeAuthorizationGeneration,
+        runtimeAuthorizationState,
+        now
+      );
     } else if (controller) {
       this.advanceControlFence(sessionId);
     }
@@ -3062,6 +4159,20 @@ class SqliteTeamSessions implements TeamSessions {
           now
         );
       events.push(runtimeEvent);
+      if (runTransition) {
+        events.push(
+          this.appendEvent(sessionId, command, now, "run.runtime-authorization.rebinding", {
+            agentRunId: runTransition.agentRunId,
+            lifecycle: runTransition.lifecycle,
+            stateVersion: runTransition.stateVersion,
+            reason: "assignee-loss",
+            runtimeAuthorizationGeneration,
+            sandboxState: runTransition.sandboxState,
+            invalidatedGrantCount: runTransition.invalidatedGrantCount,
+            runStateRevision: runTransition.runStateRevision,
+          })
+        );
+      }
       events.push(
         this.appendEvent(sessionId, command, now, "assignee.required", {
           previousAssigneeUserId: userId,
@@ -3072,6 +4183,94 @@ class SqliteTeamSessions implements TeamSessions {
       );
     }
     return events;
+  }
+
+  private beginRunRecoveryAfterAssigneeLoss(
+    sessionId: string,
+    runtimeAuthorizationGeneration: number,
+    runtimeAuthorizationState: "pending" | "quarantined",
+    now: number
+  ): AssigneeLossRunTransition | undefined {
+    const run = this.mutableAgentRun(sessionId);
+    if (!run) return undefined;
+    const assignment = this.requireRuntimeAssignment(run.runtime_assignment_id as string);
+
+    // Emergency Stop already owns this transition. Assignee loss may advance
+    // the Session fence, but it must not replace quarantine/retirement with an
+    // ordinary recoverable pause.
+    if (run.lifecycle === "pausing" && assignment.status === "quarantined") {
+      return undefined;
+    }
+    if (run.lifecycle === "pausing") {
+      throw new TeamSessionError("conflict", "Run pause enforcement is already in progress");
+    }
+    if (assignment.status === "retired" || assignment.status === "failed") {
+      throw new TeamSessionError("conflict", "Run Runtime Assignment cannot be recovered");
+    }
+
+    const assignmentState = this.db
+      .prepare(
+        `UPDATE runtime_assignments
+         SET runtime_authorization_generation = ?,
+             status = CASE
+               WHEN status = 'quarantined' OR ? = 'quarantined' THEN 'quarantined'
+               ELSE 'recovering'
+             END
+         WHERE id = ? AND session_id = ? AND generation = ?
+           AND status IN ('provisioning', 'ready', 'checkpointing', 'recovering', 'quarantined')
+         RETURNING status`
+      )
+      .get(
+        runtimeAuthorizationGeneration,
+        runtimeAuthorizationState,
+        assignment.id,
+        sessionId,
+        assignment.generation
+      ) as SqlRow | undefined;
+    if (!assignmentState) {
+      throw new TeamSessionError("stale-revision", "Run Runtime Assignment changed concurrently");
+    }
+    this.recordRuntimeAuthorizationEpoch(
+      sessionId,
+      this.requireRuntimeAssignment(assignment.id as string),
+      runtimeAuthorizationGeneration,
+      now
+    );
+
+    const nextLifecycle =
+      run.lifecycle === "active" ? "pausing" : (run.lifecycle as "paused" | "agent-work-finished");
+    const updated = this.db
+      .prepare(
+        `UPDATE agent_runs
+         SET lifecycle = ?, state_version = state_version + 1, updated_at_ms = ?,
+             runtime_authorization_generation = ?
+         WHERE id = ? AND session_id = ? AND state_version = ?
+           AND lifecycle IN ('active', 'paused', 'agent-work-finished')
+         RETURNING state_version`
+      )
+      .get(
+        nextLifecycle,
+        now,
+        runtimeAuthorizationGeneration,
+        run.id,
+        sessionId,
+        run.state_version
+      ) as SqlRow | undefined;
+    if (!updated) throw new TeamSessionError("stale-revision", "Run state changed concurrently");
+
+    const invalidatedGrantCount = this.invalidateMutableRunGrants(
+      run.id as string,
+      now,
+      "runtime-authorization"
+    );
+    return {
+      agentRunId: run.id as string,
+      lifecycle: nextLifecycle,
+      stateVersion: updated.state_version as number,
+      sandboxState: assignmentState.status as "recovering" | "quarantined",
+      invalidatedGrantCount,
+      runStateRevision: this.advanceRunStateRevision(sessionId),
+    };
   }
 
   private terminalAuthorization(query: SessionTerminalAuthorizationQuery): TerminalAuthorization {
@@ -3317,6 +4516,7 @@ class SqliteTeamSessions implements TeamSessions {
         controlRevision: session.control_revision as number,
         controlEpoch: session.control_epoch as number,
         runtimeAuthorizationGeneration: session.runtime_authorization_generation as number,
+        runStateRevision: session.run_state_revision as number,
         latestSequence,
       },
       capabilities: this.publicSessionCapabilities({
@@ -3745,6 +4945,124 @@ class SqliteTeamSessions implements TeamSessions {
     }));
   }
 
+  private projectSessionRunState(sessionId: string): SessionRunStateView | null {
+    const session = this.requireSession(sessionId);
+    const run = this.db
+      .prepare(
+        `SELECT * FROM agent_runs
+         WHERE session_id = ?
+         ORDER BY CASE
+           WHEN lifecycle IN ('active', 'pausing', 'paused', 'agent-work-finished') THEN 0
+           ELSE 1
+         END ASC,
+         created_at_ms DESC,
+         id DESC
+         LIMIT 1`
+      )
+      .get(sessionId) as SqlRow | undefined;
+    if (!run) return null;
+    const policy = this.readRunPolicyDraft(run.id as string, run.current_policy_revision as number);
+    const goalSet = this.currentGoalSetSnapshot(run);
+    const evidenceRows = this.db
+      .prepare(
+        `SELECT * FROM goal_evidence
+         WHERE agent_run_id = ? AND goal_set_revision = ?
+         ORDER BY created_at_ms ASC, id ASC`
+      )
+      .all(run.id, goalSet.revision) as SqlRow[];
+    const currentGoalsById = new Map(goalSet.goals.map((goal) => [goal.goalId, goal]));
+    const evidenceByGoal = new Map<string, GoalEvidence[]>();
+    for (const row of evidenceRows) {
+      const goalId = row.goal_id as string;
+      const currentGoal = currentGoalsById.get(goalId);
+      if (!currentGoal || row.goal_version !== currentGoal.version) continue;
+      const evidence: GoalEvidence = {
+        evidenceId: row.id as string,
+        agentRunId: row.agent_run_id as string,
+        goalSetRevision: row.goal_set_revision as number,
+        goalId,
+        goalVersion: row.goal_version as number,
+        evidenceRef: row.evidence_ref as string,
+        evidenceDigest: row.evidence_digest as string,
+        status: row.status as GoalEvidence["status"],
+        createdAtMs: row.created_at_ms as number,
+        ...(row.reviewed_at_ms === null ? {} : { reviewedAtMs: row.reviewed_at_ms as number }),
+      };
+      const existing = evidenceByGoal.get(goalId) ?? [];
+      existing.push(evidence);
+      evidenceByGoal.set(goalId, existing);
+    }
+    const attentionRows = this.db
+      .prepare(
+        `SELECT request.* FROM attention_requests request
+         WHERE request.agent_run_id = ?
+           AND request.version = (
+             SELECT MAX(candidate.version) FROM attention_requests candidate
+             WHERE candidate.id = request.id
+           )
+           AND request.status = 'open'
+         ORDER BY request.deadline_at_ms ASC, request.id ASC`
+      )
+      .all(run.id) as SqlRow[];
+    const assignment = this.requireRuntimeAssignment(run.runtime_assignment_id as string);
+    const policySnapshot = this.db
+      .prepare(
+        `SELECT runtime_assignment_id, runtime_assignment_generation,
+                sandbox_id, sandbox_generation, runtime_principal_id,
+                runtime_authorization_generation
+         FROM run_policy_revisions WHERE agent_run_id = ? AND revision = ?`
+      )
+      .get(run.id, run.current_policy_revision) as SqlRow | undefined;
+    if (!policySnapshot) {
+      throw new TeamSessionError("conflict", "Run policy revision is unavailable");
+    }
+    const lifecycle = run.lifecycle as AgentRunLifecycle;
+    return {
+      agentRunId: run.id as string,
+      lifecycle,
+      stateVersion: run.state_version as number,
+      attention: {
+        openRequestIds: attentionRows.map((row) => row.id as string),
+        blockingRequestIds: attentionRows
+          .filter((row) => row.independent_work_may_continue === 0)
+          .map((row) => row.id as string),
+        independentAuthorizedWorkMayContinue: attentionRows.every(
+          (row) => row.independent_work_may_continue === 1
+        ),
+      },
+      // Phase 4 has immutable configured limits but no authoritative usage ledger yet.
+      // Never claim compliance until Runtime receipts drive durable accounting.
+      limitStatus: "accounting-unavailable",
+      sandboxState: assignment.status as SessionRunStateView["sandboxState"],
+      finalReviewState:
+        lifecycle === "completed"
+          ? "accepted"
+          : lifecycle === "agent-work-finished"
+            ? "open"
+            : "not-ready",
+      mode: policy.mode,
+      runPolicyRevision: run.current_policy_revision as number,
+      goalSetRevision: run.current_goal_set_revision as number,
+      finalReviewVersion: run.final_review_version as number,
+      limits: policy.limits,
+      policyRuntimeBindingCurrent:
+        run.runtime_authorization_generation === session.runtime_authorization_generation &&
+        this.policySnapshotMatchesAssignment(
+          policySnapshot,
+          assignment,
+          session.runtime_authorization_generation as number
+        ),
+      runtimeAssignmentGeneration: assignment.generation as number,
+      sandboxGeneration: assignment.sandbox_generation as number,
+      runtimeAuthorizationGeneration: run.runtime_authorization_generation as number,
+      completionPolicy: policy.completionPolicy.kind,
+      goals: goalSet.goals.map((goal) => ({
+        ...goal,
+        evidence: evidenceByGoal.get(goal.goalId) ?? [],
+      })),
+    };
+  }
+
   private projectSession(sessionId: string): SessionView {
     const session = this.requireSession(sessionId);
     const projectionNow = this.clock();
@@ -3856,6 +5174,7 @@ class SqliteTeamSessions implements TeamSessions {
       steeringRevision: session.steering_revision as number,
       controlRevision: session.control_revision as number,
       controlEpoch: session.control_epoch as number,
+      runStateRevision: session.run_state_revision as number,
       runtime: {
         kind: "local-tmux",
         isolation: "trusted-shared-host",
@@ -3964,6 +5283,604 @@ class SqliteTeamSessions implements TeamSessions {
 
   private requireSessionManager(sessionId: string, userId: string): void {
     if (!this.isSessionManager(sessionId, userId)) deny();
+  }
+
+  private requireRunAssignee(sessionId: string, userId: string): void {
+    if (
+      !this.hasSessionAccess(sessionId, userId) ||
+      !this.hasResponsibility(sessionId, userId, "assignee")
+    ) {
+      deny();
+    }
+  }
+
+  private requireRunSteeringAuthority(sessionId: string, userId: string): SqlRow {
+    const session = this.requireConversationParticipant(sessionId, userId);
+    if (session.status !== "active") {
+      throw new TeamSessionError("conflict", "An inactive Session cannot steer a Run");
+    }
+    const steerer = this.hasResponsibility(sessionId, userId, "steerer");
+    const controller = this.hasResponsibility(sessionId, userId, "controller");
+    if (!steerer || (session.steering_policy === "single" && !controller)) deny();
+    return session;
+  }
+
+  private mutableAgentRun(sessionId: string): SqlRow | undefined {
+    return this.db
+      .prepare(
+        `SELECT * FROM agent_runs
+         WHERE session_id = ?
+           AND lifecycle IN ('active', 'pausing', 'paused', 'agent-work-finished')
+         ORDER BY created_at_ms DESC, id DESC LIMIT 1`
+      )
+      .get(sessionId) as SqlRow | undefined;
+  }
+
+  private requireMutableAgentRun(sessionId: string, agentRunId: string): SqlRow {
+    const run = this.db
+      .prepare(
+        `SELECT * FROM agent_runs
+         WHERE id = ? AND session_id = ?
+           AND lifecycle IN ('active', 'pausing', 'paused', 'agent-work-finished')`
+      )
+      .get(agentRunId, sessionId) as SqlRow | undefined;
+    if (!run) deny();
+    return run;
+  }
+
+  private requireRuntimeAssignment(runtimeAssignmentId: string): SqlRow {
+    const assignment = this.db
+      .prepare(`SELECT * FROM runtime_assignments WHERE id = ?`)
+      .get(runtimeAssignmentId) as SqlRow | undefined;
+    if (!assignment) {
+      throw new TeamSessionError("conflict", "Run Runtime Assignment is unavailable");
+    }
+    return assignment;
+  }
+
+  private ensureCurrentRuntimeAssignment(session: SqlRow, now: number): SqlRow {
+    const current = this.db
+      .prepare(
+        `SELECT * FROM runtime_assignments
+         WHERE session_id = ? AND status IN (
+           'provisioning', 'ready', 'checkpointing', 'recovering', 'quarantined'
+         )
+         ORDER BY generation DESC LIMIT 1`
+      )
+      .get(session.id) as SqlRow | undefined;
+    if (current) {
+      if (
+        current.team_id !== session.team_id ||
+        current.project_id !== session.project_id ||
+        current.runtime_authorization_generation !== session.runtime_authorization_generation
+      ) {
+        throw new TeamSessionError("conflict", "Runtime Assignment binding is stale");
+      }
+      if (current.status !== "ready") {
+        throw new TeamSessionError("conflict", "Runtime Assignment is not ready");
+      }
+      this.recordRuntimeAuthorizationEpoch(
+        session.id as string,
+        current,
+        session.runtime_authorization_generation as number,
+        now
+      );
+      return current;
+    }
+    const assignmentId = this.nextId("runtime-assignment");
+    const sandboxId = this.nextId("sandbox");
+    const runtimePrincipalId = this.nextId("runtime-principal");
+    this.db
+      .prepare(
+        `INSERT INTO runtime_assignments
+           (id, session_id, team_id, project_id, generation, runtime_kind,
+            sandbox_id, sandbox_generation, runtime_principal_id,
+            runtime_authorization_generation, status, created_at_ms, retired_at_ms)
+         VALUES (?, ?, ?, ?, 1, ?, ?, 1, ?, ?, 'ready', ?, NULL)`
+      )
+      .run(
+        assignmentId,
+        session.id,
+        session.team_id,
+        session.project_id,
+        session.runtime_kind,
+        sandboxId,
+        runtimePrincipalId,
+        session.runtime_authorization_generation,
+        now
+      );
+    const assignment = this.requireRuntimeAssignment(assignmentId);
+    this.recordRuntimeAuthorizationEpoch(
+      session.id as string,
+      assignment,
+      session.runtime_authorization_generation as number,
+      now
+    );
+    return assignment;
+  }
+
+  private recordRuntimeAuthorizationEpoch(
+    sessionId: string,
+    assignment: SqlRow,
+    generation: number,
+    now: number
+  ): void {
+    this.db
+      .prepare(
+        `INSERT INTO runtime_authorization_epochs
+           (session_id, generation, runtime_assignment_id, runtime_assignment_generation,
+            sandbox_id, sandbox_generation, runtime_principal_id, created_at_ms)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(session_id, generation) DO NOTHING`
+      )
+      .run(
+        sessionId,
+        generation,
+        assignment.id,
+        assignment.generation,
+        assignment.sandbox_id,
+        assignment.sandbox_generation,
+        assignment.runtime_principal_id,
+        now
+      );
+    const exact = this.db
+      .prepare(
+        `SELECT 1 FROM runtime_authorization_epochs
+         WHERE session_id = ? AND generation = ? AND runtime_assignment_id = ?
+           AND runtime_assignment_generation = ? AND sandbox_id = ?
+           AND sandbox_generation = ? AND runtime_principal_id = ?`
+      )
+      .get(
+        sessionId,
+        generation,
+        assignment.id,
+        assignment.generation,
+        assignment.sandbox_id,
+        assignment.sandbox_generation,
+        assignment.runtime_principal_id
+      );
+    if (!exact) {
+      throw new TeamSessionError("conflict", "Runtime Authorization epoch binding is immutable");
+    }
+  }
+
+  private assertRunPolicyCommit(
+    commit: Extract<SessionCommand, { type: "run.start" }>["commit"],
+    session: SqlRow,
+    assignment: SqlRow
+  ): void {
+    try {
+      assertValidRunPolicyCommit(commit, {
+        sessionName: session.name as string,
+        yoloEligible: session.yolo_eligible === 1,
+        projectCeilingRevision: LOCAL_TMUX_PROJECT_CEILING_REVISION,
+        runtimeAssignmentGeneration: assignment.generation as number,
+        sandboxId: assignment.sandbox_id as string,
+        sandboxGeneration: assignment.sandbox_generation as number,
+        runtimeAuthorizationGeneration: assignment.runtime_authorization_generation as number,
+      });
+    } catch (error) {
+      throw new TeamSessionError(
+        "invalid-command",
+        error instanceof Error ? error.message : "Run policy is invalid"
+      );
+    }
+  }
+
+  private insertRunPolicyRevision(input: {
+    agentRunId: string;
+    sessionId: string;
+    revision: number;
+    previousRevision?: number;
+    policy: RunPolicyDraft;
+    policyDigest: string;
+    goalSetId: string;
+    goalSetRevision: number;
+    goalSetDigest: string;
+    assignment: SqlRow;
+    yoloConfirmationRef?: string;
+    now: number;
+  }): void {
+    const snapshotDigest = sha256(
+      canonicalJson({
+        agentRunId: input.agentRunId,
+        sessionId: input.sessionId,
+        revision: input.revision,
+        previousRevision: input.previousRevision ?? null,
+        policyBodyDigest: input.policyDigest,
+        policy: input.policy,
+        scopedExternalRules: [],
+        initialGoalSet: {
+          goalSetId: input.goalSetId,
+          revision: input.goalSetRevision,
+          digest: input.goalSetDigest,
+        },
+        projectCeilingRevision: LOCAL_TMUX_PROJECT_CEILING_REVISION,
+        projectCeilingDigest: LOCAL_TMUX_PROJECT_CEILING_DIGEST,
+        binding: {
+          runtimeAssignmentId: input.assignment.id,
+          runtimeAssignmentGeneration: input.assignment.generation,
+          sandboxId: input.assignment.sandbox_id,
+          sandboxGeneration: input.assignment.sandbox_generation,
+          runtimePrincipalId: input.assignment.runtime_principal_id,
+        },
+        runtimeAuthorizationGeneration: input.assignment.runtime_authorization_generation,
+        yoloConfirmationRef: input.yoloConfirmationRef ?? null,
+        createdAtMs: input.now,
+      })
+    );
+    this.db
+      .prepare(
+        `INSERT INTO run_policy_revisions
+           (agent_run_id, session_id, revision, previous_revision, digest, policy_body_digest,
+            mode, completion_policy,
+            scoped_external_policy_ref, scoped_external_rules_json, limits_json,
+            initial_goal_set_id, initial_goal_set_revision,
+            project_ceiling_revision, project_ceiling_digest,
+            runtime_assignment_id, runtime_assignment_generation,
+            sandbox_id, sandbox_generation, runtime_principal_id,
+            runtime_authorization_generation, yolo_confirmation_ref, created_at_ms)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        input.agentRunId,
+        input.sessionId,
+        input.revision,
+        input.previousRevision ?? null,
+        snapshotDigest,
+        input.policyDigest,
+        input.policy.mode,
+        input.policy.completionPolicy.kind,
+        input.policy.scopedExternalPolicyRef,
+        JSON.stringify(input.policy.limits),
+        input.goalSetId,
+        input.goalSetRevision,
+        LOCAL_TMUX_PROJECT_CEILING_REVISION,
+        LOCAL_TMUX_PROJECT_CEILING_DIGEST,
+        input.assignment.id,
+        input.assignment.generation,
+        input.assignment.sandbox_id,
+        input.assignment.sandbox_generation,
+        input.assignment.runtime_principal_id,
+        input.assignment.runtime_authorization_generation,
+        input.yoloConfirmationRef ?? null,
+        input.now
+      );
+  }
+
+  private readRunPolicyDraft(agentRunId: string, revision: number): RunPolicyDraft {
+    const row = this.db
+      .prepare(
+        `SELECT mode, completion_policy, scoped_external_policy_ref, limits_json
+         FROM run_policy_revisions WHERE agent_run_id = ? AND revision = ?`
+      )
+      .get(agentRunId, revision) as SqlRow | undefined;
+    if (!row) throw new TeamSessionError("conflict", "Run policy revision is unavailable");
+    return {
+      mode: row.mode as RunPolicyDraft["mode"],
+      completionPolicy: {
+        kind: row.completion_policy as RunPolicyDraft["completionPolicy"]["kind"],
+      },
+      scopedExternalPolicyRef: row.scoped_external_policy_ref as string,
+      limits: JSON.parse(row.limits_json as string) as RunPolicyDraft["limits"],
+    };
+  }
+
+  private policySnapshotMatchesAssignment(
+    snapshot: SqlRow,
+    assignment: SqlRow,
+    runtimeAuthorizationGeneration: number
+  ): boolean {
+    return (
+      snapshot.runtime_assignment_id === assignment.id &&
+      snapshot.runtime_assignment_generation === assignment.generation &&
+      snapshot.sandbox_id === assignment.sandbox_id &&
+      snapshot.sandbox_generation === assignment.sandbox_generation &&
+      snapshot.runtime_principal_id === assignment.runtime_principal_id &&
+      snapshot.runtime_authorization_generation === runtimeAuthorizationGeneration &&
+      assignment.runtime_authorization_generation === runtimeAuthorizationGeneration
+    );
+  }
+
+  private requireReadyRunRuntimeBinding(session: SqlRow, run: SqlRow): SqlRow {
+    const assignment = this.requireRuntimeAssignment(run.runtime_assignment_id as string);
+    const policySnapshot = this.db
+      .prepare(
+        `SELECT runtime_assignment_id, runtime_assignment_generation,
+                sandbox_id, sandbox_generation, runtime_principal_id,
+                runtime_authorization_generation
+         FROM run_policy_revisions WHERE agent_run_id = ? AND revision = ?`
+      )
+      .get(run.id, run.current_policy_revision) as SqlRow | undefined;
+    if (
+      session.status !== "active" ||
+      session.runtime_authorization_state !== "enforced" ||
+      run.runtime_authorization_generation !== session.runtime_authorization_generation ||
+      assignment.status !== "ready" ||
+      !policySnapshot ||
+      !this.policySnapshotMatchesAssignment(
+        policySnapshot,
+        assignment,
+        session.runtime_authorization_generation as number
+      )
+    ) {
+      throw new TeamSessionError(
+        "conflict",
+        "Run Runtime enforcement is not ready; use Emergency Stop if safety requires termination"
+      );
+    }
+    return assignment;
+  }
+
+  private insertGoalSetSnapshot(input: {
+    agentRunId: string;
+    goalSetId: string;
+    revision: number;
+    previousRevision?: number;
+    goals: ReadonlyArray<GoalItem | MutableGoalItem>;
+    now: number;
+  }): string {
+    const digest = sha256(
+      canonicalJson({
+        goalSetId: input.goalSetId,
+        agentRunId: input.agentRunId,
+        revision: input.revision,
+        previousRevision: input.previousRevision,
+        goals: input.goals,
+      })
+    );
+    this.db
+      .prepare(
+        `INSERT INTO goal_sets
+           (goal_set_id, agent_run_id, revision, previous_revision, digest, created_at_ms)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        input.goalSetId,
+        input.agentRunId,
+        input.revision,
+        input.previousRevision ?? null,
+        digest,
+        input.now
+      );
+    const insertGoal = this.db.prepare(
+      `INSERT INTO goals
+         (agent_run_id, goal_set_id, goal_set_revision, goal_id, position, version, title,
+          acceptance_criteria_json, dependency_goal_ids_json, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    );
+    for (const goal of input.goals) {
+      insertGoal.run(
+        input.agentRunId,
+        input.goalSetId,
+        input.revision,
+        goal.goalId,
+        goal.position,
+        goal.version,
+        goal.title,
+        JSON.stringify(goal.acceptanceCriteria),
+        JSON.stringify(goal.dependencyGoalIds),
+        goal.status
+      );
+    }
+    return digest;
+  }
+
+  private currentGoalSetSnapshot(run: SqlRow): {
+    goalSetId: string;
+    revision: number;
+    digest: string;
+    goals: MutableGoalItem[];
+  } {
+    const revision = run.current_goal_set_revision as number;
+    const set = this.db
+      .prepare(
+        `SELECT goal_set_id, digest FROM goal_sets
+         WHERE agent_run_id = ? AND revision = ?`
+      )
+      .get(run.id, revision) as SqlRow | undefined;
+    if (!set) throw new TeamSessionError("conflict", "Current Goal Set is unavailable");
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM goals
+         WHERE goal_set_id = ? AND goal_set_revision = ?
+         ORDER BY position ASC, goal_id ASC`
+      )
+      .all(set.goal_set_id, revision) as SqlRow[];
+    return {
+      goalSetId: set.goal_set_id as string,
+      revision,
+      digest: set.digest as string,
+      goals: rows.map((row) => ({
+        goalId: row.goal_id as string,
+        position: row.position as number,
+        title: row.title as string,
+        acceptanceCriteria: JSON.parse(row.acceptance_criteria_json as string) as string[],
+        dependencyGoalIds: JSON.parse(row.dependency_goal_ids_json as string) as string[],
+        version: row.version as number,
+        status: row.status as GoalItem["status"],
+      })),
+    };
+  }
+
+  private appendRunDirective(
+    command: SessionCommand & { sessionId: string },
+    now: number,
+    session: SqlRow,
+    directive: { format: "plain-text"; body: string },
+    origin: Record<string, unknown>
+  ): SessionEvent {
+    if (!directive || directive.format !== "plain-text") {
+      throw new TeamSessionError("invalid-command", "Run Directive format is invalid");
+    }
+    const body = requiredConversationBody(directive.body, "Run Directive body");
+    const directiveId = this.reserveConversationIdentity(command.sessionId, "directive", now);
+    return this.appendQueuedDirective(command, now, directiveId, body, session, origin);
+  }
+
+  private commitGoalSetMutation(
+    command: SessionCommand & { sessionId: string; agentRunId: string },
+    run: SqlRow,
+    current: { goalSetId: string; revision: number },
+    goals: MutableGoalItem[],
+    now: number,
+    directive: SessionEvent | undefined,
+    change: Record<string, unknown>
+  ): CommandResult {
+    const revision = current.revision + 1;
+    const digest = this.insertGoalSetSnapshot({
+      agentRunId: command.agentRunId,
+      goalSetId: current.goalSetId,
+      revision,
+      previousRevision: current.revision,
+      goals,
+      now,
+    });
+    const updated = this.db
+      .prepare(
+        `UPDATE agent_runs
+         SET current_goal_set_revision = ?, state_version = state_version + 1, updated_at_ms = ?
+         WHERE id = ? AND session_id = ? AND current_goal_set_revision = ?
+         RETURNING state_version`
+      )
+      .get(revision, now, command.agentRunId, command.sessionId, current.revision) as
+      | SqlRow
+      | undefined;
+    if (!updated) throw new TeamSessionError("stale-revision", "Goal Set changed concurrently");
+    const runStateRevision = this.advanceRunStateRevision(command.sessionId);
+    const event = this.appendEvent(command.sessionId, command, now, "goal-set.revised", {
+      agentRunId: command.agentRunId,
+      previousGoalSetRevision: current.revision,
+      goalSetRevision: revision,
+      goalSetDigest: digest,
+      goalCount: goals.length,
+      stateVersion: updated.state_version,
+      directiveId: directive?.payload.directiveId ?? null,
+      ...change,
+      runStateRevision,
+    });
+    const events = directive ? [directive, event] : [event];
+    return result(
+      command,
+      {
+        sessionId: command.sessionId,
+        agentRunId: command.agentRunId,
+        goalSetRevision: revision,
+        goalSetDigest: digest,
+        stateVersion: updated.state_version,
+        directiveId: directive?.payload.directiveId,
+        runStateRevision,
+      },
+      events
+    );
+  }
+
+  private transitionAgentRunLifecycle(
+    command: Extract<SessionCommand, { type: "run.pause" | "run.resume" | "run.stop" }>,
+    run: SqlRow,
+    lifecycle: AgentRunLifecycle,
+    now: number,
+    eventType: string
+  ): CommandResult {
+    const transitioned = this.updateAgentRunLifecycle(run, lifecycle, now);
+    const invalidatedGrantCount =
+      lifecycle === "stopped" ? this.invalidateMutableRunGrants(run.id as string, now) : 0;
+    const runStateRevision = this.advanceRunStateRevision(command.sessionId);
+    const event = this.appendEvent(command.sessionId, command, now, eventType, {
+      agentRunId: run.id,
+      lifecycle,
+      stateVersion: transitioned.stateVersion,
+      reason: "reason" in command ? (command.reason ?? null) : null,
+      invalidatedGrantCount,
+      runStateRevision,
+    });
+    return result(
+      command,
+      {
+        sessionId: command.sessionId,
+        agentRunId: run.id,
+        lifecycle,
+        stateVersion: transitioned.stateVersion,
+        invalidatedGrantCount,
+        runStateRevision,
+      },
+      [event]
+    );
+  }
+
+  private updateAgentRunLifecycle(
+    run: SqlRow,
+    lifecycle: AgentRunLifecycle,
+    now: number,
+    runtimeAuthorizationGeneration?: number
+  ): { stateVersion: number } {
+    const terminal = isTerminalRunLifecycle(lifecycle);
+    const updated = this.db
+      .prepare(
+        `UPDATE agent_runs
+         SET lifecycle = ?, state_version = state_version + 1, updated_at_ms = ?,
+             terminal_at_ms = ?, runtime_authorization_generation = COALESCE(?, runtime_authorization_generation)
+         WHERE id = ? AND session_id = ? AND state_version = ?
+         RETURNING state_version`
+      )
+      .get(
+        lifecycle,
+        now,
+        terminal ? now : null,
+        runtimeAuthorizationGeneration ?? null,
+        run.id,
+        run.session_id,
+        run.state_version
+      ) as SqlRow | undefined;
+    if (!updated) throw new TeamSessionError("stale-revision", "Run state changed concurrently");
+    return { stateVersion: updated.state_version as number };
+  }
+
+  private invalidateMutableRunGrants(
+    agentRunId: string,
+    now: number,
+    reason:
+      | "policy-revision"
+      | "runtime-assignment"
+      | "sandbox-generation"
+      | "runtime-authorization"
+      | "run-terminal" = "run-terminal"
+  ): number {
+    const grants = this.db
+      .prepare(
+        `SELECT grant.id, state.version
+         FROM action_grants grant
+         JOIN action_grant_states state ON state.grant_id = grant.id
+         WHERE grant.agent_run_id = ?
+           AND state.version = (
+             SELECT MAX(candidate.version) FROM action_grant_states candidate
+             WHERE candidate.grant_id = grant.id
+           )
+           AND state.status IN ('issued', 'enforcement-pending', 'active')
+         ORDER BY grant.id ASC`
+      )
+      .all(agentRunId) as SqlRow[];
+    const insert = this.db.prepare(
+      `INSERT INTO action_grant_states
+         (grant_id, version, previous_version, status, reason, actor_ref, created_at_ms)
+       VALUES (?, ?, ?, 'invalidated', ?, 'team-session-kernel', ?)`
+    );
+    for (const grant of grants) {
+      const version = grant.version as number;
+      insert.run(grant.id, version + 1, version, reason, now);
+    }
+    return grants.length;
+  }
+
+  private advanceRunStateRevision(sessionId: string): number {
+    const updated = this.db
+      .prepare(
+        `UPDATE sessions SET run_state_revision = run_state_revision + 1
+         WHERE id = ? RETURNING run_state_revision`
+      )
+      .get(sessionId) as SqlRow | undefined;
+    if (!updated) deny();
+    return updated.run_state_revision as number;
   }
 
   private requireProjectAdministrator(project: SqlRow, userId: string): void {
@@ -4804,6 +6721,105 @@ function validateCommandPayload(command: SessionCommand): void {
       requiredRevision(command.expectedSteeringRevision, "Steering");
       rejectClientOwnedField(command, "directiveId", "Directive id");
       return;
+    case "run.start":
+      requiredIdentifier(command.sessionId, "Session id");
+      requiredRevision(command.expectedSessionRevision, "Run state");
+      validateInitialGoalsOrThrow(command.initialGoals);
+      if (command.initialYoloActionGrantId !== undefined) {
+        requiredIdentifier(command.initialYoloActionGrantId, "Initial YOLO Action Grant id");
+      }
+      return;
+    case "run.policy.revise":
+      requiredIdentifier(command.sessionId, "Session id");
+      requiredIdentifier(command.agentRunId, "Agent Run id");
+      requiredRevision(command.expectedRunPolicyRevision, "Run policy");
+      return;
+    case "run.pause":
+    case "run.stop":
+      requiredIdentifier(command.sessionId, "Session id");
+      requiredIdentifier(command.agentRunId, "Agent Run id");
+      requiredRevision(command.expectedRunStateVersion, "Run state");
+      optionalText(command.reason, 1_000);
+      return;
+    case "run.resume":
+      requiredIdentifier(command.sessionId, "Session id");
+      requiredIdentifier(command.agentRunId, "Agent Run id");
+      requiredRevision(command.expectedRunStateVersion, "Run state");
+      requiredRevision(command.expectedRunPolicyRevision, "Run policy");
+      requiredRevision(command.expectedRuntimeAuthorizationGeneration, "Run Runtime Authorization");
+      return;
+    case "run.emergency-stop":
+      requiredIdentifier(command.sessionId, "Session id");
+      requiredIdentifier(command.agentRunId, "Agent Run id");
+      requiredIdentifier(command.runtimeBinding?.runtimeAssignmentId, "Runtime Assignment id");
+      requiredRevision(command.runtimeBinding?.runtimeAssignmentGeneration, "Runtime Assignment");
+      requiredIdentifier(command.runtimeBinding?.sandboxId, "Sandbox id");
+      requiredRevision(command.runtimeBinding?.sandboxGeneration, "Sandbox generation");
+      if (command.revokeAllRunGrants !== true) {
+        throw new TeamSessionError("invalid-command", "Emergency stop must revoke every Run grant");
+      }
+      requiredConversationBody(command.reason, "Emergency-stop reason");
+      return;
+    case "goal.add":
+      requiredIdentifier(command.sessionId, "Session id");
+      requiredIdentifier(command.agentRunId, "Agent Run id");
+      requiredRevision(command.expectedGoalSetRevision, "Goal Set");
+      requiredGoalDefinition(command.goal);
+      requiredRunDirective(command.directive);
+      return;
+    case "goal.criteria.strengthen":
+      requiredIdentifier(command.sessionId, "Session id");
+      requiredIdentifier(command.agentRunId, "Agent Run id");
+      requiredIdentifier(command.goalId, "Goal id");
+      requiredRevision(command.expectedGoalSetRevision, "Goal Set");
+      if (
+        !Array.isArray(command.addedCriteria) ||
+        command.addedCriteria.length < 1 ||
+        command.addedCriteria.length > 32
+      ) {
+        throw new TeamSessionError("invalid-command", "Added Goal criteria are invalid");
+      }
+      command.addedCriteria.forEach((criterion) =>
+        requiredText(criterion, "Goal acceptance criterion", 1_000)
+      );
+      requiredRunDirective(command.directive);
+      return;
+    case "goal.dependency.add":
+      requiredIdentifier(command.sessionId, "Session id");
+      requiredIdentifier(command.agentRunId, "Agent Run id");
+      requiredIdentifier(command.goalId, "Goal id");
+      requiredIdentifier(command.dependencyGoalId, "Dependency Goal id");
+      requiredRevision(command.expectedGoalSetRevision, "Goal Set");
+      requiredRunDirective(command.directive);
+      return;
+    case "goal.reorder":
+      requiredIdentifier(command.sessionId, "Session id");
+      requiredIdentifier(command.agentRunId, "Agent Run id");
+      requiredIdentifier(command.goalId, "Goal id");
+      if (command.beforeGoalId !== undefined) {
+        requiredIdentifier(command.beforeGoalId, "Before Goal id");
+      }
+      requiredRevision(command.expectedGoalSetRevision, "Goal Set");
+      requiredRunDirective(command.directive);
+      return;
+    case "goal.evidence.review":
+      requiredIdentifier(command.sessionId, "Session id");
+      requiredIdentifier(command.agentRunId, "Agent Run id");
+      requiredIdentifier(command.goalId, "Goal id");
+      requiredRevision(command.expectedGoalVersion, "Goal");
+      assertEnum(command.disposition, ["validate", "request-more-work"], "Evidence review");
+      if (command.directive !== undefined) requiredRunDirective(command.directive);
+      return;
+    case "run.final-review.resolve":
+      requiredIdentifier(command.sessionId, "Session id");
+      requiredIdentifier(command.agentRunId, "Agent Run id");
+      requiredRevision(command.expectedFinalReviewVersion, "Final review");
+      if (command.resolution?.kind === "continue-work") {
+        requiredRunDirective(command.resolution.directive);
+      } else if (command.resolution?.kind !== "accept-outcome") {
+        throw new TeamSessionError("invalid-command", "Final review resolution is invalid");
+      }
+      return;
     case "runtime.outbox.acknowledge":
       requiredIdentifier(command.outboxId, "Runtime outbox id");
       requiredIdentifier(command.workerId, "Runtime worker id");
@@ -4830,11 +6846,13 @@ function validateQuery(
     | WorkspaceDiscoveryQuery
     | SessionInboxQuery
     | SessionDetailQuery
+    | PublicSessionRunStateQuery
     | SessionEventsQuery
     | SessionTerminalAuthorizationQuery
     | SessionAdmissionQuery
     | TeamAccessQuery
     | ProjectAccessQuery
+    | SessionRunStateQuery
 ): void {
   switch (query.type) {
     case "session.get":
@@ -4849,6 +6867,9 @@ function validateQuery(
       if (query.teamId !== undefined) requiredIdentifier(query.teamId, "Team id");
       return;
     case "session.detail":
+      requiredIdentifier(query.sessionId, "Session id");
+      return;
+    case "session.public-run-state":
       requiredIdentifier(query.sessionId, "Session id");
       return;
     case "session.events":
@@ -4892,6 +6913,9 @@ function validateQuery(
     case "project.access":
       requiredIdentifier(query.projectId, "Project id");
       return;
+    case "session.run-state":
+      requiredIdentifier(query.sessionId, "Session id");
+      return;
     default:
       throw new TeamSessionError("invalid-command", "Unsupported query type");
   }
@@ -4928,6 +6952,58 @@ function requiredConversationBody(value: unknown, label: string): string {
     throw new TeamSessionError("invalid-command", `${label} is invalid`);
   }
   return value;
+}
+
+function requiredRunDirective(
+  value: unknown
+): asserts value is { format: "plain-text"; body: string } {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new TeamSessionError("invalid-command", "Run Directive is invalid");
+  }
+  const directive = value as Record<string, unknown>;
+  const keys = Object.keys(directive).sort();
+  if (keys.length !== 2 || keys[0] !== "body" || keys[1] !== "format") {
+    throw new TeamSessionError("invalid-command", "Run Directive contains an unknown field");
+  }
+  if (directive.format !== "plain-text") {
+    throw new TeamSessionError("invalid-command", "Run Directive format is invalid");
+  }
+  requiredConversationBody(directive.body, "Run Directive body");
+}
+
+function requiredGoalDefinition(value: unknown): asserts value is GoalDefinition {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new TeamSessionError("invalid-command", "Goal is invalid");
+  }
+  const goal = value as Record<string, unknown>;
+  const expected = ["acceptanceCriteria", "dependencyGoalIds", "goalId", "position", "title"];
+  const keys = Object.keys(goal).sort();
+  if (keys.length !== expected.length || keys.some((key, index) => key !== expected[index])) {
+    throw new TeamSessionError("invalid-command", "Goal contains an unknown or missing field");
+  }
+  requiredIdentifier(goal.goalId, "Goal id");
+  requiredRevision(goal.position, "Goal position");
+  requiredText(goal.title, "Goal title", 1_000);
+  if (
+    !Array.isArray(goal.acceptanceCriteria) ||
+    goal.acceptanceCriteria.length < 1 ||
+    goal.acceptanceCriteria.length > 32
+  ) {
+    throw new TeamSessionError("invalid-command", "Goal acceptance criteria are invalid");
+  }
+  goal.acceptanceCriteria.forEach((criterion) =>
+    requiredText(criterion, "Goal acceptance criterion", 1_000)
+  );
+  if (
+    !Array.isArray(goal.dependencyGoalIds) ||
+    goal.dependencyGoalIds.length > 99 ||
+    goal.dependencyGoalIds.some((dependency) => typeof dependency !== "string")
+  ) {
+    throw new TeamSessionError("invalid-command", "Goal dependencies are invalid");
+  }
+  goal.dependencyGoalIds.forEach((dependency) =>
+    requiredIdentifier(dependency, "Dependency Goal id")
+  );
 }
 
 function rejectClientOwnedField(command: SessionCommand, field: string, label: string): void {
@@ -5028,7 +7104,7 @@ function projectRuntimeOutboxDelivery(
       };
     }
     case "runtime.authorization.fence":
-      if (payload.reason !== "assignee-loss") {
+      if (payload.reason !== "assignee-loss" && payload.reason !== "emergency-stop") {
         throw new TeamSessionError("conflict", "Runtime fence payload is invalid");
       }
       return {
@@ -5036,16 +7112,51 @@ function projectRuntimeOutboxDelivery(
         kind: "runtime.authorization.fence",
         payload: {
           sessionId,
-          reason: "assignee-loss",
+          reason: payload.reason,
           runtimeAuthorizationGeneration,
         },
       };
-    case "runtime.session.retire":
+    case "runtime.session.retire": {
+      const emergency = payload.reason === "emergency-stop";
+      if (
+        (payload.reason !== undefined && !emergency) ||
+        (emergency &&
+          (typeof payload.agentRunId !== "string" ||
+            typeof payload.runtimeAssignmentId !== "string" ||
+            !Number.isSafeInteger(payload.runtimeAssignmentGeneration) ||
+            typeof payload.sandboxId !== "string" ||
+            !Number.isSafeInteger(payload.sandboxGeneration))) ||
+        (!emergency &&
+          (payload.agentRunId !== undefined ||
+            payload.runtimeAssignmentId !== undefined ||
+            payload.runtimeAssignmentGeneration !== undefined ||
+            payload.sandboxId !== undefined ||
+            payload.sandboxGeneration !== undefined))
+      ) {
+        throw new TeamSessionError("conflict", "Runtime retire payload is invalid");
+      }
+      if (emergency) {
+        return {
+          ...base,
+          kind: "runtime.session.retire",
+          payload: {
+            sessionId,
+            runtimeAuthorizationGeneration,
+            reason: "emergency-stop",
+            agentRunId: payload.agentRunId as string,
+            runtimeAssignmentId: payload.runtimeAssignmentId as string,
+            runtimeAssignmentGeneration: payload.runtimeAssignmentGeneration as number,
+            sandboxId: payload.sandboxId as string,
+            sandboxGeneration: payload.sandboxGeneration as number,
+          },
+        };
+      }
       return {
         ...base,
         kind: "runtime.session.retire",
         payload: { sessionId, runtimeAuthorizationGeneration },
       };
+    }
     default:
       throw new TeamSessionError("conflict", "Runtime outbox kind is invalid");
   }
@@ -5104,6 +7215,56 @@ function normalizedTextList(
 function optionalText(value: unknown, maxLength: number): string | null {
   if (value === undefined || value === null || value === "") return null;
   return requiredText(value, "Optional text", maxLength);
+}
+
+function validateInitialGoalsOrThrow(goals: ReadonlyArray<GoalDefinition>): void {
+  try {
+    validateInitialGoals(goals);
+  } catch (error) {
+    throw new TeamSessionError(
+      "invalid-command",
+      error instanceof Error ? error.message : "Initial Goals are invalid"
+    );
+  }
+}
+
+function validateGoalItemsOrThrow(goals: ReadonlyArray<MutableGoalItem>): void {
+  validateInitialGoalsOrThrow(
+    goals.map((goal) => ({
+      goalId: goal.goalId,
+      position: goal.position,
+      title: goal.title,
+      acceptanceCriteria: goal.acceptanceCriteria,
+      dependencyGoalIds: goal.dependencyGoalIds,
+    }))
+  );
+}
+
+function cloneGoalItem(goal: GoalItem | MutableGoalItem): MutableGoalItem {
+  return {
+    goalId: goal.goalId,
+    position: goal.position,
+    title: goal.title,
+    acceptanceCriteria: [...goal.acceptanceCriteria],
+    dependencyGoalIds: [...goal.dependencyGoalIds],
+    version: goal.version,
+    status: goal.status,
+  };
+}
+
+function renumberGoals(goals: MutableGoalItem[]): void {
+  goals.forEach((goal, index) => {
+    goal.position = index + 1;
+  });
+}
+
+function isTerminalRunLifecycle(lifecycle: AgentRunLifecycle): boolean {
+  return (
+    lifecycle === "completed" ||
+    lifecycle === "failed" ||
+    lifecycle === "stopped" ||
+    lifecycle === "emergency-stopped"
+  );
 }
 
 function commandDigest(command: SessionCommand): string {

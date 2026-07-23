@@ -734,6 +734,32 @@ describe("Team Session HTTP adapter", () => {
     expect(sessionReplay).toMatchObject({ replayed: true, data: { sessionId } });
   });
 
+  it.each([
+    "run.start",
+    "run.policy.revise",
+    "run.pause",
+    "run.resume",
+    "run.stop",
+    "run.emergency-stop",
+    "goal.add",
+    "goal.criteria.strengthen",
+    "goal.dependency.add",
+    "goal.reorder",
+    "goal.evidence.review",
+    "run.final-review.resolve",
+    "approval.resolve",
+    "grant.revoke",
+    "grant.review.resolve",
+    "attention.resolve",
+  ])("keeps the %s mutation outside generic HTTP", async (type) => {
+    const response = await post({ type }, `gated-${type}`);
+
+    expect(response.status).toBe(400);
+    expect(await responseBody(response)).toEqual({
+      error: { code: "unsupported-command", message: "Command type is not supported" },
+    });
+  });
+
   it("rejects runtime-worker commands and structurally unknown Handoff briefing data", async () => {
     const runtimeCommand = await post(
       {

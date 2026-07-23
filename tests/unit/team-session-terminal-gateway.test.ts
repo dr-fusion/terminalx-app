@@ -416,6 +416,7 @@ function makeSession(
     steeringRevision: 3,
     controlRevision: 6,
     controlEpoch: overrides.controlEpoch ?? 7,
+    runStateRevision: 1,
     runtime: {
       kind: "local-tmux",
       isolation: "trusted-shared-host",

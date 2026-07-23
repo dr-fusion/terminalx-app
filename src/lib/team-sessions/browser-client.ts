@@ -11,12 +11,25 @@ import type {
   TeamSessionEventActor,
   TeamSessionIdentity,
   TeamSessionInboxItem,
+  TeamSessionActionEffectSummary,
+  TeamSessionAgentRunView,
+  TeamSessionApprovalView,
+  TeamSessionAttentionView,
+  TeamSessionGoalEvidenceSummary,
+  TeamSessionGrantCandidateView,
+  TeamSessionGrantReviewView,
+  TeamSessionGrantView,
   TeamSessionOpenHandoff,
   TeamSessionParticipant,
   TeamSessionProject,
   TeamSessionResponsibility,
   TeamSessionResponsibilities,
   TeamSessionRuntime,
+  TeamSessionRunCapabilities,
+  TeamSessionRunLimit,
+  TeamSessionRunLimitsSummary,
+  TeamSessionRunMoney,
+  TeamSessionRunState,
   TeamSessionShare,
   TeamSessionStatus,
   TeamSessionTeam,
@@ -42,6 +55,12 @@ const EVENT_PAYLOAD_MAX_ENTRIES = 1_000;
 const JSON_MAX_DEPTH = 32;
 const JSON_MAX_ENTRIES = 2_000;
 const REDACTED_VALUE = "[redacted]";
+const RUN_STATE_MAX_GOALS = 100;
+const RUN_STATE_MAX_CRITERIA = 32;
+const RUN_STATE_MAX_DEPENDENCIES = 99;
+const RUN_STATE_MAX_EVIDENCE_PER_GOAL = 100;
+const RUN_STATE_MAX_ACTION_CARDS = 100;
+const RUN_STATE_MAX_DECISION_OPTIONS = 20;
 
 export class HttpError extends Error {
   override readonly name = "HttpError";
@@ -131,6 +150,20 @@ export async function fetchTeamSessionAdmission(
   const envelope = requireRecord(body, "Session admission response");
   requireExactFields(envelope, ["admission"], "Session admission response");
   return parseSessionAdmission(envelope.admission, normalizedSessionId);
+}
+
+export async function fetchTeamSessionRunState(
+  sessionId: string,
+  options: TeamSessionFetchOptions = {}
+): Promise<TeamSessionRunState> {
+  const normalizedSessionId = requireIdentifier(sessionId, "Session id");
+  const body = await requestJson(
+    `/api/team-sessions/sessions/${encodeURIComponent(normalizedSessionId)}/run-state`,
+    { method: "GET", signal: options.signal }
+  );
+  const envelope = requireRecord(body, "Session Run state response");
+  requireExactFields(envelope, ["runState"], "Session Run state response");
+  return parseTeamSessionRunState(envelope.runState, normalizedSessionId);
 }
 
 export async function fetchTeamSessionEvents(
@@ -502,6 +535,815 @@ function parseSessionAdmission(value: unknown, expectedSessionId: string): TeamS
   };
 }
 
+/** Strict parser for the private, actor-scoped Run read model. */
+export function parseTeamSessionRunState(
+  value: unknown,
+  expectedSessionId?: string
+): TeamSessionRunState {
+  const state = requireRecord(value, "Session Run state");
+  requireExactFields(
+    state,
+    [
+      "sessionId",
+      "asOfSequence",
+      "runStateRevision",
+      "capabilities",
+      "start",
+      "currentRun",
+      "attentionRequests",
+      "approvalRequests",
+      "activeGrants",
+      "grantReviews",
+    ],
+    "Session Run state"
+  );
+  const sessionId = requireRunIdentifier(state.sessionId, "Session Run state session id");
+  if (expectedSessionId !== undefined && sessionId !== expectedSessionId) {
+    throw invalidResponse("Session Run state belongs to another Session");
+  }
+  const capabilities = parseRunCapabilities(state.capabilities);
+  const start = parseRunStartAvailability(state.start);
+  if (capabilities.startRun !== start.available) {
+    throw invalidResponse("Session Run start capability is inconsistent");
+  }
+
+  const attentionRequests = requireGatedActionCards(
+    state.attentionRequests,
+    "Attention requests"
+  ).map(parseAttention);
+  const approvalRequests = requireGatedActionCards(state.approvalRequests, "Approval requests").map(
+    parseApproval
+  );
+  const activeGrants = requireGatedActionCards(state.activeGrants, "Active Run grants").map(
+    parseGrant
+  );
+  const grantReviews = requireGatedActionCards(state.grantReviews, "Run grant reviews").map(
+    parseGrantReview
+  );
+
+  return {
+    sessionId,
+    asOfSequence: requireSafeInteger(state.asOfSequence, "Run state sequence", 0),
+    runStateRevision: requireSafeInteger(state.runStateRevision, "Run state revision", 1),
+    capabilities,
+    start,
+    currentRun: state.currentRun === null ? null : parseCurrentRun(state.currentRun),
+    attentionRequests,
+    approvalRequests,
+    activeGrants,
+    grantReviews,
+  };
+}
+
+function parseRunCapabilities(value: unknown): TeamSessionRunCapabilities {
+  const capabilities = requireRecord(value, "Session Run capabilities");
+  const fields = [
+    "startRun",
+    "reviseRunPolicy",
+    "pauseRun",
+    "resumeRun",
+    "stopRun",
+    "emergencyStopRun",
+    "editGoals",
+    "reviewGoalEvidence",
+    "resolveFinalReview",
+    "viewActionCenter",
+    "resolveAttention",
+    "resolveApprovals",
+    "revokeRunGrants",
+    "resolveGrantReviews",
+  ] as const satisfies readonly (keyof TeamSessionRunCapabilities)[];
+  requireExactFields(capabilities, fields, "Session Run capabilities");
+  const parsed = Object.fromEntries(
+    fields.map((field) => [field, requireBoolean(capabilities[field], `${field} capability`)])
+  ) as unknown as TeamSessionRunCapabilities;
+  if (fields.some((field) => parsed[field])) {
+    throw invalidResponse("Session Run mutations are not exposed");
+  }
+  return parsed;
+}
+
+function parseRunStartAvailability(value: unknown): TeamSessionRunState["start"] {
+  const start = requireRecord(value, "Session Run start availability");
+  requireExactFields(start, ["available", "reason"], "Session Run start availability");
+  const available = requireBoolean(start.available, "Run start availability");
+  const reason = requireEnum(
+    start.reason,
+    [
+      "available",
+      "not-session-manager",
+      "session-not-active",
+      "runtime-not-ready",
+      "mutable-run-exists",
+      "run-mutations-unavailable",
+    ] as const,
+    "Run start reason"
+  );
+  if (available !== (reason === "available")) {
+    throw invalidResponse("Session Run start availability is inconsistent");
+  }
+  if (available) throw invalidResponse("Session Run mutations are not exposed");
+  return { available, reason };
+}
+
+function requireGatedActionCards(value: unknown, label: string): unknown[] {
+  const cards = requireBoundedArray(value, label, RUN_STATE_MAX_ACTION_CARDS);
+  if (cards.length !== 0) throw invalidResponse(`${label} are not exposed`);
+  return cards;
+}
+
+function parseCurrentRun(value: unknown): TeamSessionAgentRunView {
+  const run = requireRecord(value, "Agent Run");
+  requireExactFields(
+    run,
+    [
+      "agentRunId",
+      "lifecycle",
+      "stateVersion",
+      "mode",
+      "completionPolicy",
+      "runPolicyRevision",
+      "goalSetRevision",
+      "finalReviewVersion",
+      "finalReviewState",
+      "requiresPolicyRebind",
+      "sandboxState",
+      "limitStatus",
+      "attentionSummary",
+      "policySummary",
+      "goals",
+    ],
+    "Agent Run"
+  );
+  const mode = requireEnum(
+    run.mode,
+    ["supervised", "autonomous", "yolo"] as const,
+    "Agent Run mode"
+  );
+  const completionPolicy = requireEnum(
+    run.completionPolicy,
+    ["stop-after-directed-work", "continue-until-all-goals-achieved"] as const,
+    "Agent Run completion policy"
+  );
+  const attention = requireRecord(run.attentionSummary, "Agent Run attention summary");
+  requireExactFields(
+    attention,
+    ["openCount", "blockingCount", "independentAuthorizedWorkMayContinue"],
+    "Agent Run attention summary"
+  );
+  const openCount = requireSafeInteger(attention.openCount, "Open attention count", 0);
+  const blockingCount = requireSafeInteger(attention.blockingCount, "Blocking attention count", 0);
+  if (blockingCount > openCount) {
+    throw invalidResponse("Blocking attention count exceeds open attention count");
+  }
+  const policy = requireRecord(run.policySummary, "Agent Run policy summary");
+  requireExactFields(policy, ["mode", "completionPolicy", "limits"], "Agent Run policy summary");
+  const policyMode = requireEnum(
+    policy.mode,
+    ["supervised", "autonomous", "yolo"] as const,
+    "Run policy mode"
+  );
+  const policyCompletion = requireEnum(
+    policy.completionPolicy,
+    ["stop-after-directed-work", "continue-until-all-goals-achieved"] as const,
+    "Run policy completion policy"
+  );
+  if (policyMode !== mode || policyCompletion !== completionPolicy) {
+    throw invalidResponse("Agent Run policy summary is inconsistent");
+  }
+  const goals = requireBoundedArray(run.goals, "Agent Run goals", RUN_STATE_MAX_GOALS).map(
+    parseRunGoal
+  );
+  if (goals.length === 0) throw invalidResponse("Agent Run requires at least one Goal");
+  const goalIds = new Set(goals.map((goal) => goal.goalId));
+  if (goalIds.size !== goals.length) throw invalidResponse("Agent Run goal ids are not unique");
+  for (const [index, goal] of goals.entries()) {
+    if (goal.position !== index + 1) throw invalidResponse("Agent Run goal order is invalid");
+    if (
+      new Set(goal.dependencyGoalIds).size !== goal.dependencyGoalIds.length ||
+      goal.dependencyGoalIds.some(
+        (dependencyGoalId) => dependencyGoalId === goal.goalId || !goalIds.has(dependencyGoalId)
+      )
+    ) {
+      throw invalidResponse("Agent Run goal dependencies are invalid");
+    }
+  }
+
+  return {
+    agentRunId: requireRunIdentifier(run.agentRunId, "Agent Run id"),
+    lifecycle: requireEnum(
+      run.lifecycle,
+      [
+        "active",
+        "pausing",
+        "paused",
+        "agent-work-finished",
+        "completed",
+        "failed",
+        "stopped",
+        "emergency-stopped",
+      ] as const,
+      "Agent Run lifecycle"
+    ),
+    stateVersion: requireSafeInteger(run.stateVersion, "Agent Run state version", 1),
+    mode,
+    completionPolicy,
+    runPolicyRevision: requireSafeInteger(run.runPolicyRevision, "Run policy revision", 1),
+    goalSetRevision: requireSafeInteger(run.goalSetRevision, "Goal Set revision", 1),
+    finalReviewVersion: requireSafeInteger(run.finalReviewVersion, "Final review version", 1),
+    finalReviewState: requireEnum(
+      run.finalReviewState,
+      ["not-ready", "open", "accepted"] as const,
+      "Final review state"
+    ),
+    requiresPolicyRebind: requireBoolean(run.requiresPolicyRebind, "Run policy rebind requirement"),
+    sandboxState: requireEnum(
+      run.sandboxState,
+      [
+        "provisioning",
+        "ready",
+        "checkpointing",
+        "recovering",
+        "quarantined",
+        "retired",
+        "failed",
+      ] as const,
+      "Sandbox state"
+    ),
+    limitStatus: requireEnum(
+      run.limitStatus,
+      [
+        "accounting-unavailable",
+        "within-configured-limits",
+        "warning-75-percent",
+        "approaching-90-percent",
+        "configured-limit-reached",
+      ] as const,
+      "Run limit status"
+    ),
+    attentionSummary: {
+      openCount,
+      blockingCount,
+      independentAuthorizedWorkMayContinue: requireBoolean(
+        attention.independentAuthorizedWorkMayContinue,
+        "Independent authorized work flag"
+      ),
+    },
+    policySummary: {
+      mode: policyMode,
+      completionPolicy: policyCompletion,
+      limits: parseRunLimits(policy.limits),
+    },
+    goals,
+  };
+}
+
+function parseRunGoal(value: unknown): TeamSessionAgentRunView["goals"][number] {
+  const goal = requireRecord(value, "Agent Run goal");
+  requireExactFields(
+    goal,
+    [
+      "goalId",
+      "position",
+      "title",
+      "acceptanceCriteria",
+      "dependencyGoalIds",
+      "version",
+      "status",
+      "evidenceTotalCount",
+      "evidence",
+    ],
+    "Agent Run goal"
+  );
+  const evidence = requireBoundedArray(
+    goal.evidence,
+    "Goal evidence",
+    RUN_STATE_MAX_EVIDENCE_PER_GOAL
+  ).map(parseEvidenceSummary);
+  const evidenceIds = new Set(evidence.map((entry) => entry.evidenceId));
+  if (evidenceIds.size !== evidence.length)
+    throw invalidResponse("Goal evidence ids are not unique");
+  const evidenceTotalCount = requireSafeInteger(
+    goal.evidenceTotalCount,
+    "Goal evidence total count",
+    0
+  );
+  if (evidenceTotalCount < evidence.length) {
+    throw invalidResponse("Goal evidence total count is inconsistent");
+  }
+  return {
+    goalId: requireRunIdentifier(goal.goalId, "Goal id"),
+    position: requireSafeInteger(goal.position, "Goal position", 1, RUN_STATE_MAX_GOALS),
+    title: requireBoundedPublicString(goal.title, "Goal title", 1_000),
+    acceptanceCriteria: parseGoalCriteria(goal.acceptanceCriteria),
+    dependencyGoalIds: requireBoundedArray(
+      goal.dependencyGoalIds,
+      "Goal dependencies",
+      RUN_STATE_MAX_DEPENDENCIES
+    ).map((goalId) => requireRunIdentifier(goalId, "Goal dependency id")),
+    version: requireSafeInteger(goal.version, "Goal version", 1),
+    status: requireEnum(
+      goal.status,
+      ["pending", "in-progress", "blocked", "provisionally-achieved", "validated"] as const,
+      "Goal status"
+    ),
+    evidenceTotalCount,
+    evidence,
+  };
+}
+
+function parseGoalCriteria(value: unknown): string[] {
+  const criteria = requireBoundedArray(
+    value,
+    "Goal acceptance criteria",
+    RUN_STATE_MAX_CRITERIA
+  ).map((criterion) => requireBoundedPublicString(criterion, "Goal acceptance criterion", 1_000));
+  if (criteria.length === 0) throw invalidResponse("Goal requires acceptance criteria");
+  return criteria;
+}
+
+function parseEvidenceSummary(value: unknown): TeamSessionGoalEvidenceSummary {
+  const evidence = requireRecord(value, "Goal evidence summary");
+  requireExactFields(evidence, ["evidenceId", "status", "createdAtMs"], "Goal evidence summary", [
+    "reviewedAtMs",
+  ]);
+  return {
+    evidenceId: requireRunIdentifier(evidence.evidenceId, "Goal evidence id"),
+    status: requireEnum(
+      evidence.status,
+      ["proposed", "validated", "more-work-requested"] as const,
+      "Goal evidence status"
+    ),
+    createdAtMs: requireSafeInteger(evidence.createdAtMs, "Goal evidence createdAtMs", 0),
+    ...(evidence.reviewedAtMs === undefined
+      ? {}
+      : {
+          reviewedAtMs: requireSafeInteger(evidence.reviewedAtMs, "Goal evidence reviewedAtMs", 0),
+        }),
+  };
+}
+
+function parseRunLimits(value: unknown): TeamSessionRunLimitsSummary {
+  const limits = requireRecord(value, "Run limits");
+  requireExactFields(
+    limits,
+    ["wallClock", "modelTokens", "modelSpend", "outboundBytes", "actionCounts"],
+    "Run limits"
+  );
+  const actionCounts = requireRecord(limits.actionCounts, "Run action count limits");
+  requireExactFields(
+    actionCounts,
+    ["local", "scoped-external", "protected", "forbidden"],
+    "Run action count limits"
+  );
+  return {
+    wallClock: parseRunLimit(limits.wallClock, "Wall clock limit", (entry) => {
+      const duration = requireRecord(entry, "Wall clock limit value");
+      requireExactFields(duration, ["milliseconds"], "Wall clock limit value");
+      return {
+        milliseconds: requireSafeInteger(duration.milliseconds, "Wall clock milliseconds", 0),
+      };
+    }),
+    modelTokens: parseRunLimit(limits.modelTokens, "Model token limit", (entry) =>
+      requireSafeInteger(entry, "Model token limit value", 0)
+    ),
+    modelSpend: parseRunLimit(limits.modelSpend, "Model spend limit", parseRunMoney),
+    outboundBytes: parseRunLimit(limits.outboundBytes, "Outbound byte limit", (entry) =>
+      requireSafeInteger(entry, "Outbound byte limit value", 0)
+    ),
+    actionCounts: {
+      local: parseRunLimit(actionCounts.local, "Local action limit", (entry) =>
+        requireSafeInteger(entry, "Local action limit value", 0)
+      ),
+      "scoped-external": parseRunLimit(
+        actionCounts["scoped-external"],
+        "Scoped external action limit",
+        (entry) => requireSafeInteger(entry, "Scoped external action limit value", 0)
+      ),
+      protected: parseRunLimit(actionCounts.protected, "Protected action limit", (entry) =>
+        requireSafeInteger(entry, "Protected action limit value", 0)
+      ),
+      forbidden: parseRunLimit(actionCounts.forbidden, "Forbidden action limit", (entry) =>
+        requireSafeInteger(entry, "Forbidden action limit value", 0)
+      ),
+    },
+  };
+}
+
+function parseRunLimit<T>(
+  value: unknown,
+  label: string,
+  parseValue: (value: unknown) => T
+): TeamSessionRunLimit<T> {
+  const limit = requireRecord(value, label);
+  const kind = requireEnum(limit.kind, ["unconfigured", "capped"] as const, `${label} kind`);
+  if (kind === "unconfigured") {
+    requireExactFields(limit, ["kind"], label);
+    return { kind };
+  }
+  requireExactFields(limit, ["kind", "value"], label);
+  return { kind, value: parseValue(limit.value) };
+}
+
+function parseRunMoney(value: unknown): TeamSessionRunMoney {
+  const money = requireRecord(value, "Run money");
+  requireExactFields(money, ["currency", "minorUnits"], "Run money");
+  const currency = requireBoundedPublicString(money.currency, "Run money currency", 3);
+  if (!/^[A-Z]{3}$/.test(currency)) throw invalidResponse("Run money currency is invalid");
+  return {
+    currency,
+    minorUnits: requireSafeInteger(money.minorUnits, "Run money minor units", 0),
+  };
+}
+
+function parseActionEffect(value: unknown): TeamSessionActionEffectSummary {
+  const effect = requireRecord(value, "Action effect summary");
+  requireExactFields(
+    effect,
+    ["wallClockMilliseconds", "modelTokens", "modelSpend", "outboundBytes", "actionCounts"],
+    "Action effect summary"
+  );
+  const actionCounts = requireRecord(effect.actionCounts, "Action effect counts");
+  requireExactFields(
+    actionCounts,
+    ["local", "scoped-external", "protected", "forbidden"],
+    "Action effect counts"
+  );
+  return {
+    wallClockMilliseconds: requireSafeInteger(
+      effect.wallClockMilliseconds,
+      "Action effect wall clock",
+      0
+    ),
+    modelTokens: requireSafeInteger(effect.modelTokens, "Action effect model tokens", 0),
+    modelSpend: parseRunMoney(effect.modelSpend),
+    outboundBytes: requireSafeInteger(effect.outboundBytes, "Action effect outbound bytes", 0),
+    actionCounts: {
+      local: requireSafeInteger(actionCounts.local, "Local action effect count", 0),
+      "scoped-external": requireSafeInteger(
+        actionCounts["scoped-external"],
+        "Scoped external action effect count",
+        0
+      ),
+      protected: requireSafeInteger(actionCounts.protected, "Protected action effect count", 0),
+      forbidden: requireSafeInteger(actionCounts.forbidden, "Forbidden action effect count", 0),
+    },
+  };
+}
+
+function parseApproval(value: unknown): TeamSessionApprovalView {
+  const approval = requireRecord(value, "Approval request");
+  requireExactFields(
+    approval,
+    [
+      "approvalRequestId",
+      "version",
+      "status",
+      "expiresAtMs",
+      "displayDigest",
+      "actionClass",
+      "provider",
+      "operation",
+      "exactTarget",
+      "expectedEffect",
+      "reason",
+      "risk",
+      "allowedResolutions",
+    ],
+    "Approval request",
+    ["runApprovalPattern"]
+  );
+  const actionClass = requireEnum(
+    approval.actionClass,
+    ["scoped-external", "protected"] as const,
+    "Approval action class"
+  );
+  const allowedResolutions = parseUniqueEnumArray(
+    approval.allowedResolutions,
+    ["approve-once", "approve-for-run", "deny"] as const,
+    "Approval resolutions",
+    3
+  );
+  if (actionClass === "protected" && allowedResolutions.includes("approve-for-run")) {
+    throw invalidResponse("Protected action cannot be approved for a Run");
+  }
+  let runApprovalPattern: TeamSessionApprovalView["runApprovalPattern"];
+  if (approval.runApprovalPattern !== undefined) {
+    if (actionClass !== "scoped-external") {
+      throw invalidResponse("Run approval pattern has an invalid action class");
+    }
+    const pattern = requireRecord(approval.runApprovalPattern, "Run approval pattern");
+    requireExactFields(
+      pattern,
+      ["eligibleUse", "provider", "operation", "targetPattern", "displayDigest"],
+      "Run approval pattern"
+    );
+    runApprovalPattern = {
+      eligibleUse: requireEnum(
+        pattern.eligibleUse,
+        [
+          "session_branch_push",
+          "draft_pull_request_update",
+          "ephemeral_preview_update",
+          "same_credential_nonproduction_target",
+        ] as const,
+        "Run approval eligible use"
+      ),
+      provider: requireBoundedPublicString(pattern.provider, "Run approval provider", 300),
+      operation: requireBoundedPublicString(pattern.operation, "Run approval operation", 300),
+      targetPattern: requireBoundedPublicString(
+        pattern.targetPattern,
+        "Run approval target pattern",
+        2_000
+      ),
+      displayDigest: requireDisplayDigest(pattern.displayDigest, "Run approval display digest"),
+    };
+  }
+  if (allowedResolutions.includes("approve-for-run") && runApprovalPattern === undefined) {
+    throw invalidResponse("Run approval resolution is missing its safe pattern summary");
+  }
+  return {
+    approvalRequestId: requireRunIdentifier(approval.approvalRequestId, "Approval request id"),
+    version: requireSafeInteger(approval.version, "Approval request version", 1),
+    status: requireEnum(
+      approval.status,
+      ["open", "approved", "denied", "expired", "superseded"] as const,
+      "Approval request status"
+    ),
+    expiresAtMs: requireSafeInteger(approval.expiresAtMs, "Approval request expiry", 0),
+    displayDigest: requireDisplayDigest(approval.displayDigest, "Approval display digest"),
+    actionClass,
+    provider: requireBoundedPublicString(approval.provider, "Approval provider", 300),
+    operation: requireBoundedPublicString(approval.operation, "Approval operation", 300),
+    exactTarget: requireBoundedPublicString(approval.exactTarget, "Approval target", 2_000),
+    expectedEffect: parseActionEffect(approval.expectedEffect),
+    reason: requireBoundedPublicString(approval.reason, "Approval reason", 1_000),
+    risk: requireBoundedPublicString(approval.risk, "Approval risk", 1_000),
+    allowedResolutions,
+    ...(runApprovalPattern === undefined ? {} : { runApprovalPattern }),
+  };
+}
+
+function parseAttention(value: unknown): TeamSessionAttentionView {
+  const attention = requireRecord(value, "Attention request");
+  requireExactFields(
+    attention,
+    [
+      "attentionRequestId",
+      "version",
+      "deadlineAtMs",
+      "status",
+      "reason",
+      "risk",
+      "independentAuthorizedWorkMayContinue",
+      "linkedApproval",
+      "proposal",
+      "allowedResolutions",
+      "answerOptionIds",
+    ],
+    "Attention request"
+  );
+  const proposal = requireRecord(attention.proposal, "Attention proposal");
+  const proposalKind = requireEnum(
+    proposal.kind,
+    ["action-review", "structured-decision"] as const,
+    "Attention proposal kind"
+  );
+  let safeProposal: TeamSessionAttentionView["proposal"];
+  let optionIds = new Set<string>();
+  if (proposalKind === "action-review") {
+    requireExactFields(proposal, ["kind"], "Action review proposal");
+    safeProposal = { kind: proposalKind };
+  } else {
+    requireExactFields(proposal, ["kind", "options"], "Structured decision proposal");
+    const options = requireBoundedArray(
+      proposal.options,
+      "Structured decision options",
+      RUN_STATE_MAX_DECISION_OPTIONS
+    ).map((value) => {
+      const option = requireRecord(value, "Structured decision option");
+      requireExactFields(
+        option,
+        ["optionId", "label", "description"],
+        "Structured decision option"
+      );
+      return {
+        optionId: requireRunIdentifier(option.optionId, "Decision option id"),
+        label: requireBoundedPublicString(option.label, "Decision option label", 300),
+        description: requireBoundedPublicString(
+          option.description,
+          "Decision option description",
+          1_000,
+          true
+        ),
+      };
+    });
+    optionIds = new Set(options.map((option) => option.optionId));
+    if (optionIds.size !== options.length)
+      throw invalidResponse("Decision option ids are not unique");
+    safeProposal = { kind: proposalKind, options };
+  }
+  const allowedResolutions = parseUniqueEnumArray(
+    attention.allowedResolutions,
+    ["deny-proposed-action", "supersede-with-directive", "answer"] as const,
+    "Attention resolutions",
+    3
+  );
+  const answerOptionIds = requireBoundedArray(
+    attention.answerOptionIds,
+    "Attention answer options",
+    RUN_STATE_MAX_DECISION_OPTIONS
+  ).map((optionId) => requireRunIdentifier(optionId, "Attention answer option id"));
+  if (
+    new Set(answerOptionIds).size !== answerOptionIds.length ||
+    answerOptionIds.some((optionId) => !optionIds.has(optionId)) ||
+    (!allowedResolutions.includes("answer") && answerOptionIds.length > 0)
+  ) {
+    throw invalidResponse("Attention answer options are invalid");
+  }
+  if (allowedResolutions.includes("answer") && answerOptionIds.length === 0) {
+    throw invalidResponse("Attention answer resolution has no advertised options");
+  }
+  return {
+    attentionRequestId: requireRunIdentifier(attention.attentionRequestId, "Attention request id"),
+    version: requireSafeInteger(attention.version, "Attention request version", 1),
+    deadlineAtMs: requireSafeInteger(attention.deadlineAtMs, "Attention request deadline", 0),
+    status: requireEnum(
+      attention.status,
+      ["open", "resolved", "superseded", "timed-out"] as const,
+      "Attention request status"
+    ),
+    reason: requireBoundedPublicString(attention.reason, "Attention reason", 1_000),
+    risk: requireBoundedPublicString(attention.risk, "Attention risk", 1_000),
+    independentAuthorizedWorkMayContinue: requireBoolean(
+      attention.independentAuthorizedWorkMayContinue,
+      "Independent work flag"
+    ),
+    linkedApproval: requireBoolean(attention.linkedApproval, "Linked approval flag"),
+    proposal: safeProposal,
+    allowedResolutions,
+    answerOptionIds,
+  };
+}
+
+function parseGrant(value: unknown): TeamSessionGrantView {
+  const grant = requireRecord(value, "Run grant");
+  requireExactFields(
+    grant,
+    [
+      "grantId",
+      "version",
+      "status",
+      "actionClass",
+      "provider",
+      "operation",
+      "exactTarget",
+      "scope",
+      "expiresAtMs",
+      "allowedActions",
+    ],
+    "Run grant"
+  );
+  const actionClass = requireEnum(
+    grant.actionClass,
+    ["scoped-external", "protected"] as const,
+    "Run grant action class"
+  );
+  const scope = requireEnum(grant.scope, ["once", "run"] as const, "Run grant scope");
+  if (actionClass === "protected" && scope === "run") {
+    throw invalidResponse("Protected grant cannot have Run scope");
+  }
+  return {
+    grantId: requireRunIdentifier(grant.grantId, "Run grant id"),
+    version: requireSafeInteger(grant.version, "Run grant version", 1),
+    status: requireEnum(
+      grant.status,
+      [
+        "issued",
+        "enforcement-pending",
+        "active",
+        "consumed",
+        "expired",
+        "revoked",
+        "invalidated",
+        "enforcement-failed",
+      ] as const,
+      "Run grant status"
+    ),
+    actionClass,
+    provider: requireBoundedPublicString(grant.provider, "Run grant provider", 300),
+    operation: requireBoundedPublicString(grant.operation, "Run grant operation", 300),
+    exactTarget: requireBoundedPublicString(grant.exactTarget, "Run grant target", 2_000),
+    scope,
+    expiresAtMs: requireSafeInteger(grant.expiresAtMs, "Run grant expiry", 0),
+    allowedActions: parseUniqueEnumArray(
+      grant.allowedActions,
+      ["revoke"] as const,
+      "Run grant actions",
+      1
+    ),
+  };
+}
+
+function parseGrantCandidate(value: unknown): TeamSessionGrantCandidateView {
+  const candidate = requireRecord(value, "Reissuable grant candidate");
+  requireExactFields(
+    candidate,
+    ["grantId", "actionClass", "provider", "operation", "exactTarget", "scope"],
+    "Reissuable grant candidate"
+  );
+  const actionClass = requireEnum(
+    candidate.actionClass,
+    ["scoped-external", "protected"] as const,
+    "Grant candidate action class"
+  );
+  const scope = requireEnum(candidate.scope, ["once", "run"] as const, "Grant candidate scope");
+  if (actionClass === "protected" && scope === "run") {
+    throw invalidResponse("Protected grant candidate cannot have Run scope");
+  }
+  return {
+    grantId: requireRunIdentifier(candidate.grantId, "Grant candidate id"),
+    actionClass,
+    provider: requireBoundedPublicString(candidate.provider, "Grant candidate provider", 300),
+    operation: requireBoundedPublicString(candidate.operation, "Grant candidate operation", 300),
+    exactTarget: requireBoundedPublicString(candidate.exactTarget, "Grant candidate target", 2_000),
+    scope,
+  };
+}
+
+function parseGrantReview(value: unknown): TeamSessionGrantReviewView {
+  const review = requireRecord(value, "Grant review");
+  requireExactFields(
+    review,
+    [
+      "grantReviewId",
+      "version",
+      "reason",
+      "status",
+      "safeDefault",
+      "deliberatelyRevokedCount",
+      "reissuableCandidates",
+      "allowedActions",
+    ],
+    "Grant review"
+  );
+  const candidates = requireBoundedArray(
+    review.reissuableCandidates,
+    "Reissuable grant candidates",
+    RUN_STATE_MAX_ACTION_CARDS
+  ).map(parseGrantCandidate);
+  const candidateIds = new Set(candidates.map((candidate) => candidate.grantId));
+  if (candidateIds.size !== candidates.length) {
+    throw invalidResponse("Reissuable grant candidate ids are not unique");
+  }
+  const actions = requireRecord(review.allowedActions, "Grant review actions");
+  requireExactFields(actions, ["revokeAll", "reissueCandidateGrantIds"], "Grant review actions");
+  const reissueCandidateGrantIds = requireBoundedArray(
+    actions.reissueCandidateGrantIds,
+    "Reissuable grant action ids",
+    RUN_STATE_MAX_ACTION_CARDS
+  ).map((grantId) => requireRunIdentifier(grantId, "Reissuable grant action id"));
+  if (
+    new Set(reissueCandidateGrantIds).size !== reissueCandidateGrantIds.length ||
+    reissueCandidateGrantIds.some((grantId) => !candidateIds.has(grantId))
+  ) {
+    throw invalidResponse("Grant review action candidates are invalid");
+  }
+  return {
+    grantReviewId: requireRunIdentifier(review.grantReviewId, "Grant review id"),
+    version: requireSafeInteger(review.version, "Grant review version", 1),
+    reason: requireEnum(
+      review.reason,
+      [
+        "policy-revision",
+        "runtime-assignment",
+        "sandbox-generation",
+        "runtime-authorization",
+        "credential",
+        "explicit-revocation",
+        "recovery",
+      ] as const,
+      "Grant review reason"
+    ),
+    status: requireEnum(
+      review.status,
+      ["open", "resolved", "superseded"] as const,
+      "Grant review status"
+    ),
+    safeDefault: requireLiteral(review.safeDefault, "revoke-all", "Grant review safe default"),
+    deliberatelyRevokedCount: requireSafeInteger(
+      review.deliberatelyRevokedCount,
+      "Deliberately revoked grant count",
+      0
+    ),
+    reissuableCandidates: candidates,
+    allowedActions: {
+      revokeAll: requireBoolean(actions.revokeAll, "Revoke-all action"),
+      reissueCandidateGrantIds,
+    },
+  };
+}
+
 function parseRuntime(value: unknown): TeamSessionRuntime {
   const runtime = requireRecord(value, "Session Runtime");
   requireExactFields(
@@ -687,6 +1529,7 @@ function parseViewerBasis(value: unknown): TeamSessionViewerBasis {
       "controlRevision",
       "controlEpoch",
       "runtimeAuthorizationGeneration",
+      "runStateRevision",
       "latestSequence",
     ],
     "Session viewer basis",
@@ -728,6 +1571,7 @@ function parseViewerBasis(value: unknown): TeamSessionViewerBasis {
       "Runtime authorization generation",
       1
     ),
+    runStateRevision: requireSafeInteger(basis.runStateRevision, "Run state revision", 1),
     latestSequence: requireSafeInteger(basis.latestSequence, "Viewer latest sequence", 0),
   };
 }
@@ -955,11 +1799,59 @@ function requireArray(value: unknown, label: string): unknown[] {
   return value;
 }
 
+function requireBoundedArray(value: unknown, label: string, maximum: number): unknown[] {
+  const array = requireArray(value, label);
+  if (array.length > maximum) throw invalidResponse(`${label} exceeds its size limit`);
+  return array;
+}
+
+function parseUniqueEnumArray<const Values extends readonly string[]>(
+  value: unknown,
+  allowed: Values,
+  label: string,
+  maximum: number
+): Values[number][] {
+  const result = requireBoundedArray(value, label, maximum).map((entry) =>
+    requireEnum(entry, allowed, label)
+  );
+  if (new Set(result).size !== result.length) {
+    throw invalidResponse(`${label} contains duplicates`);
+  }
+  return result;
+}
+
 function requireString(value: unknown, label: string, allowEmpty = false): string {
   if (typeof value !== "string" || (!allowEmpty && value.length === 0)) {
     throw invalidResponse(`${label} is invalid`);
   }
   return value;
+}
+
+function requireBoundedPublicString(
+  value: unknown,
+  label: string,
+  maximum: number,
+  allowEmpty = false
+): string {
+  const text = requireString(value, label, allowEmpty);
+  if (text.length > maximum || /[\u0000-\u0008\u000b-\u001f\u007f]/.test(text)) {
+    throw invalidResponse(`${label} is invalid`);
+  }
+  return text;
+}
+
+function requireRunIdentifier(value: unknown, label: string): string {
+  const identifier = requireBoundedPublicString(value, label, 300);
+  if (identifier.trim() !== identifier) throw invalidResponse(`${label} is invalid`);
+  return identifier;
+}
+
+function requireDisplayDigest(value: unknown, label: string): string {
+  const digest = requireBoundedPublicString(value, label, 71);
+  if (!/^sha256:[0-9a-f]{12,64}$/.test(digest)) {
+    throw invalidResponse(`${label} is invalid`);
+  }
+  return digest;
 }
 
 function requireIdentifier(value: string, label: string): string {
