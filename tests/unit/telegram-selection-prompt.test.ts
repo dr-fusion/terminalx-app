@@ -52,6 +52,36 @@ describe("extractSelectionPrompt", () => {
     expect(prompt!.text).not.toContain("Some earlier assistant output");
   });
 
+  it("extracts Codex approval prompts with an instruction footer below the options", () => {
+    const prompt = extractSelectionPrompt(`
+◦ Running npm run dev:admin
+
+${"─".repeat(80)}
+
+  Would you like to run the following command?
+
+  Environment: local
+
+  Reason: Allow starting the admin Next.js dev server on port 3002 so I can capture board-deck screenshots.
+
+  $ npm run dev:admin
+
+› 1. Yes, proceed (y)
+  2. Yes, and don't ask again for commands that start with \`npm run dev:admin\` (p)
+  3. No, and tell Codex what to do differently (esc)
+
+  Press enter to confirm or esc to cancel
+
+`);
+
+    expect(prompt).not.toBeNull();
+    expect(prompt!.text).toContain("Would you like to run the following command?");
+    expect(prompt!.text).toContain("$ npm run dev:admin");
+    expect(prompt!.text).toContain("1. Yes, proceed (y)");
+    expect(prompt!.text).toContain("3. No, and tell Codex what to do differently");
+    expect(prompt!.text).not.toContain("Press enter to confirm");
+  });
+
   it("extracts Claude inline session rating prompts", () => {
     const prompt = extractSelectionPrompt(`
 Some Claude output

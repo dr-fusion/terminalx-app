@@ -10,6 +10,22 @@ import type { SessionKind } from "@/lib/ai-sessions";
  */
 export type ViewMode = "screen" | "chat" | "off";
 
+export interface TelegramDeliveryState {
+  status: "pending" | "sent" | "failed";
+  jsonlPath: string;
+  /** Last byte offset known to be safe to skip on restart. */
+  jsonlOffset: number;
+  /** End offset for the line that failed, if status is failed. */
+  nextJsonlOffset?: number;
+  error?: string;
+  updatedAtMs: number;
+}
+
+export interface TelegramSentMessageHash {
+  hash: string;
+  atMs: number;
+}
+
 export interface TopicBinding {
   topicId: number;
   sessionName: string;
@@ -21,11 +37,16 @@ export interface TopicBinding {
   /** Native Claude/Codex transcript session id (not the tmux session name). */
   transcriptSessionId?: string;
   jsonlOffset?: number;
+  telegramDelivery?: TelegramDeliveryState;
+  /** Bounded dedupe cache for transcript messages already accepted by Telegram. */
+  telegramSentMessageHashes?: TelegramSentMessageHash[];
   /** Last Telegram prompt sent to an AI CLI before its transcript was bound. */
   pendingPrompt?: string;
   /** Unix ms when pendingPrompt was sent to tmux. */
   lastPromptAtMs?: number;
   pinnedMsgId?: number;
+  /** Unix ms after the one-time TUI hint was posted for this topic. */
+  tuiHintedAtMs?: number;
   /** screen = pinned code-block edits; chat = each new chunk as its own msg. */
   viewMode?: ViewMode;
   /** Unix ms when the backing tmux session ended; topic is kept for cleanup. */
@@ -60,9 +81,12 @@ export function topicSessionIncarnationPatch(
       jsonlPath: undefined,
       transcriptSessionId: undefined,
       jsonlOffset: undefined,
+      telegramDelivery: undefined,
+      telegramSentMessageHashes: undefined,
       pendingPrompt: undefined,
       lastPromptAtMs: undefined,
       pinnedMsgId: undefined,
+      tuiHintedAtMs: undefined,
       endedAtMs: undefined,
     },
   };

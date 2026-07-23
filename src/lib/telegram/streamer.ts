@@ -58,6 +58,8 @@ interface RuntimeState {
   claudeDetectedAtMs?: number;
   /** Signature of the last interactive selection prompt we surfaced (dedup). */
   lastPromptSignature?: string;
+  /** Last forced live-screen snapshot sent while the topic was in chat mode. */
+  lastForcedRendered?: string;
 }
 
 /** Default view mode for a freshly-attached topic. */
@@ -418,7 +420,7 @@ async function flushChat(
     if ((isClaudeCli || isCodexCli) && binding?.pendingPrompt && binding.lastPromptAtMs) {
       return;
     }
-    if (!rt.tuiHinted) {
+    if (!rt.tuiHinted && !binding?.tuiHintedAtMs) {
       rt.tuiHinted = true;
       try {
         await bot.api.sendMessage(
@@ -426,9 +428,12 @@ async function flushChat(
           "(TUI app running. /view screen to see the live screen, or attach via web for full fidelity.)",
           { message_thread_id: topicId }
         );
+        await patchTopic(topicId, { tuiHintedAtMs: Date.now() });
       } catch {
         /* ignore */
       }
+    } else if (binding?.tuiHintedAtMs) {
+      rt.tuiHinted = true;
     }
     return;
   }
@@ -522,11 +527,35 @@ export function resetStreamerSessionState(topicId: number): void {
   rt.tuiHinted = false;
   rt.claudeDetectedAtMs = undefined;
   rt.lastPromptSignature = undefined;
+  rt.lastForcedRendered = undefined;
 }
 
 /** Force a flush now (used by `/snap` and after key/scroll input). */
 export function snap(bot: Bot, topicId: number): void {
   void renderAndFlush(bot, topicId);
+}
+
+/** Send the current live screen as a chat message without changing view mode. */
+export function snapScreenMessage(bot: Bot, topicId: number): void {
+  void (async () => {
+    const rt = runtimes.get(topicId);
+    const binding = getTopic(topicId);
+    const chatId = getForumChatId();
+    if (!rt || !binding || !chatId || !hasSession(binding.sessionName)) return;
+    try {
+      const rendered = renderScreen(captureVisiblePane(binding.sessionName));
+      if (!rendered || rendered === rt.lastForcedRendered) return;
+      await bot.api.sendMessage(chatId, rendered, {
+        message_thread_id: topicId,
+        parse_mode: "MarkdownV2",
+        reply_markup: attachedKeyboard(),
+      });
+      rt.lastForcedRendered = rendered;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error("[telegram/streamer] forced screen send failed:", msg);
+    }
+  })();
 }
 
 function stopStreamerSync(topicId: number): void {

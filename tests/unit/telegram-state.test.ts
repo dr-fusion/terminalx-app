@@ -75,9 +75,17 @@ describe("telegram state", () => {
       jsonlPath: "/old/rollout.jsonl",
       transcriptSessionId: "old-codex-id",
       jsonlOffset: 42,
+      telegramDelivery: {
+        status: "sent" as const,
+        jsonlPath: "/old/rollout.jsonl",
+        jsonlOffset: 42,
+        updatedAtMs: 1_600,
+      },
+      telegramSentMessageHashes: [{ hash: "old-hash", atMs: 1_600 }],
       pendingPrompt: "old prompt",
       lastPromptAtMs: 1_500,
       pinnedMsgId: 99,
+      tuiHintedAtMs: 1_700,
       endedAtMs: 1_900,
     };
 
@@ -88,9 +96,12 @@ describe("telegram state", () => {
         jsonlPath: undefined,
         transcriptSessionId: undefined,
         jsonlOffset: undefined,
+        telegramDelivery: undefined,
+        telegramSentMessageHashes: undefined,
         pendingPrompt: undefined,
         lastPromptAtMs: undefined,
         pinnedMsgId: undefined,
+        tuiHintedAtMs: undefined,
         endedAtMs: undefined,
       },
     });

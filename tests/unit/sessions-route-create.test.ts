@@ -186,6 +186,11 @@ describe("POST /api/sessions", () => {
     const body = await res.json();
 
     expect(res.status).toBe(201);
+    expect(mocks.commandForKind).toHaveBeenCalledWith("codex", {
+      dangerouslySkipPermissions: true,
+      planMode: false,
+      model: undefined,
+    });
     expect(mocks.createSession).toHaveBeenCalledWith("agent", "codex --yolo", tmpDir);
     expect(mocks.bridgedEnsureTopic).toHaveBeenCalledWith(
       { username: "admin", role: "admin" },

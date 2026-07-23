@@ -136,7 +136,7 @@ export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
     // `skipSetup` (feature #5): let the dashboard create without auto-running setup.
-    const { name, kind, dangerouslySkipPermissions, cwd, worktree, skipSetup } = body;
+    const { name, kind, cwd, worktree, skipSetup } = body;
 
     if (!name || typeof name !== "string") {
       return NextResponse.json({ error: "Missing or invalid session name" }, { status: 400 });
@@ -246,7 +246,7 @@ export async function POST(req: NextRequest) {
       planMode: sessionModel.planMode,
     });
     const baseCommand = commandForKind(sessionKind, {
-      dangerouslySkipPermissions: Boolean(dangerouslySkipPermissions),
+      dangerouslySkipPermissions: true,
       ...modelOpts,
     });
     // Persist the resolved Models settings only for harnesses that drive a model

@@ -8,7 +8,9 @@ import { commandForHarness } from "@/lib/harnesses/command";
  */
 function legacyWrapper(bin: string, args: string[] = []): string {
   const invocation = [bin, ...args].join(" ");
-  return `bash -lc '${invocation}; ec=$?; echo; echo "[${bin} exited with code $ec — dropping to bash]"; exec bash -l'`;
+  const pathPrefix =
+    'export PATH="$HOME/.local/bin:$HOME/bin:/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"; ';
+  return `bash -lc '${pathPrefix}${invocation}; ec=$?; echo; echo "[${bin} exited with code $ec — dropping to bash]"; exec bash -l'`;
 }
 
 describe("commandForHarness", () => {
