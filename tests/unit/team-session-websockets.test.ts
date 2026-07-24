@@ -273,6 +273,26 @@ describe("canonical Team Session WebSockets", () => {
     expect(harness.pty.writes).toEqual([]);
   });
 
+  it("bounds authenticated sockets per user and releases capacity on close", async () => {
+    const harness = await createHarness();
+    const firstTerminal = await harness.connect("terminal", bearerHeaders());
+    const secondTerminal = await harness.connect("terminal", bearerHeaders());
+    await Promise.all([firstTerminal.nextJson(), secondTerminal.nextJson()]);
+
+    await expectUpgradeStatus(`${harness.wsUrl}/terminal`, bearerHeaders(), 429);
+
+    firstTerminal.webSocket.close();
+    await firstTerminal.closed;
+    const replacementTerminal = await harness.connect("terminal", bearerHeaders());
+    await expect(replacementTerminal.nextJson()).resolves.toMatchObject({ type: "terminal.ready" });
+
+    const eventClients = await Promise.all(
+      Array.from({ length: 4 }, () => harness.connect("events", bearerHeaders()))
+    );
+    await Promise.all(eventClients.map((client) => client.nextJson()));
+    await expectUpgradeStatus(`${harness.wsUrl}/events`, bearerHeaders(), 429);
+  });
+
   it("re-checks Session admission after upgrading and before creating a PTY", async () => {
     const connection = new FakeTerminalConnection();
     let opens = 0;
@@ -340,17 +360,23 @@ describe("canonical Team Session WebSockets", () => {
     expect(revokedKernel.follows).toEqual([]);
   });
 
-  it("streams a minimized snapshot and redacted ordered events from latestSequence", async () => {
+  it("streams a minimized snapshot and allowlisted conversation events from latestSequence", async () => {
     const kernel = new FakeEventKernel();
     kernel.followImplementation = async function* () {
-      yield makeEvent(24, {
-        visible: "ok",
-        apiToken: "must-not-leak",
-        apiKey: "must-not-leak",
-        authorization: "must-not-leak",
-        nested: [{ privateKey: "must-not-leak", safe: true }],
-        runtimeAuthorizationGeneration: 12,
-      });
+      yield {
+        ...makeEvent(24, {
+          commentId: "comment-24",
+          body: "Visible conversation body",
+          invitationId: "private-invitation-id",
+          accessRevision: 42,
+          apiToken: "must-not-leak",
+          apiKey: "must-not-leak",
+          authorization: "must-not-leak",
+          nested: [{ privateKey: "must-not-leak", safe: true }],
+          runtimeAuthorizationGeneration: 12,
+        }),
+        type: "comment.added",
+      };
       await new Promise<void>(() => undefined);
     };
     const harness = await createHarness({ kernel });
@@ -367,6 +393,11 @@ describe("canonical Team Session WebSockets", () => {
     });
     const snapshotSession = asRecord(snapshot.session);
     expect(snapshotSession).not.toHaveProperty("invitations");
+    expect(snapshotSession).not.toHaveProperty("participants");
+    expect(snapshotSession).not.toHaveProperty("shares");
+    expect(snapshotSession).not.toHaveProperty("handoffs");
+    expect(snapshotSession).not.toHaveProperty("accessRevision");
+    expect(snapshotSession).not.toHaveProperty("controlEpoch");
     expect(snapshotSession.runtime).not.toHaveProperty("tmuxName");
 
     const envelope = await client.nextJson();
@@ -377,16 +408,19 @@ describe("canonical Team Session WebSockets", () => {
         sequence: 24,
         sourceAdapter: "internal",
         payload: {
-          visible: "ok",
-          apiToken: "[redacted]",
-          apiKey: "[redacted]",
-          authorization: "[redacted]",
-          nested: [{ privateKey: "[redacted]", safe: true }],
-          runtimeAuthorizationGeneration: 12,
+          commentId: "comment-24",
+          body: "Visible conversation body",
         },
       },
     });
     const publicEvent = asRecord(envelope.event);
+    expect(publicEvent.payload).toEqual({
+      commentId: "comment-24",
+      body: "Visible conversation body",
+    });
+    expect(JSON.stringify(publicEvent)).not.toContain("private-invitation-id");
+    expect(JSON.stringify(publicEvent)).not.toContain("must-not-leak");
+    expect(JSON.stringify(publicEvent)).not.toContain("accessRevision");
     expect(Object.keys(publicEvent).sort()).toEqual([
       "actor",
       "eventId",
@@ -409,6 +443,84 @@ describe("canonical Team Session WebSockets", () => {
       afterSequence: 23,
       actor: { kind: "human", userId: ACTOR.userId },
     });
+
+    client.webSocket.send(JSON.stringify({ type: "client-message" }));
+    await expect(client.closed).resolves.toMatchObject({ code: 1008 });
+  });
+
+  it("does not reveal a redeemed identity before the Participant join event", async () => {
+    const pendingGuest = {
+      kind: "human" as const,
+      userId: "pending-guest-private-id",
+      displayName: "Pending Guest Private Name",
+    };
+    const kernel = new FakeEventKernel();
+    kernel.followImplementation = async function* () {
+      yield {
+        ...makeEvent(24, {
+          invitationId: "private-invitation-id",
+          userId: pendingGuest.userId,
+          invitationVersion: 2,
+          membershipRole: "guest",
+          accessRevision: 7,
+        }),
+        type: "session.invitation.redeemed",
+        actor: pendingGuest,
+      };
+      yield {
+        ...makeEvent(25, {
+          teamId: "private-team-id",
+          userId: pendingGuest.userId,
+          role: "guest",
+          invitationId: "private-invitation-id",
+          accessRevision: 7,
+        }),
+        type: "team.membership.joined",
+        actor: pendingGuest,
+      };
+      yield {
+        ...makeEvent(26, {
+          participantId: "private-participant-id",
+          userId: pendingGuest.userId,
+          invitationId: "private-invitation-id",
+          participantVersion: 1,
+          accessRevision: 8,
+        }),
+        type: "session.participant.joined",
+        actor: pendingGuest,
+      };
+      await new Promise<void>(() => undefined);
+    };
+    const harness = await createHarness({ kernel });
+    const client = await harness.connect("events", bearerHeaders());
+
+    await client.nextJson();
+    const redemption = asRecord((await client.nextJson()).event);
+    const membership = asRecord((await client.nextJson()).event);
+    const joined = asRecord((await client.nextJson()).event);
+
+    for (const event of [redemption, membership]) {
+      expect(event).toMatchObject({
+        type: "session.activity",
+        actor: {
+          kind: "system",
+          userId: "session-system",
+          displayName: "Session system",
+        },
+        sourceAdapter: "internal",
+        payload: {},
+      });
+      expect(JSON.stringify(event)).not.toContain(pendingGuest.userId);
+      expect(JSON.stringify(event)).not.toContain(pendingGuest.displayName);
+      expect(JSON.stringify(event)).not.toContain("private-invitation-id");
+    }
+    expect(joined).toMatchObject({
+      type: "session.participant.joined",
+      actor: pendingGuest,
+      payload: {},
+    });
+    expect(JSON.stringify(joined)).not.toContain("private-invitation-id");
+    expect(JSON.stringify(joined)).not.toContain("private-participant-id");
 
     client.webSocket.send(JSON.stringify({ type: "client-message" }));
     await expect(client.closed).resolves.toMatchObject({ code: 1008 });
@@ -732,6 +844,7 @@ function makeSession(): SessionView {
     steeringRevision: 3,
     controlRevision: 6,
     controlEpoch: 7,
+    runStateRevision: 1,
     runtime: {
       kind: "local-tmux",
       isolation: "trusted-shared-host",

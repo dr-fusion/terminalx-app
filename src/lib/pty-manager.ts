@@ -89,7 +89,10 @@ export function createCanonicalPty(
     "attach-session",
     "-E",
   ];
-  if (binding.readOnly) args.push("-r");
+  // tmux normally lets every attached client influence the shared window size.
+  // An Observer is deliberately non-mutating, so exclude its PTY dimensions
+  // from tmux sizing in addition to attaching it read-only.
+  if (binding.readOnly) args.push("-r", "-f", "ignore-size");
   args.push("-t", canonicalTmuxTarget(sessionName));
   return spawnPty(sessionName, shell, cols, rows, args, Object.freeze({ ...binding }));
 }

@@ -24,6 +24,10 @@ const MAX_BUFFERED_OUTPUT_BYTES = 4 * 1024 * 1024;
 const MAX_QUEUED_TERMINAL_MESSAGES = 16;
 const DEFAULT_CREDENTIAL_CHECK_INTERVAL_MS = 1_000;
 const DEFAULT_EVENT_POLL_INTERVAL_MS = 100;
+const CONNECTION_LIMITS = Object.freeze({
+  terminal: { perUser: 2, perSession: 8, global: 16 },
+  events: { perUser: 4, perSession: 32, global: 256 },
+});
 const CANONICAL_SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._~-]{0,255}$/;
 const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
 
@@ -116,6 +120,7 @@ interface CanonicalRouteBase {
 }
 
 type CanonicalRoute = CanonicalRouteBase & ({ kind: "terminal" } | { kind: "events" });
+type CanonicalRouteKind = CanonicalRoute["kind"];
 
 interface Admission {
   actor: HumanActorContext;
@@ -151,6 +156,7 @@ export function createTeamSessionWebSockets(
     maxPayload: MAX_WEBSOCKET_PAYLOAD_BYTES,
   });
   const mutationQueues = new Map<string, Promise<void>>();
+  const connectionQuota = createConnectionQuota();
   let closed = false;
 
   const enqueueMutation = (sessionId: string, mutation: () => Promise<void>): Promise<void> => {
@@ -214,21 +220,34 @@ export function createTeamSessionWebSockets(
           return true;
         }
 
-        terminalWebSocketServer.handleUpgrade(request, socket, head, (webSocket) => {
-          void serveTerminal(
-            webSocket,
-            {
-              actor,
-              credentials,
-              route,
-              connection,
-            },
-            options,
-            resolveActor,
-            credentialCheckIntervalMs,
-            enqueueMutation
-          );
-        });
+        const releaseQuota = connectionQuota.reserve(route.kind, actor.userId, route.sessionId);
+        if (!releaseQuota) {
+          rejectUpgrade(socket, 429, "Too Many Requests");
+          return true;
+        }
+
+        try {
+          terminalWebSocketServer.handleUpgrade(request, socket, head, (webSocket) => {
+            void serveTerminal(
+              webSocket,
+              {
+                actor,
+                credentials,
+                route,
+                connection,
+              },
+              options,
+              resolveActor,
+              credentialCheckIntervalMs,
+              enqueueMutation,
+              releaseQuota
+            );
+          });
+        } catch (error) {
+          releaseQuota();
+          reportError(error, options.reportInternalError);
+          rejectUpgrade(socket, 503, "Service Unavailable");
+        }
         return true;
       }
 
@@ -248,16 +267,29 @@ export function createTeamSessionWebSockets(
         return true;
       }
 
-      eventWebSocketServer.handleUpgrade(request, socket, head, (webSocket) => {
-        void serveEvents(
-          webSocket,
-          { actor, credentials, route, session },
-          options,
-          resolveActor,
-          credentialCheckIntervalMs,
-          eventPollIntervalMs
-        );
-      });
+      const releaseQuota = connectionQuota.reserve(route.kind, actor.userId, route.sessionId);
+      if (!releaseQuota) {
+        rejectUpgrade(socket, 429, "Too Many Requests");
+        return true;
+      }
+
+      try {
+        eventWebSocketServer.handleUpgrade(request, socket, head, (webSocket) => {
+          void serveEvents(
+            webSocket,
+            { actor, credentials, route, session },
+            options,
+            resolveActor,
+            credentialCheckIntervalMs,
+            eventPollIntervalMs,
+            releaseQuota
+          );
+        });
+      } catch (error) {
+        releaseQuota();
+        reportError(error, options.reportInternalError);
+        rejectUpgrade(socket, 503, "Service Unavailable");
+      }
       return true;
     },
 
@@ -280,7 +312,8 @@ async function serveTerminal(
   options: CreateTeamSessionWebSocketsOptions,
   resolveActor: (headers: RequestHeaders) => Promise<RequestActor | null>,
   credentialCheckIntervalMs: number,
-  enqueueMutation: (sessionId: string, mutation: () => Promise<void>) => Promise<void>
+  enqueueMutation: (sessionId: string, mutation: () => Promise<void>) => Promise<void>,
+  releaseQuota: () => void
 ): Promise<void> {
   const abortController = new AbortController();
   let pty: CanonicalTerminalPty | undefined;
@@ -294,6 +327,7 @@ async function serveTerminal(
     cleanedUp = true;
     abortController.abort();
     clearInterval(credentialTimer);
+    releaseQuota();
     dataSubscription?.dispose();
     exitSubscription?.dispose();
     if (pty) options.pty.destroy(pty);
@@ -496,7 +530,8 @@ async function serveEvents(
   options: CreateTeamSessionWebSocketsOptions,
   resolveActor: (headers: RequestHeaders) => Promise<RequestActor | null>,
   credentialCheckIntervalMs: number,
-  eventPollIntervalMs: number
+  eventPollIntervalMs: number,
+  releaseQuota: () => void
 ): Promise<void> {
   const abortController = new AbortController();
   let credentialCheckActive = false;
@@ -507,6 +542,7 @@ async function serveEvents(
     cleanedUp = true;
     abortController.abort();
     clearInterval(credentialTimer);
+    releaseQuota();
   };
   const closeUnavailable = (): void => {
     cleanup();
@@ -711,6 +747,53 @@ function parseTerminalMessage(rawData: RawData, isBinary: boolean): TerminalMess
   }
 }
 
+function createConnectionQuota(): {
+  reserve(kind: CanonicalRouteKind, userId: string, sessionId: string): (() => void) | null;
+} {
+  const totals: Record<CanonicalRouteKind, number> = { terminal: 0, events: 0 };
+  const perUser: Record<CanonicalRouteKind, Map<string, number>> = {
+    terminal: new Map(),
+    events: new Map(),
+  };
+  const perSession: Record<CanonicalRouteKind, Map<string, number>> = {
+    terminal: new Map(),
+    events: new Map(),
+  };
+
+  return {
+    reserve(kind, userId, sessionId) {
+      const limits = CONNECTION_LIMITS[kind];
+      const userCount = perUser[kind].get(userId) ?? 0;
+      const sessionCount = perSession[kind].get(sessionId) ?? 0;
+      if (
+        totals[kind] >= limits.global ||
+        userCount >= limits.perUser ||
+        sessionCount >= limits.perSession
+      ) {
+        return null;
+      }
+
+      totals[kind] += 1;
+      perUser[kind].set(userId, userCount + 1);
+      perSession[kind].set(sessionId, sessionCount + 1);
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        totals[kind] = Math.max(0, totals[kind] - 1);
+        decrementConnectionCount(perUser[kind], userId);
+        decrementConnectionCount(perSession[kind], sessionId);
+      };
+    },
+  };
+}
+
+function decrementConnectionCount(counts: Map<string, number>, key: string): void {
+  const next = (counts.get(key) ?? 1) - 1;
+  if (next <= 0) counts.delete(key);
+  else counts.set(key, next);
+}
+
 function parseCanonicalRoute(request: IncomingMessage): CanonicalRoute | null {
   let url: URL;
   try {
@@ -815,12 +898,6 @@ function publicSessionSnapshot(session: SessionView): Record<string, unknown> {
     name: session.name,
     status: session.status,
     steeringPolicy: session.steeringPolicy,
-    accessRevision: session.accessRevision,
-    assigneeRevision: session.assigneeRevision,
-    supervisionRevision: session.supervisionRevision,
-    steeringRevision: session.steeringRevision,
-    controlRevision: session.controlRevision,
-    controlEpoch: session.controlEpoch,
     runtime: {
       kind: session.runtime.kind,
       isolation: session.runtime.isolation,
@@ -828,9 +905,6 @@ function publicSessionSnapshot(session: SessionView): Record<string, unknown> {
       authorizationGeneration: session.runtime.authorizationGeneration,
       authorizationState: session.runtime.authorizationState,
     },
-    participants: session.participants,
-    shares: session.shares,
-    handoffs: session.handoffs,
     latestSequence: session.latestSequence,
     createdAtMs: session.createdAtMs,
   };

@@ -141,6 +141,11 @@ Set `TERMINALX_MULTIPLAYER_ENABLED=true` and use the custom `npm run dev` or `np
 
 Enabling this mode disables the legacy direct `/ws/terminal/:tmuxName` upgrade path. Browser connections require same-origin cookie authentication; non-browser clients may use a Bearer header. Credentials are re-verified throughout long-lived connections, and every terminal mutation is checked against the current Control epoch and Runtime authorization generation. Each canonical Session runs on its own derived tmux server socket, so a tmux client cannot navigate into another Team Session. LocalTmux remains a trusted shared-host Runtime, not a Sandbox boundary: processes still run as the same host user and therefore require mutually trusted collaborators.
 
+Agent Run contracts and safe read state are being introduced behind additional release gates.
+See [Phase 4 Agent Run release gates](docs/multiplayer/phase-4-release-gates.md) for the Runtime
+truth, Daytona isolation, secret-broker, approval, limit-accounting, YOLO, and emergency-recovery
+work required before those mutations can be exposed.
+
 The public API exposes actor-scoped discovery at `/api/team-sessions/discovery`, a minimized Session inbox at `/api/team-sessions`, and Session detail and ordered event catch-up under `/api/team-sessions/sessions/:sessionId`. Conversation mutations are explicit Comments, Suggestions, Suggestion resolutions, or queued Directives; arbitrary chat text is never inferred to be executable. Shared Steering serializes Directives by canonical Session sequence while raw terminal input remains Controller-only. Pending queues are operationally bounded to 64 Directives per author and 256 per Session so access revocation remains finite and atomic. These queue safety ceilings are separate from user-configured Agent Run limits, which are not implemented by the LocalTmux Runtime.
 
 ## Configuration

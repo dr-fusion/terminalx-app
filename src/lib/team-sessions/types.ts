@@ -1,3 +1,5 @@
+import type * as Phase4Contracts from "./contracts";
+
 export const TEAM_SESSION_SCHEMA_VERSION = 1 as const;
 
 export type TeamRole = "owner" | "admin" | "member" | "guest";
@@ -260,7 +262,8 @@ export type SessionCommand =
       retryable: boolean;
       /** Closed, safe class only; raw Runtime errors and output never enter the kernel ledger. */
       errorCode: RuntimeOutboxErrorCode;
-    });
+    })
+  | (CommandBase & Phase4Contracts.AgentRunCommandPayload);
 
 export interface CommandResult {
   accepted: true;
@@ -306,6 +309,16 @@ export interface SessionDetailQuery extends QueryBase {
   sessionId: string;
 }
 
+/**
+ * Browser-safe Run state composed with Session authority in one kernel read
+ * transaction. Keep the internal Runtime-facing `session.run-state` query
+ * separate so HTTP never has to join independently authorized snapshots.
+ */
+export interface PublicSessionRunStateQuery extends QueryBase {
+  type: "session.public-run-state";
+  sessionId: string;
+}
+
 export interface SessionEventsQuery extends QueryBase {
   type: "session.events";
   sessionId: string;
@@ -342,11 +355,13 @@ export type SessionQuery =
   | WorkspaceDiscoveryQuery
   | SessionInboxQuery
   | SessionDetailQuery
+  | PublicSessionRunStateQuery
   | SessionEventsQuery
   | SessionTerminalAuthorizationQuery
   | SessionAdmissionQuery
   | TeamAccessQuery
-  | ProjectAccessQuery;
+  | ProjectAccessQuery
+  | Phase4Contracts.SessionRunStateQuery;
 
 export interface SessionEvent {
   schemaVersion: typeof TEAM_SESSION_SCHEMA_VERSION;
@@ -396,10 +411,35 @@ export interface SessionInvitationView {
 
 export interface SessionAdmissionView {
   sessionId: string;
-  teamId: string;
-  projectId: string;
   accessRevision: number;
-  invitations: SessionInvitationView[];
+  capabilities: {
+    canRevokeInvitations: boolean;
+    canGrantGuestShare: boolean;
+    canGrantProjectAccess: boolean;
+  };
+  activeInvitations: Array<{
+    invitationId: string;
+    membershipRole: "member" | "guest";
+    version: number;
+    expiresAtMs: number;
+  }>;
+  accessCandidates: Array<
+    | {
+        invitationId: string;
+        userId: string;
+        displayName: string;
+        membershipRole: "guest";
+        requiredGrant: "session-share";
+      }
+    | {
+        invitationId: string;
+        userId: string;
+        displayName: string;
+        membershipRole: "member";
+        requiredGrant: "project-access";
+        expectedProjectAccessVersion: number;
+      }
+  >;
 }
 
 export interface SessionHandoffView {
@@ -459,7 +499,7 @@ export type RuntimeOutboxDelivery = RuntimeOutboxDeliveryBase &
         kind: "runtime.authorization.fence";
         payload: {
           sessionId: string;
-          reason: "assignee-loss";
+          reason: "assignee-loss" | "emergency-stop";
           runtimeAuthorizationGeneration: number;
         };
       }
@@ -468,7 +508,24 @@ export type RuntimeOutboxDelivery = RuntimeOutboxDeliveryBase &
         payload: {
           sessionId: string;
           runtimeAuthorizationGeneration: number;
-        };
+        } & (
+          | {
+              reason?: never;
+              agentRunId?: never;
+              runtimeAssignmentId?: never;
+              runtimeAssignmentGeneration?: never;
+              sandboxId?: never;
+              sandboxGeneration?: never;
+            }
+          | {
+              reason: "emergency-stop";
+              agentRunId: string;
+              runtimeAssignmentId: string;
+              runtimeAssignmentGeneration: number;
+              sandboxId: string;
+              sandboxGeneration: number;
+            }
+        );
       }
   );
 
@@ -567,6 +624,7 @@ export interface SessionViewerBasis {
   controlRevision: number;
   controlEpoch: number;
   runtimeAuthorizationGeneration: number;
+  runStateRevision: number;
   latestSequence: number;
 }
 
@@ -663,6 +721,229 @@ export interface SessionDetailView extends SessionInboxItemView {
   openHandoffs: PublicOpenHandoffView[];
 }
 
+export type PublicSessionRunStartReason =
+  | "available"
+  | "not-session-manager"
+  | "session-not-active"
+  | "runtime-not-ready"
+  | "mutable-run-exists"
+  | "run-mutations-unavailable";
+
+export interface PublicSessionRunStartAvailability {
+  available: boolean;
+  reason: PublicSessionRunStartReason;
+}
+
+/**
+ * Actor-scoped browser actions. Phase 4 keeps every value false until the
+ * corresponding HTTP mutation and exact-bound Runtime enforcement ship
+ * together; kernel-only authority must not be advertised as an available UI
+ * action.
+ */
+export interface PublicSessionRunCapabilities {
+  startRun: boolean;
+  reviseRunPolicy: boolean;
+  pauseRun: boolean;
+  resumeRun: boolean;
+  stopRun: boolean;
+  emergencyStopRun: boolean;
+  editGoals: boolean;
+  reviewGoalEvidence: boolean;
+  resolveFinalReview: boolean;
+  viewActionCenter: boolean;
+  resolveAttention: boolean;
+  resolveApprovals: boolean;
+  revokeRunGrants: boolean;
+  resolveGrantReviews: boolean;
+}
+
+export type PublicSessionRunLimit<T> = { kind: "unconfigured" } | { kind: "capped"; value: T };
+
+export interface PublicSessionRunMoney {
+  currency: string;
+  minorUnits: number;
+}
+
+export interface PublicSessionRunLimitsSummary {
+  wallClock: PublicSessionRunLimit<{ milliseconds: number }>;
+  modelTokens: PublicSessionRunLimit<number>;
+  modelSpend: PublicSessionRunLimit<PublicSessionRunMoney>;
+  outboundBytes: PublicSessionRunLimit<number>;
+  actionCounts: {
+    local: PublicSessionRunLimit<number>;
+    "scoped-external": PublicSessionRunLimit<number>;
+    protected: PublicSessionRunLimit<number>;
+    forbidden: PublicSessionRunLimit<number>;
+  };
+}
+
+export interface PublicSessionGoalEvidenceSummary {
+  evidenceId: string;
+  status: "proposed" | "validated" | "more-work-requested";
+  createdAtMs: number;
+  reviewedAtMs?: number;
+}
+
+export interface PublicSessionRunGoalView {
+  goalId: string;
+  position: number;
+  title: string;
+  acceptanceCriteria: string[];
+  dependencyGoalIds: string[];
+  version: number;
+  status: "pending" | "in-progress" | "blocked" | "provisionally-achieved" | "validated";
+  evidenceTotalCount: number;
+  evidence: PublicSessionGoalEvidenceSummary[];
+}
+
+export interface PublicSessionAgentRunView {
+  agentRunId: string;
+  lifecycle: Phase4Contracts.AgentRunLifecycle;
+  stateVersion: number;
+  mode: Phase4Contracts.AgentRunMode;
+  completionPolicy: Phase4Contracts.CompletionPolicy["kind"];
+  runPolicyRevision: number;
+  goalSetRevision: number;
+  finalReviewVersion: number;
+  finalReviewState: "not-ready" | "open" | "accepted";
+  requiresPolicyRebind: boolean;
+  sandboxState:
+    | "provisioning"
+    | "ready"
+    | "checkpointing"
+    | "recovering"
+    | "quarantined"
+    | "retired"
+    | "failed";
+  limitStatus:
+    | "accounting-unavailable"
+    | "within-configured-limits"
+    | "warning-75-percent"
+    | "approaching-90-percent"
+    | "configured-limit-reached";
+  attentionSummary: {
+    openCount: number;
+    blockingCount: number;
+    independentAuthorizedWorkMayContinue: boolean;
+  };
+  policySummary: {
+    mode: Phase4Contracts.AgentRunMode;
+    completionPolicy: Phase4Contracts.CompletionPolicy["kind"];
+    limits: PublicSessionRunLimitsSummary;
+  };
+  goals: PublicSessionRunGoalView[];
+}
+
+export interface PublicSessionActionEffectSummary {
+  wallClockMilliseconds: number;
+  modelTokens: number;
+  modelSpend: PublicSessionRunMoney;
+  outboundBytes: number;
+  actionCounts: {
+    local: number;
+    "scoped-external": number;
+    protected: number;
+    forbidden: number;
+  };
+}
+
+export interface PublicSessionApprovalView {
+  approvalRequestId: string;
+  version: number;
+  status: Phase4Contracts.ApprovalRequestStatus;
+  expiresAtMs: number;
+  displayDigest: string;
+  actionClass: Phase4Contracts.ApprovableActionClass;
+  provider: string;
+  operation: string;
+  exactTarget: string;
+  expectedEffect: PublicSessionActionEffectSummary;
+  reason: string;
+  risk: string;
+  allowedResolutions: Array<"approve-once" | "approve-for-run" | "deny">;
+  runApprovalPattern?: {
+    eligibleUse: Phase4Contracts.EligibleRunGrantUse;
+    provider: string;
+    operation: string;
+    targetPattern: string;
+    displayDigest: string;
+  };
+}
+
+export interface PublicSessionAttentionView {
+  attentionRequestId: string;
+  version: number;
+  deadlineAtMs: number;
+  status: Phase4Contracts.AttentionRequestStatus;
+  reason: string;
+  risk: string;
+  independentAuthorizedWorkMayContinue: boolean;
+  linkedApproval: boolean;
+  proposal:
+    | { kind: "action-review" }
+    | {
+        kind: "structured-decision";
+        options: Array<{ optionId: string; label: string; description: string }>;
+      };
+  allowedResolutions: Array<"deny-proposed-action" | "supersede-with-directive" | "answer">;
+  answerOptionIds: string[];
+}
+
+export interface PublicSessionGrantView {
+  grantId: string;
+  version: number;
+  status: Phase4Contracts.ActionGrantStatus;
+  actionClass: Phase4Contracts.ApprovableActionClass;
+  provider: string;
+  operation: string;
+  exactTarget: string;
+  scope: "once" | "run";
+  expiresAtMs: number;
+  allowedActions: Array<"revoke">;
+}
+
+export interface PublicSessionGrantCandidateView {
+  grantId: string;
+  actionClass: Phase4Contracts.ApprovableActionClass;
+  provider: string;
+  operation: string;
+  exactTarget: string;
+  scope: "once" | "run";
+}
+
+export interface PublicSessionGrantReviewView {
+  grantReviewId: string;
+  version: number;
+  reason: Phase4Contracts.GrantReviewReason;
+  status: Phase4Contracts.GrantReviewStatus;
+  safeDefault: "revoke-all";
+  deliberatelyRevokedCount: number;
+  reissuableCandidates: PublicSessionGrantCandidateView[];
+  allowedActions: {
+    revokeAll: boolean;
+    reissueCandidateGrantIds: string[];
+  };
+}
+
+/**
+ * Browser-safe Run projection. It intentionally omits Runtime assignment,
+ * Sandbox and principal identifiers, authorization generations, credential
+ * references, signatures, ledgers, raw artifact references and provider
+ * payloads.
+ */
+export interface PublicSessionRunStateView {
+  sessionId: string;
+  asOfSequence: number;
+  runStateRevision: number;
+  capabilities: PublicSessionRunCapabilities;
+  start: PublicSessionRunStartAvailability;
+  currentRun: PublicSessionAgentRunView | null;
+  attentionRequests: PublicSessionAttentionView[];
+  approvalRequests: PublicSessionApprovalView[];
+  activeGrants: PublicSessionGrantView[];
+  grantReviews: PublicSessionGrantReviewView[];
+}
+
 export interface SessionView {
   sessionId: string;
   teamId: string;
@@ -676,6 +957,7 @@ export interface SessionView {
   steeringRevision: number;
   controlRevision: number;
   controlEpoch: number;
+  runStateRevision: number;
   runtime: {
     kind: "local-tmux";
     isolation: "trusted-shared-host";
@@ -723,11 +1005,15 @@ export interface TeamSessions {
   inspect(query: WorkspaceDiscoveryQuery): Promise<WorkspaceDiscoveryView>;
   inspect(query: SessionInboxQuery): Promise<SessionInboxItemView[]>;
   inspect(query: SessionDetailQuery): Promise<SessionDetailView | null>;
+  inspect(query: PublicSessionRunStateQuery): Promise<PublicSessionRunStateView | null>;
   inspect(query: SessionEventsQuery): Promise<SessionEvent[]>;
   inspect(query: SessionTerminalAuthorizationQuery): Promise<TerminalAuthorization>;
   inspect(query: SessionAdmissionQuery): Promise<SessionAdmissionView>;
   inspect(query: TeamAccessQuery): Promise<TeamAccessView>;
   inspect(query: ProjectAccessQuery): Promise<ProjectAccessView>;
+  inspect(
+    query: Phase4Contracts.SessionRunStateQuery
+  ): Promise<Phase4Contracts.SessionRunStateView | null>;
   /**
    * Hold an immediate SQLite transaction across the final authorization read
    * and one synchronous terminal effect. This gives control transfers and
@@ -737,6 +1023,22 @@ export interface TeamSessions {
   performTerminalMutation(query: SessionTerminalAuthorizationQuery, mutation: () => void): void;
   follow(options: FollowSessionOptions): AsyncIterable<SessionEvent>;
   claimRuntimeOutbox(options: RuntimeOutboxClaimOptions): Promise<RuntimeOutboxDelivery[]>;
+  runtimeEnsureState(input: {
+    sessionId: string;
+    tmuxName: string;
+    runtimeAuthorizationGeneration: number;
+  }): "pending" | "enforced" | "stale";
+  isCurrentRuntimeBinding(input: {
+    sessionId: string;
+    runtimeAuthorizationGeneration: number;
+    emergencyStop?: {
+      agentRunId: string;
+      runtimeAssignmentId: string;
+      runtimeAssignmentGeneration: number;
+      sandboxId: string;
+      sandboxGeneration: number;
+    };
+  }): boolean;
   close(): void;
 }
 
@@ -760,3 +1062,52 @@ export class TeamSessionError extends Error {
     this.name = "TeamSessionError";
   }
 }
+
+// Phase 4 portable contracts are re-exported here so existing type-only imports
+// from `team-sessions/types` continue to have one stable Interface.
+export type {
+  ActionClass,
+  ActionControlCommandPayload,
+  ActionControlSessionCommand,
+  ActionGrant,
+  ActionGrantBudget,
+  ActionGrantStatus,
+  ActionManifest,
+  ActionSchemaRef,
+  AgentRun,
+  AgentRunCommandPayload,
+  AgentRunLifecycle,
+  AgentRunMode,
+  AgentRunPolicySnapshot,
+  AgentRunSessionCommand,
+  ApprovalRequest,
+  ApprovalRequestStatus,
+  ApprovableActionClass,
+  AttentionRequest,
+  AttentionRequestStatus,
+  CompletionPolicy,
+  DirectiveAttributionInput,
+  Duration,
+  EligibleRunGrantUse,
+  GoalDefinition,
+  GoalEvidence,
+  GoalItem,
+  GoalSet,
+  GoalStatus,
+  GrantReview,
+  GrantReviewReason,
+  GrantReviewStatus,
+  Money,
+  ResourceEffect,
+  RunActionPattern,
+  RunLimit,
+  RunLimits,
+  RunPolicyCommit,
+  RunPolicyDraft,
+  RunPolicyRevision,
+  RuntimeBinding,
+  ScopedExternalRule,
+  SessionRunStateQuery,
+  SessionRunStateView,
+  YoloConfirmation,
+} from "./contracts";
