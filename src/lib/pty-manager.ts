@@ -1,11 +1,21 @@
 import * as pty from "node-pty";
-import { hasSession, tmuxTarget } from "./tmux";
+import { randomUUID } from "node:crypto";
+import { hasSession, isValidTmuxSessionName, tmuxTarget } from "./tmux";
+import { CANONICAL_TMUX_CONFIG_FILE, canonicalTmuxTarget } from "./runtime";
+
+export interface CanonicalPtyBinding {
+  teamSessionId: string;
+  runtimeAuthorizationGeneration: number;
+  tmuxSocketName: string;
+  readOnly: boolean;
+}
 
 export interface PtyInstance {
   id: string;
   sessionName: string;
   process: pty.IPty;
   createdAt: Date;
+  canonicalBinding?: CanonicalPtyBinding;
 }
 
 const activePtys = new Map<string, PtyInstance>();
@@ -34,8 +44,7 @@ export function createPty(
     throw new Error(`Maximum number of PTY sessions reached (${maxSessions})`);
   }
 
-  // Validate sessionName
-  if (!/^[a-zA-Z0-9_.\-]+$/.test(sessionName)) {
+  if (!isValidTmuxSessionName(sessionName)) {
     throw new Error("Invalid session name");
   }
 
@@ -43,7 +52,57 @@ export function createPty(
     throw new Error("Session does not exist. Create it from the dashboard first.");
   }
 
-  const id = `pty-${sessionName}-${Date.now()}`;
+  return spawnPty(sessionName, shell, cols, rows, [
+    "attach-session",
+    "-t",
+    tmuxTarget(sessionName),
+  ]);
+}
+
+export function createCanonicalPty(
+  sessionName: string,
+  shell: string,
+  cols: number,
+  rows: number,
+  binding: CanonicalPtyBinding
+): PtyInstance {
+  if (activePtys.size >= maxSessions) {
+    throw new Error(`Maximum number of PTY sessions reached (${maxSessions})`);
+  }
+  if (!isValidTmuxSessionName(sessionName)) throw new Error("Invalid session name");
+  if (
+    !binding.teamSessionId ||
+    binding.teamSessionId.length > 256 ||
+    /[\0\r\n\t]/.test(binding.teamSessionId) ||
+    !Number.isSafeInteger(binding.runtimeAuthorizationGeneration) ||
+    binding.runtimeAuthorizationGeneration < 1 ||
+    !/^[a-zA-Z0-9_-]{1,64}$/.test(binding.tmuxSocketName) ||
+    typeof binding.readOnly !== "boolean"
+  ) {
+    throw new Error("Invalid canonical PTY binding");
+  }
+  const args = [
+    "-L",
+    binding.tmuxSocketName,
+    "-f",
+    CANONICAL_TMUX_CONFIG_FILE,
+    "attach-session",
+    "-E",
+  ];
+  if (binding.readOnly) args.push("-r");
+  args.push("-t", canonicalTmuxTarget(sessionName));
+  return spawnPty(sessionName, shell, cols, rows, args, Object.freeze({ ...binding }));
+}
+
+function spawnPty(
+  sessionName: string,
+  shell: string,
+  cols: number,
+  rows: number,
+  args: string[],
+  canonicalBinding?: CanonicalPtyBinding
+): PtyInstance {
+  const id = `pty-${sessionName}-${randomUUID()}`;
 
   // Build a sanitized environment for PTY processes.
   // NEVER spread process.env — it contains server secrets (JWT secret, admin password, etc.)
@@ -86,8 +145,7 @@ export function createPty(
   safeEnv.TERM = "xterm-256color";
   safeEnv.SHELL = shell;
 
-  // Spawn node-pty that attaches to the tmux session
-  const proc = pty.spawn("tmux", ["attach-session", "-t", tmuxTarget(sessionName)], {
+  const proc = pty.spawn("tmux", args, {
     name: "xterm-256color",
     cols: Math.max(1, Math.min(cols, 500)),
     rows: Math.max(1, Math.min(rows, 200)),
@@ -100,6 +158,7 @@ export function createPty(
     sessionName,
     process: proc,
     createdAt: new Date(),
+    ...(canonicalBinding ? { canonicalBinding } : {}),
   };
 
   activePtys.set(id, instance);
@@ -110,6 +169,25 @@ export function createPty(
   });
 
   return instance;
+}
+
+export function destroyCanonicalPtys(input: {
+  teamSessionId: string;
+  runtimeAuthorizationGeneration: number;
+  includeCurrentGeneration?: boolean;
+}): number {
+  let destroyed = 0;
+  for (const instance of [...activePtys.values()]) {
+    const binding = instance.canonicalBinding;
+    if (!binding || binding.teamSessionId !== input.teamSessionId) continue;
+    const stale = input.includeCurrentGeneration
+      ? binding.runtimeAuthorizationGeneration <= input.runtimeAuthorizationGeneration
+      : binding.runtimeAuthorizationGeneration < input.runtimeAuthorizationGeneration;
+    if (!stale) continue;
+    destroyPty(instance.id);
+    destroyed += 1;
+  }
+  return destroyed;
 }
 
 export function resizePty(id: string, cols: number, rows: number): void {

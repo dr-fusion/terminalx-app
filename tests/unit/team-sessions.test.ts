@@ -574,6 +574,44 @@ describe("Team Session kernel", () => {
     });
   });
 
+  it("owns the final terminal effect inside an immediate fenced authorization transaction", async () => {
+    await bootstrap();
+    await enforceNextRuntimeDelivery("runtime.session.ensure");
+    const view = await requireSession();
+    const query = {
+      schemaVersion: TEAM_SESSION_SCHEMA_VERSION,
+      actor: ALICE,
+      type: "session.terminal-authorization" as const,
+      sessionId: SESSION_ID,
+      action: "input" as const,
+      expectedControlEpoch: view.controlEpoch,
+      expectedRuntimeAuthorizationGeneration: view.runtime.authorizationGeneration,
+    };
+    let effects = 0;
+
+    kernel().performTerminalMutation(query, () => {
+      effects += 1;
+    });
+    expect(effects).toBe(1);
+
+    expect(() =>
+      kernel().performTerminalMutation(
+        { ...query, expectedControlEpoch: view.controlEpoch + 1 },
+        () => {
+          effects += 1;
+        }
+      )
+    ).toThrowError(expect.objectContaining({ code: "not-authorized" }));
+    expect(effects).toBe(1);
+
+    expect(() =>
+      kernel().performTerminalMutation(query, (() => Promise.resolve()) as unknown as () => void)
+    ).toThrowError(expect.objectContaining({ code: "invalid-command" }));
+    expect(() =>
+      kernel().performTerminalMutation({ ...query, action: "observe" }, () => undefined)
+    ).toThrowError(expect.objectContaining({ code: "invalid-command" }));
+  });
+
   it("admits a Member through independent invitation, Project Access, and first Session join transitions", async () => {
     await bootstrap();
     const invitation = await createInvitation("member");
@@ -696,6 +734,191 @@ describe("Team Session kernel", () => {
 
     const next = await createInvitation("member");
     expect(next.result.acceptedSequence).toBe(first.acceptedSequence + 1);
+  });
+
+  it("returns the same non-secret receipt to an actor who still has current Session access", async () => {
+    await bootstrap();
+    const view = await requireSession();
+    const command = makeCommand(
+      {
+        type: "session.control.release",
+        sessionId: SESSION_ID,
+        expectedControlRevision: view.controlRevision,
+        expectedControlEpoch: view.controlEpoch,
+      },
+      ALICE,
+      "authorized-session-replay"
+    );
+
+    const first = await kernel().dispatch(command);
+    const replay = await kernel().dispatch(command);
+
+    expect(replay).toEqual({ ...first, replayed: true });
+  });
+
+  it("replays a consumed invitation receipt while Membership remains active, then hides it after revocation", async () => {
+    await bootstrap();
+    const invitation = await createInvitation("member");
+    const command = makeCommand(
+      { type: "session.invitation.redeem", token: invitation.token },
+      BOB,
+      "redeemed-invitation-replay"
+    );
+
+    const first = await kernel().dispatch(command);
+    expect(first).toMatchObject({
+      data: {
+        invitationId: invitation.invitationId,
+        sessionId: SESSION_ID,
+        teamId: TEAM_ID,
+        projectAccessGranted: false,
+        participantGranted: false,
+      },
+      events: [],
+    });
+    await expect(kernel().dispatch(command)).resolves.toEqual({ ...first, replayed: true });
+
+    await revokeMembership(BOB);
+    await expect(kernel().dispatch(command)).resolves.toMatchObject({
+      replayed: true,
+      data: { receiptUnavailable: true },
+      events: [],
+    });
+  });
+
+  it("does not apply human visibility projection to system Runtime receipts", async () => {
+    await bootstrap();
+    const delivery = await claimNextRuntimeDelivery("runtime.session.ensure");
+    const command = makeCommand(
+      {
+        type: "runtime.outbox.acknowledge",
+        outboxId: delivery.outboxId,
+        workerId: SYSTEM.userId,
+        expectedAttempt: delivery.attempts,
+      },
+      SYSTEM,
+      "system-runtime-replay"
+    );
+
+    const first = await kernel().dispatch(command);
+    const replay = await kernel().dispatch(command);
+
+    expect(replay).toEqual({ ...first, replayed: true });
+    expect(replay.data).toMatchObject({
+      outboxId: delivery.outboxId,
+      sessionId: SESSION_ID,
+      runtimeAuthorizationGeneration: 1,
+    });
+  });
+
+  it("does not replay Participant ids or revisions after the actor loses Session access", async () => {
+    await bootstrap();
+    const invitation = await createInvitation("member");
+    await redeemInvitation(invitation, BOB);
+    await grantProjectAccess(BOB);
+    const command = makeCommand(
+      {
+        type: "session.join",
+        sessionId: SESSION_ID,
+        invitationId: invitation.invitationId,
+      },
+      BOB,
+      "revoked-session-replay"
+    );
+    const first = await kernel().dispatch(command);
+    expect(first.data).toMatchObject({
+      sessionId: SESSION_ID,
+      participantId: expect.any(String),
+      participantVersion: 1,
+      accessRevision: expect.any(Number),
+    });
+
+    await revokeParticipant(BOB);
+    await expect(getSession(SESSION_ID, BOB)).resolves.toBeNull();
+    const replay = await kernel().dispatch(command);
+
+    expect(replay).toMatchObject({
+      accepted: true,
+      acceptedSequence: first.acceptedSequence,
+      commandType: "session.join",
+      replayed: true,
+      data: { receiptUnavailable: true },
+      events: [],
+    });
+    expect(replay.data).toEqual({ receiptUnavailable: true });
+  });
+
+  it("re-evaluates Project visibility on every replay and hides scoped receipts after revocation", async () => {
+    await bootstrap();
+    await grantMembership(BOB, "member");
+    await grantProjectAccess(BOB, "maintainer");
+    await grantMembership(CAROL, "member");
+    const command = makeCommand(
+      {
+        type: "project.access.grant",
+        projectId: PROJECT_ID,
+        userId: CAROL.userId,
+        role: "contributor",
+        expectedAccessVersion: 0,
+      },
+      BOB,
+      "revoked-project-replay"
+    );
+    const first = await kernel().dispatch(command);
+    expect(first.data).toMatchObject({
+      projectId: PROJECT_ID,
+      userId: CAROL.userId,
+      accessVersion: 1,
+    });
+    await expect(kernel().dispatch(command)).resolves.toEqual({ ...first, replayed: true });
+
+    await revokeProjectAccess(BOB);
+    const replay = await kernel().dispatch(command);
+
+    expect(replay).toMatchObject({
+      accepted: true,
+      acceptedSequence: first.acceptedSequence,
+      commandType: "project.access.grant",
+      replayed: true,
+      data: { receiptUnavailable: true },
+      events: [],
+    });
+    expect(replay.data).toEqual({ receiptUnavailable: true });
+  });
+
+  it("does not replay Team-scoped ids or versions after Membership revocation", async () => {
+    await bootstrap();
+    await grantMembership(BOB, "admin");
+    const command = makeCommand(
+      {
+        type: "team.membership.grant",
+        teamId: TEAM_ID,
+        userId: DAVE.userId,
+        role: "member",
+        expectedMembershipVersion: 0,
+      },
+      BOB,
+      "revoked-team-replay"
+    );
+    const first = await kernel().dispatch(command);
+    expect(first.data).toMatchObject({
+      teamId: TEAM_ID,
+      userId: DAVE.userId,
+      membershipVersion: 1,
+    });
+
+    await revokeMembership(BOB);
+    const replay = await kernel().dispatch(command);
+
+    expect(replay).toMatchObject({
+      accepted: true,
+      acceptedSequence: first.acceptedSequence,
+      commandType: "team.membership.grant",
+      replayed: true,
+      data: { receiptUnavailable: true },
+      events: [],
+    });
+    expect(replay.data).toEqual({ receiptUnavailable: true });
   });
 
   it("persists only an invitation digest while the plaintext remains redeemable", async () => {
@@ -1651,6 +1874,17 @@ describe("Team Session kernel", () => {
       {
         schemaVersion: TEAM_SESSION_SCHEMA_VERSION,
         actor: ALICE,
+        idempotency: { scope: "vitest:invalid", key: "session-id" },
+        type: "session.start",
+        teamId: TEAM_ID,
+        projectId: PROJECT_ID,
+        sessionId: "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
+        name: "Bad canonical id",
+        tmuxName: "valid-tmux-name",
+      },
+      {
+        schemaVersion: TEAM_SESSION_SCHEMA_VERSION,
+        actor: ALICE,
         idempotency: { scope: "vitest:invalid", key: "version" },
         type: "team.membership.grant",
         teamId: TEAM_ID,
@@ -1664,5 +1898,48 @@ describe("Team Session kernel", () => {
         code: "invalid-command",
       });
     }
+  });
+
+  it("rejects an invalid generated Session id before committing Runtime state", async () => {
+    await dispatch({ type: "team.create", teamId: TEAM_ID, name: "Acme" });
+    await dispatch({
+      type: "project.create",
+      teamId: TEAM_ID,
+      projectId: PROJECT_ID,
+      name: "Terminal X",
+      sourceRef: "/srv/terminalx",
+    });
+    teamSessions?.close();
+    teamSessions = createTeamSessions({
+      filename,
+      clock: () => nowMs,
+      idGenerator: () => "custom-session-id",
+      invitationTokenGenerator: () => `txi_test_${"x".repeat(64)}`,
+    });
+
+    await expect(
+      dispatch({
+        type: "session.start",
+        teamId: TEAM_ID,
+        projectId: PROJECT_ID,
+        name: "Invalid generated id",
+        tmuxName: "valid-tmux-name",
+      })
+    ).rejects.toMatchObject({ code: "invalid-command" });
+
+    await expect(
+      kernel().inspect({
+        schemaVersion: TEAM_SESSION_SCHEMA_VERSION,
+        type: "session.list",
+        actor: ALICE,
+      })
+    ).resolves.toEqual([]);
+    await expect(
+      kernel().claimRuntimeOutbox({
+        workerId: "runtime-test-worker",
+        leaseDurationMs: 1_000,
+        limit: 10,
+      })
+    ).resolves.toEqual([]);
   });
 });
