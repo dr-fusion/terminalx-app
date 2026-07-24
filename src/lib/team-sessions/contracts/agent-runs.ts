@@ -4,6 +4,7 @@ import type { ActionClass, Duration, Money, RuntimeBinding } from "./shared";
 export type AgentRunMode = "supervised" | "autonomous" | "yolo";
 
 export type AgentRunLifecycle =
+  | "starting"
   | "active"
   | "pausing"
   | "paused"
@@ -292,6 +293,11 @@ export interface SessionRunStateView {
   readonly agentRunId: string;
   readonly lifecycle: AgentRunLifecycle;
   readonly stateVersion: number;
+  readonly pendingLifecycleOperation: {
+    readonly kind: "start" | "pause" | "resume" | "stop";
+    readonly status: "queued" | "awaiting-runtime" | "compensating";
+    readonly requestedAtMs: number;
+  } | null;
   readonly attention: {
     readonly openRequestIds: ReadonlyArray<string>;
     readonly blockingRequestIds: ReadonlyArray<string>;

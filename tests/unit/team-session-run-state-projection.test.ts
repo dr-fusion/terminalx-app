@@ -269,6 +269,7 @@ function runFixture(): SessionRunStateView {
     agentRunId: "run-1",
     lifecycle: "active",
     stateVersion: 3,
+    pendingLifecycleOperation: null,
     attention: {
       openRequestIds: ["attention-1", "attention-2"],
       blockingRequestIds: ["attention-1"],

@@ -5,7 +5,7 @@ import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   TEAM_SESSION_SCHEMA_VERSION,
-  createTeamSessions,
+  createTeamSessionKernel,
   type ActorContext,
   type RunPolicyDraft,
   type SessionCommand,
@@ -13,7 +13,9 @@ import {
   type SessionView,
   type TeamSessions,
 } from "@/lib/team-sessions";
+import type { RuntimeLifecycleCommand, RuntimeLifecycleJournal } from "@/lib/runtime";
 import { digestRunPolicyDraft } from "@/lib/team-sessions/run-policy";
+import { createTestRuntimeCommandAuthorityIssuer } from "../helpers/runtime-authority";
 
 const TEAM_ID = "11111111-1111-4111-8111-111111111111";
 const PROJECT_ID = "22222222-2222-4222-8222-222222222222";
@@ -41,6 +43,7 @@ describe("Team Session active Run recovery", () => {
   let directory: string;
   let filename: string;
   let sessions: TeamSessions;
+  let runtimeJournal: RuntimeLifecycleJournal;
   let now: number;
   let sequence: number;
   let generated: number;
@@ -51,14 +54,17 @@ describe("Team Session active Run recovery", () => {
     now = 2_000_000_000_000;
     sequence = 0;
     generated = 0;
-    sessions = createTeamSessions({
+    const kernel = createTeamSessionKernel({
       filename,
       clock: () => now,
       idGenerator: () => {
         generated += 1;
         return `00000000-0000-4000-8000-${String(generated).padStart(12, "0")}`;
       },
+      runtimeCommandAuthorityIssuer: createTestRuntimeCommandAuthorityIssuer(),
     });
+    sessions = kernel.teamSessions;
+    runtimeJournal = kernel.runtimeLifecycleJournal;
 
     await dispatch({ type: "team.create", teamId: TEAM_ID, name: "Acme" });
     await dispatch({
@@ -211,7 +217,7 @@ describe("Team Session active Run recovery", () => {
 
   async function startRun(runPolicy: RunPolicyDraft) {
     await enforceNextRuntime("runtime.session.ensure");
-    return dispatch({
+    const started = await dispatch({
       type: "run.start",
       sessionId: SESSION_ID,
       expectedSessionRevision: 1,
@@ -226,6 +232,38 @@ describe("Team Session active Run recovery", () => {
       ],
       commit: commit(runPolicy, 1),
     });
+    await enforceLifecycleCommand("run.start");
+    return started;
+  }
+
+  async function enforceLifecycleCommand(expectedKind: RuntimeLifecycleCommand["kind"]) {
+    const [delivery] = await runtimeJournal.claim({
+      workerId: RUNTIME.userId,
+      limit: 1,
+      leaseDurationMs: 30_000,
+      nowMs: now,
+    });
+    expect(delivery?.command.kind).toBe(expectedKind);
+    if (!delivery) throw new Error("Expected a Runtime lifecycle delivery");
+    await runtimeJournal.complete({
+      commandId: delivery.command.commandId,
+      workerId: RUNTIME.userId,
+      expectedAttempt: delivery.attempt,
+      expectedLeaseExpiresAtMs: delivery.leaseExpiresAtMs,
+      observedAtMs: now,
+      outcome: {
+        kind: "receipt",
+        receipt: {
+          commandId: delivery.command.commandId,
+          binding: delivery.command.binding,
+          runtimeAuthorizationGeneration: delivery.command.runtimeAuthorizationGeneration,
+          outcome: "enforced",
+          effectRef: `effect:${delivery.command.commandId}`,
+          enforcedFence: delivery.command.toRunStateVersion,
+        },
+      },
+    });
+    return delivery.command;
   }
 
   async function revokeAliceSessionAccess() {
@@ -433,14 +471,14 @@ describe("Team Session active Run recovery", () => {
     const awaiting = await requireSession(BOB);
     expect(awaiting).toMatchObject({
       status: "awaiting_assignee",
-      runStateRevision: 3,
+      runStateRevision: 4,
       runtime: { authorizationGeneration: 2, authorizationState: "pending" },
     });
     const recovering = await requireRunState(BOB);
     expect(recovering).toMatchObject({
       agentRunId,
       lifecycle: "pausing",
-      stateVersion: 2,
+      stateVersion: 3,
       runPolicyRevision: 1,
       runtimeAuthorizationGeneration: 2,
       sandboxState: "recovering",
@@ -458,10 +496,10 @@ describe("Team Session active Run recovery", () => {
     });
 
     await enforceNextRuntime("runtime.authorization.fence");
-    expect((await requireSession(BOB)).runStateRevision).toBe(4);
+    expect((await requireSession(BOB)).runStateRevision).toBe(5);
     expect(await requireRunState(BOB)).toMatchObject({
       lifecycle: "paused",
-      stateVersion: 3,
+      stateVersion: 4,
       sandboxState: "ready",
       runtimeAuthorizationGeneration: 2,
     });
@@ -512,7 +550,7 @@ describe("Team Session active Run recovery", () => {
       },
       BOB
     );
-    expect(rebound.data).toMatchObject({ runPolicyRevision: 2, stateVersion: 4 });
+    expect(rebound.data).toMatchObject({ runPolicyRevision: 2, stateVersion: 5 });
 
     const db = new Database(filename, { readonly: true });
     try {
@@ -551,7 +589,9 @@ describe("Team Session active Run recovery", () => {
       },
       BOB
     );
-    expect(resumed.data).toMatchObject({ lifecycle: "active", stateVersion: 5 });
+    expect(resumed.data).toMatchObject({ lifecycle: "paused", stateVersion: 5 });
+    await enforceLifecycleCommand("run.resume");
+    expect(await requireRunState(BOB)).toMatchObject({ lifecycle: "active", stateVersion: 6 });
   });
 
   it("preserves agent-work-finished while rebinding its Runtime authorization", async () => {
@@ -561,7 +601,7 @@ describe("Team Session active Run recovery", () => {
     try {
       db.prepare(
         `UPDATE agent_runs
-         SET lifecycle = 'agent-work-finished', state_version = 2, updated_at_ms = ?
+         SET lifecycle = 'agent-work-finished', state_version = 3, updated_at_ms = ?
          WHERE id = ?`
       ).run(now, agentRunId);
     } finally {
@@ -571,7 +611,7 @@ describe("Team Session active Run recovery", () => {
     await revokeAliceSessionAccess();
     expect(await requireRunState(BOB)).toMatchObject({
       lifecycle: "agent-work-finished",
-      stateVersion: 3,
+      stateVersion: 4,
       sandboxState: "recovering",
       runtimeAuthorizationGeneration: 2,
       finalReviewState: "open",
@@ -580,7 +620,7 @@ describe("Team Session active Run recovery", () => {
     await enforceNextRuntime("runtime.authorization.fence");
     expect(await requireRunState(BOB)).toMatchObject({
       lifecycle: "agent-work-finished",
-      stateVersion: 3,
+      stateVersion: 4,
       sandboxState: "ready",
       runtimeAuthorizationGeneration: 2,
       finalReviewState: "open",
@@ -594,15 +634,16 @@ describe("Team Session active Run recovery", () => {
       type: "run.pause",
       sessionId: SESSION_ID,
       agentRunId,
-      expectedRunStateVersion: 1,
+      expectedRunStateVersion: 2,
       reason: "Review before handoff",
     });
+    await enforceLifecycleCommand("run.pause");
 
     await revokeAliceSessionAccess();
     const recovering = await requireRunState(BOB);
     expect(recovering).toMatchObject({
       lifecycle: "paused",
-      stateVersion: 3,
+      stateVersion: 4,
       sandboxState: "recovering",
     });
     await expect(
@@ -621,7 +662,7 @@ describe("Team Session active Run recovery", () => {
     await enforceNextRuntime("runtime.authorization.fence");
     expect(await requireRunState(BOB)).toMatchObject({
       lifecycle: "paused",
-      stateVersion: 3,
+      stateVersion: 4,
       sandboxState: "ready",
     });
   });

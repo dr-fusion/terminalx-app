@@ -660,6 +660,7 @@ function parseCurrentRun(value: unknown): TeamSessionAgentRunView {
       "agentRunId",
       "lifecycle",
       "stateVersion",
+      "pendingOperation",
       "mode",
       "completionPolicy",
       "runPolicyRevision",
@@ -685,6 +686,24 @@ function parseCurrentRun(value: unknown): TeamSessionAgentRunView {
     ["stop-after-directed-work", "continue-until-all-goals-achieved"] as const,
     "Agent Run completion policy"
   );
+  let pendingOperation: TeamSessionAgentRunView["pendingOperation"] = null;
+  if (run.pendingOperation !== null) {
+    const pending = requireRecord(run.pendingOperation, "Pending Run operation");
+    requireExactFields(pending, ["kind", "status", "requestedAtMs"], "Pending Run operation");
+    pendingOperation = {
+      kind: requireEnum(
+        pending.kind,
+        ["start", "pause", "resume", "stop"] as const,
+        "Pending Run operation kind"
+      ),
+      status: requireEnum(
+        pending.status,
+        ["queued", "awaiting-runtime", "compensating"] as const,
+        "Pending Run operation status"
+      ),
+      requestedAtMs: requireSafeInteger(pending.requestedAtMs, "Pending Run operation time", 0),
+    };
+  }
   const attention = requireRecord(run.attentionSummary, "Agent Run attention summary");
   requireExactFields(
     attention,
@@ -734,6 +753,7 @@ function parseCurrentRun(value: unknown): TeamSessionAgentRunView {
     lifecycle: requireEnum(
       run.lifecycle,
       [
+        "starting",
         "active",
         "pausing",
         "paused",
@@ -746,6 +766,7 @@ function parseCurrentRun(value: unknown): TeamSessionAgentRunView {
       "Agent Run lifecycle"
     ),
     stateVersion: requireSafeInteger(run.stateVersion, "Agent Run state version", 1),
+    pendingOperation,
     mode,
     completionPolicy,
     runPolicyRevision: requireSafeInteger(run.runPolicyRevision, "Run policy revision", 1),

@@ -5,9 +5,13 @@ import type {
   NonDuplicateRuntimeReceipt,
   Runtime,
   RuntimeHandle,
-  RuntimePostStartLifecycleCommand,
+  RuntimeLifecycleCommand,
   RuntimeReceipt,
 } from "./contracts";
+import {
+  verifyActionManifestDigest,
+  type ActionManifest as DigestibleActionManifest,
+} from "./action-policy";
 import { assertRuntimeCommandAuthorityBinding } from "./runtime-authority";
 
 const SHA256 = /^[0-9a-f]{64}$/;
@@ -18,7 +22,8 @@ const MAX_SNAPSHOT_FIELDS = 1_000;
 const MAX_SNAPSHOT_STRING_BYTES = 1_000_000;
 const AGGREGATE_PROOF_DIGEST_DOMAIN = "terminalx/runtime-aggregate-enforcement-proof/v1\0";
 
-const LIFECYCLE_KINDS = new Set<RuntimePostStartLifecycleCommand["kind"]>([
+const LIFECYCLE_KINDS = new Set<RuntimeLifecycleCommand["kind"]>([
+  "run.start",
   "run.pause",
   "run.resume",
   "run.stop",
@@ -98,6 +103,13 @@ export type RuntimeCommandExecutionErrorCode =
   | "runtime_command_failed"
   | "invalid_receipt";
 
+/**
+ * Whether the control plane can prove that the portable Runtime command did
+ * not cross the adapter seam. Unknown must be handled as potentially enforced;
+ * it can never be compensated as a simple rejection.
+ */
+export type RuntimeCommandDispatchCertainty = "not-dispatched" | "dispatch-uncertain";
+
 const SAFE_ERROR_MESSAGES: Readonly<Record<RuntimeCommandExecutionErrorCode, string>> = {
   invalid_input: "Runtime command input is invalid",
   invalid_authority: "Runtime command authority is invalid",
@@ -108,17 +120,32 @@ const SAFE_ERROR_MESSAGES: Readonly<Record<RuntimeCommandExecutionErrorCode, str
   invalid_receipt: "Runtime returned an invalid receipt",
 };
 
+const DISPATCH_CERTAINTY: Readonly<
+  Record<RuntimeCommandExecutionErrorCode, RuntimeCommandDispatchCertainty>
+> = {
+  invalid_input: "not-dispatched",
+  invalid_authority: "not-dispatched",
+  authority_verification_failed: "not-dispatched",
+  binding_mismatch: "not-dispatched",
+  deadline_expired: "not-dispatched",
+  runtime_command_failed: "dispatch-uncertain",
+  invalid_receipt: "dispatch-uncertain",
+};
+
 /** Safe error surface: provider and verifier failures are never attached as causes. */
 export class RuntimeCommandExecutionError extends Error {
+  readonly dispatchCertainty: RuntimeCommandDispatchCertainty;
+
   constructor(readonly code: RuntimeCommandExecutionErrorCode) {
     super(SAFE_ERROR_MESSAGES[code]);
     this.name = "RuntimeCommandExecutionError";
+    this.dispatchCertainty = DISPATCH_CERTAINTY[code];
   }
 }
 
 export interface RuntimeAuthorityVerificationInput {
   readonly handle: RuntimeHandle;
-  readonly command: RuntimePostStartLifecycleCommand;
+  readonly command: RuntimeLifecycleCommand;
   readonly nowMs: number;
 }
 
@@ -133,20 +160,19 @@ type AggregateEnforcementProofDigestInput = Omit<AggregateEnforcementProof, "agg
 
 type RuntimeDispatch = (
   handle: RuntimeHandle,
-  command: RuntimePostStartLifecycleCommand
+  command: RuntimeLifecycleCommand
 ) => Promise<RuntimeReceipt>;
 
 /**
- * Deep execution Module for existing-Run lifecycle transitions at the
- * untrusted Runtime adapter seam. Durable `run.start` execution remains closed
- * until its complete policy, YOLO, and persistence invariants are implemented.
- * The verifier and adapter receive frozen snapshots, never caller-owned objects,
- * and the returned receipt is an independently validated snapshot.
+ * Deep execution Module for exact-bound lifecycle transitions at the untrusted
+ * Runtime adapter seam. The verifier and adapter receive frozen snapshots,
+ * never caller-owned objects, and the returned receipt is an independently
+ * validated snapshot. Persistence remains a separate journal responsibility.
  */
 export async function executeRuntimeCommand(
   runtime: Runtime,
   handle: RuntimeHandle,
-  command: RuntimePostStartLifecycleCommand,
+  command: RuntimeLifecycleCommand,
   verifyAuthority: RuntimeAuthorityVerifier,
   clock: RuntimeCommandClock
 ): Promise<RuntimeReceipt> {
@@ -184,12 +210,33 @@ export async function executeRuntimeCommand(
     fail("runtime_command_failed");
   }
 
-  const receiptSnapshot = snapshotPortable(providerReceipt, "invalid_receipt");
-  validateReceipt(receiptSnapshot, {
+  return snapshotRuntimeReceiptForCommand(providerReceipt, {
     commandId: preflight.commandId,
     binding: preflight.binding,
-    authorizationGeneration: preflight.authorizationGeneration,
-    lifecycleFence: preflight.lifecycleFence,
+    runtimeAuthorizationGeneration: preflight.authorizationGeneration,
+    toRunStateVersion: preflight.lifecycleFence,
+  });
+}
+
+/**
+ * Capture and strictly validate a provider receipt against one exact lifecycle
+ * command. The journal reuses this boundary so duplicate originals cannot
+ * substitute another command, tenant, binding, authorization generation, or
+ * lifecycle fence.
+ */
+export function snapshotRuntimeReceiptForCommand(
+  receipt: RuntimeReceipt,
+  expected: Pick<
+    RuntimeLifecycleCommand,
+    "commandId" | "binding" | "runtimeAuthorizationGeneration" | "toRunStateVersion"
+  >
+): RuntimeReceipt {
+  const receiptSnapshot = snapshotPortable(receipt, "invalid_receipt");
+  validateReceipt(receiptSnapshot, {
+    commandId: expected.commandId,
+    binding: expected.binding,
+    authorizationGeneration: expected.runtimeAuthorizationGeneration,
+    lifecycleFence: expected.toRunStateVersion,
   });
   return receiptSnapshot;
 }
@@ -230,20 +277,17 @@ interface CommandPreflight {
 
 function preflightCommand(
   handle: RuntimeHandle,
-  command: RuntimePostStartLifecycleCommand,
+  command: RuntimeLifecycleCommand,
   nowMs: number
 ): CommandPreflight {
   const handleRecord = validateHandle(handle);
   const commandRecord = plainRecord(command, "invalid_input");
   const kind = dataField(commandRecord, "kind", "invalid_input");
-  if (
-    typeof kind !== "string" ||
-    !LIFECYCLE_KINDS.has(kind as RuntimePostStartLifecycleCommand["kind"])
-  ) {
+  if (typeof kind !== "string" || !LIFECYCLE_KINDS.has(kind as RuntimeLifecycleCommand["kind"])) {
     fail("invalid_input");
   }
 
-  validateLifecycleCommandShape(commandRecord, kind as RuntimePostStartLifecycleCommand["kind"]);
+  validateLifecycleCommandShape(commandRecord, kind as RuntimeLifecycleCommand["kind"]);
   try {
     assertRuntimeCommandAuthorityBinding(command);
   } catch {
@@ -254,7 +298,10 @@ function preflightCommand(
     dataField(commandRecord, "commandId", "invalid_input"),
     "invalid_input"
   );
-  safeRef(dataField(commandRecord, "projectCeilingRevision", "invalid_input"), "invalid_input");
+  const projectCeilingRevision = safeRef(
+    dataField(commandRecord, "projectCeilingRevision", "invalid_input"),
+    "invalid_input"
+  );
   safeRef(dataField(commandRecord, "causationId", "invalid_input"), "invalid_input");
   validateActor(dataField(commandRecord, "actor", "invalid_input"));
 
@@ -272,8 +319,14 @@ function preflightCommand(
     dataField(commandRecord, "runtimeAuthorizationGeneration", "invalid_input"),
     "invalid_input"
   );
-  safeRef(dataField(commandRecord, "agentRunId", "invalid_input"), "invalid_input");
-  positiveInteger(dataField(commandRecord, "runPolicyRevision", "invalid_input"), "invalid_input");
+  const agentRunId = safeRef(
+    dataField(commandRecord, "agentRunId", "invalid_input"),
+    "invalid_input"
+  );
+  const runPolicyRevision = positiveInteger(
+    dataField(commandRecord, "runPolicyRevision", "invalid_input"),
+    "invalid_input"
+  );
   const fromRunStateVersion = positiveInteger(
     dataField(commandRecord, "fromRunStateVersion", "invalid_input"),
     "invalid_input"
@@ -283,6 +336,19 @@ function preflightCommand(
     "invalid_input"
   );
   if (toRunStateVersion !== fromRunStateVersion + 1) fail("invalid_input");
+
+  if (kind === "run.start") {
+    if (runPolicyRevision !== 1 || fromRunStateVersion !== 1 || toRunStateVersion !== 2) {
+      fail("invalid_input");
+    }
+    validateStartCommandPayload(commandRecord, handleRecord, {
+      commandBinding,
+      authorizationGeneration,
+      agentRunId,
+      runPolicyRevision,
+      projectCeilingRevision,
+    });
+  }
 
   const commandIssuedAtMs = nonNegativeInteger(
     dataField(commandRecord, "issuedAtMs", "invalid_input"),
@@ -351,8 +417,17 @@ function validateHandle(handle: RuntimeHandle): Record<string, unknown> {
 
 function validateLifecycleCommandShape(
   command: Record<string, unknown>,
-  kind: RuntimePostStartLifecycleCommand["kind"]
+  kind: RuntimeLifecycleCommand["kind"]
 ): void {
+  if (kind === "run.start") {
+    exactFields(
+      command,
+      [...COMMAND_BASE_FIELDS, ...LIFECYCLE_FIELDS, "policy"],
+      ["yoloAuthorization"],
+      "invalid_input"
+    );
+    return;
+  }
   if (kind === "run.pause") {
     exactFields(
       command,
@@ -394,6 +469,684 @@ function validateLifecycleCommandShape(
   ) {
     fail("invalid_input");
   }
+}
+
+interface StartCommandValidationContext {
+  readonly commandBinding: RuntimeBinding;
+  readonly authorizationGeneration: number;
+  readonly agentRunId: string;
+  readonly runPolicyRevision: number;
+  readonly projectCeilingRevision: string;
+}
+
+function validateStartCommandPayload(
+  command: Record<string, unknown>,
+  handle: Record<string, unknown>,
+  context: StartCommandValidationContext
+): void {
+  const policy = exactRecord(
+    dataField(command, "policy", "invalid_input"),
+    [
+      "agentRunId",
+      "revision",
+      "digest",
+      "policyBodyDigest",
+      "mode",
+      "completionPolicy",
+      "scopedExternalPolicyRef",
+      "limits",
+      "initialGoalSet",
+      "scopedExternalRules",
+      "projectCeilingRevision",
+      "projectCeilingDigest",
+      "binding",
+      "runtimeAuthorizationGeneration",
+      "createdAtMs",
+    ],
+    ["previousRevision", "yoloConfirmationRef"]
+  );
+
+  if (
+    safeRef(dataField(policy, "agentRunId", "invalid_input"), "invalid_input") !==
+      context.agentRunId ||
+    positiveInteger(dataField(policy, "revision", "invalid_input"), "invalid_input") !==
+      context.runPolicyRevision ||
+    safeRef(dataField(policy, "projectCeilingRevision", "invalid_input"), "invalid_input") !==
+      context.projectCeilingRevision ||
+    positiveInteger(
+      dataField(policy, "runtimeAuthorizationGeneration", "invalid_input"),
+      "invalid_input"
+    ) !== context.authorizationGeneration
+  ) {
+    fail("invalid_input");
+  }
+  sha256(dataField(policy, "digest", "invalid_input"), "invalid_input");
+  sha256(dataField(policy, "policyBodyDigest", "invalid_input"), "invalid_input");
+  sha256(dataField(policy, "projectCeilingDigest", "invalid_input"), "invalid_input");
+  const policyBinding = validateBinding(
+    dataField(policy, "binding", "invalid_input"),
+    "invalid_input"
+  );
+  if (!sameBinding(policyBinding, context.commandBinding)) fail("invalid_input");
+
+  const previousRevision = optionalDataField(policy, "previousRevision", "invalid_input");
+  if (
+    previousRevision !== undefined &&
+    positiveInteger(previousRevision, "invalid_input") >= context.runPolicyRevision
+  ) {
+    fail("invalid_input");
+  }
+  const yoloConfirmationRef = optionalDataField(policy, "yoloConfirmationRef", "invalid_input");
+  if (yoloConfirmationRef !== undefined) safeRef(yoloConfirmationRef, "invalid_input");
+
+  const createdAtMs = nonNegativeInteger(
+    dataField(policy, "createdAtMs", "invalid_input"),
+    "invalid_input"
+  );
+  const issuedAtMs = nonNegativeInteger(
+    dataField(command, "issuedAtMs", "invalid_input"),
+    "invalid_input"
+  );
+  if (createdAtMs > issuedAtMs) fail("invalid_input");
+
+  const mode = dataField(policy, "mode", "invalid_input");
+  if (mode !== "supervised" && mode !== "autonomous" && mode !== "yolo") {
+    fail("invalid_input");
+  }
+  const completionPolicy = exactRecord(dataField(policy, "completionPolicy", "invalid_input"), [
+    "kind",
+  ]);
+  const completionKind = dataField(completionPolicy, "kind", "invalid_input");
+  if (
+    completionKind !== "stop-after-directed-work" &&
+    completionKind !== "continue-until-all-goals-achieved"
+  ) {
+    fail("invalid_input");
+  }
+  if (mode === "supervised" && completionKind === "continue-until-all-goals-achieved") {
+    fail("invalid_input");
+  }
+  safeRef(dataField(policy, "scopedExternalPolicyRef", "invalid_input"), "invalid_input");
+  const limits = validateRunLimits(dataField(policy, "limits", "invalid_input"));
+  validateInitialGoalSet(dataField(policy, "initialGoalSet", "invalid_input"), context.agentRunId);
+  validateScopedExternalRules(dataField(policy, "scopedExternalRules", "invalid_input"));
+
+  const capabilities = plainRecord(
+    dataField(handle, "capabilities", "invalid_input"),
+    "invalid_input"
+  );
+  if (dataField(capabilities, "isolatedExecution", "invalid_input") !== true) {
+    fail("invalid_input");
+  }
+
+  if (mode === "yolo") {
+    if (
+      yoloConfirmationRef === undefined ||
+      dataField(capabilities, "yoloEligible", "invalid_input") !== true ||
+      dataField(capabilities, "brokeredCredentials", "invalid_input") !== true ||
+      dataField(capabilities, "proxyOnlyEgress", "invalid_input") !== true
+    ) {
+      fail("invalid_input");
+    }
+  } else if (yoloConfirmationRef !== undefined) {
+    fail("invalid_input");
+  }
+
+  const yoloAuthorization = optionalDataField(command, "yoloAuthorization", "invalid_input");
+  if (mode === "yolo") {
+    if (yoloAuthorization === undefined) fail("invalid_input");
+    validateYoloAuthorization(yoloAuthorization, context, issuedAtMs, limits);
+  } else if (yoloAuthorization !== undefined) {
+    fail("invalid_input");
+  }
+}
+
+interface ValidatedMoney {
+  readonly currency: string;
+  readonly minorUnits: number;
+}
+
+interface ValidatedRunLimits {
+  readonly wallClock?: number;
+  readonly modelTokens?: number;
+  readonly modelSpend?: ValidatedMoney;
+  readonly outboundBytes?: number;
+  readonly actionCounts: Readonly<
+    Record<"local" | "scoped-external" | "protected" | "forbidden", number | undefined>
+  >;
+}
+
+interface ValidatedResourceEffect {
+  readonly wallClock: number;
+  readonly modelTokens: number;
+  readonly modelSpend: ValidatedMoney;
+  readonly outboundBytes: number;
+  readonly actionCounts: Readonly<
+    Record<"local" | "scoped-external" | "protected" | "forbidden", number>
+  >;
+}
+
+function validateRunLimits(value: unknown): ValidatedRunLimits {
+  const limits = exactRecord(value, [
+    "wallClock",
+    "modelTokens",
+    "modelSpend",
+    "outboundBytes",
+    "actionCounts",
+  ]);
+  const wallClock = validateRunLimit(
+    dataField(limits, "wallClock", "invalid_input"),
+    (duration) => {
+      const record = exactRecord(duration, ["milliseconds"]);
+      return nonNegativeInteger(
+        dataField(record, "milliseconds", "invalid_input"),
+        "invalid_input"
+      );
+    }
+  );
+  const modelTokens = validateRunLimit(
+    dataField(limits, "modelTokens", "invalid_input"),
+    (tokens) => nonNegativeInteger(tokens, "invalid_input")
+  );
+  const modelSpend = validateRunLimit(
+    dataField(limits, "modelSpend", "invalid_input"),
+    validateMoney
+  );
+  const outboundBytes = validateRunLimit(
+    dataField(limits, "outboundBytes", "invalid_input"),
+    (bytes) => nonNegativeInteger(bytes, "invalid_input")
+  );
+  const actionCounts = exactRecord(dataField(limits, "actionCounts", "invalid_input"), [
+    "local",
+    "scoped-external",
+    "protected",
+    "forbidden",
+  ]);
+  const validatedActionCounts = {
+    local: validateRunLimit(dataField(actionCounts, "local", "invalid_input"), (count) =>
+      nonNegativeInteger(count, "invalid_input")
+    ),
+    "scoped-external": validateRunLimit(
+      dataField(actionCounts, "scoped-external", "invalid_input"),
+      (count) => nonNegativeInteger(count, "invalid_input")
+    ),
+    protected: validateRunLimit(dataField(actionCounts, "protected", "invalid_input"), (count) =>
+      nonNegativeInteger(count, "invalid_input")
+    ),
+    forbidden: validateRunLimit(dataField(actionCounts, "forbidden", "invalid_input"), (count) =>
+      nonNegativeInteger(count, "invalid_input")
+    ),
+  };
+  return { wallClock, modelTokens, modelSpend, outboundBytes, actionCounts: validatedActionCounts };
+}
+
+function validateRunLimit<T>(value: unknown, validateValue: (value: unknown) => T): T | undefined {
+  const limit = plainRecord(value, "invalid_input");
+  const kind = dataField(limit, "kind", "invalid_input");
+  if (kind === "unconfigured") {
+    exactFields(limit, ["kind"], [], "invalid_input");
+    return undefined;
+  }
+  if (kind !== "capped") fail("invalid_input");
+  exactFields(limit, ["kind", "value"], [], "invalid_input");
+  return validateValue(dataField(limit, "value", "invalid_input"));
+}
+
+function validateMoney(value: unknown): ValidatedMoney {
+  const money = exactRecord(value, ["currency", "minorUnits"]);
+  const currency = dataField(money, "currency", "invalid_input");
+  if (typeof currency !== "string" || !/^[A-Z]{3}$/.test(currency)) fail("invalid_input");
+  return {
+    currency,
+    minorUnits: nonNegativeInteger(
+      dataField(money, "minorUnits", "invalid_input"),
+      "invalid_input"
+    ),
+  };
+}
+
+function validateInitialGoalSet(value: unknown, agentRunId: string): void {
+  const goalSet = exactRecord(
+    value,
+    ["goalSetId", "agentRunId", "revision", "digest", "goals"],
+    ["previousRevision"]
+  );
+  safeRef(dataField(goalSet, "goalSetId", "invalid_input"), "invalid_input");
+  if (dataField(goalSet, "agentRunId", "invalid_input") !== agentRunId) fail("invalid_input");
+  const revision = positiveInteger(
+    dataField(goalSet, "revision", "invalid_input"),
+    "invalid_input"
+  );
+  if (revision !== 1) fail("invalid_input");
+  sha256(dataField(goalSet, "digest", "invalid_input"), "invalid_input");
+  const previousRevision = optionalDataField(goalSet, "previousRevision", "invalid_input");
+  if (
+    previousRevision !== undefined &&
+    positiveInteger(previousRevision, "invalid_input") >= revision
+  ) {
+    fail("invalid_input");
+  }
+  const goals = dataField(goalSet, "goals", "invalid_input");
+  if (!Array.isArray(goals) || goals.length < 1 || goals.length > 100) fail("invalid_input");
+  const ids = new Set<string>();
+  const dependencies = new Map<string, readonly string[]>();
+  for (const [index, goalValue] of goals.entries()) {
+    const goal = exactRecord(goalValue, [
+      "goalId",
+      "position",
+      "title",
+      "acceptanceCriteria",
+      "dependencyGoalIds",
+      "version",
+      "status",
+    ]);
+    const goalId = safeRef(dataField(goal, "goalId", "invalid_input"), "invalid_input");
+    if (ids.has(goalId) || dataField(goal, "position", "invalid_input") !== index + 1) {
+      fail("invalid_input");
+    }
+    ids.add(goalId);
+    safeText(dataField(goal, "title", "invalid_input"), 1_000, "invalid_input");
+    if (positiveInteger(dataField(goal, "version", "invalid_input"), "invalid_input") !== 1) {
+      fail("invalid_input");
+    }
+    const status = dataField(goal, "status", "invalid_input");
+    if (status !== "pending") fail("invalid_input");
+    const criteria = dataField(goal, "acceptanceCriteria", "invalid_input");
+    if (!Array.isArray(criteria) || criteria.length < 1 || criteria.length > 32) {
+      fail("invalid_input");
+    }
+    for (const criterion of criteria) safeText(criterion, 1_000, "invalid_input");
+    const dependencyIds = dataField(goal, "dependencyGoalIds", "invalid_input");
+    if (
+      !Array.isArray(dependencyIds) ||
+      dependencyIds.length > 99 ||
+      dependencyIds.some((dependency) => typeof dependency !== "string")
+    ) {
+      fail("invalid_input");
+    }
+    const normalized = dependencyIds.map((dependency) => safeRef(dependency, "invalid_input"));
+    if (new Set(normalized).size !== normalized.length) fail("invalid_input");
+    dependencies.set(goalId, normalized);
+  }
+  for (const [goalId, dependencyIds] of dependencies) {
+    if (dependencyIds.some((dependency) => dependency === goalId || !ids.has(dependency))) {
+      fail("invalid_input");
+    }
+  }
+  assertAcyclicGoals(dependencies);
+}
+
+function assertAcyclicGoals(dependencies: ReadonlyMap<string, readonly string[]>): void {
+  const visiting = new Set<string>();
+  const visited = new Set<string>();
+  const visit = (goalId: string): void => {
+    if (visiting.has(goalId)) fail("invalid_input");
+    if (visited.has(goalId)) return;
+    visiting.add(goalId);
+    for (const dependency of dependencies.get(goalId) ?? []) visit(dependency);
+    visiting.delete(goalId);
+    visited.add(goalId);
+  };
+  for (const goalId of dependencies.keys()) visit(goalId);
+}
+
+function validateScopedExternalRules(value: unknown): void {
+  if (!Array.isArray(value) || value.length > 256) fail("invalid_input");
+  const identities = new Set<string>();
+  for (const ruleValue of value) {
+    const rule = exactRecord(
+      ruleValue,
+      ["actionClass", "provider", "operation", "targetPattern"],
+      ["credentialRef"]
+    );
+    const actionClass = dataField(rule, "actionClass", "invalid_input");
+    if (
+      actionClass !== "local" &&
+      actionClass !== "scoped-external" &&
+      actionClass !== "protected" &&
+      actionClass !== "forbidden"
+    ) {
+      fail("invalid_input");
+    }
+    const provider = safeRef(dataField(rule, "provider", "invalid_input"), "invalid_input");
+    const operation = safeRef(dataField(rule, "operation", "invalid_input"), "invalid_input");
+    const targetPattern = safeText(
+      dataField(rule, "targetPattern", "invalid_input"),
+      4_000,
+      "invalid_input"
+    );
+    const credentialRef = optionalDataField(rule, "credentialRef", "invalid_input");
+    if (credentialRef !== undefined) safeRef(credentialRef, "invalid_input");
+    const identity = `${actionClass}\0${provider}\0${operation}\0${targetPattern}\0${String(
+      credentialRef ?? ""
+    )}`;
+    if (identities.has(identity)) fail("invalid_input");
+    identities.add(identity);
+  }
+}
+
+function validateYoloAuthorization(
+  value: unknown,
+  context: StartCommandValidationContext,
+  commandIssuedAtMs: number,
+  runLimits: ValidatedRunLimits
+): void {
+  const authorization = exactRecord(value, ["manifest", "grant"]);
+  const manifest = exactRecord(
+    dataField(authorization, "manifest", "invalid_input"),
+    [
+      "version",
+      "manifestId",
+      "digest",
+      "actionClass",
+      "provider",
+      "operation",
+      "exactTarget",
+      "actionSchema",
+      "canonicalEffectInputDigest",
+      "effectIdempotencyKey",
+      "expectedEffect",
+      "expiresAtMs",
+    ],
+    ["commitSha", "artifactDigest", "credentialRef"]
+  );
+  if (!verifyActionManifestDigest(manifest as unknown as DigestibleActionManifest)) {
+    fail("invalid_input");
+  }
+  if (typeof dataField(manifest, "exactTarget", "invalid_input") !== "string") {
+    fail("invalid_input");
+  }
+  const expectedEffect = validateResourceEffect(
+    dataField(manifest, "expectedEffect", "invalid_input")
+  );
+  assertEffectWithinRunLimits(expectedEffect, runLimits);
+  const manifestDigest = sha256(dataField(manifest, "digest", "invalid_input"), "invalid_input");
+  const manifestClass = dataField(manifest, "actionClass", "invalid_input");
+  if (manifestClass !== "scoped-external" && manifestClass !== "protected") {
+    fail("invalid_input");
+  }
+  if (
+    positiveInteger(dataField(manifest, "expiresAtMs", "invalid_input"), "invalid_input") <=
+    commandIssuedAtMs
+  ) {
+    fail("invalid_input");
+  }
+
+  const grant = exactRecord(
+    dataField(authorization, "grant", "invalid_input"),
+    [
+      "grantId",
+      "teamId",
+      "projectId",
+      "sessionId",
+      "agentRunId",
+      "runPolicyRevision",
+      "runtimeAssignmentId",
+      "runtimeAssignmentGeneration",
+      "sandboxId",
+      "sandboxGeneration",
+      "runtimePrincipalId",
+      "runtimeAuthorizationGeneration",
+      "approvalRequestId",
+      "approvalRequestVersion",
+      "provider",
+      "operation",
+      "target",
+      "budget",
+      "usageLedgerRef",
+      "issuerActorRef",
+      "issuerApprovalAuthorityRevision",
+      "expiresAtMs",
+      "signature",
+      "createdAtMs",
+      "actionClass",
+      "scope",
+    ],
+    ["credentialRef"]
+  );
+  for (const field of [
+    "grantId",
+    "approvalRequestId",
+    "usageLedgerRef",
+    "issuerActorRef",
+    "issuerApprovalAuthorityRevision",
+  ]) {
+    safeRef(dataField(grant, field, "invalid_input"), "invalid_input");
+  }
+  const bindingFields = [
+    "teamId",
+    "projectId",
+    "sessionId",
+    "runtimeAssignmentId",
+    "sandboxId",
+    "runtimePrincipalId",
+  ] as const;
+  for (const field of bindingFields) {
+    if (
+      safeRef(dataField(grant, field, "invalid_input"), "invalid_input") !==
+      context.commandBinding[field]
+    ) {
+      fail("invalid_input");
+    }
+  }
+  for (const [field, expected] of [
+    ["runtimeAssignmentGeneration", context.commandBinding.runtimeAssignmentGeneration],
+    ["sandboxGeneration", context.commandBinding.sandboxGeneration],
+    ["runtimeAuthorizationGeneration", context.authorizationGeneration],
+    ["runPolicyRevision", context.runPolicyRevision],
+  ] as const) {
+    if (positiveInteger(dataField(grant, field, "invalid_input"), "invalid_input") !== expected) {
+      fail("invalid_input");
+    }
+  }
+  if (dataField(grant, "agentRunId", "invalid_input") !== context.agentRunId) {
+    fail("invalid_input");
+  }
+  if (
+    dataField(grant, "actionClass", "invalid_input") !== manifestClass ||
+    dataField(grant, "provider", "invalid_input") !==
+      dataField(manifest, "provider", "invalid_input") ||
+    dataField(grant, "operation", "invalid_input") !==
+      dataField(manifest, "operation", "invalid_input") ||
+    dataField(grant, "target", "invalid_input") !==
+      dataField(manifest, "exactTarget", "invalid_input")
+  ) {
+    fail("invalid_input");
+  }
+  const manifestCredential = optionalDataField(manifest, "credentialRef", "invalid_input");
+  const grantCredential = optionalDataField(grant, "credentialRef", "invalid_input");
+  if (manifestCredential !== grantCredential) fail("invalid_input");
+  if (grantCredential !== undefined) safeRef(grantCredential, "invalid_input");
+  positiveInteger(dataField(grant, "approvalRequestVersion", "invalid_input"), "invalid_input");
+  const grantCreatedAtMs = nonNegativeInteger(
+    dataField(grant, "createdAtMs", "invalid_input"),
+    "invalid_input"
+  );
+  const grantExpiresAtMs = positiveInteger(
+    dataField(grant, "expiresAtMs", "invalid_input"),
+    "invalid_input"
+  );
+  if (grantCreatedAtMs > commandIssuedAtMs || grantExpiresAtMs <= commandIssuedAtMs) {
+    fail("invalid_input");
+  }
+  safeText(dataField(grant, "signature", "invalid_input"), 4_000, "invalid_input");
+  validateActionGrantBudget(dataField(grant, "budget", "invalid_input"), expectedEffect);
+  validateActionGrantScope(
+    dataField(grant, "scope", "invalid_input"),
+    manifest,
+    manifestDigest,
+    manifestClass,
+    grantCredential
+  );
+}
+
+function validateActionGrantScope(
+  value: unknown,
+  manifest: Record<string, unknown>,
+  manifestDigest: string,
+  manifestClass: "scoped-external" | "protected",
+  grantCredential: unknown
+): void {
+  const scope = plainRecord(value, "invalid_input");
+  const kind = dataField(scope, "kind", "invalid_input");
+  if (kind === "once") {
+    exactFields(scope, ["kind", "manifestDigest", "effectIdempotencyKey"], [], "invalid_input");
+    if (
+      dataField(scope, "manifestDigest", "invalid_input") !== manifestDigest ||
+      dataField(scope, "effectIdempotencyKey", "invalid_input") !==
+        dataField(manifest, "effectIdempotencyKey", "invalid_input")
+    ) {
+      fail("invalid_input");
+    }
+    return;
+  }
+  if (kind !== "run" || manifestClass !== "scoped-external") fail("invalid_input");
+  exactFields(
+    scope,
+    ["kind", "actionClass", "provider", "operation", "targetPattern", "eligibleUse", "digest"],
+    ["credentialRef"],
+    "invalid_input"
+  );
+  if (
+    dataField(scope, "actionClass", "invalid_input") !== "scoped-external" ||
+    dataField(scope, "provider", "invalid_input") !==
+      dataField(manifest, "provider", "invalid_input") ||
+    dataField(scope, "operation", "invalid_input") !==
+      dataField(manifest, "operation", "invalid_input")
+  ) {
+    fail("invalid_input");
+  }
+  safeText(dataField(scope, "targetPattern", "invalid_input"), 4_000, "invalid_input");
+  sha256(dataField(scope, "digest", "invalid_input"), "invalid_input");
+  const eligibleUse = dataField(scope, "eligibleUse", "invalid_input");
+  if (
+    eligibleUse !== "session_branch_push" &&
+    eligibleUse !== "draft_pull_request_update" &&
+    eligibleUse !== "ephemeral_preview_update" &&
+    eligibleUse !== "same_credential_nonproduction_target"
+  ) {
+    fail("invalid_input");
+  }
+  const scopeCredential = optionalDataField(scope, "credentialRef", "invalid_input");
+  if (scopeCredential !== grantCredential) fail("invalid_input");
+  if (scopeCredential !== undefined) safeRef(scopeCredential, "invalid_input");
+  if (eligibleUse === "same_credential_nonproduction_target" && scopeCredential === undefined) {
+    fail("invalid_input");
+  }
+}
+
+function validateActionGrantBudget(value: unknown, expectedEffect: ValidatedResourceEffect): void {
+  const budget = exactRecord(value, ["perEffectLimit", "cumulativeLimit"]);
+  const perEffectLimit = validateResourceEffect(
+    dataField(budget, "perEffectLimit", "invalid_input")
+  );
+  const cumulativeLimit = validateResourceEffect(
+    dataField(budget, "cumulativeLimit", "invalid_input")
+  );
+  if (
+    !effectFitsWithin(expectedEffect, perEffectLimit) ||
+    !effectFitsWithin(perEffectLimit, cumulativeLimit)
+  ) {
+    fail("invalid_input");
+  }
+}
+
+function validateResourceEffect(value: unknown): ValidatedResourceEffect {
+  const effect = exactRecord(value, [
+    "wallClock",
+    "modelTokens",
+    "modelSpend",
+    "outboundBytes",
+    "actionCounts",
+  ]);
+  const duration = exactRecord(dataField(effect, "wallClock", "invalid_input"), ["milliseconds"]);
+  const wallClock = nonNegativeInteger(
+    dataField(duration, "milliseconds", "invalid_input"),
+    "invalid_input"
+  );
+  const modelTokens = nonNegativeInteger(
+    dataField(effect, "modelTokens", "invalid_input"),
+    "invalid_input"
+  );
+  const modelSpend = validateMoney(dataField(effect, "modelSpend", "invalid_input"));
+  const outboundBytes = nonNegativeInteger(
+    dataField(effect, "outboundBytes", "invalid_input"),
+    "invalid_input"
+  );
+  const actionCounts = exactRecord(dataField(effect, "actionCounts", "invalid_input"), [
+    "local",
+    "scoped-external",
+    "protected",
+    "forbidden",
+  ]);
+  return {
+    wallClock,
+    modelTokens,
+    modelSpend,
+    outboundBytes,
+    actionCounts: {
+      local: nonNegativeInteger(dataField(actionCounts, "local", "invalid_input"), "invalid_input"),
+      "scoped-external": nonNegativeInteger(
+        dataField(actionCounts, "scoped-external", "invalid_input"),
+        "invalid_input"
+      ),
+      protected: nonNegativeInteger(
+        dataField(actionCounts, "protected", "invalid_input"),
+        "invalid_input"
+      ),
+      forbidden: nonNegativeInteger(
+        dataField(actionCounts, "forbidden", "invalid_input"),
+        "invalid_input"
+      ),
+    },
+  };
+}
+
+function assertEffectWithinRunLimits(
+  effect: ValidatedResourceEffect,
+  limits: ValidatedRunLimits
+): void {
+  if (
+    (limits.wallClock !== undefined && effect.wallClock > limits.wallClock) ||
+    (limits.modelTokens !== undefined && effect.modelTokens > limits.modelTokens) ||
+    (limits.outboundBytes !== undefined && effect.outboundBytes > limits.outboundBytes) ||
+    (limits.modelSpend !== undefined &&
+      (effect.modelSpend.currency !== limits.modelSpend.currency ||
+        effect.modelSpend.minorUnits > limits.modelSpend.minorUnits))
+  ) {
+    fail("invalid_input");
+  }
+  for (const actionClass of ["local", "scoped-external", "protected", "forbidden"] as const) {
+    const cap = limits.actionCounts[actionClass];
+    if (cap !== undefined && effect.actionCounts[actionClass] > cap) fail("invalid_input");
+  }
+}
+
+function effectFitsWithin(
+  effect: ValidatedResourceEffect,
+  limit: ValidatedResourceEffect
+): boolean {
+  return (
+    effect.wallClock <= limit.wallClock &&
+    effect.modelTokens <= limit.modelTokens &&
+    effect.outboundBytes <= limit.outboundBytes &&
+    effect.modelSpend.currency === limit.modelSpend.currency &&
+    effect.modelSpend.minorUnits <= limit.modelSpend.minorUnits &&
+    effect.actionCounts.local <= limit.actionCounts.local &&
+    effect.actionCounts["scoped-external"] <= limit.actionCounts["scoped-external"] &&
+    effect.actionCounts.protected <= limit.actionCounts.protected &&
+    effect.actionCounts.forbidden <= limit.actionCounts.forbidden
+  );
+}
+
+function exactRecord(
+  value: unknown,
+  required: readonly string[],
+  optional: readonly string[] = []
+): Record<string, unknown> {
+  const record = plainRecord(value, "invalid_input");
+  exactFields(record, required, optional, "invalid_input");
+  return record;
 }
 
 function validateActor(value: unknown): void {

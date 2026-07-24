@@ -154,6 +154,7 @@ function activeRunFixture() {
       agentRunId: "run-1",
       lifecycle: "active" as const,
       stateVersion: 2,
+      pendingOperation: null,
       mode: "autonomous" as const,
       completionPolicy: "continue-until-all-goals-achieved" as const,
       runPolicyRevision: 2,

@@ -27,10 +27,10 @@ describe("Team Session Agent Run schema", () => {
     fs.rmSync(directory, { recursive: true, force: true });
   });
 
-  it("initializes the portable Agent Run record set and Runtime command journal at schema v4", () => {
+  it("initializes the portable Agent Run record set and Runtime command journal at schema v5", () => {
     database = openTeamSessionDatabase({ filename });
 
-    expect(database.db.pragma("user_version", { simple: true })).toBe(4);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(5);
     const tables = database.db
       .prepare(
         `SELECT name FROM sqlite_schema
@@ -63,14 +63,47 @@ describe("Team Session Agent Run schema", () => {
       name: string;
     }>;
     expect(sessionColumns.map(({ name }) => name)).toContain("run_state_revision");
+    const runColumns = database.db.prepare("PRAGMA table_info(agent_runs)").all() as Array<{
+      name: string;
+    }>;
+    expect(runColumns.map(({ name }) => name)).toContain("start_command_id");
+    const dispatchColumns = database.db
+      .prepare("PRAGMA table_info(runtime_run_command_dispatch)")
+      .all() as Array<{ name: string }>;
+    expect(dispatchColumns.map(({ name }) => name)).toContain("available_at_ms");
+    expect(
+      database.db
+        .prepare(
+          `SELECT sql FROM sqlite_schema
+           WHERE type = 'index' AND name = 'runtime_run_command_dispatch_claimable'`
+        )
+        .get()
+    ).toMatchObject({ sql: expect.stringContaining("available_at_ms") });
+    expect(
+      database.db
+        .prepare(
+          `SELECT sql FROM sqlite_schema
+           WHERE type = 'index' AND name = 'one_unresolved_runtime_run_command_per_run'`
+        )
+        .get()
+    ).toMatchObject({ sql: expect.stringContaining("'compensating'") });
+    const commandTable = database.db
+      .prepare(
+        `SELECT sql FROM sqlite_schema
+         WHERE type = 'table' AND name = 'runtime_run_commands'`
+      )
+      .get() as { sql: string };
+    expect(commandTable.sql).toContain("operation <> 'run.start'");
+    expect(commandTable.sql).toContain("expected_run_state_version = 1");
+    expect(commandTable.sql).toContain("target_run_state_version = 2");
   });
 
-  it("migrates a genuine v2 Session schema through v3 to v4 in one open", () => {
+  it("migrates a genuine v2 Session schema through v3, v4, and v5 in one open", () => {
     createAgentRunSchemaV2Fixture(filename);
 
     database = openTeamSessionDatabase({ filename });
 
-    expect(database.db.pragma("user_version", { simple: true })).toBe(4);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(5);
     expect(
       database.db
         .prepare(`SELECT name FROM sqlite_schema WHERE type = 'table' AND name = 'agent_runs'`)
@@ -399,7 +432,7 @@ describe("Team Session Agent Run schema", () => {
 
     database = openTeamSessionDatabase({ filename });
 
-    expect(database.db.pragma("user_version", { simple: true })).toBe(4);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(5);
     expect(
       database.db
         .prepare(`SELECT name FROM sqlite_schema WHERE type = 'table' AND name = ?`)
@@ -428,6 +461,383 @@ describe("Team Session Agent Run schema", () => {
     expect(database.db.pragma("foreign_key_check")).toEqual([]);
   });
 
+  it("migrates a genuinely populated v4 Runtime journal to v5 without losing truth", () => {
+    const beforeMigration = createPopulatedRuntimeRunSchemaV4Fixture(filename);
+
+    database = openTeamSessionDatabase({ filename });
+
+    expect(database.db.pragma("user_version", { simple: true })).toBe(5);
+    expect(
+      database.db
+        .prepare(`SELECT * FROM runtime_run_commands WHERE id = ?`)
+        .get("runtime-command-1")
+    ).toEqual(beforeMigration.command);
+    expect(
+      database.db
+        .prepare(`SELECT * FROM runtime_run_command_receipts WHERE id = ?`)
+        .get("receipt-1")
+    ).toEqual(beforeMigration.receipt);
+    expect(
+      database.db
+        .prepare(`SELECT * FROM runtime_run_command_effects WHERE command_id = ?`)
+        .get("runtime-command-1")
+    ).toEqual(beforeMigration.effect);
+    expect(database.db.prepare(`SELECT * FROM agent_runs WHERE id = 'run-1'`).get()).toMatchObject({
+      ...beforeMigration.run,
+      start_command_id: null,
+    });
+    expect(
+      database.db
+        .prepare(`SELECT * FROM runtime_run_command_dispatch WHERE command_id = ?`)
+        .get("runtime-command-1")
+    ).toMatchObject({ ...beforeMigration.dispatch, available_at_ms: 120 });
+    expect(database.db.pragma("foreign_key_check")).toEqual([]);
+  });
+
+  it.each([
+    ["pending", "pending", 100, null, 0],
+    ["processing-live", "awaiting-receipt", 101, "migration_dispatch_uncertain", 0],
+    ["processing-expired", "awaiting-receipt", 101, "migration_dispatch_uncertain", 0],
+    ["retried-pending", "awaiting-receipt", 102, "migration_dispatch_uncertain", 0],
+    ["awaiting", "awaiting-receipt", 110, null, 0],
+    ["accepted", "awaiting-receipt", 110, null, 1],
+  ] as const)(
+    "migrates a populated v4 %s dispatch without inventing redispatch certainty",
+    (fixtureState, expectedStatus, expectedAvailableAtMs, expectedSafeCode, expectedReceipts) => {
+      createRuntimeRunSchemaV4DispatchFixture(filename, fixtureState);
+
+      database = openTeamSessionDatabase({ filename });
+
+      expect(database.db.pragma("user_version", { simple: true })).toBe(5);
+      expect(
+        database.db
+          .prepare(
+            `SELECT status, available_at_ms, lease_owner, lease_expires_at_ms,
+                    last_safe_error_code
+             FROM runtime_run_command_dispatch WHERE command_id = 'runtime-command-1'`
+          )
+          .get()
+      ).toEqual({
+        status: expectedStatus,
+        available_at_ms: expectedAvailableAtMs,
+        lease_owner: null,
+        lease_expires_at_ms: null,
+        last_safe_error_code: expectedSafeCode,
+      });
+      expect(
+        database.db
+          .prepare(
+            `SELECT COUNT(*) AS count FROM runtime_run_command_receipts
+             WHERE command_id = 'runtime-command-1'`
+          )
+          .get()
+      ).toEqual({ count: expectedReceipts });
+      expect(database.db.pragma("foreign_key_check")).toEqual([]);
+      expect(database.db.pragma("quick_check", { simple: true })).toBe("ok");
+    }
+  );
+
+  it("fences starting Runs behind their exact durable start effect", () => {
+    database = openTeamSessionDatabase({ filename });
+    seedStartingRuntimeRunCommand(database.db);
+
+    expect(
+      database.db
+        .prepare(
+          `SELECT lifecycle, state_version, start_command_id FROM agent_runs WHERE id = 'run-1'`
+        )
+        .get()
+    ).toEqual({
+      lifecycle: "starting",
+      state_version: 1,
+      start_command_id: "runtime-command-start",
+    });
+    expect(() =>
+      database!.db
+        .prepare(
+          `UPDATE agent_runs
+           SET lifecycle = 'active', state_version = 2, updated_at_ms = 115
+           WHERE id = 'run-1'`
+        )
+        .run()
+    ).toThrow(/lacks an enforced effect/);
+    expect(() =>
+      database!.db
+        .prepare(`UPDATE agent_runs SET start_command_id = 'different-command' WHERE id = 'run-1'`)
+        .run()
+    ).toThrow(/start command identity is immutable/);
+
+    claimRuntimeRunDispatch(database.db, "runtime-command-start");
+    insertRuntimeRunReceipt(database.db, { commandId: "runtime-command-start" });
+    insertRuntimeRequestEvent(database.db, 2, "event:start-enforced", {
+      commandId: "runtime-command-start",
+      type: "run.started",
+      operation: "run.start",
+    });
+    insertRuntimeRunEffect(database.db, digestFor("start-effect"), {
+      commandId: "runtime-command-start",
+    });
+    expect(() =>
+      database!.db
+        .prepare(
+          `UPDATE agent_runs
+           SET lifecycle = 'active', state_version = 2, updated_at_ms = 115
+           WHERE id = 'run-1'`
+        )
+        .run()
+    ).not.toThrow();
+    expect(() =>
+      terminalizeRuntimeRunDispatch(database!.db, 120, "enforced", "runtime-command-start")
+    ).not.toThrow();
+  });
+
+  it("keeps emergency quarantine reachable and rejects a late start effect", () => {
+    database = openTeamSessionDatabase({ filename });
+    seedStartingRuntimeRunCommand(database.db);
+    claimRuntimeRunDispatch(database.db, "runtime-command-start");
+
+    database.db
+      .prepare(
+        `UPDATE agent_runs
+         SET lifecycle = 'pausing', state_version = 2, updated_at_ms = 105
+         WHERE id = 'run-1'`
+      )
+      .run();
+    insertRuntimeRunReceipt(database.db, { commandId: "runtime-command-start" });
+    insertRuntimeRequestEvent(database.db, 2, "event:late-start-enforced", {
+      commandId: "runtime-command-start",
+      type: "run.started",
+      operation: "run.start",
+    });
+    expect(() =>
+      insertRuntimeRunEffect(database!.db, digestFor("late-start-effect"), {
+        commandId: "runtime-command-start",
+      })
+    ).toThrow(/does not match current dispatch and Run state/);
+    expect(() =>
+      database!.db
+        .prepare(
+          `UPDATE agent_runs
+           SET lifecycle = 'emergency-stopped', state_version = 3,
+               terminal_at_ms = 110, updated_at_ms = 110
+           WHERE id = 'run-1'`
+        )
+        .run()
+    ).not.toThrow();
+  });
+
+  it.each(["rejected", "quarantined"] as const)(
+    "allows a proven terminal %s start to fail its Run",
+    (outcome) => {
+      database = openTeamSessionDatabase({ filename });
+      seedStartingRuntimeRunCommand(database.db);
+      claimRuntimeRunDispatch(database.db, "runtime-command-start");
+      insertRuntimeRunReceipt(database.db, {
+        commandId: "runtime-command-start",
+        outcome,
+      });
+
+      expect(() =>
+        database!.db
+          .prepare(
+            `UPDATE agent_runs
+             SET lifecycle = 'failed', state_version = 2, terminal_at_ms = 120,
+                 updated_at_ms = 120
+             WHERE id = 'run-1'`
+          )
+          .run()
+      ).toThrow(/lacks a terminal dispatch proof/);
+      terminalizeRuntimeRunDispatch(database.db, 120, outcome, "runtime-command-start");
+      expect(() =>
+        database!.db
+          .prepare(
+            `UPDATE agent_runs
+             SET lifecycle = 'failed', state_version = 2, terminal_at_ms = 121,
+                 updated_at_ms = 121
+             WHERE id = 'run-1'`
+          )
+          .run()
+      ).not.toThrow();
+    }
+  );
+
+  it("allows a safe permanent pre-dispatch start failure but not an unproven one", () => {
+    database = openTeamSessionDatabase({ filename });
+    seedStartingRuntimeRunCommand(database.db);
+
+    const failWithoutSafeProof = database.db.transaction(() => {
+      database!.db
+        .prepare(
+          `UPDATE runtime_run_command_dispatch
+           SET status = 'failed', terminal_at_ms = 109, updated_at_ms = 109
+           WHERE command_id = 'runtime-command-start'`
+        )
+        .run();
+      database!.db
+        .prepare(
+          `UPDATE agent_runs
+           SET lifecycle = 'failed', state_version = 2, terminal_at_ms = 109,
+               updated_at_ms = 109
+           WHERE id = 'run-1'`
+        )
+        .run();
+    });
+    expect(() => failWithoutSafeProof()).toThrow(
+      /Invalid Runtime Run command dispatch transition|lacks a terminal dispatch proof/
+    );
+
+    database.db
+      .prepare(
+        `UPDATE runtime_run_command_dispatch
+         SET status = 'failed', last_safe_error_code = 'invalid_authority',
+             terminal_at_ms = 110, updated_at_ms = 110
+         WHERE command_id = 'runtime-command-start'`
+      )
+      .run();
+    expect(() =>
+      database!.db
+        .prepare(
+          `UPDATE agent_runs
+           SET lifecycle = 'failed', state_version = 2, terminal_at_ms = 111,
+               updated_at_ms = 111
+           WHERE id = 'run-1'`
+        )
+        .run()
+    ).not.toThrow();
+    expect(() =>
+      database!.db
+        .prepare(
+          `UPDATE runtime_run_command_dispatch
+           SET status = 'pending', terminal_at_ms = NULL, updated_at_ms = 112
+           WHERE command_id = 'runtime-command-start'`
+        )
+        .run()
+    ).toThrow(/Invalid Runtime Run command dispatch transition/);
+  });
+
+  it("enforces due-time claims and treats an expired dispatch lease as uncertain", () => {
+    database = openTeamSessionDatabase({ filename });
+    seedRuntimeRunCommand(database.db);
+
+    expect(() => claimRuntimeRunDispatch(database!.db, "runtime-command-1", 99)).toThrow(
+      /Invalid Runtime Run command dispatch transition/
+    );
+    claimRuntimeRunDispatch(database.db, "runtime-command-1");
+    for (const unsafeCode of [null, "arbitrary", "runtime_command_failed"] as const) {
+      expect(() =>
+        database!.db
+          .prepare(
+            `UPDATE runtime_run_command_dispatch
+             SET status = 'pending', available_at_ms = 150,
+                 lease_owner = NULL, lease_expires_at_ms = NULL,
+                 last_safe_error_code = ?, updated_at_ms = 102
+             WHERE command_id = 'runtime-command-1'`
+          )
+          .run(unsafeCode)
+      ).toThrow(/Invalid Runtime Run command dispatch transition/);
+    }
+    expect(() =>
+      database!.db
+        .prepare(
+          `UPDATE runtime_run_command_dispatch
+           SET lease_owner = 'worker-2', lease_expires_at_ms = 220, updated_at_ms = 102
+           WHERE command_id = 'runtime-command-1'`
+        )
+        .run()
+    ).toThrow(/Invalid Runtime Run command dispatch transition/);
+    expect(() =>
+      database!.db
+        .prepare(
+          `UPDATE runtime_run_command_dispatch
+           SET attempts = 2, lease_owner = 'worker-2', lease_expires_at_ms = 300,
+               updated_at_ms = 199
+           WHERE command_id = 'runtime-command-1'`
+        )
+        .run()
+    ).toThrow(/Invalid Runtime Run command dispatch transition/);
+    expect(() =>
+      database!.db
+        .prepare(
+          `UPDATE runtime_run_command_dispatch
+           SET attempts = 2, lease_owner = 'worker-2', lease_expires_at_ms = 300,
+               updated_at_ms = 200
+           WHERE command_id = 'runtime-command-1'`
+        )
+        .run()
+    ).toThrow(/Invalid Runtime Run command dispatch transition/);
+
+    database.db
+      .prepare(
+        `UPDATE runtime_run_command_dispatch
+         SET status = 'awaiting-receipt', lease_owner = NULL, lease_expires_at_ms = NULL,
+             available_at_ms = 210, updated_at_ms = 200
+         WHERE command_id = 'runtime-command-1'`
+      )
+      .run();
+    expect(() =>
+      database!.db
+        .prepare(
+          `UPDATE runtime_run_command_dispatch
+           SET status = 'processing', attempts = 2, lease_owner = 'worker-2',
+               lease_expires_at_ms = 300, updated_at_ms = 210
+           WHERE command_id = 'runtime-command-1'`
+        )
+        .run()
+    ).toThrow(/Invalid Runtime Run command dispatch transition/);
+  });
+
+  it("retains a stale enforced receipt in a non-claimable compensating state", () => {
+    database = openTeamSessionDatabase({ filename });
+    seedRuntimeRunCommand(database.db);
+    claimRuntimeRunDispatch(database.db, "runtime-command-1");
+    database.db
+      .prepare(
+        `UPDATE agent_runs
+         SET lifecycle = 'pausing', state_version = 2, updated_at_ms = 105
+         WHERE id = 'run-1'`
+      )
+      .run();
+
+    expect(() =>
+      database!.db
+        .prepare(
+          `UPDATE runtime_run_command_dispatch
+           SET status = 'compensating', lease_owner = NULL, lease_expires_at_ms = NULL,
+               updated_at_ms = 110
+           WHERE command_id = 'runtime-command-1'`
+        )
+        .run()
+    ).toThrow(/Invalid Runtime Run command dispatch transition/);
+    insertRuntimeRunReceipt(database.db);
+    expect(() =>
+      database!.db
+        .prepare(
+          `UPDATE runtime_run_command_dispatch
+           SET status = 'compensating', lease_owner = NULL, lease_expires_at_ms = NULL,
+               updated_at_ms = 110
+           WHERE command_id = 'runtime-command-1'`
+        )
+        .run()
+    ).not.toThrow();
+    expect(
+      database.db
+        .prepare(
+          `SELECT status, attempts, terminal_at_ms
+           FROM runtime_run_command_dispatch WHERE command_id = 'runtime-command-1'`
+        )
+        .get()
+    ).toEqual({ status: "compensating", attempts: 1, terminal_at_ms: null });
+    expect(() =>
+      database!.db
+        .prepare(
+          `UPDATE runtime_run_command_dispatch
+           SET status = 'pending', available_at_ms = 111, updated_at_ms = 111
+           WHERE command_id = 'runtime-command-1'`
+        )
+        .run()
+    ).toThrow(/Invalid Runtime Run command dispatch transition/);
+  });
+
   it("binds immutable Runtime Run commands to one exact Run snapshot", () => {
     database = openTeamSessionDatabase({ filename });
     seedSessionAndAssignment(database.db);
@@ -438,13 +848,15 @@ describe("Team Session Agent Run schema", () => {
       insertRuntimeRunCommand(database!.db, {
         sandboxGeneration: 2,
       })
-    ).toThrow(/FOREIGN KEY constraint failed|JSON scope does not match/);
+    ).toThrow(
+      /FOREIGN KEY constraint failed|JSON scope does not match|does not match current Run state/
+    );
     expect(() =>
       insertRuntimeRunCommand(database!.db, {
         operation: "run.pause",
         targetLifecycle: "active",
       })
-    ).toThrow(/CHECK constraint failed/);
+    ).toThrow(/CHECK constraint failed|source event does not match/);
     expect(() =>
       insertRuntimeRunCommand(database!.db, {
         commandDigest: "A".repeat(64),
@@ -452,11 +864,13 @@ describe("Team Session Agent Run schema", () => {
     ).toThrow(/CHECK constraint failed/);
     expect(() =>
       insertRuntimeRunCommand(database!.db, {
-        // v4 deliberately rejects start before interpreting a portable start payload.
+        // v5 accepts start only for an exact-bound starting Run and policy snapshot.
         operation: "run.start",
         targetLifecycle: "active",
       })
-    ).toThrow(/CHECK constraint failed/);
+    ).toThrow(
+      /CHECK constraint failed|does not match current Run state|source event does not match/
+    );
     expect(() => insertRuntimeRunCommand(database!.db, { omitPerKindField: true })).toThrow(
       /CHECK constraint failed/
     );
@@ -469,7 +883,7 @@ describe("Team Session Agent Run schema", () => {
       insertRuntimeRunCommand(database!.db, {
         targetRunStateVersion: 3,
       })
-    ).toThrow(/CHECK constraint failed/);
+    ).toThrow(/CHECK constraint failed|source event does not match/);
     expect(() =>
       insertRuntimeRunCommand(database!.db, { projectCeilingRevision: "other-ceiling" })
     ).toThrow(/source event does not match/);
@@ -557,7 +971,8 @@ describe("Team Session Agent Run schema", () => {
     database.db
       .prepare(
         `UPDATE runtime_run_command_dispatch
-         SET status = 'failed', terminal_at_ms = 110, updated_at_ms = 110
+         SET status = 'failed', last_safe_error_code = 'invalid_input',
+             terminal_at_ms = 110, updated_at_ms = 110
          WHERE command_id = 'runtime-command-1'`
       )
       .run();
@@ -583,9 +998,9 @@ describe("Team Session Agent Run schema", () => {
       database!.db
         .prepare(
           `INSERT INTO runtime_run_command_dispatch
-             (command_id, agent_run_id, status, attempts,
+             (command_id, agent_run_id, status, attempts, available_at_ms,
               created_at_ms, updated_at_ms, terminal_at_ms)
-           VALUES ('runtime-command-1', 'run-1', 'failed', 0, 100, 100, 100)`
+           VALUES ('runtime-command-1', 'run-1', 'failed', 0, 100, 100, 100, 100)`
         )
         .run()
     ).toThrow(/must begin pending/);
@@ -595,6 +1010,10 @@ describe("Team Session Agent Run schema", () => {
     database = openTeamSessionDatabase({ filename });
     seedRuntimeRunCommand(database.db);
 
+    expect(() => insertRuntimeRunReceipt(database!.db)).toThrow(
+      /dispatch is not accepting receipts/
+    );
+    claimRuntimeRunDispatch(database.db, "runtime-command-1");
     expect(() => insertRuntimeRunReceipt(database!.db, { enforcedFence: 1 })).toThrow(
       /CHECK constraint failed/
     );
@@ -631,9 +1050,31 @@ describe("Team Session Agent Run schema", () => {
     ).toThrow(/Runtime Run command receipts are immutable/);
   });
 
+  it("accepts a follow-ingested receipt while the exact dispatch awaits reconciliation", () => {
+    database = openTeamSessionDatabase({ filename });
+    seedRuntimeRunCommand(database.db);
+    claimRuntimeRunDispatch(database.db, "runtime-command-1");
+    database.db
+      .prepare(
+        `UPDATE runtime_run_command_dispatch
+         SET status = 'awaiting-receipt', available_at_ms = 110,
+             lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = 110
+         WHERE command_id = 'runtime-command-1'`
+      )
+      .run();
+
+    expect(() =>
+      insertRuntimeRunReceipt(database!.db, {
+        outcome: "accepted",
+        receiptDigest: digestFor("follow-accepted"),
+      })
+    ).not.toThrow();
+  });
+
   it("does not let duplicate receipts promote an accepted outcome", () => {
     database = openTeamSessionDatabase({ filename });
     seedRuntimeRunCommand(database.db);
+    claimRuntimeRunDispatch(database.db, "runtime-command-1");
     const acceptedDigest = digestFor("receipt-accepted");
     insertRuntimeRunReceipt(database.db, {
       receiptId: "receipt-accepted",
@@ -688,6 +1129,7 @@ describe("Team Session Agent Run schema", () => {
     (originalOutcome) => {
       database = openTeamSessionDatabase({ filename });
       seedRuntimeRunCommand(database.db);
+      claimRuntimeRunDispatch(database.db, "runtime-command-1");
 
       expect(() =>
         insertRuntimeRunReceipt(database!.db, {
@@ -792,7 +1234,7 @@ describe("Team Session Agent Run schema", () => {
         insertRuntimeRunEffect(database!.db);
       });
       expect(() => applyFromInvalidDispatch()).toThrow(
-        /does not match current dispatch and Run state/
+        /does not match current dispatch and Run state|Invalid Runtime Run command dispatch transition/
       );
     }
     for (const staleMutation of [
@@ -836,14 +1278,91 @@ function seedRuntimeRunCommand(db: Database.Database): void {
   insertRuntimeRunCommand(db);
 }
 
+function seedStartingRuntimeRunCommand(db: Database.Database): void {
+  seedSessionAndAssignment(db);
+  db.transaction(() => {
+    db.prepare(
+      `INSERT INTO agent_runs
+         (id, session_id, team_id, project_id, runtime_assignment_id, start_command_id,
+          lifecycle, current_policy_revision, current_goal_set_revision,
+          runtime_authorization_generation, created_by_user_id, created_at_ms, updated_at_ms)
+       VALUES ('run-1', ?, ?, ?, ?, 'runtime-command-start',
+               'starting', 1, 1, 1, 'user-alice', 10, 10)`
+    ).run(SESSION_ID, TEAM_ID, PROJECT_ID, ASSIGNMENT_ID);
+    db.prepare(
+      `INSERT INTO goal_sets
+         (goal_set_id, agent_run_id, revision, previous_revision, digest, created_at_ms)
+       VALUES ('goal-set-1', 'run-1', 1, NULL, ?, 20)`
+    ).run(digestFor("goal-set:run-1:1"));
+    db.prepare(
+      `INSERT INTO run_policy_revisions
+         (agent_run_id, session_id, revision, previous_revision, digest, policy_body_digest,
+          mode, completion_policy,
+          scoped_external_policy_ref, scoped_external_rules_json, limits_json,
+          initial_goal_set_id, initial_goal_set_revision,
+          project_ceiling_revision, project_ceiling_digest,
+          runtime_assignment_id, runtime_assignment_generation,
+          sandbox_id, sandbox_generation, runtime_principal_id,
+          runtime_authorization_generation, yolo_confirmation_ref, created_at_ms)
+       VALUES
+         ('run-1', ?, 1, NULL, ?, ?, 'autonomous', 'continue-until-all-goals-achieved',
+          'scoped-policy-1', '[]', ?, 'goal-set-1', 1,
+          'ceiling-1', ?, ?, 1, 'sandbox-1', 1, 'principal-1', 1, NULL, 20)`
+    ).run(
+      SESSION_ID,
+      digestFor("policy-snapshot:run-1:1"),
+      digestFor("policy-body:run-1:1"),
+      JSON.stringify(completeLimits()),
+      digestFor("project-ceiling"),
+      ASSIGNMENT_ID
+    );
+    insertRuntimeRequestEvent(db, 1, "event:start-requested", {
+      commandId: "runtime-command-start",
+      operation: "run.start",
+    });
+    insertRuntimeRunCommand(db, {
+      commandId: "runtime-command-start",
+      operation: "run.start",
+      targetLifecycle: "active",
+    });
+  })();
+}
+
+function claimRuntimeRunDispatch(
+  db: Database.Database,
+  commandId: string,
+  now = 101,
+  worker = "worker-1"
+): void {
+  db.prepare(
+    `UPDATE runtime_run_command_dispatch
+     SET status = 'processing', attempts = attempts + 1, lease_owner = ?,
+         lease_expires_at_ms = 200, updated_at_ms = ?
+     WHERE command_id = ?`
+  ).run(worker, now, commandId);
+}
+
 function insertRuntimeRequestEvent(
   db: Database.Database,
   sequence: number,
   eventId: string,
-  options: { commandId?: string; type?: string } = {}
+  options: {
+    commandId?: string;
+    type?: string;
+    operation?: "run.start" | "run.pause" | "run.resume" | "run.stop";
+    fromRunStateVersion?: number;
+    toRunStateVersion?: number;
+    targetLifecycle?: "active" | "paused" | "stopped";
+  } = {}
 ): void {
   const commandId = options.commandId ?? "runtime-command-1";
   const eventType = options.type ?? "run.runtime-command.requested";
+  const operation = options.operation ?? "run.pause";
+  const fromRunStateVersion = options.fromRunStateVersion ?? 1;
+  const toRunStateVersion = options.toRunStateVersion ?? 2;
+  const targetLifecycle =
+    options.targetLifecycle ??
+    (operation === "run.pause" ? "paused" : operation === "run.stop" ? "stopped" : "active");
   db.prepare(
     `INSERT INTO session_events
        (session_id, sequence, event_id, type, occurred_at_ms,
@@ -860,8 +1379,10 @@ function insertRuntimeRequestEvent(
     JSON.stringify({
       commandId,
       agentRunId: "run-1",
-      fromRunStateVersion: 1,
-      toRunStateVersion: 2,
+      operation,
+      fromRunStateVersion,
+      toRunStateVersion,
+      targetLifecycle,
     })
   );
 }
@@ -897,7 +1418,7 @@ function insertRuntimeRunCommand(
   const targetRunStateVersion = options.targetRunStateVersion ?? 2;
   const sandboxGeneration = options.sandboxGeneration ?? 1;
   const sourceSessionSequence = options.sourceSessionSequence ?? 1;
-  const commandDigest = options.commandDigest ?? digestFor("runtime-command-1");
+  const commandDigest = options.commandDigest ?? digestFor(commandId);
   const sourceEvent = db
     .prepare(
       `SELECT event_id, actor_kind, actor_user_id FROM session_events
@@ -909,11 +1430,21 @@ function insertRuntimeRunCommand(
   if (!sourceEvent) throw new Error("Expected a Runtime command source event");
   const policy = db
     .prepare(
-      `SELECT project_ceiling_revision FROM run_policy_revisions
+      `SELECT digest, policy_body_digest, project_ceiling_revision
+       FROM run_policy_revisions
        WHERE agent_run_id = 'run-1' AND revision = 1`
     )
-    .get() as { project_ceiling_revision: string } | undefined;
+    .get() as
+    | { digest: string; policy_body_digest: string; project_ceiling_revision: string }
+    | undefined;
   if (!policy) throw new Error("Expected a Runtime command policy");
+  const goalSet = db
+    .prepare(
+      `SELECT goal_set_id, digest FROM goal_sets
+       WHERE agent_run_id = 'run-1' AND revision = 1`
+    )
+    .get() as { goal_set_id: string; digest: string } | undefined;
+  if (!goalSet) throw new Error("Expected a Runtime command Goal Set");
   const authorityDigest = digestFor(`authority:${commandId}`);
   const commandJson =
     options.commandJson ??
@@ -953,6 +1484,31 @@ function insertRuntimeRunCommand(
         sandboxGeneration,
         runtimePrincipalId: "principal-1",
       },
+      ...(operation === "run.start"
+        ? {
+            policy: {
+              agentRunId: "run-1",
+              revision: 1,
+              digest: policy.digest,
+              policyBodyDigest: policy.policy_body_digest,
+              projectCeilingRevision: policy.project_ceiling_revision,
+              initialGoalSet: {
+                agentRunId: "run-1",
+                goalSetId: goalSet.goal_set_id,
+                revision: 1,
+                digest: goalSet.digest,
+              },
+              runtimeAuthorizationGeneration: 1,
+              binding: {
+                runtimeAssignmentId: ASSIGNMENT_ID,
+                runtimeAssignmentGeneration: 1,
+                sandboxId: "sandbox-1",
+                sandboxGeneration,
+                runtimePrincipalId: "principal-1",
+              },
+            },
+          }
+        : {}),
       ...(operation === "run.pause" && !options.omitPerKindField ? { reason: "human" } : {}),
       ...(operation === "run.resume" && !options.omitPerKindField
         ? { accountableAssigneePresent: true }
@@ -990,8 +1546,9 @@ function insertRuntimeRunCommand(
     if (!options.skipDispatch) {
       db.prepare(
         `INSERT INTO runtime_run_command_dispatch
-           (command_id, agent_run_id, status, attempts, created_at_ms, updated_at_ms)
-         VALUES (?, 'run-1', 'pending', 0, 100, 100)`
+           (command_id, agent_run_id, status, attempts, available_at_ms,
+            created_at_ms, updated_at_ms)
+         VALUES (?, 'run-1', 'pending', 0, 100, 100, 100)`
       ).run(commandId);
     }
   })();
@@ -1000,6 +1557,7 @@ function insertRuntimeRunCommand(
 function insertRuntimeRunReceipt(
   db: Database.Database,
   options: {
+    commandId?: string;
     receiptId?: string;
     version?: number;
     previousVersion?: number | null;
@@ -1013,6 +1571,7 @@ function insertRuntimeRunReceipt(
     ignoreExactDuplicate?: boolean;
   } = {}
 ) {
+  const commandId = options.commandId ?? "runtime-command-1";
   const receiptId = options.receiptId ?? "receipt-1";
   const version = options.version ?? 1;
   const previousVersion = options.previousVersion === undefined ? null : options.previousVersion;
@@ -1034,7 +1593,7 @@ function insertRuntimeRunReceipt(
     runtimePrincipalId: "principal-1",
   };
   const receiptBase = {
-    commandId: "runtime-command-1",
+    commandId,
     outcome,
     binding,
     runtimeAuthorizationGeneration: 1,
@@ -1065,7 +1624,7 @@ function insertRuntimeRunReceipt(
             ...receiptBase,
             originalReceiptDigest,
             originalReceipt: {
-              commandId: "runtime-command-1",
+              commandId,
               outcome: originalOutcome,
               binding,
               runtimeAuthorizationGeneration: 1,
@@ -1100,17 +1659,18 @@ function insertRuntimeRunReceipt(
           expected_run_state_version, target_run_state_version, source_session_sequence,
           command_digest, outcome, original_outcome, original_receipt_digest,
           receipt_json, receipt_digest, received_at_ms)
-       VALUES (?, 'runtime-command-1', ?, ?, ?, 'run-1', 1, 1, 'goal-set-1', 1,
+       VALUES (?, ?, ?, ?, ?, 'run-1', 1, 1, 'goal-set-1', 1,
                ?, 1, 'sandbox-1', 1, 'principal-1', 1, 1, 2, 1,
                ?, ?, ?, ?, ?, ?, 110)`
     )
     .run(
       receiptId,
+      commandId,
       version,
       previousVersion,
       SESSION_ID,
       ASSIGNMENT_ID,
-      digestFor("runtime-command-1"),
+      digestFor(commandId),
       outcome,
       originalOutcome,
       originalReceiptDigest,
@@ -1123,18 +1683,21 @@ function insertRuntimeRunEffect(
   db: Database.Database,
   effectDigest = digestFor("effect-1"),
   options: {
+    commandId?: string;
     receiptId?: string;
     receiptOutcome?: "enforced" | "duplicate";
   } = {}
 ): void {
+  const commandId = options.commandId ?? "runtime-command-1";
   db.prepare(
     `INSERT INTO runtime_run_command_effects
        (command_id, receipt_id, receipt_outcome, session_id, agent_run_id,
         command_sequence, expected_run_state_version, target_run_state_version,
         source_session_sequence, applied_session_sequence, effect_digest, applied_at_ms)
-     VALUES ('runtime-command-1', ?, ?, ?, 'run-1',
+     VALUES (?, ?, ?, ?, 'run-1',
              1, 1, 2, 1, 2, ?, 115)`
   ).run(
+    commandId,
     options.receiptId ?? "receipt-1",
     options.receiptOutcome ?? "enforced",
     SESSION_ID,
@@ -1145,14 +1708,15 @@ function insertRuntimeRunEffect(
 function terminalizeRuntimeRunDispatch(
   db: Database.Database,
   now: number,
-  status: "enforced" | "rejected" | "quarantined" = "enforced"
+  status: "enforced" | "rejected" | "quarantined" = "enforced",
+  commandId = "runtime-command-1"
 ): void {
   db.prepare(
     `UPDATE runtime_run_command_dispatch
      SET status = ?, lease_owner = NULL, lease_expires_at_ms = NULL,
          terminal_at_ms = ?, updated_at_ms = ?
-     WHERE command_id = 'runtime-command-1'`
-  ).run(status, now, now);
+     WHERE command_id = ?`
+  ).run(status, now, now, commandId);
 }
 
 function seedSessionAndAssignment(db: Database.Database): void {
@@ -1691,4 +2255,160 @@ function createRuntimeRunSchemaV3Fixture(filename: string): {
   }
   if (!snapshot) throw new Error("Expected a v3 Runtime outbox fixture snapshot");
   return snapshot;
+}
+
+function createPopulatedRuntimeRunSchemaV4Fixture(filename: string): {
+  run: Record<string, unknown>;
+  command: Record<string, unknown>;
+  dispatch: Record<string, unknown>;
+  receipt: Record<string, unknown>;
+  effect: Record<string, unknown>;
+} {
+  createRuntimeRunSchemaV4Fixture(filename);
+
+  const db = new Database(filename);
+  try {
+    db.pragma("foreign_keys = ON");
+    expect(db.pragma("user_version", { simple: true })).toBe(4);
+    expect(
+      (db.prepare(`PRAGMA table_info(agent_runs)`).all() as Array<{ name: string }>).map(
+        ({ name }) => name
+      )
+    ).not.toContain("start_command_id");
+    expect(
+      (
+        db.prepare(`PRAGMA table_info(runtime_run_command_dispatch)`).all() as Array<{
+          name: string;
+        }>
+      ).map(({ name }) => name)
+    ).not.toContain("available_at_ms");
+    seedSessionAndAssignment(db);
+    insertRun(db, "run-1", "active");
+    insertRuntimeRequestEvent(db, 1, "event:pause-requested");
+    insertRuntimeRunCommand(db, { skipDispatch: true });
+    db.prepare(
+      `INSERT INTO runtime_run_command_dispatch
+         (command_id, agent_run_id, status, attempts, created_at_ms, updated_at_ms)
+       VALUES ('runtime-command-1', 'run-1', 'pending', 0, 100, 100)`
+    ).run();
+    claimRuntimeRunDispatch(db, "runtime-command-1");
+    insertRuntimeRunReceipt(db);
+    insertRuntimeRequestEvent(db, 2, "event:pause-enforced", { type: "run.paused" });
+    insertRuntimeRunEffect(db);
+    db.prepare(
+      `UPDATE agent_runs
+       SET lifecycle = 'paused', state_version = 2, updated_at_ms = 115
+       WHERE id = 'run-1'`
+    ).run();
+    terminalizeRuntimeRunDispatch(db, 120);
+
+    return {
+      run: db.prepare(`SELECT * FROM agent_runs WHERE id = 'run-1'`).get() as Record<
+        string,
+        unknown
+      >,
+      command: db
+        .prepare(`SELECT * FROM runtime_run_commands WHERE id = 'runtime-command-1'`)
+        .get() as Record<string, unknown>,
+      dispatch: db
+        .prepare(
+          `SELECT * FROM runtime_run_command_dispatch WHERE command_id = 'runtime-command-1'`
+        )
+        .get() as Record<string, unknown>,
+      receipt: db
+        .prepare(`SELECT * FROM runtime_run_command_receipts WHERE id = 'receipt-1'`)
+        .get() as Record<string, unknown>,
+      effect: db
+        .prepare(`SELECT * FROM runtime_run_command_effects WHERE command_id = 'runtime-command-1'`)
+        .get() as Record<string, unknown>,
+    };
+  } finally {
+    db.close();
+  }
+}
+
+function createRuntimeRunSchemaV4DispatchFixture(
+  filename: string,
+  state:
+    | "pending"
+    | "processing-live"
+    | "processing-expired"
+    | "retried-pending"
+    | "awaiting"
+    | "accepted"
+): void {
+  createRuntimeRunSchemaV4Fixture(filename);
+  const db = new Database(filename);
+  try {
+    db.pragma("foreign_keys = ON");
+    seedSessionAndAssignment(db);
+    insertRun(db, "run-1", "active");
+    insertRuntimeRequestEvent(db, 1, "event:pause-requested");
+    insertRuntimeRunCommand(db, { skipDispatch: true });
+    db.prepare(
+      `INSERT INTO runtime_run_command_dispatch
+         (command_id, agent_run_id, status, attempts, created_at_ms, updated_at_ms)
+       VALUES ('runtime-command-1', 'run-1', 'pending', 0, 100, 100)`
+    ).run();
+    if (state === "pending") return;
+
+    claimRuntimeRunDispatch(db, "runtime-command-1");
+    if (state === "processing-live") return;
+    if (state === "processing-expired") {
+      db.prepare(
+        `UPDATE runtime_run_command_dispatch
+         SET lease_expires_at_ms = updated_at_ms
+         WHERE command_id = 'runtime-command-1'`
+      ).run();
+      return;
+    }
+    if (state === "retried-pending") {
+      db.prepare(
+        `UPDATE runtime_run_command_dispatch
+         SET status = 'pending', lease_owner = NULL, lease_expires_at_ms = NULL,
+             last_safe_error_code = 'runtime_handle_unavailable', updated_at_ms = 102
+         WHERE command_id = 'runtime-command-1'`
+      ).run();
+      return;
+    }
+    if (state === "accepted") {
+      insertRuntimeRunReceipt(db, { outcome: "accepted" });
+    }
+    db.prepare(
+      `UPDATE runtime_run_command_dispatch
+       SET status = 'awaiting-receipt', lease_owner = NULL, lease_expires_at_ms = NULL,
+           updated_at_ms = 110
+       WHERE command_id = 'runtime-command-1'`
+    ).run();
+  } finally {
+    db.close();
+  }
+}
+
+function createRuntimeRunSchemaV4Fixture(filename: string): void {
+  // Stop the real initializer at the exact committed v4 boundary. This avoids
+  // maintaining a hand-copied approximation of the historical schema in the
+  // test while still exercising v5 against a database that was genuinely
+  // created by the v4 DDL.
+  const pragmaDescriptor = Object.getOwnPropertyDescriptor(Database.prototype, "pragma");
+  if (!pragmaDescriptor?.value) throw new Error("Expected better-sqlite3 pragma method");
+  let stoppedAtVersionFour = false;
+  Object.defineProperty(Database.prototype, "pragma", {
+    ...pragmaDescriptor,
+    value(this: Database.Database, source: string, ...args: unknown[]) {
+      if (source === "foreign_keys = OFF") {
+        stoppedAtVersionFour = true;
+        throw new Error("stop-after-v4-for-migration-fixture");
+      }
+      return Reflect.apply(pragmaDescriptor.value, this, [source, ...args]);
+    },
+  });
+  try {
+    expect(() => openTeamSessionDatabase({ filename })).toThrow(
+      /stop-after-v4-for-migration-fixture/
+    );
+  } finally {
+    Object.defineProperty(Database.prototype, "pragma", pragmaDescriptor);
+  }
+  if (!stoppedAtVersionFour) throw new Error("Expected initializer to reach schema v4");
 }

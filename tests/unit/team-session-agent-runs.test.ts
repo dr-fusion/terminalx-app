@@ -6,14 +6,16 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   TEAM_SESSION_SCHEMA_VERSION,
   TeamSessionError,
-  createTeamSessions,
+  createTeamSessionKernel,
   type ActorContext,
   type AgentRunCommandPayload,
   type RunPolicyDraft,
   type SessionCommand,
   type TeamSessions,
 } from "@/lib/team-sessions";
+import type { RuntimeLifecycleCommand, RuntimeLifecycleJournal } from "@/lib/runtime";
 import { digestRunPolicyDraft } from "@/lib/team-sessions/run-policy";
+import { createTestRuntimeCommandAuthorityIssuer } from "../helpers/runtime-authority";
 
 const TEAM_ID = "11111111-1111-4111-8111-111111111111";
 const PROJECT_ID = "22222222-2222-4222-8222-222222222222";
@@ -30,6 +32,7 @@ describe("Team Session Agent Runs", () => {
   let directory: string;
   let filename: string;
   let sessions: TeamSessions;
+  let runtimeJournal: RuntimeLifecycleJournal;
   let now: number;
   let sequence: number;
   let generated: number;
@@ -40,14 +43,17 @@ describe("Team Session Agent Runs", () => {
     now = 2_000_000_000_000;
     sequence = 0;
     generated = 0;
-    sessions = createTeamSessions({
+    const kernel = createTeamSessionKernel({
       filename,
       clock: () => now,
       idGenerator: () => {
         generated += 1;
         return `00000000-0000-4000-8000-${String(generated).padStart(12, "0")}`;
       },
+      runtimeCommandAuthorityIssuer: createTestRuntimeCommandAuthorityIssuer(),
     });
+    sessions = kernel.teamSessions;
+    runtimeJournal = kernel.runtimeLifecycleJournal;
     await dispatch({ type: "team.create", teamId: TEAM_ID, name: "Acme" });
     await dispatch({
       type: "project.create",
@@ -160,7 +166,39 @@ describe("Team Session Agent Runs", () => {
 
   async function startRun(runPolicy = policy()) {
     await enforceNextRuntime("runtime.session.ensure");
-    return dispatch(startInput(runPolicy) as unknown as Record<string, unknown>);
+    const started = await dispatch(startInput(runPolicy) as unknown as Record<string, unknown>);
+    await enforceLifecycleCommand("run.start");
+    return started;
+  }
+
+  async function enforceLifecycleCommand(expectedKind: RuntimeLifecycleCommand["kind"]) {
+    const [delivery] = await runtimeJournal.claim({
+      workerId: RUNTIME.userId,
+      limit: 1,
+      leaseDurationMs: 30_000,
+      nowMs: now,
+    });
+    expect(delivery?.command.kind).toBe(expectedKind);
+    if (!delivery) throw new Error("Expected a Runtime lifecycle delivery");
+    await runtimeJournal.complete({
+      commandId: delivery.command.commandId,
+      workerId: RUNTIME.userId,
+      expectedAttempt: delivery.attempt,
+      expectedLeaseExpiresAtMs: delivery.leaseExpiresAtMs,
+      observedAtMs: now,
+      outcome: {
+        kind: "receipt",
+        receipt: {
+          commandId: delivery.command.commandId,
+          binding: delivery.command.binding,
+          runtimeAuthorizationGeneration: delivery.command.runtimeAuthorizationGeneration,
+          outcome: "enforced",
+          effectRef: `effect:${delivery.command.commandId}`,
+          enforcedFence: delivery.command.toRunStateVersion,
+        },
+      },
+    });
+    return delivery.command;
   }
 
   async function runState() {
@@ -190,18 +228,20 @@ describe("Team Session Agent Runs", () => {
 
     const started = await startRun();
     expect(started.data).toMatchObject({
-      lifecycle: "active",
+      lifecycle: "starting",
       stateVersion: 1,
       runPolicyRevision: 1,
       goalSetRevision: 1,
       runStateRevision: 2,
     });
     expect(started.events).toHaveLength(1);
-    expect(started.events[0]?.type).toBe("run.started");
+    expect(started.events[0]?.type).toBe("run.runtime-command.requested");
 
     const state = await runState();
     expect(state).toMatchObject({
       lifecycle: "active",
+      stateVersion: 2,
+      pendingLifecycleOperation: null,
       mode: "autonomous",
       completionPolicy: "continue-until-all-goals-achieved",
       goals: [
@@ -220,7 +260,7 @@ describe("Team Session Agent Runs", () => {
         string,
         unknown
       >)
-    ).rejects.toMatchObject({ code: "conflict" } satisfies Partial<TeamSessionError>);
+    ).rejects.toMatchObject({ code: "stale-revision" } satisfies Partial<TeamSessionError>);
   });
 
   it("atomically projects only an authorized actor's mutable Run ahead of same-clock terminal history", async () => {
@@ -291,6 +331,7 @@ describe("Team Session Agent Runs", () => {
     );
 
     const started = await dispatch(startInput() as unknown as Record<string, unknown>);
+    await enforceLifecycleCommand("run.start");
     const agentRunId = started.data.agentRunId as string;
     const supervised = policy({
       mode: "supervised",
@@ -303,7 +344,7 @@ describe("Team Session Agent Runs", () => {
       expectedRunPolicyRevision: 1,
       commit: commit(supervised),
     });
-    expect(revised.data).toMatchObject({ runPolicyRevision: 2, stateVersion: 2 });
+    expect(revised.data).toMatchObject({ runPolicyRevision: 2, stateVersion: 3 });
     expect(await runState()).toMatchObject({ mode: "supervised", runPolicyRevision: 2 });
 
     await expect(
@@ -338,7 +379,7 @@ describe("Team Session Agent Runs", () => {
       "directive.queued",
       "goal-set.revised",
     ]);
-    expect(added.data).toMatchObject({ goalSetRevision: 2, stateVersion: 2 });
+    expect(added.data).toMatchObject({ goalSetRevision: 2, stateVersion: 3 });
 
     const strengthened = await dispatch({
       type: "goal.criteria.strengthen",
@@ -349,7 +390,7 @@ describe("Team Session Agent Runs", () => {
       addedCriteria: ["The regression test fails before the fix"],
       directive: { format: "plain-text", body: "Prove the regression before applying the fix." },
     });
-    expect(strengthened.data).toMatchObject({ goalSetRevision: 3, stateVersion: 3 });
+    expect(strengthened.data).toMatchObject({ goalSetRevision: 3, stateVersion: 4 });
     expect(await runState()).toMatchObject({
       goals: [
         { goalId: "goal:diagnose", position: 1 },
@@ -429,17 +470,23 @@ describe("Team Session Agent Runs", () => {
       type: "run.pause",
       sessionId: SESSION_ID,
       agentRunId,
-      expectedRunStateVersion: 1,
+      expectedRunStateVersion: 2,
       reason: "Review the trace",
     });
-    expect(paused.data).toMatchObject({ lifecycle: "paused", stateVersion: 2 });
+    expect(paused.data).toMatchObject({
+      lifecycle: "active",
+      stateVersion: 2,
+      requestedLifecycle: "paused",
+    });
+    await enforceLifecycleCommand("run.pause");
+    await expect(runState()).resolves.toMatchObject({ lifecycle: "paused", stateVersion: 3 });
 
     await expect(
       dispatch({
         type: "run.resume",
         sessionId: SESSION_ID,
         agentRunId,
-        expectedRunStateVersion: 1,
+        expectedRunStateVersion: 2,
         expectedRunPolicyRevision: 1,
         expectedRuntimeAuthorizationGeneration: 1,
       })
@@ -449,19 +496,30 @@ describe("Team Session Agent Runs", () => {
       type: "run.resume",
       sessionId: SESSION_ID,
       agentRunId,
-      expectedRunStateVersion: 2,
+      expectedRunStateVersion: 3,
       expectedRunPolicyRevision: 1,
       expectedRuntimeAuthorizationGeneration: 1,
     });
-    expect(resumed.data).toMatchObject({ lifecycle: "active", stateVersion: 3 });
+    expect(resumed.data).toMatchObject({
+      lifecycle: "paused",
+      stateVersion: 3,
+      requestedLifecycle: "active",
+    });
+    await enforceLifecycleCommand("run.resume");
 
     const stopped = await dispatch({
       type: "run.stop",
       sessionId: SESSION_ID,
       agentRunId,
-      expectedRunStateVersion: 3,
+      expectedRunStateVersion: 4,
     });
-    expect(stopped.data).toMatchObject({ lifecycle: "stopped", stateVersion: 4 });
+    expect(stopped.data).toMatchObject({
+      lifecycle: "active",
+      stateVersion: 4,
+      requestedLifecycle: "stopped",
+    });
+    await enforceLifecycleCommand("run.stop");
+    await expect(runState()).resolves.toMatchObject({ lifecycle: "stopped", stateVersion: 5 });
   });
 
   it("quarantines immediately but records emergency-stopped only after Runtime retirement", async () => {
@@ -497,7 +555,7 @@ describe("Team Session Agent Runs", () => {
     });
     expect(requested.data).toMatchObject({
       lifecycle: "pausing",
-      stateVersion: 2,
+      stateVersion: 3,
       enforcementPending: true,
       runtimeAuthorizationGeneration: 2,
     });
@@ -554,7 +612,7 @@ describe("Team Session Agent Runs", () => {
     await enforceNextRuntime("runtime.session.retire");
     expect(await runState()).toMatchObject({
       lifecycle: "emergency-stopped",
-      stateVersion: 4,
+      stateVersion: 5,
       sandboxState: "retired",
     });
     expect(

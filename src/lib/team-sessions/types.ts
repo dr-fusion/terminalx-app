@@ -800,6 +800,11 @@ export interface PublicSessionAgentRunView {
   agentRunId: string;
   lifecycle: Phase4Contracts.AgentRunLifecycle;
   stateVersion: number;
+  pendingOperation: {
+    kind: "start" | "pause" | "resume" | "stop";
+    status: "queued" | "awaiting-runtime" | "compensating";
+    requestedAtMs: number;
+  } | null;
   mode: Phase4Contracts.AgentRunMode;
   completionPolicy: Phase4Contracts.CompletionPolicy["kind"];
   runPolicyRevision: number;
