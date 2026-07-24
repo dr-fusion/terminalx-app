@@ -15,10 +15,7 @@ async function freshModules() {
 function writeUserSettings(cwd: string, models: unknown) {
   const dir = path.join(cwd, "data", "settings");
   fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(
-    path.join(dir, "user.json"),
-    JSON.stringify({ version: 1, models }, null, 2)
-  );
+  fs.writeFileSync(path.join(dir, "user.json"), JSON.stringify({ version: 1, models }, null, 2));
 }
 
 describe("resolveSessionModelSettings (feature #11)", () => {
@@ -69,8 +66,6 @@ describe("resolveSessionModelSettings (feature #11)", () => {
 
   it("never throws on a missing repo root (degrades to user/default)", async () => {
     const { resolveSessionModelSettings } = await freshModules();
-    expect(() =>
-      resolveSessionModelSettings("/path/that/does/not/exist")
-    ).not.toThrow();
+    expect(() => resolveSessionModelSettings("/path/that/does/not/exist")).not.toThrow();
   });
 });
