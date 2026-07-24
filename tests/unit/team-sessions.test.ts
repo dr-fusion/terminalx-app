@@ -565,6 +565,12 @@ describe("Team Session kernel", () => {
     try {
       database.exec(`
         PRAGMA foreign_keys = OFF;
+        DROP TRIGGER runtime_run_referenced_session_events_immutable_update;
+        DROP TRIGGER runtime_run_referenced_session_events_immutable_delete;
+        DROP TABLE runtime_run_command_effects;
+        DROP TABLE runtime_run_command_receipts;
+        DROP TABLE runtime_run_command_dispatch;
+        DROP TABLE runtime_run_commands;
         DROP TABLE grant_reviews;
         DROP TABLE action_grant_states;
         DROP TABLE action_grants;
@@ -2228,7 +2234,7 @@ describe("Team Session kernel", () => {
 
     const database = new Database(filename, { readonly: true });
     try {
-      expect(database.pragma("user_version", { simple: true })).toBe(3);
+      expect(database.pragma("user_version", { simple: true })).toBe(4);
       expect(database.pragma("foreign_key_check")).toEqual([]);
       expect(
         database

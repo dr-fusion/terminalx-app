@@ -43,6 +43,16 @@ export {
   assertRuntimeCommandAuthorityBinding,
   assertRuntimeRetireAuthorityBinding,
 } from "./runtime-authority";
+export {
+  RuntimeCommandExecutionError,
+  digestAggregateEnforcementProof,
+  digestNonDuplicateRuntimeReceipt,
+  executeRuntimeCommand,
+  type RuntimeAuthorityVerificationInput,
+  type RuntimeAuthorityVerifier,
+  type RuntimeCommandClock,
+  type RuntimeCommandExecutionErrorCode,
+} from "./runtime-command-execution";
 export type {
   AggregateEnforcementProof,
   ArtifactChunkRef,
@@ -50,6 +60,7 @@ export type {
   CheckpointReason,
   FenceAdvance,
   GrantUsageLedgerSnapshot,
+  NonDuplicateRuntimeReceipt,
   ProjectRuntimeCeiling,
   ResourceProfile,
   Runtime,
@@ -60,6 +71,8 @@ export type {
   RuntimeCursor,
   RuntimeEvent,
   RuntimeHandle,
+  RuntimeLifecycleCommand,
+  RuntimePostStartLifecycleCommand,
   RuntimeReceipt,
   RuntimeRetireAuthorityEnvelope,
   RuntimeRetireRequest,
