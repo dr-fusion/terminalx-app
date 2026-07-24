@@ -17,6 +17,7 @@ import {
   runtimeHealthClockMinimum,
   sampleRuntimeHealthClock,
 } from "./runtime-supervisor-operation";
+import { snapshotRuntimeSupervisorPortableData } from "./runtime-supervisor-snapshot";
 
 export interface RuntimeOutboxApplier {
   apply(delivery: RuntimeOutboxDelivery, signal: AbortSignal): Promise<void>;
@@ -466,7 +467,18 @@ const RUNTIME_OUTBOX_DELIVERY_KEYS = Object.freeze([
 ] as const);
 
 function snapshotRuntimeOutboxDelivery(delivery: RuntimeOutboxDelivery): RuntimeOutboxDelivery {
-  const root = snapshotExactDataRecord(delivery, RUNTIME_OUTBOX_DELIVERY_KEYS);
+  // Hosted payloads carry a nested immutable Runtime binding. Detach the whole
+  // delivery before acquiring the durable dispatch interlock so a caller-owned
+  // binding, proxy, or accessor cannot retarget provider work after the lease
+  // identity has been accepted.
+  let detached: unknown;
+  try {
+    detached = snapshotRuntimeSupervisorPortableData(delivery);
+  } catch (error) {
+    if (error instanceof RuntimeEffectError) throw error;
+    throw invalidRuntimeClaim();
+  }
+  const root = snapshotExactDataRecord(detached, RUNTIME_OUTBOX_DELIVERY_KEYS);
   const payload = Object.freeze(
     snapshotExactDataRecordOneOf(root.payload, runtimeOutboxPayloadKeySets(root.kind))
   );
@@ -538,9 +550,30 @@ function snapshotExactDataRecordOneOf(
 function runtimeOutboxPayloadKeySets(kind: unknown): readonly (readonly string[])[] {
   switch (kind) {
     case "runtime.session.ensure":
-      return [["sessionId", "runtimeKind", "tmuxName", "runtimeAuthorizationGeneration"]];
+      return [
+        ["sessionId", "runtimeKind", "tmuxName", "runtimeAuthorizationGeneration"],
+        [
+          "sessionId",
+          "runtimeKind",
+          "runtimeAuthorizationGeneration",
+          "binding",
+          "assignmentPlanRef",
+          "assignmentPlanDigest",
+        ],
+      ];
     case "runtime.authorization.fence":
-      return [["sessionId", "reason", "runtimeAuthorizationGeneration"]];
+      return [
+        ["sessionId", "reason", "runtimeAuthorizationGeneration"],
+        [
+          "sessionId",
+          "reason",
+          "runtimeAuthorizationGeneration",
+          "runtimeKind",
+          "binding",
+          "assignmentPlanRef",
+          "assignmentPlanDigest",
+        ],
+      ];
     case "runtime.session.retire":
       return [
         ["sessionId", "runtimeAuthorizationGeneration"],
@@ -553,6 +586,20 @@ function runtimeOutboxPayloadKeySets(kind: unknown): readonly (readonly string[]
           "runtimeAssignmentGeneration",
           "sandboxId",
           "sandboxGeneration",
+        ],
+        [
+          "sessionId",
+          "runtimeAuthorizationGeneration",
+          "reason",
+          "agentRunId",
+          "runtimeAssignmentId",
+          "runtimeAssignmentGeneration",
+          "sandboxId",
+          "sandboxGeneration",
+          "runtimeKind",
+          "binding",
+          "assignmentPlanRef",
+          "assignmentPlanDigest",
         ],
       ];
     default:

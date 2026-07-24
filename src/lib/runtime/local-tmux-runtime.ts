@@ -273,6 +273,9 @@ export class LocalTmuxRuntime {
     delivery: Extract<RuntimeOutboxDelivery, { kind: "runtime.session.ensure" }>,
     signal: AbortSignal
   ): Promise<void> {
+    if (delivery.payload.runtimeKind !== "local-tmux") {
+      throw new RuntimeEffectError("runtime_invalid_state", false);
+    }
     const { sessionId, tmuxName, runtimeAuthorizationGeneration } = delivery.payload;
     validateBinding(sessionId, tmuxName, runtimeAuthorizationGeneration);
     const desiredState = await this.runtimeEnsureState(
@@ -365,6 +368,9 @@ export class LocalTmuxRuntime {
     signal: AbortSignal,
     allowAbsent: boolean
   ): Promise<void> {
+    if ("runtimeKind" in delivery.payload) {
+      throw new RuntimeEffectError("runtime_invalid_state", false);
+    }
     const { sessionId, runtimeAuthorizationGeneration } = delivery.payload;
     validateGeneration(runtimeAuthorizationGeneration);
     validateCanonicalSessionId(sessionId);
@@ -462,6 +468,9 @@ export class LocalTmuxRuntime {
     delivery: Extract<RuntimeOutboxDelivery, { kind: "runtime.session.ensure" }>,
     signal: AbortSignal
   ): Promise<void> {
+    if (delivery.payload.runtimeKind !== "local-tmux") {
+      throw new RuntimeEffectError("runtime_invalid_state", false);
+    }
     const { sessionId, tmuxName, runtimeAuthorizationGeneration } = delivery.payload;
     validateBinding(sessionId, tmuxName, runtimeAuthorizationGeneration);
     const initialState = await this.runtimeEnsureState(
@@ -629,6 +638,9 @@ export class LocalTmuxRuntime {
     delivery: Extract<RuntimeOutboxDelivery, { kind: "runtime.session.retire" }>,
     signal: AbortSignal
   ): Promise<void> {
+    if ("runtimeKind" in delivery.payload) {
+      throw new RuntimeEffectError("runtime_invalid_state", false);
+    }
     const { sessionId, runtimeAuthorizationGeneration } = delivery.payload;
     validateGeneration(runtimeAuthorizationGeneration);
     validateCanonicalSessionId(sessionId);
