@@ -1,23 +1,17 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getUserScoping } from "@/lib/session-scope";
 import { listDevicesForUser, revokeDevice } from "@/lib/devices";
 import { audit } from "@/lib/audit-log";
+import { resolveRequestActor } from "@/lib/request-actor";
 
 // GET /api/auth/devices — list paired devices for the current user
 // DELETE /api/auth/devices?id=dvc_... — revoke a device
 
-function requireUserId(req: NextRequest): string | null {
-  const id = req.headers.get("x-user-id");
-  return id && id.length ? id : null;
-}
-
 export async function GET(req: NextRequest) {
-  const { hasIdentity } = getUserScoping(req.headers);
-  if (!hasIdentity) {
+  const actor = await resolveRequestActor(req.headers);
+  if (!actor) {
     return NextResponse.json({ error: "Not authenticated" }, { status: 401 });
   }
-  const userId = requireUserId(req) ?? "single-user";
-  const devices = listDevicesForUser(userId).map((d) => ({
+  const devices = listDevicesForUser(actor.userId).map((d) => ({
     id: d.id,
     name: d.name,
     createdAt: d.createdAt,
@@ -28,21 +22,21 @@ export async function GET(req: NextRequest) {
 }
 
 export async function DELETE(req: NextRequest) {
-  const { hasIdentity } = getUserScoping(req.headers);
-  if (!hasIdentity) {
+  const actor = await resolveRequestActor(req.headers);
+  if (!actor) {
     return NextResponse.json({ error: "Not authenticated" }, { status: 401 });
   }
   const deviceId = req.nextUrl.searchParams.get("id");
   if (!deviceId) {
     return NextResponse.json({ error: "Missing device id" }, { status: 400 });
   }
-  const userId = requireUserId(req) ?? "single-user";
-  const ok = await revokeDevice(deviceId, userId);
+  const ok = await revokeDevice(deviceId, actor.userId);
   if (!ok) {
     return NextResponse.json({ error: "Device not found" }, { status: 404 });
   }
   audit("device_revoked", {
-    username: req.headers.get("x-username") ?? undefined,
+    username: actor.username,
+    userId: actor.userId,
     detail: deviceId,
   });
   return NextResponse.json({ success: true });

@@ -522,15 +522,16 @@ export class TelegramMessageAuditStore {
   private closed = false;
 
   constructor(filename: string) {
-    const resolved = filename === ":memory:" ? filename : path.resolve(filename);
+    const resolved =
+      filename === ":memory:" ? filename : path.resolve(/* turbopackIgnore: true */ filename);
     if (resolved !== ":memory:") {
-      const parent = path.dirname(resolved);
+      const parent = path.dirname(/* turbopackIgnore: true */ resolved);
       // Create missing directories privately, but never chmod an existing
       // operator-selected parent because it may be shared by other services.
-      fs.mkdirSync(parent, { recursive: true, mode: 0o700 });
+      fs.mkdirSync(/* turbopackIgnore: true */ parent, { recursive: true, mode: 0o700 });
       this.filename = resolved;
     }
-    this.db = new Database(resolved);
+    this.db = new Database(/* turbopackIgnore: true */ resolved);
     // Secure the main file before enabling WAL so its sidecars inherit a
     // private mode rather than the process's potentially permissive umask.
     this.secureDatabaseFiles();
@@ -552,7 +553,9 @@ export class TelegramMessageAuditStore {
       `${this.filename}-shm`,
       `${this.filename}-journal`,
     ]) {
-      if (fs.existsSync(filename)) fs.chmodSync(filename, 0o600);
+      if (fs.existsSync(/* turbopackIgnore: true */ filename)) {
+        fs.chmodSync(/* turbopackIgnore: true */ filename, 0o600);
+      }
     }
   }
 
@@ -1102,14 +1105,14 @@ let defaultStore: TelegramMessageAuditStore | null = null;
 export function getTelegramMessageAuditStore(): TelegramMessageAuditStore {
   if (defaultStore) return defaultStore;
   const dataDir = process.env.TERMINALX_DATA_DIR
-    ? path.resolve(process.env.TERMINALX_DATA_DIR)
-    : path.join(process.cwd(), "data");
+    ? path.resolve(/* turbopackIgnore: true */ process.env.TERMINALX_DATA_DIR)
+    : path.join(/* turbopackIgnore: true */ process.cwd(), "data");
   // This is a trusted operator-controlled persistence path, not a path from an
   // HTTP/Telegram user. It is intentionally allowed outside TERMINUS_ROOT so
   // Docker volumes and dedicated data disks can hold the audit database.
   const filename = process.env.TERMINALX_TELEGRAM_MESSAGE_DB_PATH
-    ? path.resolve(process.env.TERMINALX_TELEGRAM_MESSAGE_DB_PATH)
-    : path.join(dataDir, "telegram-messages.sqlite");
+    ? path.resolve(/* turbopackIgnore: true */ process.env.TERMINALX_TELEGRAM_MESSAGE_DB_PATH)
+    : path.join(/* turbopackIgnore: true */ dataDir, "telegram-messages.sqlite");
   defaultStore = createTelegramMessageAuditStore(filename);
   return defaultStore;
 }

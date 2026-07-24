@@ -1,12 +1,9 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  // NEVER put secrets in the `env` block — it ships to client bundles when
-  // referenced by client code. Edge middleware reads process.env at runtime,
-  // so no inlining is needed.
-  env: {
-    TERMINALX_AUTH_MODE: process.env.TERMINALX_AUTH_MODE ?? "none",
-  },
+  // Do not use NextConfig.env for authentication or security configuration.
+  // Those values are compiled into bundles at image-build time. Proxy and
+  // route handlers must read the container's runtime environment instead.
   async headers() {
     return [
       {

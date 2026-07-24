@@ -25,9 +25,9 @@ function getLogPaths(): string[] {
   return raw.split(",").map((p) => {
     const trimmed = p.trim();
     if (trimmed.startsWith("~")) {
-      return path.join(process.env.HOME || "/", trimmed.slice(1));
+      return path.join(/* turbopackIgnore: true */ process.env.HOME || "/", trimmed.slice(1));
     }
-    return path.resolve(trimmed);
+    return path.resolve(/* turbopackIgnore: true */ trimmed);
   });
 }
 
@@ -35,7 +35,7 @@ function getLogPaths(): string[] {
  * Validate that a file path is within one of the allowed log directories.
  */
 function validateLogPath(filePath: string): string {
-  const resolved = path.resolve(filePath);
+  const resolved = path.resolve(/* turbopackIgnore: true */ filePath);
   const allowedDirs = getLogPaths();
 
   const isAllowed = allowedDirs.some(
@@ -48,7 +48,7 @@ function validateLogPath(filePath: string): string {
 
   // Follow symlinks and re-check to prevent symlink traversal
   try {
-    const realPath = fs.realpathSync(resolved);
+    const realPath = fs.realpathSync(/* turbopackIgnore: true */ resolved);
     const realIsAllowed = allowedDirs.some(
       (dir) => realPath.startsWith(dir + path.sep) || realPath === dir
     );
@@ -75,11 +75,11 @@ export function createLogStream(filePath: string): LogStream {
     throw new Error("Only .log, .out, and .err files can be streamed");
   }
 
-  if (!fs.existsSync(safePath)) {
+  if (!fs.existsSync(/* turbopackIgnore: true */ safePath)) {
     throw new Error("Log file does not exist");
   }
 
-  const stats = fs.statSync(safePath);
+  const stats = fs.statSync(/* turbopackIgnore: true */ safePath);
   if (!stats.isFile()) {
     throw new Error("Path is not a file");
   }
@@ -135,12 +135,14 @@ export function listLogFiles(): LogFileEntry[] {
 
   for (const dir of logPaths) {
     try {
-      if (!fs.existsSync(dir)) continue;
+      if (!fs.existsSync(/* turbopackIgnore: true */ dir)) continue;
 
-      const stats = fs.statSync(dir);
+      const stats = fs.statSync(/* turbopackIgnore: true */ dir);
       if (!stats.isDirectory()) continue;
 
-      const entries = fs.readdirSync(dir, { withFileTypes: true });
+      const entries = fs.readdirSync(/* turbopackIgnore: true */ dir, {
+        withFileTypes: true,
+      });
       for (const entry of entries) {
         if (
           entry.isFile() &&
@@ -148,9 +150,9 @@ export function listLogFiles(): LogFileEntry[] {
             entry.name.endsWith(".out") ||
             entry.name.endsWith(".err"))
         ) {
-          const fullPath = path.join(dir, entry.name);
+          const fullPath = path.join(/* turbopackIgnore: true */ dir, entry.name);
           try {
-            const fileStat = fs.statSync(fullPath);
+            const fileStat = fs.statSync(/* turbopackIgnore: true */ fullPath);
             results.push({
               name: entry.name,
               path: fullPath,

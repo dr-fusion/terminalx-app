@@ -28,9 +28,11 @@ async function loadRoute() {
 describe("GET /api/harnesses/opencode/providers", () => {
   beforeEach(() => {
     process.env.TERMINALX_AUTH_MODE = "none";
+    process.env.TERMINALX_ALLOW_AUTH_NONE = "true";
   });
   afterEach(() => {
     delete process.env.TERMINALX_AUTH_MODE;
+    delete process.env.TERMINALX_ALLOW_AUTH_NONE;
   });
 
   it("returns the 7 featured rows + total 96 by default", async () => {
@@ -70,6 +72,7 @@ describe("POST/DELETE /api/harnesses/opencode/providers (repo scope, fs)", () =>
     root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "tx-oc-route-")));
     process.env.TERMINUS_ROOT = root;
     process.env.TERMINALX_AUTH_MODE = "none";
+    process.env.TERMINALX_ALLOW_AUTH_NONE = "true";
     repoRoot = path.join(root, "repo");
     fs.mkdirSync(repoRoot, { recursive: true });
   });
@@ -77,6 +80,7 @@ describe("POST/DELETE /api/harnesses/opencode/providers (repo scope, fs)", () =>
     fs.rmSync(root, { recursive: true, force: true });
     delete process.env.TERMINUS_ROOT;
     delete process.env.TERMINALX_AUTH_MODE;
+    delete process.env.TERMINALX_ALLOW_AUTH_NONE;
   });
 
   it("POST persists a provider to .terminalx/settings.toml (repo scope) and increments the count", async () => {

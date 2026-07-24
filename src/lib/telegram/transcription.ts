@@ -42,7 +42,7 @@ function whisperMainPath(): string {
 
 function ffmpegPath(): string {
   const explicitPath = process.env.TERMINALX_FFMPEG_PATH?.trim();
-  if (explicitPath) return path.resolve(explicitPath);
+  if (explicitPath) return path.resolve(/* turbopackIgnore: true */ explicitPath);
   const platformPackage = FFMPEG_PACKAGES[`${process.platform}:${process.arch}`];
   if (!platformPackage) {
     throw new Error(`unsupported ffmpeg platform: ${process.platform}/${process.arch}`);
@@ -55,7 +55,7 @@ function ffmpegPath(): string {
     platformPackage,
     executable
   );
-  if (!fs.existsSync(binaryPath)) {
+  if (!fs.existsSync(/* turbopackIgnore: true */ binaryPath)) {
     throw new Error("ffmpeg binary is missing; run `npm ci` or set TERMINALX_FFMPEG_PATH");
   }
   return binaryPath;
@@ -65,7 +65,10 @@ function modelPath(): { name: string; path: string } {
   const explicitPath = process.env.TERMINALX_TELEGRAM_TRANSCRIBE_MODEL_PATH?.trim();
   const name = (process.env.TERMINALX_TELEGRAM_TRANSCRIBE_MODEL || DEFAULT_MODEL).trim();
   if (explicitPath) {
-    return { name: path.basename(explicitPath), path: path.resolve(explicitPath) };
+    return {
+      name: path.basename(explicitPath),
+      path: path.resolve(/* turbopackIgnore: true */ explicitPath),
+    };
   }
   const filename = MODEL_FILES[name];
   if (!filename) {
@@ -105,15 +108,18 @@ export async function transcribeAudioFile(audioPath: string): Promise<{
   durationMs: number;
 }> {
   const startedAt = Date.now();
-  const sourcePath = path.resolve(audioPath);
-  const wavPath = path.join(path.dirname(sourcePath), `${path.basename(sourcePath)}.16k.wav`);
+  const sourcePath = path.resolve(/* turbopackIgnore: true */ audioPath);
+  const wavPath = path.join(
+    /* turbopackIgnore: true */ path.dirname(sourcePath),
+    `${path.basename(sourcePath)}.16k.wav`
+  );
   const mainPath = whisperMainPath();
-  if (!fs.existsSync(mainPath)) {
+  if (!fs.existsSync(/* turbopackIgnore: true */ mainPath)) {
     throw new Error("voice transcription is not set up; run `npm run setup:whisper -- tiny.en`");
   }
 
   const model = modelPath();
-  if (!fs.existsSync(model.path)) {
+  if (!fs.existsSync(/* turbopackIgnore: true */ model.path)) {
     throw new Error(
       `transcription model ${model.name} is missing; run \`npm run setup:whisper -- ${model.name}\``
     );
@@ -154,7 +160,7 @@ export async function transcribeAudioFile(audioPath: string): Promise<{
     throw new Error(`voice transcription failed: ${commandError(err)}`);
   } finally {
     try {
-      fs.rmSync(wavPath, { force: true });
+      fs.rmSync(/* turbopackIgnore: true */ wavPath, { force: true });
     } catch {
       /* ignore */
     }
