@@ -7,7 +7,9 @@ export async function GET(req: NextRequest) {
 
   if (authMode === "none") {
     return NextResponse.json({
+      userId: "single-user",
       username: "admin",
+      displayName: "admin",
       role: "admin",
       authMode: "none",
     });
@@ -28,7 +30,9 @@ export async function GET(req: NextRequest) {
   }
 
   return NextResponse.json({
+    userId: payload.userId,
     username: payload.username,
+    displayName: payload.username,
     role: payload.role,
     authMode,
   });

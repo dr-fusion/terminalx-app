@@ -7,6 +7,8 @@ import {
   TEAM_SESSION_SCHEMA_VERSION,
   TeamSessionError,
   createTeamSessions,
+  type SessionCommand,
+  type SessionEvent,
   type TeamSessions,
 } from "@/lib/team-sessions";
 import {
@@ -21,6 +23,7 @@ import {
   handleSessionList,
   handleTeamAccess,
   handleTeamSessionCommand,
+  handleWorkspaceDiscovery,
   type TeamSessionHttpDependencies,
 } from "@/lib/team-sessions/http";
 import type { RequestActor } from "@/lib/request-actor";
@@ -321,6 +324,197 @@ describe("Team Session HTTP adapter", () => {
           message: "Request contains an unknown command field",
         },
       });
+    }
+  });
+
+  it("admits only the public conversation command fields and keeps item IDs server-owned", async () => {
+    const dispatched: SessionCommand[] = [];
+    const captureSessions = {
+      dispatch: async (command: SessionCommand) => {
+        dispatched.push(command);
+        return {
+          accepted: true,
+          acceptedSequence: dispatched.length,
+          commandType: command.type,
+          replayed: false,
+          data: {},
+          events: [],
+        };
+      },
+    } as unknown as TeamSessions;
+    const conversationDependencies = { ...dependencies, teamSessions: captureSessions };
+    const commands = [
+      { type: "comment.add", sessionId: CALLER_SESSION_ID, body: "Please check this." },
+      { type: "suggestion.add", sessionId: CALLER_SESSION_ID, body: "Run the tests." },
+      {
+        type: "suggestion.resolve",
+        sessionId: CALLER_SESSION_ID,
+        suggestionId: "suggestion-1",
+        resolution: "accept",
+        expectedSuggestionVersion: 1,
+        expectedSteeringRevision: 2,
+      },
+      {
+        type: "suggestion.resolve",
+        sessionId: CALLER_SESSION_ID,
+        suggestionId: "suggestion-2",
+        resolution: "reject",
+        expectedSuggestionVersion: 1,
+        expectedSteeringRevision: 2,
+      },
+      {
+        type: "suggestion.resolve",
+        sessionId: CALLER_SESSION_ID,
+        suggestionId: "suggestion-3",
+        resolution: "accept-edited",
+        editedBody: "Run only the focused tests.",
+        expectedSuggestionVersion: 1,
+        expectedSteeringRevision: 2,
+      },
+      {
+        type: "directive.enqueue",
+        sessionId: CALLER_SESSION_ID,
+        body: "Continue with the focused tests.",
+        expectedSteeringRevision: 2,
+      },
+    ] as const;
+
+    for (const [index, command] of commands.entries()) {
+      const response = await handleTeamSessionCommand(
+        commandRequest(command, `conversation-command-${index}`),
+        conversationDependencies
+      );
+      expect(response.status).toBe(200);
+    }
+
+    expect(dispatched).toHaveLength(commands.length);
+    for (const [index, command] of commands.entries()) {
+      expect(dispatched[index]).toMatchObject({
+        ...command,
+        schemaVersion: TEAM_SESSION_SCHEMA_VERSION,
+        actor: { kind: "human", userId: ALICE.userId, displayName: ALICE.displayName },
+      });
+    }
+    expect(dispatched[0]).not.toHaveProperty("commentId");
+    expect(dispatched[1]).not.toHaveProperty("suggestionId");
+    expect(dispatched[5]).not.toHaveProperty("directiveId");
+  });
+
+  it("projects command response events without changing intentional one-time result data", async () => {
+    const sourceEvent: SessionEvent = {
+      schemaVersion: TEAM_SESSION_SCHEMA_VERSION,
+      eventId: "event-command-response",
+      sessionId: CALLER_SESSION_ID,
+      sequence: 7,
+      type: "session.invitation.created",
+      occurredAtMs: 2_000_000_000_000,
+      actor: { kind: "human", userId: ALICE.userId, displayName: ALICE.displayName },
+      source: { scope: "private:adapter", key: "private-idempotency-key" },
+      payload: {
+        invitationId: "invitation-1",
+        apiToken: "must-not-leak-from-event",
+      },
+    };
+    const commandSessions = {
+      dispatch: async () => ({
+        accepted: true,
+        acceptedSequence: 7,
+        commandType: "comment.add",
+        replayed: false,
+        data: { invitationToken: "intentional-one-time-token" },
+        events: [sourceEvent],
+      }),
+    } as unknown as TeamSessions;
+
+    const response = await handleTeamSessionCommand(
+      commandRequest(
+        { type: "comment.add", sessionId: CALLER_SESSION_ID, body: "A comment" },
+        "project-command-events"
+      ),
+      { ...dependencies, teamSessions: commandSessions }
+    );
+    const body = await responseBody(response);
+    const result = body.result as Record<string, unknown>;
+    const [event] = result.events as Array<Record<string, unknown>>;
+
+    expect(response.status).toBe(200);
+    expect(result.data).toEqual({ invitationToken: "intentional-one-time-token" });
+    expect(event).toMatchObject({
+      eventId: sourceEvent.eventId,
+      actor: sourceEvent.actor,
+      sourceAdapter: "internal",
+      payload: { invitationId: "invitation-1", apiToken: "[redacted]" },
+    });
+    expect(event).not.toHaveProperty("source");
+    expect(sourceEvent.payload.apiToken).toBe("must-not-leak-from-event");
+  });
+
+  it("rejects client conversation IDs, source data, and invalid suggestion resolution edits", async () => {
+    const invalidCommands = [
+      {
+        type: "comment.add",
+        sessionId: CALLER_SESSION_ID,
+        body: "Comment",
+        commentId: "caller-comment",
+      },
+      {
+        type: "suggestion.add",
+        sessionId: CALLER_SESSION_ID,
+        body: "Suggestion",
+        suggestionId: "caller-suggestion",
+      },
+      {
+        type: "directive.enqueue",
+        sessionId: CALLER_SESSION_ID,
+        body: "Directive",
+        expectedSteeringRevision: 2,
+        directiveId: "caller-directive",
+      },
+      {
+        type: "comment.add",
+        sessionId: CALLER_SESSION_ID,
+        body: "Comment",
+        source: { scope: "caller", key: "caller" },
+      },
+      {
+        type: "suggestion.resolve",
+        sessionId: CALLER_SESSION_ID,
+        suggestionId: "suggestion-1",
+        resolution: "accept",
+        editedBody: "Not allowed",
+        expectedSuggestionVersion: 1,
+        expectedSteeringRevision: 2,
+      },
+      {
+        type: "suggestion.resolve",
+        sessionId: CALLER_SESSION_ID,
+        suggestionId: "suggestion-1",
+        resolution: "reject",
+        editedBody: "Not allowed",
+        expectedSuggestionVersion: 1,
+        expectedSteeringRevision: 2,
+      },
+      {
+        type: "suggestion.resolve",
+        sessionId: CALLER_SESSION_ID,
+        suggestionId: "suggestion-1",
+        resolution: "accept-edited",
+        expectedSuggestionVersion: 1,
+        expectedSteeringRevision: 2,
+      },
+      {
+        type: "suggestion.resolve",
+        sessionId: CALLER_SESSION_ID,
+        suggestionId: "suggestion-1",
+        resolution: "merge",
+        expectedSuggestionVersion: 1,
+        expectedSteeringRevision: 2,
+      },
+    ];
+
+    for (const [index, command] of invalidCommands.entries()) {
+      const response = await post(command, `invalid-conversation-command-${index}`);
+      expect(response.status).toBe(400);
     }
   });
 
@@ -663,9 +857,13 @@ describe("Team Session HTTP adapter", () => {
     expect((await handleTeamSessionCommand(wrongMediaType, dependencies)).status).toBe(415);
   });
 
-  it("returns authorized list, get, events, admission, Team, and Project projections", async () => {
+  it("returns minimized discovery, inbox, detail, events, and administrative projections", async () => {
     await bootstrap();
 
+    const discovery = await handleWorkspaceDiscovery(
+      getRequest("/api/team-sessions/discovery"),
+      dependencies
+    );
     const list = await handleSessionList(
       getRequest(`/api/team-sessions?teamId=${teamId}`),
       dependencies
@@ -699,13 +897,50 @@ describe("Team Session HTTP adapter", () => {
     expect((await responseBody(list)).sessions).toEqual([
       expect.objectContaining({ sessionId, steeringPolicy: "shared" }),
     ]);
-    expect((await responseBody(get)).session).toMatchObject({
+    expect((await responseBody(discovery)).discovery).toMatchObject({
+      teams: [
+        {
+          teamId,
+          name: "Acme",
+          createdAtMs: 2_000_000_000_000,
+          viewerMembership: { role: "owner", version: 1 },
+          capabilities: { createProject: true, manageMemberships: true },
+          projects: [
+            expect.objectContaining({
+              projectId,
+              visibility: "content",
+              capabilities: { viewContent: true, startSession: true, manageAccess: true },
+            }),
+          ],
+        },
+      ],
+    });
+    const publicSession = (await responseBody(get)).session as Record<string, unknown>;
+    expect(publicSession).toMatchObject({
       sessionId,
       projectId,
-      runtime: { tmuxName: deriveHttpTmuxName(sessionId) },
+      runtime: {
+        kind: "local-tmux",
+        authorizationGeneration: 1,
+        authorizationState: "pending",
+      },
+      viewer: {
+        userId: ALICE.userId,
+        displayName: ALICE.displayName,
+        capabilities: { addComment: true, enqueueDirective: true, mutateTerminal: false },
+      },
     });
+    const serializedPublicSession = JSON.stringify(publicSession);
+    expect(serializedPublicSession).not.toContain(deriveHttpTmuxName(sessionId));
+    expect(serializedPublicSession).not.toContain("tmuxName");
+    expect(serializedPublicSession).not.toContain("invitations");
+    expect(serializedPublicSession).not.toContain("revokedAtMs");
     expect((await responseBody(events)).events).toEqual([
-      expect.objectContaining({ sessionId, type: "session.started" }),
+      expect.objectContaining({
+        sessionId,
+        type: "session.started",
+        sourceAdapter: "web",
+      }),
     ]);
     expect((await responseBody(admission)).admission).toMatchObject({
       sessionId,
@@ -716,16 +951,104 @@ describe("Team Session HTTP adapter", () => {
       projectId,
       teamId,
     });
-    for (const response of [list, get, events, admission, team, project]) {
+    for (const response of [discovery, list, get, events, admission, team, project]) {
       expect(response.headers.get("cache-control")).toBe("private, no-store");
       expect(response.headers.get("vary")).toBe("Cookie, Authorization");
     }
+  });
+
+  it("returns the bounded redacted public event projection over HTTP", async () => {
+    let deep: unknown = { visible: "too-deep" };
+    for (let index = 0; index < 18; index += 1) deep = { nested: deep };
+    const many = Object.fromEntries(
+      Array.from({ length: 1_100 }, (_entry, index) => [`field${index}`, index])
+    );
+    const sourceEvent: SessionEvent = {
+      schemaVersion: TEAM_SESSION_SCHEMA_VERSION,
+      eventId: "event-public-projection",
+      sessionId: CALLER_SESSION_ID,
+      sequence: 42,
+      type: "session.test-event",
+      occurredAtMs: 2_000_000_000_000,
+      actor: { kind: "human", userId: ALICE.userId, displayName: ALICE.displayName },
+      source: { scope: "private:adapter", key: "private-idempotency-key" },
+      payload: {
+        visible: "ok",
+        apiToken: "must-not-leak",
+        apiKey: "must-not-leak",
+        encryptionKey: "must-not-leak",
+        mnemonic: "must-not-leak",
+        recoveryPhrase: "must-not-leak",
+        authorization: "must-not-leak",
+        nested: [{ privateKey: "must-not-leak", safe: true }],
+        runtimeAuthorizationGeneration: 12,
+        deep,
+        many,
+      },
+    };
+    const eventSessions = {
+      inspect: async () => [sourceEvent],
+    } as unknown as TeamSessions;
+
+    const response = await handleSessionEvents(
+      getRequest(`/api/team-sessions/sessions/${CALLER_SESSION_ID}/events`),
+      CALLER_SESSION_ID,
+      { ...dependencies, teamSessions: eventSessions }
+    );
+    const responseJson = await responseBody(response);
+    const [event] = responseJson.events as Array<Record<string, unknown>>;
+    const payload = event?.payload as Record<string, unknown>;
+
+    expect(response.status).toBe(200);
+    expect(Object.keys(event ?? {}).sort()).toEqual([
+      "actor",
+      "eventId",
+      "occurredAtMs",
+      "payload",
+      "schemaVersion",
+      "sequence",
+      "sessionId",
+      "sourceAdapter",
+      "type",
+    ]);
+    expect(event).toMatchObject({
+      schemaVersion: TEAM_SESSION_SCHEMA_VERSION,
+      eventId: sourceEvent.eventId,
+      sessionId: CALLER_SESSION_ID,
+      sequence: 42,
+      type: sourceEvent.type,
+      occurredAtMs: sourceEvent.occurredAtMs,
+      actor: sourceEvent.actor,
+      sourceAdapter: "internal",
+      payload: {
+        visible: "ok",
+        apiToken: "[redacted]",
+        apiKey: "[redacted]",
+        encryptionKey: "[redacted]",
+        mnemonic: "[redacted]",
+        recoveryPhrase: "[redacted]",
+        authorization: "[redacted]",
+        nested: [{ privateKey: "[redacted]", safe: true }],
+        runtimeAuthorizationGeneration: 12,
+      },
+    });
+    expect(event).not.toHaveProperty("source");
+    expect(JSON.stringify(payload.deep)).toContain("[redacted]");
+    expect(Object.keys(payload.many as Record<string, unknown>).length).toBeLessThan(1_100);
+    expect(sourceEvent.payload).toMatchObject({
+      apiToken: "must-not-leak",
+      nested: [{ privateKey: "must-not-leak" }],
+    });
   });
 
   it("keeps private Session misses and higher-scope access uniformly unavailable", async () => {
     await bootstrap();
     const bobDependencies = { ...dependencies, resolveActor: actorResolver(BOB) };
 
+    const discovery = await handleWorkspaceDiscovery(
+      getRequest("/api/team-sessions/discovery"),
+      bobDependencies
+    );
     const list = await handleSessionList(getRequest("/api/team-sessions"), bobDependencies);
     const get = await handleSessionGet(
       getRequest(`/api/team-sessions/sessions/${sessionId}`),
@@ -743,6 +1066,10 @@ describe("Team Session HTTP adapter", () => {
       bobDependencies
     );
 
+    expect(await responseBody(discovery)).toEqual({
+      discovery: { teams: [] },
+    });
+    expect(discovery.headers.get("cache-control")).toBe("private, no-store");
     expect(await responseBody(list)).toEqual({ sessions: [] });
     expect(await responseBody(events)).toEqual({ events: [] });
     for (const response of [get, team]) {

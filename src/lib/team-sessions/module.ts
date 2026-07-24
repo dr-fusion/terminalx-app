@@ -13,25 +13,39 @@ import {
   type ProjectRole,
   type ProjectAccessQuery,
   type ProjectAccessView,
+  type PublicOpenHandoffView,
+  type PublicSessionIdentityView,
+  type PublicSessionParticipantView,
+  type PublicSessionResponsibilityView,
+  type PublicSessionShareView,
   type RuntimeOutboxClaimOptions,
   type RuntimeOutboxDelivery,
   type RuntimeOutboxKind,
   type SessionCommand,
   type SessionAdmissionQuery,
   type SessionAdmissionView,
+  type SessionDetailQuery,
+  type SessionDetailView,
   type SessionEvent,
   type SessionEventsQuery,
   type SessionGetQuery,
+  type SessionInboxItemView,
+  type SessionInboxQuery,
   type SessionListQuery,
   type SessionParticipantView,
   type SessionResponsibility,
   type SessionTerminalAuthorizationQuery,
   type SessionView,
+  type SessionViewerCapabilities,
+  type SessionViewerView,
   type TeamRole,
   type TeamAccessQuery,
   type TeamAccessView,
   type TeamSessions,
   type TerminalAuthorization,
+  type WorkspaceDiscoveryQuery,
+  type WorkspaceDiscoveryView,
+  type WorkspaceProjectView,
 } from "./types";
 
 type SqlValue = string | number | null;
@@ -59,6 +73,11 @@ const RESPONSIBILITY_ORDER: SessionResponsibility[] = [
 ];
 
 const DEFAULT_HANDOFF_TTL_MS = 24 * 60 * 60 * 1_000;
+const MAX_CONVERSATION_BODY_BYTES = 16 * 1_024;
+const MAX_PENDING_DIRECTIVES_PER_AUTHOR = 64;
+const MAX_PENDING_DIRECTIVES_PER_SESSION = 256;
+
+type ConversationIdentityKind = "comment" | "suggestion" | "resolution" | "directive";
 
 type RuntimeOutboxPayload<K extends RuntimeOutboxKind> = Extract<
   RuntimeOutboxDelivery,
@@ -147,6 +166,9 @@ class SqliteTeamSessions implements TeamSessions {
 
   inspect(query: SessionGetQuery): Promise<SessionView | null>;
   inspect(query: SessionListQuery): Promise<SessionView[]>;
+  inspect(query: WorkspaceDiscoveryQuery): Promise<WorkspaceDiscoveryView>;
+  inspect(query: SessionInboxQuery): Promise<SessionInboxItemView[]>;
+  inspect(query: SessionDetailQuery): Promise<SessionDetailView | null>;
   inspect(query: SessionEventsQuery): Promise<SessionEvent[]>;
   inspect(query: SessionTerminalAuthorizationQuery): Promise<TerminalAuthorization>;
   inspect(query: SessionAdmissionQuery): Promise<SessionAdmissionView>;
@@ -156,6 +178,9 @@ class SqliteTeamSessions implements TeamSessions {
     query:
       | SessionGetQuery
       | SessionListQuery
+      | WorkspaceDiscoveryQuery
+      | SessionInboxQuery
+      | SessionDetailQuery
       | SessionEventsQuery
       | SessionTerminalAuthorizationQuery
       | SessionAdmissionQuery
@@ -165,6 +190,9 @@ class SqliteTeamSessions implements TeamSessions {
     | SessionView
     | null
     | SessionView[]
+    | WorkspaceDiscoveryView
+    | SessionInboxItemView[]
+    | SessionDetailView
     | SessionEvent[]
     | TerminalAuthorization
     | SessionAdmissionView
@@ -190,6 +218,22 @@ class SqliteTeamSessions implements TeamSessions {
             : null;
         case "session.list":
           return this.listVisibleSessions(query.actor.userId, query.teamId);
+        case "workspace.discovery":
+          return this.projectWorkspaceDiscovery(query.actor.userId);
+        case "session.inbox":
+          return this.listPublicSessions(
+            query.actor.userId,
+            query.teamId,
+            this.publicProjectionTime()
+          );
+        case "session.detail":
+          return this.hasSessionAccess(query.sessionId, query.actor.userId)
+            ? this.projectPublicSessionDetail(
+                query.sessionId,
+                query.actor.userId,
+                this.publicProjectionTime()
+              )
+            : null;
         case "session.events":
           if (!this.hasSessionAccess(query.sessionId, query.actor.userId)) return [];
           return this.readEvents(
@@ -396,6 +440,14 @@ class SqliteTeamSessions implements TeamSessions {
         return this.acceptHandoff(command, now);
       case "session.handoff.cancel":
         return this.cancelHandoff(command, now);
+      case "comment.add":
+        return this.addComment(command, now);
+      case "suggestion.add":
+        return this.addSuggestion(command, now);
+      case "suggestion.resolve":
+        return this.resolveSuggestion(command, now);
+      case "directive.enqueue":
+        return this.enqueueDirective(command, now);
       case "runtime.outbox.acknowledge":
         return this.acknowledgeRuntimeOutbox(command, now);
       case "runtime.outbox.fail":
@@ -1407,6 +1459,17 @@ class SqliteTeamSessions implements TeamSessions {
         ...(controlReleased ? this.controlProjection(command.sessionId) : {}),
       }),
     ];
+    if (command.responsibility === "steerer") {
+      events.push(
+        ...this.appendQueuedDirectiveCancellationEvents(
+          command.sessionId,
+          command,
+          now,
+          command.userId,
+          "steerer-revoked"
+        )
+      );
+    }
     if (controlReleased) {
       events.push(
         this.appendEvent(command.sessionId, command, now, "session.control.released", {
@@ -1499,13 +1562,21 @@ class SqliteTeamSessions implements TeamSessions {
       : (session.steering_revision as number);
     const events: SessionEvent[] = [];
     for (const removed of removedSteerers) {
+      const removedUserId = removed.user_id as string;
       events.push(
         this.appendEvent(command.sessionId, command, now, "session.responsibility.revoked", {
-          userId: removed.user_id,
+          userId: removedUserId,
           responsibility: "steerer",
           reason: "single-policy-control-transfer",
           steeringRevision,
-        })
+        }),
+        ...this.appendQueuedDirectiveCancellationEvents(
+          command.sessionId,
+          command,
+          now,
+          removedUserId,
+          "single-policy-control-transfer"
+        )
       );
     }
     if (!targetWasSteerer) {
@@ -1596,7 +1667,14 @@ class SqliteTeamSessions implements TeamSessions {
           responsibility: "steerer",
           reason: "single-policy-control-release",
           steeringRevision,
-        })
+        }),
+        ...this.appendQueuedDirectiveCancellationEvents(
+          command.sessionId,
+          command,
+          now,
+          command.actor.userId,
+          "single-policy-control-release"
+        )
       );
     }
     this.advanceControlFence(
@@ -1999,13 +2077,21 @@ class SqliteTeamSessions implements TeamSessions {
       );
     }
     for (const removed of removedSteerers) {
+      const removedUserId = removed.user_id as string;
       events.push(
         this.appendEvent(command.sessionId, command, now, "session.responsibility.revoked", {
-          userId: removed.user_id,
+          userId: removedUserId,
           responsibility: "steerer",
           reason: "single-policy-handoff",
           steeringRevision,
-        })
+        }),
+        ...this.appendQueuedDirectiveCancellationEvents(
+          command.sessionId,
+          command,
+          now,
+          removedUserId,
+          "single-policy-handoff"
+        )
       );
     }
     if (!wasSteerer) {
@@ -2114,6 +2200,318 @@ class SqliteTeamSessions implements TeamSessions {
       },
       [event]
     );
+  }
+
+  private addComment(
+    command: Extract<SessionCommand, { type: "comment.add" }>,
+    now: number
+  ): CommandResult {
+    this.requireConversationParticipant(command.sessionId, command.actor.userId);
+    const body = requiredConversationBody(command.body, "Comment body");
+    const commentId = this.reserveConversationIdentity(command.sessionId, "comment", now);
+    const event = this.appendEvent(command.sessionId, command, now, "comment.added", {
+      commentId,
+      body,
+    });
+    this.bindConversationIdentity(commentId, command.sessionId, "comment", event.sequence);
+    return result(command, { sessionId: command.sessionId, commentId, sequence: event.sequence }, [
+      event,
+    ]);
+  }
+
+  private addSuggestion(
+    command: Extract<SessionCommand, { type: "suggestion.add" }>,
+    now: number
+  ): CommandResult {
+    const session = this.requireConversationParticipant(command.sessionId, command.actor.userId);
+    if (session.status === "ended") {
+      throw new TeamSessionError("conflict", "An ended Session cannot add Suggestions");
+    }
+    const body = requiredConversationBody(command.body, "Suggestion body");
+    const suggestionId = this.reserveConversationIdentity(command.sessionId, "suggestion", now);
+    const event = this.appendEvent(command.sessionId, command, now, "suggestion.added", {
+      suggestionId,
+      suggestionVersion: 1,
+      body,
+    });
+    this.bindConversationIdentity(suggestionId, command.sessionId, "suggestion", event.sequence);
+    return result(
+      command,
+      {
+        sessionId: command.sessionId,
+        suggestionId,
+        suggestionVersion: 1,
+        sequence: event.sequence,
+      },
+      [event]
+    );
+  }
+
+  private resolveSuggestion(
+    command: Extract<SessionCommand, { type: "suggestion.resolve" }>,
+    now: number
+  ): CommandResult {
+    const session = this.requireDirectiveAuthority(
+      command.sessionId,
+      command.actor.userId,
+      command.expectedSteeringRevision
+    );
+    const suggestion = this.requireSuggestionEvent(command.sessionId, command.suggestionId);
+    const previousResolution = this.suggestionResolutionEvent(
+      command.sessionId,
+      command.suggestionId
+    );
+    const currentVersion = previousResolution?.suggestionVersion ?? 1;
+    assertExpectedVersion(currentVersion, command.expectedSuggestionVersion, "Suggestion");
+    if (previousResolution) {
+      throw new TeamSessionError("conflict", "Suggestion is already resolved");
+    }
+
+    const accepted = command.resolution !== "reject";
+    const directiveBody =
+      command.resolution === "accept-edited"
+        ? requiredConversationBody(command.editedBody, "Edited Directive body")
+        : suggestion.body;
+    const resolutionId = this.reserveConversationIdentity(command.sessionId, "resolution", now);
+    const directiveId = accepted
+      ? this.reserveConversationIdentity(command.sessionId, "directive", now)
+      : undefined;
+    const resolutionEvent = this.appendEvent(
+      command.sessionId,
+      command,
+      now,
+      "suggestion.resolved",
+      {
+        suggestionId: command.suggestionId,
+        suggestionSequence: suggestion.sequence,
+        suggestionVersion: 2,
+        resolutionId,
+        resolution: command.resolution,
+        ...(directiveId === undefined ? {} : { directiveId }),
+      }
+    );
+    this.bindConversationIdentity(
+      resolutionId,
+      command.sessionId,
+      "resolution",
+      resolutionEvent.sequence
+    );
+    const events = [resolutionEvent];
+    let directiveEvent: SessionEvent | undefined;
+    if (directiveId !== undefined) {
+      directiveEvent = this.appendQueuedDirective(
+        command,
+        now,
+        directiveId,
+        directiveBody,
+        session,
+        {
+          kind: "suggestion",
+          suggestionId: command.suggestionId,
+          resolutionId,
+        }
+      );
+      events.push(directiveEvent);
+    }
+    this.recordSuggestionResolution(
+      command.sessionId,
+      command.suggestionId,
+      resolutionId,
+      resolutionEvent.sequence,
+      command.resolution,
+      directiveId
+    );
+    return result(
+      command,
+      {
+        sessionId: command.sessionId,
+        suggestionId: command.suggestionId,
+        suggestionVersion: 2,
+        resolutionId,
+        resolution: command.resolution,
+        ...(directiveId === undefined
+          ? {}
+          : {
+              directiveId,
+              directiveStatus: "queued",
+              directiveQueueSequence: directiveEvent?.sequence,
+            }),
+      },
+      events
+    );
+  }
+
+  private enqueueDirective(
+    command: Extract<SessionCommand, { type: "directive.enqueue" }>,
+    now: number
+  ): CommandResult {
+    const session = this.requireDirectiveAuthority(
+      command.sessionId,
+      command.actor.userId,
+      command.expectedSteeringRevision
+    );
+    const body = requiredConversationBody(command.body, "Directive body");
+    const directiveId = this.reserveConversationIdentity(command.sessionId, "directive", now);
+    const event = this.appendQueuedDirective(command, now, directiveId, body, session, {
+      kind: "direct",
+    });
+    return result(
+      command,
+      {
+        sessionId: command.sessionId,
+        directiveId,
+        directiveStatus: "queued",
+        queueSequence: event.sequence,
+        steeringRevision: session.steering_revision,
+      },
+      [event]
+    );
+  }
+
+  private appendQueuedDirective(
+    command: Extract<SessionCommand, { type: "directive.enqueue" | "suggestion.resolve" }>,
+    now: number,
+    directiveId: string,
+    body: string,
+    session: SqlRow,
+    origin: Record<string, unknown>
+  ): SessionEvent {
+    this.assertPendingDirectiveCapacity(command.sessionId, command.actor.userId);
+    const event = this.appendEvent(command.sessionId, command, now, "directive.queued", {
+      directiveId,
+      status: "queued",
+      body,
+      steeringPolicy: session.steering_policy,
+      steeringRevision: session.steering_revision,
+      origin,
+    });
+    this.bindConversationIdentity(directiveId, command.sessionId, "directive", event.sequence);
+    this.db
+      .prepare(
+        `INSERT INTO conversation_directives
+           (directive_id, session_id, author_user_id, queue_sequence, status, terminal_sequence)
+         VALUES (?, ?, ?, ?, 'queued', NULL)`
+      )
+      .run(directiveId, command.sessionId, command.actor.userId, event.sequence);
+    return event;
+  }
+
+  private assertPendingDirectiveCapacity(sessionId: string, authorUserId: string): void {
+    const authorPending = this.db
+      .prepare(
+        `SELECT COUNT(*) AS count FROM conversation_directives
+         WHERE author_user_id = ? AND status = 'queued'`
+      )
+      .get(authorUserId) as SqlRow;
+    if ((authorPending.count as number) >= MAX_PENDING_DIRECTIVES_PER_AUTHOR) {
+      throw new TeamSessionError(
+        "conflict",
+        `A Steerer may have at most ${MAX_PENDING_DIRECTIVES_PER_AUTHOR} pending Directives`
+      );
+    }
+    const sessionPending = this.db
+      .prepare(
+        `SELECT COUNT(*) AS count FROM conversation_directives
+         WHERE session_id = ? AND status = 'queued'`
+      )
+      .get(sessionId) as SqlRow;
+    if ((sessionPending.count as number) >= MAX_PENDING_DIRECTIVES_PER_SESSION) {
+      throw new TeamSessionError(
+        "conflict",
+        `A Session may have at most ${MAX_PENDING_DIRECTIVES_PER_SESSION} pending Directives`
+      );
+    }
+  }
+
+  private requireConversationParticipant(sessionId: string, userId: string): SqlRow {
+    const session = this.requireSession(sessionId);
+    if (!this.hasSessionAccess(sessionId, userId)) deny();
+    return session;
+  }
+
+  private requireDirectiveAuthority(
+    sessionId: string,
+    userId: string,
+    expectedSteeringRevision: number
+  ): SqlRow {
+    const session = this.requireConversationParticipant(sessionId, userId);
+    if (session.status !== "active") {
+      throw new TeamSessionError("conflict", "An inactive Session cannot queue Directives");
+    }
+    const isSteerer = this.hasResponsibility(sessionId, userId, "steerer");
+    const isSingleController =
+      session.steering_policy === "single" &&
+      this.hasResponsibility(sessionId, userId, "controller");
+    if (!isSteerer || (session.steering_policy === "single" && !isSingleController)) deny();
+    assertExpectedRevision(
+      session.steering_revision as number,
+      expectedSteeringRevision,
+      "Steering"
+    );
+    return session;
+  }
+
+  private requireSuggestionEvent(
+    sessionId: string,
+    suggestionId: string
+  ): { sequence: number; body: string } {
+    const row = this.db
+      .prepare(
+        `SELECT identity.created_sequence AS sequence, event.payload_json
+         FROM conversation_identities identity
+         JOIN session_events event
+           ON event.session_id = identity.session_id
+          AND event.sequence = identity.created_sequence
+         WHERE identity.id = ? AND identity.session_id = ? AND identity.kind = 'suggestion'`
+      )
+      .get(suggestionId, sessionId) as SqlRow | undefined;
+    if (!row) deny();
+    const payload = JSON.parse(row.payload_json as string) as Record<string, unknown>;
+    if (payload.suggestionId !== suggestionId) {
+      throw new TeamSessionError("conflict", "Suggestion identity ledger is invalid");
+    }
+    return {
+      sequence: row.sequence as number,
+      body: requiredConversationBody(payload.body, "Stored Suggestion body"),
+    };
+  }
+
+  private suggestionResolutionEvent(
+    sessionId: string,
+    suggestionId: string
+  ): { suggestionVersion: number } | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT suggestion_version FROM conversation_suggestion_resolutions
+         WHERE suggestion_id = ? AND session_id = ?`
+      )
+      .get(suggestionId, sessionId) as SqlRow | undefined;
+    return row ? { suggestionVersion: row.suggestion_version as number } : undefined;
+  }
+
+  private recordSuggestionResolution(
+    sessionId: string,
+    suggestionId: string,
+    resolutionId: string,
+    resolutionSequence: number,
+    decision: "accept" | "accept-edited" | "reject",
+    directiveId: string | undefined
+  ): void {
+    this.db
+      .prepare(
+        `INSERT INTO conversation_suggestion_resolutions
+           (suggestion_id, session_id, resolution_id, resolution_sequence,
+            suggestion_version, decision, directive_id)
+         VALUES (?, ?, ?, ?, 2, ?, ?)`
+      )
+      .run(
+        suggestionId,
+        sessionId,
+        resolutionId,
+        resolutionSequence,
+        decision,
+        directiveId ?? null
+      );
   }
 
   private acknowledgeRuntimeOutbox(
@@ -2407,6 +2805,10 @@ class SqliteTeamSessions implements TeamSessions {
       case "session.handoff.offer":
       case "session.handoff.accept":
       case "session.handoff.cancel":
+      case "comment.add":
+      case "suggestion.add":
+      case "suggestion.resolve":
+      case "directive.enqueue":
         return this.hasSessionAccess(command.sessionId, actorUserId);
       case "runtime.outbox.acknowledge":
       case "runtime.outbox.fail":
@@ -2602,6 +3004,11 @@ class SqliteTeamSessions implements TeamSessions {
         ...(assigneeRevision === undefined ? {} : { assigneeRevision }),
       }),
     ];
+    if (steerer) {
+      events.push(
+        ...this.appendQueuedDirectiveCancellationEvents(sessionId, command, now, userId, eventType)
+      );
+    }
     if (controller) {
       events.push(
         this.appendEvent(sessionId, command, now, "session.control.released", {
@@ -2751,6 +3158,403 @@ class SqliteTeamSessions implements TeamSessions {
       controlEpoch: epoch,
       runtimeAuthorizationGeneration,
     };
+  }
+
+  private projectWorkspaceDiscovery(actorUserId: string): WorkspaceDiscoveryView {
+    const memberships = this.db
+      .prepare(
+        `SELECT t.id, t.name, t.created_at_ms, m.role, m.version
+         FROM team_memberships m
+         JOIN teams t ON t.id = m.team_id
+         WHERE m.user_id = ? AND m.status = 'active'
+         ORDER BY t.created_at_ms ASC, t.id ASC`
+      )
+      .all(actorUserId) as SqlRow[];
+    const teams = memberships.map((membership) => {
+      const teamId = membership.id as string;
+      const role = membership.role as TeamRole;
+      const administrator = role === "owner" || role === "admin";
+      const projects = this.db
+        .prepare(
+          `SELECT p.id, p.name, p.created_at_ms,
+                  pa.role AS access_role, pa.version AS access_version
+           FROM projects p
+           LEFT JOIN project_access pa
+             ON pa.project_id = p.id AND pa.user_id = ? AND pa.status = 'active'
+           WHERE p.team_id = ? AND (
+             ? = 1 OR
+             (? <> 'guest' AND pa.user_id IS NOT NULL) OR
+             (? = 'guest' AND EXISTS (
+               SELECT 1 FROM sessions s
+               JOIN session_participants sp
+                 ON sp.session_id = s.id AND sp.user_id = ? AND sp.status = 'active'
+               JOIN session_shares ss
+                 ON ss.session_id = s.id AND ss.user_id = ? AND ss.status = 'active'
+               WHERE s.project_id = p.id
+             ))
+           )
+           ORDER BY p.created_at_ms ASC, p.id ASC`
+        )
+        .all(
+          actorUserId,
+          teamId,
+          administrator ? 1 : 0,
+          role,
+          role,
+          actorUserId,
+          actorUserId
+        ) as SqlRow[];
+      const projectViews: WorkspaceProjectView[] = projects.map((project) => {
+        const hasContentAccess =
+          role !== "guest" &&
+          typeof project.access_role === "string" &&
+          typeof project.access_version === "number";
+        const accessRole = hasContentAccess ? (project.access_role as ProjectRole) : undefined;
+        return {
+          projectId: project.id as string,
+          name: project.name as string,
+          createdAtMs: project.created_at_ms as number,
+          visibility: hasContentAccess
+            ? "content"
+            : administrator
+              ? "administration"
+              : "session-only",
+          ...(accessRole === undefined
+            ? {}
+            : {
+                viewerAccess: {
+                  role: accessRole,
+                  version: project.access_version as number,
+                },
+              }),
+          capabilities: {
+            viewContent: hasContentAccess,
+            startSession: hasContentAccess,
+            manageAccess: administrator || accessRole === "maintainer",
+          },
+        };
+      });
+      return {
+        teamId,
+        name: membership.name as string,
+        createdAtMs: membership.created_at_ms as number,
+        viewerMembership: {
+          role,
+          version: membership.version as number,
+        },
+        capabilities: {
+          createProject: administrator,
+          manageMemberships: administrator,
+        },
+        projects: projectViews,
+      };
+    });
+    return { teams };
+  }
+
+  private listPublicSessions(
+    userId: string,
+    teamId: string | undefined,
+    projectionNow: number
+  ): SessionInboxItemView[] {
+    const rows = this.db
+      .prepare(
+        `SELECT s.id FROM sessions s
+         JOIN session_participants p
+           ON p.session_id = s.id AND p.user_id = ? AND p.status = 'active'
+         WHERE (? IS NULL OR s.team_id = ?)
+         ORDER BY s.created_at_ms ASC, s.id ASC`
+      )
+      .all(userId, teamId ?? null, teamId ?? null) as SqlRow[];
+    return rows
+      .filter((row) => this.hasSessionAccess(row.id as string, userId))
+      .map((row) => this.projectPublicSessionInboxItem(row.id as string, userId, projectionNow));
+  }
+
+  private projectPublicSessionInboxItem(
+    sessionId: string,
+    actorUserId: string,
+    projectionNow: number,
+    projectedHandoffs?: SqlRow[]
+  ): SessionInboxItemView {
+    const session = this.requireSession(sessionId);
+    const participants = this.publicSessionParticipants(sessionId);
+    const viewerParticipant = participants.find(
+      (participant) => participant.userId === actorUserId
+    );
+    const membership = this.activeMembership(session.team_id as string, actorUserId);
+    if (!viewerParticipant || !membership || !this.hasSessionAccess(sessionId, actorUserId)) deny();
+    const projectAccess = this.activeProjectAccess(session.project_id as string, actorUserId);
+    const latestSequence = (session.next_sequence as number) - 1;
+    const responsibilities = this.publicSessionResponsibilities(participants);
+    const viewerResponsibilities = viewerParticipant.responsibilities;
+    const manager =
+      viewerResponsibilities.includes("assignee") || viewerResponsibilities.includes("supervisor");
+    const controller = viewerResponsibilities.includes("controller");
+    const steerer = viewerResponsibilities.includes("steerer");
+    const directSteering =
+      session.status === "active" &&
+      steerer &&
+      (session.steering_policy === "shared" || controller);
+    const activeHandoffs = projectedHandoffs ?? this.activeHandoffRows(sessionId, projectionNow);
+    const viewer: SessionViewerView = {
+      participantId: viewerParticipant.participantId,
+      userId: actorUserId,
+      displayName: viewerParticipant.displayName,
+      membershipRole: viewerParticipant.membershipRole,
+      responsibilities: viewerResponsibilities,
+      basis: {
+        participantVersion: viewerParticipant.version,
+        teamMembershipVersion: membership.version as number,
+        ...(projectAccess === undefined
+          ? {}
+          : { projectAccessVersion: projectAccess.version as number }),
+        responsibilityVersions: viewerParticipant.responsibilityVersions,
+        accessRevision: session.access_revision as number,
+        assigneeRevision: session.assignee_revision as number,
+        supervisionRevision: session.supervision_revision as number,
+        steeringRevision: session.steering_revision as number,
+        controlRevision: session.control_revision as number,
+        controlEpoch: session.control_epoch as number,
+        runtimeAuthorizationGeneration: session.runtime_authorization_generation as number,
+        latestSequence,
+      },
+      capabilities: this.publicSessionCapabilities({
+        session,
+        actorUserId,
+        membership,
+        projectAccess,
+        manager,
+        controller,
+        steerer,
+        directSteering,
+        activeHandoffs,
+      }),
+    };
+    return {
+      sessionId,
+      teamId: session.team_id as string,
+      projectId: session.project_id as string,
+      name: session.name as string,
+      status: session.status as SessionInboxItemView["status"],
+      steeringPolicy: session.steering_policy as SessionInboxItemView["steeringPolicy"],
+      runtime: {
+        kind: "local-tmux",
+        isolation: "trusted-shared-host",
+        yoloEligible: false,
+        authorizationGeneration: session.runtime_authorization_generation as number,
+        authorizationState:
+          session.runtime_authorization_state as SessionInboxItemView["runtime"]["authorizationState"],
+      },
+      responsibilities,
+      viewer,
+      latestSequence,
+      createdAtMs: session.created_at_ms as number,
+    };
+  }
+
+  private projectPublicSessionDetail(
+    sessionId: string,
+    actorUserId: string,
+    projectionNow: number
+  ): SessionDetailView {
+    const activeHandoffs = this.activeHandoffRows(sessionId, projectionNow);
+    const inbox = this.projectPublicSessionInboxItem(
+      sessionId,
+      actorUserId,
+      projectionNow,
+      activeHandoffs
+    );
+    const participants = this.publicSessionParticipants(sessionId);
+    const manager =
+      inbox.viewer.responsibilities.includes("assignee") ||
+      inbox.viewer.responsibilities.includes("supervisor");
+    const shares: PublicSessionShareView[] = manager
+      ? (
+          this.db
+            .prepare(
+              `SELECT user_id, version, created_at_ms FROM session_shares
+             WHERE session_id = ? AND status = 'active'
+             ORDER BY created_at_ms ASC, user_id ASC`
+            )
+            .all(sessionId) as SqlRow[]
+        ).map((share) => ({
+          userId: share.user_id as string,
+          displayName: this.latestActorDisplayName(share.user_id as string),
+          version: share.version as number,
+          createdAtMs: share.created_at_ms as number,
+        }))
+      : [];
+    const openHandoffs: PublicOpenHandoffView[] = activeHandoffs
+      .filter(
+        (handoff) =>
+          manager ||
+          handoff.offerer_user_id === actorUserId ||
+          handoff.recipient_user_id === actorUserId
+      )
+      .map((handoff) => ({
+        handoffId: handoff.id as string,
+        offererUserId: handoff.offerer_user_id as string,
+        recipientParticipantId: handoff.recipient_participant_id as string,
+        recipientUserId: handoff.recipient_user_id as string,
+        offeredUnder: handoff.offered_under_kind as "assignee" | "supervisor",
+        version: handoff.version as number,
+        contextSequence: handoff.context_sequence as number,
+        expiresAtMs: handoff.expires_at_ms as number,
+        createdAtMs: handoff.created_at_ms as number,
+        briefing: JSON.parse(handoff.briefing_json as string) as PublicOpenHandoffView["briefing"],
+      }));
+    return { ...inbox, participants, shares, openHandoffs };
+  }
+
+  private publicSessionParticipants(sessionId: string): PublicSessionParticipantView[] {
+    const rows = this.db
+      .prepare(
+        `SELECT p.id, p.user_id, p.version, p.joined_at_ms, m.role AS membership_role
+         FROM session_participants p
+         JOIN sessions s ON s.id = p.session_id
+         JOIN team_memberships m
+           ON m.team_id = s.team_id AND m.user_id = p.user_id AND m.status = 'active'
+         WHERE p.session_id = ? AND p.status = 'active'
+         ORDER BY p.joined_at_ms ASC, p.id ASC`
+      )
+      .all(sessionId) as SqlRow[];
+    return rows.flatMap((row) => {
+      const userId = row.user_id as string;
+      if (!this.hasSessionAccess(sessionId, userId)) return [];
+      const responsibilityRows = this.db
+        .prepare(
+          `SELECT kind, version FROM session_responsibilities
+           WHERE session_id = ? AND user_id = ? AND status = 'active'`
+        )
+        .all(sessionId, userId) as SqlRow[];
+      const responsibilities = RESPONSIBILITY_ORDER.filter((kind) =>
+        responsibilityRows.some((responsibility) => responsibility.kind === kind)
+      );
+      return [
+        {
+          participantId: row.id as string,
+          userId,
+          displayName: this.latestActorDisplayName(userId),
+          membershipRole: row.membership_role as TeamRole,
+          observer: responsibilities.length === 0,
+          responsibilities,
+          responsibilityVersions: Object.fromEntries(
+            responsibilityRows.map((responsibility) => [
+              responsibility.kind as string,
+              responsibility.version as number,
+            ])
+          ) as PublicSessionParticipantView["responsibilityVersions"],
+          joinedAtMs: row.joined_at_ms as number,
+          version: row.version as number,
+        },
+      ];
+    });
+  }
+
+  private publicSessionResponsibilities(
+    participants: PublicSessionParticipantView[]
+  ): PublicSessionResponsibilityView {
+    const holders = (kind: SessionResponsibility): PublicSessionIdentityView[] =>
+      participants
+        .filter((participant) => participant.responsibilities.includes(kind))
+        .map(({ participantId, userId, displayName }) => ({ participantId, userId, displayName }));
+    return {
+      assignee: holders("assignee")[0],
+      supervisors: holders("supervisor"),
+      steerers: holders("steerer"),
+      controller: holders("controller")[0],
+    };
+  }
+
+  private publicSessionCapabilities(input: {
+    session: SqlRow;
+    actorUserId: string;
+    membership: SqlRow;
+    projectAccess?: SqlRow;
+    manager: boolean;
+    controller: boolean;
+    steerer: boolean;
+    directSteering: boolean;
+    activeHandoffs: SqlRow[];
+  }): SessionViewerCapabilities {
+    const active = input.session.status === "active";
+    const ended = input.session.status === "ended";
+    const assignee = this.hasResponsibility(
+      input.session.id as string,
+      input.actorUserId,
+      "assignee"
+    );
+    const supervisor = this.hasResponsibility(
+      input.session.id as string,
+      input.actorUserId,
+      "supervisor"
+    );
+    const teamAdministrator =
+      input.membership.role === "owner" || input.membership.role === "admin";
+    const relevantOpenHandoff = input.activeHandoffs.some(
+      (handoff) =>
+        handoff.offerer_user_id === input.actorUserId ||
+        handoff.recipient_user_id === input.actorUserId
+    );
+    return {
+      addComment: true,
+      addSuggestion: !ended,
+      resolveSuggestion: input.directSteering,
+      enqueueDirective: input.directSteering,
+      observeTerminal: !ended,
+      mutateTerminal:
+        active &&
+        input.session.runtime_authorization_state === "enforced" &&
+        input.controller &&
+        input.steerer,
+      createInvitation: !ended && teamAdministrator,
+      revokeInvitation: teamAdministrator,
+      manageShares: input.manager,
+      manageParticipants: input.manager,
+      manageSupervisors: assignee,
+      manageSteerers: input.manager,
+      transferControl: active && (input.manager || input.controller),
+      releaseControl: input.controller,
+      offerHandoff: !ended && (assignee || supervisor),
+      acceptHandoff:
+        !ended &&
+        input.activeHandoffs.some((handoff) => handoff.recipient_user_id === input.actorUserId),
+      cancelHandoff: relevantOpenHandoff || input.manager,
+      claimAssignee:
+        input.session.status === "awaiting_assignee" &&
+        input.membership.role !== "guest" &&
+        input.projectAccess !== undefined,
+    };
+  }
+
+  private publicProjectionTime(): number {
+    const now = this.clock();
+    if (!Number.isSafeInteger(now) || now < 0) {
+      throw new TeamSessionError("invalid-command", "Invalid projection time");
+    }
+    return now;
+  }
+
+  private activeHandoffRows(sessionId: string, now: number): SqlRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM session_handoffs
+         WHERE session_id = ? AND status = 'offered' AND expires_at_ms > ?
+         ORDER BY created_at_ms ASC, id ASC`
+      )
+      .all(sessionId, now) as SqlRow[];
+  }
+
+  private latestActorDisplayName(userId: string): string {
+    const snapshot = this.db
+      .prepare(
+        `SELECT actor_display_name FROM accepted_commands
+         WHERE actor_kind = 'human' AND actor_user_id = ?
+         ORDER BY accepted_sequence DESC LIMIT 1`
+      )
+      .get(userId) as SqlRow | undefined;
+    return (snapshot?.actor_display_name as string | undefined) ?? userId;
   }
 
   private listVisibleSessions(userId: string, teamId?: string): SessionView[] {
@@ -3559,6 +4363,48 @@ class SqliteTeamSessions implements TeamSessions {
     );
   }
 
+  private appendQueuedDirectiveCancellationEvents(
+    sessionId: string,
+    command: SessionCommand,
+    now: number,
+    originalAuthorUserId: string,
+    reason: string
+  ): SessionEvent[] {
+    const queuedRows = this.db
+      .prepare(
+        `SELECT directive_id, queue_sequence FROM conversation_directives
+         WHERE session_id = ? AND author_user_id = ? AND status = 'queued'
+         ORDER BY queue_sequence ASC
+         LIMIT ?`
+      )
+      .all(sessionId, originalAuthorUserId, MAX_PENDING_DIRECTIVES_PER_AUTHOR + 1) as SqlRow[];
+    if (queuedRows.length > MAX_PENDING_DIRECTIVES_PER_AUTHOR) {
+      throw new TeamSessionError("conflict", "Pending Directive author ceiling is violated");
+    }
+    return queuedRows.map((row) => {
+      const directiveId = row.directive_id as string;
+      const queueSequence = row.queue_sequence as number;
+      const event = this.appendEvent(sessionId, command, now, "directive.cancelled", {
+        directiveId,
+        status: "cancelled",
+        queueSequence,
+        originalAuthorUserId,
+        reason,
+      });
+      const updated = this.db
+        .prepare(
+          `UPDATE conversation_directives
+           SET status = 'cancelled', terminal_sequence = ?
+           WHERE directive_id = ? AND session_id = ? AND status = 'queued'`
+        )
+        .run(event.sequence, directiveId, sessionId);
+      if (updated.changes !== 1) {
+        throw new TeamSessionError("conflict", "Queued Directive state changed concurrently");
+      }
+      return event;
+    });
+  }
+
   private sessionRow(sessionId: string): SqlRow | undefined {
     return this.db.prepare("SELECT * FROM sessions WHERE id = ?").get(sessionId) as
       | SqlRow
@@ -3586,6 +4432,46 @@ class SqliteTeamSessions implements TeamSessions {
   private nextId(label: string): string {
     const value = requiredText(this.idGenerator(), `${label} id`, 300);
     return value;
+  }
+
+  private reserveConversationIdentity(
+    sessionId: string,
+    kind: ConversationIdentityKind,
+    now: number
+  ): string {
+    for (let attempt = 0; attempt < 32; attempt += 1) {
+      const candidate = this.nextId(kind);
+      const inserted = this.db
+        .prepare(
+          `INSERT INTO conversation_identities
+             (id, session_id, kind, created_sequence, created_at_ms)
+           VALUES (?, ?, ?, NULL, ?)
+           ON CONFLICT(id) DO NOTHING`
+        )
+        .run(candidate, sessionId, kind, now);
+      if (inserted.changes === 1) return candidate;
+    }
+    throw new TeamSessionError(
+      "conflict",
+      `Could not allocate a unique ${kind} id for Session ${sessionId}`
+    );
+  }
+
+  private bindConversationIdentity(
+    id: string,
+    sessionId: string,
+    kind: ConversationIdentityKind,
+    createdSequence: number
+  ): void {
+    const updated = this.db
+      .prepare(
+        `UPDATE conversation_identities SET created_sequence = ?
+         WHERE id = ? AND session_id = ? AND kind = ? AND created_sequence IS NULL`
+      )
+      .run(createdSequence, id, sessionId, kind);
+    if (updated.changes !== 1) {
+      throw new TeamSessionError("conflict", "Conversation identity reservation is invalid");
+    }
   }
 
   private assertOpen(): void {
@@ -3799,6 +4685,43 @@ function validateCommandPayload(command: SessionCommand): void {
       requiredIdentifier(command.handoffId, "Handoff id");
       requiredVersion(command.expectedHandoffVersion, "Handoff");
       return;
+    case "comment.add":
+      requiredIdentifier(command.sessionId, "Session id");
+      requiredConversationBody(command.body, "Comment body");
+      rejectClientOwnedField(command, "commentId", "Comment id");
+      return;
+    case "suggestion.add":
+      requiredIdentifier(command.sessionId, "Session id");
+      requiredConversationBody(command.body, "Suggestion body");
+      rejectClientOwnedField(command, "suggestionId", "Suggestion id");
+      return;
+    case "suggestion.resolve":
+      requiredIdentifier(command.sessionId, "Session id");
+      requiredIdentifier(command.suggestionId, "Suggestion id");
+      assertEnum(
+        command.resolution,
+        ["accept", "accept-edited", "reject"],
+        "Suggestion resolution"
+      );
+      requiredRevision(command.expectedSuggestionVersion, "Suggestion");
+      requiredRevision(command.expectedSteeringRevision, "Steering");
+      rejectClientOwnedField(command, "resolutionId", "Suggestion resolution id");
+      rejectClientOwnedField(command, "directiveId", "Directive id");
+      if (command.resolution === "accept-edited") {
+        requiredConversationBody(command.editedBody, "Edited Directive body");
+      } else if (Object.prototype.hasOwnProperty.call(command, "editedBody")) {
+        throw new TeamSessionError(
+          "invalid-command",
+          "Edited Directive body is only valid for accept-edited"
+        );
+      }
+      return;
+    case "directive.enqueue":
+      requiredIdentifier(command.sessionId, "Session id");
+      requiredConversationBody(command.body, "Directive body");
+      requiredRevision(command.expectedSteeringRevision, "Steering");
+      rejectClientOwnedField(command, "directiveId", "Directive id");
+      return;
     case "runtime.outbox.acknowledge":
       requiredIdentifier(command.outboxId, "Runtime outbox id");
       requiredIdentifier(command.workerId, "Runtime worker id");
@@ -3822,6 +4745,9 @@ function validateQuery(
   query:
     | SessionGetQuery
     | SessionListQuery
+    | WorkspaceDiscoveryQuery
+    | SessionInboxQuery
+    | SessionDetailQuery
     | SessionEventsQuery
     | SessionTerminalAuthorizationQuery
     | SessionAdmissionQuery
@@ -3834,6 +4760,14 @@ function validateQuery(
       return;
     case "session.list":
       if (query.teamId !== undefined) requiredIdentifier(query.teamId, "Team id");
+      return;
+    case "workspace.discovery":
+      return;
+    case "session.inbox":
+      if (query.teamId !== undefined) requiredIdentifier(query.teamId, "Team id");
+      return;
+    case "session.detail":
+      requiredIdentifier(query.sessionId, "Session id");
       return;
     case "session.events":
       requiredIdentifier(query.sessionId, "Session id");
@@ -3898,6 +4832,26 @@ function requiredText(value: unknown, label: string, maxLength: number): string 
     throw new TeamSessionError("invalid-command", `${label} is invalid`);
   }
   return trimmed;
+}
+
+function requiredConversationBody(value: unknown, label: string): string {
+  if (typeof value !== "string") {
+    throw new TeamSessionError("invalid-command", `${label} is required`);
+  }
+  if (
+    value.trim().length === 0 ||
+    Buffer.byteLength(value, "utf8") > MAX_CONVERSATION_BODY_BYTES ||
+    /[\u0000-\u0008\u000b-\u001f\u007f]/.test(value)
+  ) {
+    throw new TeamSessionError("invalid-command", `${label} is invalid`);
+  }
+  return value;
+}
+
+function rejectClientOwnedField(command: SessionCommand, field: string, label: string): void {
+  if (Object.prototype.hasOwnProperty.call(command, field)) {
+    throw new TeamSessionError("invalid-command", `${label} is server-generated`);
+  }
 }
 
 function requiredIdentifier(value: unknown, label: string): string {

@@ -346,7 +346,9 @@ describe("canonical Team Session WebSockets", () => {
       yield makeEvent(24, {
         visible: "ok",
         apiToken: "must-not-leak",
-        nested: { privateKey: "must-not-leak" },
+        apiKey: "must-not-leak",
+        authorization: "must-not-leak",
+        nested: [{ privateKey: "must-not-leak", safe: true }],
         runtimeAuthorizationGeneration: 12,
       });
       await new Promise<void>(() => undefined);
@@ -373,19 +375,69 @@ describe("canonical Team Session WebSockets", () => {
       event: {
         sessionId: SESSION_ID,
         sequence: 24,
+        sourceAdapter: "internal",
         payload: {
           visible: "ok",
           apiToken: "[redacted]",
-          nested: { privateKey: "[redacted]" },
+          apiKey: "[redacted]",
+          authorization: "[redacted]",
+          nested: [{ privateKey: "[redacted]", safe: true }],
           runtimeAuthorizationGeneration: 12,
         },
       },
     });
-    expect(asRecord(envelope.event)).not.toHaveProperty("source");
+    const publicEvent = asRecord(envelope.event);
+    expect(Object.keys(publicEvent).sort()).toEqual([
+      "actor",
+      "eventId",
+      "occurredAtMs",
+      "payload",
+      "schemaVersion",
+      "sequence",
+      "sessionId",
+      "sourceAdapter",
+      "type",
+    ]);
+    expect(publicEvent.actor).toEqual({
+      kind: "human",
+      userId: ACTOR.userId,
+      displayName: ACTOR.displayName,
+    });
+    expect(publicEvent).not.toHaveProperty("source");
     expect(kernel.follows[0]).toMatchObject({
       sessionId: SESSION_ID,
       afterSequence: 23,
       actor: { kind: "human", userId: ACTOR.userId },
+    });
+
+    client.webSocket.send(JSON.stringify({ type: "client-message" }));
+    await expect(client.closed).resolves.toMatchObject({ code: 1008 });
+  });
+
+  it("keeps the event stream available for historical Comments after a Session ends", async () => {
+    const kernel = new FakeEventKernel();
+    kernel.session = { ...makeSession(), status: "ended" };
+    kernel.followImplementation = async function* () {
+      yield {
+        ...makeEvent(24, { commentId: "comment-after-end", body: "Postmortem note" }),
+        type: "comment.added",
+      };
+      await new Promise<void>(() => undefined);
+    };
+    const harness = await createHarness({ kernel });
+    const client = await harness.connect("events", bearerHeaders());
+
+    await expect(client.nextJson()).resolves.toMatchObject({
+      type: "session.snapshot",
+      session: { status: "ended", latestSequence: 23 },
+    });
+    await expect(client.nextJson()).resolves.toMatchObject({
+      type: "session.event",
+      event: {
+        type: "comment.added",
+        sequence: 24,
+        payload: { commentId: "comment-after-end", body: "Postmortem note" },
+      },
     });
 
     client.webSocket.send(JSON.stringify({ type: "client-message" }));

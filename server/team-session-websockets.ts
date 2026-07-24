@@ -8,6 +8,7 @@ import {
   type RequestHeaders,
 } from "../src/lib/request-actor";
 import { getPublicUrl, trustProxyHeaders } from "../src/lib/security-config";
+import { projectPublicSessionEvent } from "../src/lib/team-sessions/public-event";
 import {
   TEAM_SESSION_SCHEMA_VERSION,
   type ActorContext,
@@ -575,12 +576,6 @@ async function serveEvents(
     ) {
       return;
     }
-    if (currentSession.status === "ended") {
-      cleanup();
-      closeWebSocket(webSocket, 1000, "Session complete");
-      return;
-    }
-
     let latestSequence = currentSession.latestSequence;
     for await (const event of options.teamSessions.follow({
       sessionId: admission.route.sessionId,
@@ -602,15 +597,10 @@ async function serveEvents(
       if (
         !sendJson(
           webSocket,
-          { type: "session.event", event: publicSessionEvent(event) },
+          { type: "session.event", event: projectPublicSessionEvent(event) },
           closeUnavailable
         )
       ) {
-        return;
-      }
-      if (event.type === "session.ended") {
-        cleanup();
-        closeWebSocket(webSocket, 1000, "Session complete");
         return;
       }
     }
@@ -846,39 +836,6 @@ function publicSessionSnapshot(session: SessionView): Record<string, unknown> {
   };
 }
 
-function publicSessionEvent(event: SessionEvent): Record<string, unknown> {
-  return {
-    schemaVersion: event.schemaVersion,
-    eventId: event.eventId,
-    sessionId: event.sessionId,
-    sequence: event.sequence,
-    type: event.type,
-    occurredAtMs: event.occurredAtMs,
-    actor: event.actor,
-    payload: redactSensitiveEventFields(event.payload),
-  };
-}
-
-function redactSensitiveEventFields(value: unknown, depth = 0): unknown {
-  if (depth > 16) return "[redacted]";
-  if (Array.isArray(value)) {
-    return value.slice(0, 1_000).map((entry) => redactSensitiveEventFields(entry, depth + 1));
-  }
-  if (!isRecord(value)) return value;
-  const result: Record<string, unknown> = {};
-  let entries = 0;
-  for (const [key, entry] of Object.entries(value)) {
-    if (entries >= 1_000) break;
-    entries += 1;
-    if (isSensitiveFieldName(key)) {
-      result[key] = "[redacted]";
-    } else {
-      result[key] = redactSensitiveEventFields(entry, depth + 1);
-    }
-  }
-  return result;
-}
-
 function sendJson(webSocket: WebSocket, value: unknown, onBackpressure: () => void): boolean {
   if (webSocket.readyState !== WebSocket.OPEN) {
     onBackpressure();
@@ -905,19 +862,6 @@ function sendJson(webSocket: WebSocket, value: unknown, onBackpressure: () => vo
     onBackpressure();
     return false;
   }
-}
-
-function isSensitiveFieldName(key: string): boolean {
-  const normalized = key
-    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
-    .replace(/[^A-Za-z0-9]+/g, "_")
-    .toLowerCase();
-  return (
-    normalized === "authorization" ||
-    /(?:^|_)(?:token|secret|password|private_key|credential|cookie|authorization_header|authorization_token)(?:_|$)/.test(
-      normalized
-    )
-  );
 }
 
 function rejectUpgrade(socket: Duplex, status: number, reason: string): void {

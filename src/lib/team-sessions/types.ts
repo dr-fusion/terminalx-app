@@ -213,6 +213,40 @@ export type SessionCommand =
       expectedHandoffVersion: number;
     })
   | (CommandBase & {
+      type: "comment.add";
+      sessionId: string;
+      body: string;
+    })
+  | (CommandBase & {
+      type: "suggestion.add";
+      sessionId: string;
+      body: string;
+    })
+  | (CommandBase & {
+      type: "suggestion.resolve";
+      sessionId: string;
+      suggestionId: string;
+      resolution: "accept" | "reject";
+      expectedSuggestionVersion: number;
+      expectedSteeringRevision: number;
+      editedBody?: never;
+    })
+  | (CommandBase & {
+      type: "suggestion.resolve";
+      sessionId: string;
+      suggestionId: string;
+      resolution: "accept-edited";
+      editedBody: string;
+      expectedSuggestionVersion: number;
+      expectedSteeringRevision: number;
+    })
+  | (CommandBase & {
+      type: "directive.enqueue";
+      sessionId: string;
+      body: string;
+      expectedSteeringRevision: number;
+    })
+  | (CommandBase & {
       type: "runtime.outbox.acknowledge";
       outboxId: string;
       workerId: string;
@@ -255,6 +289,23 @@ export interface SessionListQuery extends QueryBase {
   teamId?: string;
 }
 
+/** Public, actor-scoped Team and Project navigation in one read snapshot. */
+export interface WorkspaceDiscoveryQuery extends QueryBase {
+  type: "workspace.discovery";
+}
+
+/** Public inbox projection. Internal Runtime callers continue to use session.list. */
+export interface SessionInboxQuery extends QueryBase {
+  type: "session.inbox";
+  teamId?: string;
+}
+
+/** Public Session projection. Internal Runtime callers continue to use session.get. */
+export interface SessionDetailQuery extends QueryBase {
+  type: "session.detail";
+  sessionId: string;
+}
+
 export interface SessionEventsQuery extends QueryBase {
   type: "session.events";
   sessionId: string;
@@ -288,6 +339,9 @@ export interface ProjectAccessQuery extends QueryBase {
 export type SessionQuery =
   | SessionGetQuery
   | SessionListQuery
+  | WorkspaceDiscoveryQuery
+  | SessionInboxQuery
+  | SessionDetailQuery
   | SessionEventsQuery
   | SessionTerminalAuthorizationQuery
   | SessionAdmissionQuery
@@ -449,6 +503,166 @@ export interface ProjectAccessView {
   access: ProjectAccessEntryView[];
 }
 
+export type WorkspaceProjectVisibility = "content" | "administration" | "session-only";
+
+export interface WorkspaceProjectView {
+  projectId: string;
+  name: string;
+  createdAtMs: number;
+  visibility: WorkspaceProjectVisibility;
+  viewerAccess?: {
+    role: ProjectRole;
+    version: number;
+  };
+  capabilities: {
+    viewContent: boolean;
+    startSession: boolean;
+    manageAccess: boolean;
+  };
+}
+
+export interface WorkspaceTeamView {
+  teamId: string;
+  name: string;
+  createdAtMs: number;
+  viewerMembership: {
+    role: TeamRole;
+    version: number;
+  };
+  capabilities: {
+    createProject: boolean;
+    manageMemberships: boolean;
+  };
+  projects: WorkspaceProjectView[];
+}
+
+export interface WorkspaceDiscoveryView {
+  teams: WorkspaceTeamView[];
+}
+
+export interface PublicSessionIdentityView {
+  participantId: string;
+  userId: string;
+  displayName: string;
+}
+
+export interface PublicSessionParticipantView extends PublicSessionIdentityView {
+  membershipRole: TeamRole;
+  observer: boolean;
+  responsibilities: SessionResponsibility[];
+  responsibilityVersions: Partial<Record<SessionResponsibility, number>>;
+  joinedAtMs: number;
+  version: number;
+}
+
+export interface SessionViewerBasis {
+  participantVersion: number;
+  teamMembershipVersion: number;
+  projectAccessVersion?: number;
+  responsibilityVersions: Partial<Record<SessionResponsibility, number>>;
+  accessRevision: number;
+  assigneeRevision: number;
+  supervisionRevision: number;
+  steeringRevision: number;
+  controlRevision: number;
+  controlEpoch: number;
+  runtimeAuthorizationGeneration: number;
+  latestSequence: number;
+}
+
+/**
+ * Actor-scoped UI hints computed from the same kernel predicates as dispatch.
+ * Target-dependent transitions still reauthorize atomically when dispatched.
+ */
+export interface SessionViewerCapabilities {
+  addComment: boolean;
+  addSuggestion: boolean;
+  resolveSuggestion: boolean;
+  enqueueDirective: boolean;
+  observeTerminal: boolean;
+  mutateTerminal: boolean;
+  createInvitation: boolean;
+  revokeInvitation: boolean;
+  manageShares: boolean;
+  manageParticipants: boolean;
+  manageSupervisors: boolean;
+  manageSteerers: boolean;
+  transferControl: boolean;
+  releaseControl: boolean;
+  offerHandoff: boolean;
+  acceptHandoff: boolean;
+  cancelHandoff: boolean;
+  claimAssignee: boolean;
+}
+
+export interface SessionViewerView extends PublicSessionIdentityView {
+  membershipRole: TeamRole;
+  responsibilities: SessionResponsibility[];
+  basis: SessionViewerBasis;
+  capabilities: SessionViewerCapabilities;
+}
+
+export interface PublicSessionRuntimeView {
+  kind: "local-tmux";
+  isolation: "trusted-shared-host";
+  yoloEligible: false;
+  authorizationGeneration: number;
+  authorizationState: "enforced" | "pending" | "quarantined";
+}
+
+export interface PublicSessionResponsibilityView {
+  assignee?: PublicSessionIdentityView;
+  supervisors: PublicSessionIdentityView[];
+  steerers: PublicSessionIdentityView[];
+  controller?: PublicSessionIdentityView;
+}
+
+export interface SessionInboxItemView {
+  sessionId: string;
+  teamId: string;
+  projectId: string;
+  name: string;
+  status: "active" | "awaiting_assignee" | "ended";
+  steeringPolicy: SteeringPolicy;
+  runtime: PublicSessionRuntimeView;
+  responsibilities: PublicSessionResponsibilityView;
+  viewer: SessionViewerView;
+  latestSequence: number;
+  createdAtMs: number;
+}
+
+export interface PublicSessionShareView {
+  userId: string;
+  displayName: string;
+  version: number;
+  createdAtMs: number;
+}
+
+export interface PublicOpenHandoffView {
+  handoffId: string;
+  offererUserId: string;
+  recipientParticipantId: string;
+  recipientUserId: string;
+  offeredUnder: "assignee" | "supervisor";
+  version: number;
+  contextSequence: number;
+  expiresAtMs: number;
+  createdAtMs: number;
+  briefing: {
+    summary: string;
+    blockers: string[];
+    artifactRefs: string[];
+  };
+}
+
+export interface SessionDetailView extends SessionInboxItemView {
+  participants: PublicSessionParticipantView[];
+  /** Active shares are visible only to the Assignee or a Supervisor. */
+  shares: PublicSessionShareView[];
+  /** Only open Handoffs relevant to the viewer or a Session manager are projected. */
+  openHandoffs: PublicOpenHandoffView[];
+}
+
 export interface SessionView {
   sessionId: string;
   teamId: string;
@@ -506,6 +720,9 @@ export interface TeamSessions {
   dispatch(command: SessionCommand): Promise<CommandResult>;
   inspect(query: SessionGetQuery): Promise<SessionView | null>;
   inspect(query: SessionListQuery): Promise<SessionView[]>;
+  inspect(query: WorkspaceDiscoveryQuery): Promise<WorkspaceDiscoveryView>;
+  inspect(query: SessionInboxQuery): Promise<SessionInboxItemView[]>;
+  inspect(query: SessionDetailQuery): Promise<SessionDetailView | null>;
   inspect(query: SessionEventsQuery): Promise<SessionEvent[]>;
   inspect(query: SessionTerminalAuthorizationQuery): Promise<TerminalAuthorization>;
   inspect(query: SessionAdmissionQuery): Promise<SessionAdmissionView>;

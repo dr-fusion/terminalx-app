@@ -41,6 +41,12 @@ const DAVE: ActorContext = {
   displayName: "Dave",
 };
 
+const EVE: ActorContext = {
+  kind: "human",
+  userId: "user-eve",
+  displayName: "Eve",
+};
+
 const LEGACY_ADMIN: ActorContext = {
   kind: "human",
   userId: "admin",
@@ -176,6 +182,17 @@ describe("Team Session kernel", () => {
     expect(view).not.toBeNull();
     if (!view) throw new Error("Expected an authorized Session view");
     return view;
+  }
+
+  async function sessionEvents(actor: ActorContext = ALICE) {
+    return kernel().inspect({
+      schemaVersion: TEAM_SESSION_SCHEMA_VERSION,
+      actor,
+      type: "session.events",
+      sessionId: SESSION_ID,
+      afterSequence: 0,
+      limit: 1_000,
+    });
   }
 
   function requireParticipant(view: SessionView, userId: string): SessionParticipantView {
@@ -527,7 +544,9 @@ describe("Team Session kernel", () => {
     });
   }
 
-  async function forceSessionStatus(status: "active" | "ended"): Promise<void> {
+  async function forceSessionStatus(
+    status: "active" | "awaiting_assignee" | "ended"
+  ): Promise<void> {
     teamSessions?.close();
     teamSessions = undefined;
     const database = new Database(filename);
@@ -537,6 +556,23 @@ describe("Team Session kernel", () => {
       database.close();
     }
     teamSessions = openKernel();
+  }
+
+  function closeAndDowngradeConversationSchemaToV1(): void {
+    teamSessions?.close();
+    teamSessions = undefined;
+    const database = new Database(filename);
+    try {
+      database.exec(`
+        PRAGMA foreign_keys = OFF;
+        DROP TABLE conversation_suggestion_resolutions;
+        DROP TABLE conversation_directives;
+        DROP TABLE conversation_identities;
+        PRAGMA user_version = 1;
+      `);
+    } finally {
+      database.close();
+    }
   }
 
   async function captureRejection(
@@ -1838,6 +1874,1346 @@ describe("Team Session kernel", () => {
       await iterator.return?.();
       follower.close();
     }
+  });
+
+  it("stores Comments and Suggestions as attributed canonical events without executable work or chat tables", async () => {
+    await bootstrap();
+    await admitMember(BOB);
+    await enforceNextRuntimeDelivery("runtime.session.ensure");
+
+    const commentBody = "I reproduced this locally.\n\tThe failing check is deterministic.";
+    const comment = await dispatch(
+      { type: "comment.add", sessionId: SESSION_ID, body: commentBody },
+      BOB,
+      "bob-comment"
+    );
+    const suggestion = await dispatch(
+      {
+        type: "suggestion.add",
+        sessionId: SESSION_ID,
+        body: "Please isolate the parser before changing the Runtime.",
+      },
+      BOB,
+      "bob-suggestion"
+    );
+
+    expect(comment.data).toMatchObject({
+      sessionId: SESSION_ID,
+      commentId: expect.any(String),
+      sequence: expect.any(Number),
+    });
+    expect(comment.events).toEqual([
+      expect.objectContaining({
+        type: "comment.added",
+        actor: BOB,
+        source: { scope: "vitest:team-sessions", key: "bob-comment" },
+        payload: { commentId: comment.data.commentId, body: commentBody },
+      }),
+    ]);
+    expect(suggestion.data).toMatchObject({
+      suggestionId: expect.any(String),
+      suggestionVersion: 1,
+    });
+    expect(suggestion.events).toEqual([
+      expect.objectContaining({
+        type: "suggestion.added",
+        actor: BOB,
+        source: { scope: "vitest:team-sessions", key: "bob-suggestion" },
+        payload: {
+          suggestionId: suggestion.data.suggestionId,
+          suggestionVersion: 1,
+          body: "Please isolate the parser before changing the Runtime.",
+        },
+      }),
+    ]);
+    await expect(
+      kernel().claimRuntimeOutbox({ workerId: SYSTEM.userId, limit: 10, leaseDurationMs: 1_000 })
+    ).resolves.toEqual([]);
+
+    const database = new Database(filename, { readonly: true });
+    try {
+      const conversationTables = database
+        .prepare(
+          `SELECT name FROM sqlite_master
+           WHERE type = 'table'
+             AND (name LIKE '%chat%' OR name LIKE '%comment%')`
+        )
+        .all();
+      expect(conversationTables).toEqual([]);
+      for (const normalizedTable of [
+        "conversation_identities",
+        "conversation_suggestion_resolutions",
+        "conversation_directives",
+      ]) {
+        const columns = database.prepare(`PRAGMA table_info(${normalizedTable})`).all() as Array<{
+          name: string;
+        }>;
+        expect(columns.map((column) => column.name)).not.toContain("body");
+        expect(columns.map((column) => column.name)).not.toContain("payload_json");
+      }
+    } finally {
+      database.close();
+    }
+  });
+
+  it("preserves LF multiline plain text and enforces a 16 KiB UTF-8 body boundary", async () => {
+    await bootstrap();
+    const exactUtf8Boundary = "é".repeat(8_192);
+    const exact = await dispatch({
+      type: "comment.add",
+      sessionId: SESSION_ID,
+      body: exactUtf8Boundary,
+    });
+    expect(exact.events[0]?.payload.body).toBe(exactUtf8Boundary);
+
+    const multiline = "first line\n\tsecond line\nthird line";
+    const preserved = await dispatch({
+      type: "suggestion.add",
+      sessionId: SESSION_ID,
+      body: multiline,
+    });
+    expect(preserved.events[0]?.payload.body).toBe(multiline);
+
+    for (const body of ["é".repeat(8_193), " \n\t ", "contains\0nul", "crlf\r\ntext"]) {
+      await expect(
+        dispatch({ type: "comment.add", sessionId: SESSION_ID, body })
+      ).rejects.toMatchObject({ code: "invalid-command" });
+    }
+    await expect(
+      kernel().dispatch({
+        ...makeCommand({ type: "comment.add", sessionId: SESSION_ID, body: "safe" }),
+        commentId: "client-owned-comment-id",
+      } as unknown as SessionCommand)
+    ).rejects.toMatchObject({ code: "invalid-command" });
+    await expect(
+      kernel().dispatch({
+        ...makeCommand({
+          type: "directive.enqueue",
+          sessionId: SESSION_ID,
+          body: "safe",
+          expectedSteeringRevision: (await requireSession()).steeringRevision,
+        }),
+        directiveId: "client-owned-directive-id",
+      } as unknown as SessionCommand)
+    ).rejects.toMatchObject({ code: "invalid-command" });
+  });
+
+  it("retries generated conversation identifiers that collide with prior payload ids", async () => {
+    await bootstrap();
+    const existing = await dispatch({
+      type: "suggestion.add",
+      sessionId: SESSION_ID,
+      body: "Existing identity",
+    });
+    const existingSuggestionId = existing.data.suggestionId as string;
+    teamSessions?.close();
+    teamSessions = undefined;
+    const generatedCandidates = [
+      existingSuggestionId,
+      "collision-safe-comment",
+      "collision-safe-comment-event",
+      existingSuggestionId,
+      "collision-safe-suggestion",
+      "collision-safe-suggestion-event",
+      "same-new-resolution-id",
+      "same-new-resolution-id",
+      "collision-safe-directive",
+      "collision-safe-resolution-event",
+      "collision-safe-directive-event",
+    ];
+    let fallbackId = 0;
+    teamSessions = createTeamSessions({
+      filename,
+      clock: () => nowMs,
+      idGenerator: () => generatedCandidates.shift() ?? `collision-safe-fallback-${++fallbackId}`,
+      invitationTokenGenerator: () => `txi_collision_${"x".repeat(64)}`,
+    });
+
+    const comment = await dispatch({
+      type: "comment.add",
+      sessionId: SESSION_ID,
+      body: "A unique Comment id",
+    });
+    expect(comment.data.commentId).toBe("collision-safe-comment");
+    const suggestion = await dispatch({
+      type: "suggestion.add",
+      sessionId: SESSION_ID,
+      body: "A unique Suggestion id",
+    });
+    expect(suggestion.data.suggestionId).toBe("collision-safe-suggestion");
+    const resolved = await dispatch({
+      type: "suggestion.resolve",
+      sessionId: SESSION_ID,
+      suggestionId: suggestion.data.suggestionId as string,
+      resolution: "accept",
+      expectedSuggestionVersion: 1,
+      expectedSteeringRevision: (await requireSession()).steeringRevision,
+    });
+    expect(resolved.data).toMatchObject({
+      resolutionId: "same-new-resolution-id",
+      directiveId: "collision-safe-directive",
+    });
+    expect(resolved.data.resolutionId).not.toBe(resolved.data.directiveId);
+    expect(
+      (await sessionEvents())
+        .flatMap((event) => [
+          event.payload.commentId,
+          event.payload.suggestionId,
+          event.payload.resolutionId,
+          event.payload.directiveId,
+        ])
+        .filter((value) => typeof value === "string" && value === existingSuggestionId)
+    ).toHaveLength(1);
+  });
+
+  it("migrates a v1 event ledger into indexed conversation state without changing canonical events", async () => {
+    await bootstrap({ steeringPolicy: "shared" });
+    await dispatch({
+      type: "comment.add",
+      sessionId: SESSION_ID,
+      body: "A Comment that predates normalization",
+    });
+    const suggestion = await dispatch({
+      type: "suggestion.add",
+      sessionId: SESSION_ID,
+      body: "Normalize canonical identity state",
+    });
+    await dispatch({
+      type: "suggestion.resolve",
+      sessionId: SESSION_ID,
+      suggestionId: suggestion.data.suggestionId as string,
+      resolution: "accept",
+      expectedSuggestionVersion: 1,
+      expectedSteeringRevision: (await requireSession()).steeringRevision,
+    });
+    const beforeRevocation = await requireSession();
+    await dispatch({
+      type: "session.responsibility.revoke",
+      sessionId: SESSION_ID,
+      userId: ALICE.userId,
+      responsibility: "steerer",
+      expectedSteeringRevision: beforeRevocation.steeringRevision,
+      expectedControlRevision: beforeRevocation.controlRevision,
+      expectedControlEpoch: beforeRevocation.controlEpoch,
+    });
+    const eventsBeforeMigration = await sessionEvents();
+
+    closeAndDowngradeConversationSchemaToV1();
+    teamSessions = openKernel();
+    expect(await sessionEvents()).toEqual(eventsBeforeMigration);
+
+    const database = new Database(filename, { readonly: true });
+    try {
+      expect(database.pragma("user_version", { simple: true })).toBe(2);
+      expect(database.pragma("foreign_key_check")).toEqual([]);
+      expect(
+        database
+          .prepare(
+            "SELECT kind, COUNT(*) AS count FROM conversation_identities GROUP BY kind ORDER BY kind"
+          )
+          .all()
+      ).toEqual([
+        { kind: "comment", count: 1 },
+        { kind: "directive", count: 1 },
+        { kind: "resolution", count: 1 },
+        { kind: "suggestion", count: 1 },
+      ]);
+      expect(
+        database
+          .prepare(`SELECT suggestion_version, decision FROM conversation_suggestion_resolutions`)
+          .all()
+      ).toEqual([{ suggestion_version: 2, decision: "accept" }]);
+      expect(
+        database
+          .prepare(`SELECT author_user_id, status, terminal_sequence FROM conversation_directives`)
+          .all()
+      ).toEqual([
+        {
+          author_user_id: ALICE.userId,
+          status: "cancelled",
+          terminal_sequence: expect.any(Number),
+        },
+      ]);
+      expect(
+        database
+          .prepare(
+            `SELECT name FROM sqlite_master
+             WHERE type = 'index' AND name LIKE 'conversation_%'
+             ORDER BY name`
+          )
+          .all()
+      ).toEqual(
+        expect.arrayContaining([
+          { name: "conversation_directives_by_author_status" },
+          { name: "conversation_directives_by_session_status" },
+          { name: "conversation_identities_by_session_kind" },
+        ])
+      );
+    } finally {
+      database.close();
+    }
+  });
+
+  it("rolls back v1 migration when legacy payload identities are ambiguous", async () => {
+    await bootstrap();
+    const first = await dispatch({
+      type: "suggestion.add",
+      sessionId: SESSION_ID,
+      body: "First legacy Suggestion",
+    });
+    await dispatch({
+      type: "suggestion.add",
+      sessionId: SESSION_ID,
+      body: "Second legacy Suggestion",
+    });
+    teamSessions?.close();
+    teamSessions = undefined;
+    const corrupt = new Database(filename);
+    try {
+      const second = corrupt
+        .prepare(
+          `SELECT sequence, payload_json FROM session_events
+           WHERE session_id = ? AND type = 'suggestion.added'
+           ORDER BY sequence DESC LIMIT 1`
+        )
+        .get(SESSION_ID) as { sequence: number; payload_json: string };
+      const payload = JSON.parse(second.payload_json) as Record<string, unknown>;
+      payload.suggestionId = first.data.suggestionId;
+      corrupt
+        .prepare(`UPDATE session_events SET payload_json = ? WHERE session_id = ? AND sequence = ?`)
+        .run(JSON.stringify(payload), SESSION_ID, second.sequence);
+    } finally {
+      corrupt.close();
+    }
+    closeAndDowngradeConversationSchemaToV1();
+
+    expect(() => openKernel()).toThrow();
+    const database = new Database(filename, { readonly: true });
+    try {
+      expect(database.pragma("user_version", { simple: true })).toBe(1);
+      expect(
+        database
+          .prepare(
+            `SELECT name FROM sqlite_master
+             WHERE type = 'table' AND name = 'conversation_identities'`
+          )
+          .get()
+      ).toBeUndefined();
+    } finally {
+      database.close();
+    }
+  });
+
+  it("requires the current Controller and Steerer under single steering", async () => {
+    await bootstrap();
+    await admitMember(BOB);
+    const beforeTransfer = await requireSession();
+
+    await expect(
+      dispatch(
+        {
+          type: "directive.enqueue",
+          sessionId: SESSION_ID,
+          body: "Bob cannot steer yet",
+          expectedSteeringRevision: beforeTransfer.steeringRevision,
+        },
+        BOB
+      )
+    ).rejects.toMatchObject({ code: "not-authorized" });
+    const aliceDirective = await dispatch({
+      type: "directive.enqueue",
+      sessionId: SESSION_ID,
+      body: "Alice is the current Controller and Steerer",
+      expectedSteeringRevision: beforeTransfer.steeringRevision,
+    });
+    expect(aliceDirective.events[0]).toMatchObject({
+      type: "directive.queued",
+      actor: ALICE,
+      payload: { status: "queued", steeringPolicy: "single" },
+    });
+
+    await transferControl(BOB, ALICE);
+    const afterTransfer = await requireSession(SESSION_ID, BOB);
+    await expect(
+      dispatch(
+        {
+          type: "directive.enqueue",
+          sessionId: SESSION_ID,
+          body: "A stale policy envelope",
+          expectedSteeringRevision: beforeTransfer.steeringRevision,
+        },
+        BOB
+      )
+    ).rejects.toMatchObject({ code: "stale-revision" });
+    await expect(
+      dispatch(
+        {
+          type: "directive.enqueue",
+          sessionId: SESSION_ID,
+          body: "Alice no longer controls the Session",
+          expectedSteeringRevision: afterTransfer.steeringRevision,
+        },
+        ALICE
+      )
+    ).rejects.toMatchObject({ code: "not-authorized" });
+    await expect(
+      dispatch(
+        {
+          type: "directive.enqueue",
+          sessionId: SESSION_ID,
+          body: "Bob now holds both responsibilities",
+          expectedSteeringRevision: afterTransfer.steeringRevision,
+        },
+        BOB
+      )
+    ).resolves.toMatchObject({
+      data: { directiveStatus: "queued", steeringRevision: afterTransfer.steeringRevision },
+    });
+  });
+
+  it("serializes shared Steerers by canonical event order even with no Controller", async () => {
+    await bootstrap({ steeringPolicy: "shared" });
+    await admitMember(BOB);
+    const beforeGrant = await requireSession();
+    await grantSteerer(BOB);
+    const shared = await requireSession();
+    await expect(
+      dispatch(
+        {
+          type: "directive.enqueue",
+          sessionId: SESSION_ID,
+          body: "Stale shared envelope",
+          expectedSteeringRevision: beforeGrant.steeringRevision,
+        },
+        BOB
+      )
+    ).rejects.toMatchObject({ code: "stale-revision" });
+
+    await dispatch({
+      type: "session.control.release",
+      sessionId: SESSION_ID,
+      expectedControlRevision: shared.controlRevision,
+      expectedControlEpoch: shared.controlEpoch,
+    });
+    expect(
+      (await requireSession()).participants.some((participant) =>
+        participant.responsibilities.includes("controller")
+      )
+    ).toBe(false);
+
+    const bobDirective = await dispatch(
+      {
+        type: "directive.enqueue",
+        sessionId: SESSION_ID,
+        body: "Bob's queued work",
+        expectedSteeringRevision: shared.steeringRevision,
+      },
+      BOB
+    );
+    const aliceDirective = await dispatch({
+      type: "directive.enqueue",
+      sessionId: SESSION_ID,
+      body: "Alice's later queued work",
+      expectedSteeringRevision: shared.steeringRevision,
+    });
+    const bobEvent = bobDirective.events[0];
+    const aliceEvent = aliceDirective.events[0];
+    expect(bobEvent).toMatchObject({ type: "directive.queued", actor: BOB });
+    expect(aliceEvent).toMatchObject({ type: "directive.queued", actor: ALICE });
+    expect(bobDirective.data.queueSequence).toBe(bobEvent?.sequence);
+    expect(aliceDirective.data.queueSequence).toBe(aliceEvent?.sequence);
+    expect(bobEvent?.sequence).toBeLessThan(aliceEvent?.sequence ?? 0);
+  });
+
+  it("enforces the global 64-Directive author ceiling and bounds higher-scope revocation across Sessions", async () => {
+    await bootstrap({ steeringPolicy: "shared" });
+    await admitMember(BOB);
+    await grantMembership(BOB, "owner");
+    await dispatch({
+      type: "session.start",
+      teamId: TEAM_ID,
+      projectId: PROJECT_ID,
+      sessionId: SECOND_SESSION_ID,
+      name: "Second bounded queue",
+      tmuxName: "second-bounded-queue",
+      steeringPolicy: "shared",
+    });
+    const firstRevision = (await requireSession()).steeringRevision;
+    const secondRevision = (await requireSession(SECOND_SESSION_ID)).steeringRevision;
+    for (let index = 0; index < 32; index += 1) {
+      await dispatch({
+        type: "directive.enqueue",
+        sessionId: SESSION_ID,
+        body: `First Session Directive ${index}`,
+        expectedSteeringRevision: firstRevision,
+      });
+      await dispatch({
+        type: "directive.enqueue",
+        sessionId: SECOND_SESSION_ID,
+        body: `Second Session Directive ${index}`,
+        expectedSteeringRevision: secondRevision,
+      });
+    }
+    await expect(
+      dispatch({
+        type: "directive.enqueue",
+        sessionId: SESSION_ID,
+        body: "The sixty-fifth global pending Directive",
+        expectedSteeringRevision: firstRevision,
+      })
+    ).rejects.toMatchObject({ code: "conflict" });
+
+    const suggestion = await dispatch({
+      type: "suggestion.add",
+      sessionId: SESSION_ID,
+      body: "Acceptance would exceed the pending ceiling",
+    });
+    await expect(
+      dispatch({
+        type: "suggestion.resolve",
+        sessionId: SESSION_ID,
+        suggestionId: suggestion.data.suggestionId as string,
+        resolution: "accept",
+        expectedSuggestionVersion: 1,
+        expectedSteeringRevision: firstRevision,
+      })
+    ).rejects.toMatchObject({ code: "conflict" });
+    expect(
+      (await sessionEvents()).filter(
+        (event) =>
+          event.type === "suggestion.resolved" &&
+          event.payload.suggestionId === suggestion.data.suggestionId
+      )
+    ).toEqual([]);
+    await expect(
+      dispatch({
+        type: "suggestion.resolve",
+        sessionId: SESSION_ID,
+        suggestionId: suggestion.data.suggestionId as string,
+        resolution: "reject",
+        expectedSuggestionVersion: 1,
+        expectedSteeringRevision: firstRevision,
+      })
+    ).resolves.toMatchObject({ commandType: "suggestion.resolve" });
+
+    await revokeMembership(ALICE, BOB);
+    const database = new Database(filename, { readonly: true });
+    try {
+      expect(
+        database
+          .prepare(`SELECT status, COUNT(*) AS count FROM conversation_directives GROUP BY status`)
+          .all()
+      ).toEqual([{ status: "cancelled", count: 64 }]);
+      expect(
+        database
+          .prepare(
+            `SELECT COUNT(*) AS count FROM session_events WHERE type = 'directive.cancelled'`
+          )
+          .get()
+      ).toEqual({ count: 64 });
+      expect(
+        database
+          .prepare(
+            `SELECT COUNT(*) AS count FROM conversation_directives
+             WHERE terminal_sequence IS NULL`
+          )
+          .get()
+      ).toEqual({ count: 0 });
+    } finally {
+      database.close();
+    }
+  });
+
+  it("enforces the 256-Directive Session ceiling across multiple Steerers", async () => {
+    await bootstrap({ steeringPolicy: "shared" });
+    for (const participant of [BOB, CAROL, DAVE, EVE]) {
+      await admitMember(participant);
+      await grantSteerer(participant);
+    }
+    const steeringRevision = (await requireSession()).steeringRevision;
+    for (const author of [ALICE, BOB, CAROL, DAVE]) {
+      for (let index = 0; index < 64; index += 1) {
+        await dispatch(
+          {
+            type: "directive.enqueue",
+            sessionId: SESSION_ID,
+            body: `${author.displayName} pending Directive ${index}`,
+            expectedSteeringRevision: steeringRevision,
+          },
+          author
+        );
+      }
+    }
+    await expect(
+      dispatch(
+        {
+          type: "directive.enqueue",
+          sessionId: SESSION_ID,
+          body: "The Session-wide two-hundred-fifty-seventh Directive",
+          expectedSteeringRevision: steeringRevision,
+        },
+        EVE
+      )
+    ).rejects.toMatchObject({ code: "conflict" });
+
+    const database = new Database(filename, { readonly: true });
+    try {
+      expect(
+        database
+          .prepare(
+            `SELECT COUNT(*) AS count FROM conversation_directives
+             WHERE session_id = ? AND status = 'queued'`
+          )
+          .get(SESSION_ID)
+      ).toEqual({ count: 256 });
+    } finally {
+      database.close();
+    }
+  });
+
+  it("resolves Suggestions atomically and queues accepted text without claiming Runtime dispatch", async () => {
+    await bootstrap({ steeringPolicy: "shared" });
+    await admitMember(BOB);
+    await grantSteerer(BOB);
+    await enforceNextRuntimeDelivery("runtime.session.ensure");
+    const steeringRevision = (await requireSession()).steeringRevision;
+
+    const editedSuggestion = await dispatch({
+      type: "suggestion.add",
+      sessionId: SESSION_ID,
+      body: "Run every test.",
+    });
+    const editedCommand = makeCommand(
+      {
+        type: "suggestion.resolve",
+        sessionId: SESSION_ID,
+        suggestionId: editedSuggestion.data.suggestionId as string,
+        resolution: "accept-edited",
+        editedBody: "Run the focused tests first.\nThen run the full suite.",
+        expectedSuggestionVersion: 1,
+        expectedSteeringRevision: steeringRevision,
+      },
+      BOB,
+      "accept-edited-suggestion"
+    );
+    const edited = await kernel().dispatch(editedCommand);
+    expect(edited.events.map((event) => event.type)).toEqual([
+      "suggestion.resolved",
+      "directive.queued",
+    ]);
+    expect(edited.events[1]?.sequence).toBe((edited.events[0]?.sequence ?? 0) + 1);
+    expect(edited.events[0]).toMatchObject({
+      actor: BOB,
+      payload: {
+        suggestionId: editedSuggestion.data.suggestionId,
+        suggestionVersion: 2,
+        resolution: "accept-edited",
+        directiveId: edited.data.directiveId,
+      },
+    });
+    expect(edited.events[1]).toMatchObject({
+      actor: BOB,
+      payload: {
+        directiveId: edited.data.directiveId,
+        status: "queued",
+        body: "Run the focused tests first.\nThen run the full suite.",
+        origin: {
+          kind: "suggestion",
+          suggestionId: editedSuggestion.data.suggestionId,
+          resolutionId: edited.data.resolutionId,
+        },
+      },
+    });
+    await expect(kernel().dispatch(editedCommand)).resolves.toEqual({
+      ...edited,
+      replayed: true,
+    });
+
+    const acceptedSuggestion = await dispatch({
+      type: "suggestion.add",
+      sessionId: SESSION_ID,
+      body: "Keep the original proposal exactly.",
+    });
+    const accepted = await dispatch(
+      {
+        type: "suggestion.resolve",
+        sessionId: SESSION_ID,
+        suggestionId: acceptedSuggestion.data.suggestionId as string,
+        resolution: "accept",
+        expectedSuggestionVersion: 1,
+        expectedSteeringRevision: steeringRevision,
+      },
+      BOB
+    );
+    expect(accepted.events[1]?.payload.body).toBe("Keep the original proposal exactly.");
+
+    const rejectedSuggestion = await dispatch({
+      type: "suggestion.add",
+      sessionId: SESSION_ID,
+      body: "Delete the repository.",
+    });
+    const rejected = await dispatch(
+      {
+        type: "suggestion.resolve",
+        sessionId: SESSION_ID,
+        suggestionId: rejectedSuggestion.data.suggestionId as string,
+        resolution: "reject",
+        expectedSuggestionVersion: 1,
+        expectedSteeringRevision: steeringRevision,
+      },
+      BOB
+    );
+    expect(rejected.events.map((event) => event.type)).toEqual(["suggestion.resolved"]);
+    expect(rejected.data).not.toHaveProperty("directiveId");
+    await expect(
+      kernel().claimRuntimeOutbox({ workerId: SYSTEM.userId, limit: 10, leaseDurationMs: 1_000 })
+    ).resolves.toEqual([]);
+  });
+
+  it("lets only the first valid Suggestion resolution win across kernel instances", async () => {
+    await bootstrap({ steeringPolicy: "shared" });
+    await admitMember(BOB);
+    await grantSteerer(BOB);
+    const suggestion = await dispatch({
+      type: "suggestion.add",
+      sessionId: SESSION_ID,
+      body: "Use the event ledger as canonical state.",
+    });
+    const steeringRevision = (await requireSession()).steeringRevision;
+    const suggestionId = suggestion.data.suggestionId as string;
+    const contender = openKernel();
+    try {
+      const accept = makeCommand(
+        {
+          type: "suggestion.resolve",
+          sessionId: SESSION_ID,
+          suggestionId,
+          resolution: "accept",
+          expectedSuggestionVersion: 1,
+          expectedSteeringRevision: steeringRevision,
+        },
+        ALICE,
+        "concurrent-suggestion-accept"
+      );
+      const reject = makeCommand(
+        {
+          type: "suggestion.resolve",
+          sessionId: SESSION_ID,
+          suggestionId,
+          resolution: "reject",
+          expectedSuggestionVersion: 1,
+          expectedSteeringRevision: steeringRevision,
+        },
+        BOB,
+        "concurrent-suggestion-reject"
+      );
+      const attempts = await Promise.allSettled([
+        kernel().dispatch(accept),
+        contender.dispatch(reject),
+      ]);
+      expect(attempts.filter((attempt) => attempt.status === "fulfilled")).toHaveLength(1);
+      const rejectedAttempt = attempts.find((attempt) => attempt.status === "rejected");
+      expect(rejectedAttempt).toMatchObject({
+        status: "rejected",
+        reason: expect.objectContaining({ code: "stale-revision" }),
+      });
+      expect(
+        (await sessionEvents()).filter(
+          (event) =>
+            event.type === "suggestion.resolved" && event.payload.suggestionId === suggestionId
+        )
+      ).toHaveLength(1);
+      await expect(
+        dispatch(
+          {
+            type: "suggestion.resolve",
+            sessionId: SESSION_ID,
+            suggestionId,
+            resolution: "reject",
+            expectedSuggestionVersion: 2,
+            expectedSteeringRevision: steeringRevision,
+          },
+          BOB
+        )
+      ).rejects.toMatchObject({ code: "conflict" });
+    } finally {
+      contender.close();
+    }
+  });
+
+  it("keeps cross-Session Suggestion probes as opaque as unknown identifiers", async () => {
+    await bootstrap();
+    const suggestion = await dispatch({
+      type: "suggestion.add",
+      sessionId: SESSION_ID,
+      body: "Private to the first Session",
+    });
+    await dispatch({
+      type: "session.start",
+      teamId: TEAM_ID,
+      projectId: PROJECT_ID,
+      sessionId: SECOND_SESSION_ID,
+      name: "Second private Session",
+      tmuxName: "second-private-session",
+    });
+    const second = await requireSession(SECOND_SESSION_ID);
+    const foreignProbe = await captureRejection(
+      {
+        type: "suggestion.resolve",
+        sessionId: SECOND_SESSION_ID,
+        suggestionId: suggestion.data.suggestionId as string,
+        resolution: "reject",
+        expectedSuggestionVersion: 1,
+        expectedSteeringRevision: second.steeringRevision,
+      },
+      ALICE
+    );
+    const unknownProbe = await captureRejection(
+      {
+        type: "suggestion.resolve",
+        sessionId: SECOND_SESSION_ID,
+        suggestionId: "unknown-suggestion-id",
+        resolution: "reject",
+        expectedSuggestionVersion: 1,
+        expectedSteeringRevision: second.steeringRevision,
+      },
+      ALICE
+    );
+    expect(foreignProbe).toEqual(unknownProbe);
+    expect(foreignProbe).toMatchObject({ code: "not-authorized" });
+  });
+
+  it("keeps replay idempotent but hides receipts and rejects new content after participation or access revocation", async () => {
+    await bootstrap();
+    await admitMember(BOB);
+    const commentCommand = makeCommand(
+      { type: "comment.add", sessionId: SESSION_ID, body: "A durable review note." },
+      BOB,
+      "revocable-comment"
+    );
+    const comment = await kernel().dispatch(commentCommand);
+    await expect(kernel().dispatch(commentCommand)).resolves.toEqual({
+      ...comment,
+      replayed: true,
+    });
+    const conflictingComment = makeCommand(
+      { type: "comment.add", sessionId: SESSION_ID, body: "Changed payload" },
+      BOB,
+      "revocable-comment"
+    );
+    await expect(kernel().dispatch(conflictingComment)).rejects.toMatchObject({
+      code: "idempotency-conflict",
+    });
+
+    await revokeParticipant(BOB);
+    await expect(kernel().dispatch(commentCommand)).resolves.toMatchObject({
+      replayed: true,
+      data: { receiptUnavailable: true },
+      events: [],
+    });
+    await expect(
+      dispatch({ type: "comment.add", sessionId: SESSION_ID, body: "No longer admitted" }, BOB)
+    ).rejects.toMatchObject({ code: "not-authorized" });
+
+    await grantParticipant(BOB);
+    const suggestionCommand = makeCommand(
+      {
+        type: "suggestion.add",
+        sessionId: SESSION_ID,
+        body: "Visible until Project Access is revoked.",
+      },
+      BOB,
+      "revocable-suggestion"
+    );
+    await kernel().dispatch(suggestionCommand);
+    await revokeProjectAccess(BOB);
+    await expect(kernel().dispatch(suggestionCommand)).resolves.toMatchObject({
+      replayed: true,
+      data: { receiptUnavailable: true },
+      events: [],
+    });
+    await expect(
+      dispatch({ type: "suggestion.add", sessionId: SESSION_ID, body: "No current access" }, BOB)
+    ).rejects.toMatchObject({ code: "not-authorized" });
+  });
+
+  it("atomically cancels a revoked Steerer's queued Directives while retaining discussion access", async () => {
+    await bootstrap({ steeringPolicy: "shared" });
+    await admitMember(BOB);
+    await grantSteerer(BOB);
+    const beforeRevocation = await requireSession();
+    const first = await dispatch(
+      {
+        type: "directive.enqueue",
+        sessionId: SESSION_ID,
+        body: "First pending Directive",
+        expectedSteeringRevision: beforeRevocation.steeringRevision,
+      },
+      BOB
+    );
+    const second = await dispatch(
+      {
+        type: "directive.enqueue",
+        sessionId: SESSION_ID,
+        body: "Second pending Directive",
+        expectedSteeringRevision: beforeRevocation.steeringRevision,
+      },
+      BOB
+    );
+    const revoked = await dispatch({
+      type: "session.responsibility.revoke",
+      sessionId: SESSION_ID,
+      userId: BOB.userId,
+      responsibility: "steerer",
+      expectedSteeringRevision: beforeRevocation.steeringRevision,
+      expectedControlRevision: beforeRevocation.controlRevision,
+      expectedControlEpoch: beforeRevocation.controlEpoch,
+    });
+    const cancellations = revoked.events.filter((event) => event.type === "directive.cancelled");
+    expect(cancellations).toEqual([
+      expect.objectContaining({
+        payload: expect.objectContaining({
+          directiveId: first.data.directiveId,
+          queueSequence: first.data.queueSequence,
+          originalAuthorUserId: BOB.userId,
+          status: "cancelled",
+          reason: "steerer-revoked",
+        }),
+      }),
+      expect.objectContaining({
+        payload: expect.objectContaining({
+          directiveId: second.data.directiveId,
+          queueSequence: second.data.queueSequence,
+          originalAuthorUserId: BOB.userId,
+          status: "cancelled",
+          reason: "steerer-revoked",
+        }),
+      }),
+    ]);
+    const afterRevocation = await requireSession();
+    await expect(
+      dispatch(
+        {
+          type: "directive.enqueue",
+          sessionId: SESSION_ID,
+          body: "No longer a Steerer",
+          expectedSteeringRevision: afterRevocation.steeringRevision,
+        },
+        BOB
+      )
+    ).rejects.toMatchObject({ code: "not-authorized" });
+    await expect(
+      dispatch({ type: "comment.add", sessionId: SESSION_ID, body: "Still a Participant" }, BOB)
+    ).resolves.toMatchObject({ commandType: "comment.add" });
+    await expect(
+      dispatch({ type: "suggestion.add", sessionId: SESSION_ID, body: "Can still suggest" }, BOB)
+    ).resolves.toMatchObject({ commandType: "suggestion.add" });
+  });
+
+  it("allows bounded discussion while inactive without creating permanently unresolvable work", async () => {
+    await bootstrap();
+    await forceSessionStatus("awaiting_assignee");
+    await expect(
+      dispatch({
+        type: "comment.add",
+        sessionId: SESSION_ID,
+        body: "Discussion remains open while awaiting an Assignee",
+      })
+    ).resolves.toMatchObject({ commandType: "comment.add" });
+    const awaitingSuggestion = await dispatch({
+      type: "suggestion.add",
+      sessionId: SESSION_ID,
+      body: "A non-executable proposal can wait for accountability",
+    });
+    let view = await requireSession();
+    await expect(
+      dispatch({
+        type: "directive.enqueue",
+        sessionId: SESSION_ID,
+        body: "Must not queue without an active Session",
+        expectedSteeringRevision: view.steeringRevision,
+      })
+    ).rejects.toMatchObject({ code: "conflict" });
+    await expect(
+      dispatch({
+        type: "suggestion.resolve",
+        sessionId: SESSION_ID,
+        suggestionId: awaitingSuggestion.data.suggestionId as string,
+        resolution: "reject",
+        expectedSuggestionVersion: 1,
+        expectedSteeringRevision: view.steeringRevision,
+      })
+    ).rejects.toMatchObject({ code: "conflict" });
+
+    await forceSessionStatus("active");
+    const openSuggestion = await dispatch({
+      type: "suggestion.add",
+      sessionId: SESSION_ID,
+      body: "This proposal existed before the Session ended",
+    });
+    await forceSessionStatus("ended");
+    await expect(
+      dispatch({
+        type: "comment.add",
+        sessionId: SESSION_ID,
+        body: "A final historical discussion note",
+      })
+    ).resolves.toMatchObject({ commandType: "comment.add" });
+    await expect(
+      dispatch({
+        type: "suggestion.add",
+        sessionId: SESSION_ID,
+        body: "This would be permanently unresolvable",
+      })
+    ).rejects.toMatchObject({ code: "conflict" });
+    view = await requireSession();
+    await expect(
+      dispatch({
+        type: "suggestion.resolve",
+        sessionId: SESSION_ID,
+        suggestionId: openSuggestion.data.suggestionId as string,
+        resolution: "reject",
+        expectedSuggestionVersion: 1,
+        expectedSteeringRevision: view.steeringRevision,
+      })
+    ).rejects.toMatchObject({ code: "conflict" });
+  });
+
+  it("discovers only actor-scoped Team and Project navigation metadata", async () => {
+    await bootstrap();
+    await grantMembership(BOB, "admin");
+    await grantMembership(CAROL, "member");
+    await grantMembership(DAVE, "guest");
+
+    const alice = await kernel().inspect({
+      schemaVersion: TEAM_SESSION_SCHEMA_VERSION,
+      actor: ALICE,
+      type: "workspace.discovery",
+    });
+    expect(alice.teams).toEqual([
+      expect.objectContaining({
+        teamId: TEAM_ID,
+        viewerMembership: { role: "owner", version: 1 },
+        capabilities: { createProject: true, manageMemberships: true },
+        projects: [
+          expect.objectContaining({
+            projectId: PROJECT_ID,
+            visibility: "content",
+            viewerAccess: { role: "maintainer", version: 1 },
+            capabilities: { viewContent: true, startSession: true, manageAccess: true },
+          }),
+        ],
+      }),
+    ]);
+
+    const bob = await kernel().inspect({
+      schemaVersion: TEAM_SESSION_SCHEMA_VERSION,
+      actor: BOB,
+      type: "workspace.discovery",
+    });
+    expect(bob.teams[0]).toMatchObject({
+      viewerMembership: { role: "admin", version: 1 },
+      projects: [
+        {
+          projectId: PROJECT_ID,
+          name: "Terminal X",
+          createdAtMs: nowMs,
+          visibility: "administration",
+          capabilities: { viewContent: false, startSession: false, manageAccess: true },
+        },
+      ],
+    });
+    expect(bob.teams[0]?.projects[0]).not.toHaveProperty("viewerAccess");
+    await expect(
+      kernel().inspect({
+        schemaVersion: TEAM_SESSION_SCHEMA_VERSION,
+        actor: BOB,
+        type: "session.inbox",
+      })
+    ).resolves.toEqual([]);
+
+    const carolBefore = await kernel().inspect({
+      schemaVersion: TEAM_SESSION_SCHEMA_VERSION,
+      actor: CAROL,
+      type: "workspace.discovery",
+    });
+    expect(carolBefore.teams[0]?.projects).toEqual([]);
+    await grantProjectAccess(CAROL);
+    const carolAfter = await kernel().inspect({
+      schemaVersion: TEAM_SESSION_SCHEMA_VERSION,
+      actor: CAROL,
+      type: "workspace.discovery",
+    });
+    expect(carolAfter.teams[0]?.projects).toEqual([
+      expect.objectContaining({
+        projectId: PROJECT_ID,
+        visibility: "content",
+        viewerAccess: { role: "contributor", version: 1 },
+        capabilities: { viewContent: true, startSession: true, manageAccess: false },
+      }),
+    ]);
+
+    const guestBefore = await kernel().inspect({
+      schemaVersion: TEAM_SESSION_SCHEMA_VERSION,
+      actor: DAVE,
+      type: "workspace.discovery",
+    });
+    expect(guestBefore.teams[0]?.projects).toEqual([]);
+    await createShare(DAVE);
+    await grantParticipant(DAVE);
+    const guestAfter = await kernel().inspect({
+      schemaVersion: TEAM_SESSION_SCHEMA_VERSION,
+      actor: DAVE,
+      type: "workspace.discovery",
+    });
+    expect(guestAfter.teams[0]?.projects).toEqual([
+      {
+        projectId: PROJECT_ID,
+        name: "Terminal X",
+        createdAtMs: nowMs,
+        visibility: "session-only",
+        capabilities: { viewContent: false, startSession: false, manageAccess: false },
+      },
+    ]);
+    expect(JSON.stringify(guestAfter)).not.toContain("/srv/terminalx");
+    expect(JSON.stringify(guestAfter)).not.toContain(SESSION_ID);
+
+    await expect(
+      kernel().inspect({
+        schemaVersion: TEAM_SESSION_SCHEMA_VERSION,
+        actor: LEGACY_ADMIN,
+        type: "workspace.discovery",
+      })
+    ).resolves.toEqual({ teams: [] });
+  });
+
+  it("projects a minimized public inbox and detail with canonical display snapshots", async () => {
+    await bootstrap({ steeringPolicy: "shared" });
+    await admitMember(BOB);
+    const fullBefore = await requireSession();
+    const bobParticipant = requireParticipant(fullBefore, BOB.userId);
+    await grantSteerer(BOB);
+
+    const inbox = await kernel().inspect({
+      schemaVersion: TEAM_SESSION_SCHEMA_VERSION,
+      actor: ALICE,
+      type: "session.inbox",
+    });
+    const detail = await kernel().inspect({
+      schemaVersion: TEAM_SESSION_SCHEMA_VERSION,
+      actor: ALICE,
+      type: "session.detail",
+      sessionId: SESSION_ID,
+    });
+    expect(detail).not.toBeNull();
+    if (!detail) throw new Error("Expected public Session detail");
+    expect(inbox).toHaveLength(1);
+    expect(inbox[0]?.responsibilities.steerers).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ userId: BOB.userId, displayName: BOB.displayName }),
+      ])
+    );
+    expect(detail.participants).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          participantId: bobParticipant.participantId,
+          userId: BOB.userId,
+          displayName: BOB.displayName,
+        }),
+      ])
+    );
+    for (const projection of [inbox[0], detail]) {
+      const serialized = JSON.stringify(projection);
+      expect(serialized).not.toContain("tmuxName");
+      expect(serialized).not.toContain("multiplayer-kernel");
+      expect(serialized).not.toContain("invitations");
+      expect(serialized).not.toContain("token");
+      expect(serialized).not.toContain("sourceRef");
+      expect(serialized).not.toContain("revokedAtMs");
+    }
+
+    await revokeParticipant(BOB);
+    const afterRevocation = await kernel().inspect({
+      schemaVersion: TEAM_SESSION_SCHEMA_VERSION,
+      actor: ALICE,
+      type: "session.detail",
+      sessionId: SESSION_ID,
+    });
+    expect(
+      afterRevocation?.participants.some((participant) => participant.userId === BOB.userId)
+    ).toBe(false);
+    await expect(
+      kernel().inspect({
+        schemaVersion: TEAM_SESSION_SCHEMA_VERSION,
+        actor: BOB,
+        type: "session.detail",
+        sessionId: SESSION_ID,
+      })
+    ).resolves.toBeNull();
+  });
+
+  it("projects viewer capabilities from current shared and Runtime state", async () => {
+    await bootstrap({ steeringPolicy: "shared" });
+    await admitMember(BOB);
+    await grantSteerer(BOB);
+
+    let alice = await kernel().inspect({
+      schemaVersion: TEAM_SESSION_SCHEMA_VERSION,
+      actor: ALICE,
+      type: "session.detail",
+      sessionId: SESSION_ID,
+    });
+    const bob = await kernel().inspect({
+      schemaVersion: TEAM_SESSION_SCHEMA_VERSION,
+      actor: BOB,
+      type: "session.detail",
+      sessionId: SESSION_ID,
+    });
+    expect(alice?.viewer.capabilities).toMatchObject({
+      resolveSuggestion: true,
+      enqueueDirective: true,
+      observeTerminal: true,
+      mutateTerminal: false,
+      manageParticipants: true,
+      transferControl: true,
+    });
+    expect(bob?.viewer.capabilities).toMatchObject({
+      resolveSuggestion: true,
+      enqueueDirective: true,
+      mutateTerminal: false,
+      manageParticipants: false,
+      transferControl: false,
+    });
+
+    await enforceNextRuntimeDelivery("runtime.session.ensure");
+    alice = await kernel().inspect({
+      schemaVersion: TEAM_SESSION_SCHEMA_VERSION,
+      actor: ALICE,
+      type: "session.detail",
+      sessionId: SESSION_ID,
+    });
+    expect(alice?.viewer.capabilities.mutateTerminal).toBe(true);
+
+    await forceSessionStatus("awaiting_assignee");
+    alice = await kernel().inspect({
+      schemaVersion: TEAM_SESSION_SCHEMA_VERSION,
+      actor: ALICE,
+      type: "session.detail",
+      sessionId: SESSION_ID,
+    });
+    expect(alice?.viewer.capabilities).toMatchObject({
+      addComment: true,
+      addSuggestion: true,
+      resolveSuggestion: false,
+      enqueueDirective: false,
+      observeTerminal: true,
+      mutateTerminal: false,
+    });
+
+    await forceSessionStatus("ended");
+    alice = await kernel().inspect({
+      schemaVersion: TEAM_SESSION_SCHEMA_VERSION,
+      actor: ALICE,
+      type: "session.detail",
+      sessionId: SESSION_ID,
+    });
+    expect(alice?.viewer.capabilities).toMatchObject({
+      addComment: true,
+      addSuggestion: false,
+      resolveSuggestion: false,
+      enqueueDirective: false,
+      observeTerminal: false,
+      mutateTerminal: false,
+      createInvitation: false,
+      revokeInvitation: true,
+    });
+  });
+
+  it("uses one expiration instant for Handoff detail and capabilities", async () => {
+    await bootstrap();
+    await admitMember(BOB);
+    await offerHandoff(BOB, ALICE, nowMs + 1);
+    teamSessions?.close();
+    teamSessions = undefined;
+    let clockCalls = 0;
+    teamSessions = createTeamSessions({
+      filename,
+      clock: () => {
+        clockCalls += 1;
+        return clockCalls === 1 ? nowMs : nowMs + 2;
+      },
+      idGenerator: () => `projection-id-${++generatedId}`,
+      invitationTokenGenerator: () => `txi_projection_${"x".repeat(64)}`,
+    });
+
+    const detail = await kernel().inspect({
+      schemaVersion: TEAM_SESSION_SCHEMA_VERSION,
+      actor: BOB,
+      type: "session.detail",
+      sessionId: SESSION_ID,
+    });
+
+    expect(clockCalls).toBe(1);
+    expect(detail?.viewer.capabilities.acceptHandoff).toBe(true);
+    expect(detail?.openHandoffs).toHaveLength(1);
+  });
+
+  it("treats rendered capabilities as projections and reauthorizes later writes", async () => {
+    await bootstrap({ steeringPolicy: "shared" });
+    await admitMember(BOB);
+    const rendered = await kernel().inspect({
+      schemaVersion: TEAM_SESSION_SCHEMA_VERSION,
+      actor: BOB,
+      type: "session.detail",
+      sessionId: SESSION_ID,
+    });
+    expect(rendered?.viewer.capabilities.addComment).toBe(true);
+    await revokeProjectAccess(BOB);
+
+    await expect(
+      dispatch(
+        { type: "comment.add", sessionId: SESSION_ID, body: "Use my stale rendered state" },
+        BOB
+      )
+    ).rejects.toMatchObject({ code: "not-authorized" });
+    await expect(
+      kernel().inspect({
+        schemaVersion: TEAM_SESSION_SCHEMA_VERSION,
+        actor: BOB,
+        type: "session.inbox",
+      })
+    ).resolves.toEqual([]);
+    const discovery = await kernel().inspect({
+      schemaVersion: TEAM_SESSION_SCHEMA_VERSION,
+      actor: BOB,
+      type: "workspace.discovery",
+    });
+    expect(discovery.teams[0]?.projects).toEqual([]);
+  });
+
+  it("keeps single-policy Directive capability Controller-only", async () => {
+    await bootstrap({ steeringPolicy: "single" });
+    await admitMember(BOB);
+    const alice = await kernel().inspect({
+      schemaVersion: TEAM_SESSION_SCHEMA_VERSION,
+      actor: ALICE,
+      type: "session.detail",
+      sessionId: SESSION_ID,
+    });
+    const bob = await kernel().inspect({
+      schemaVersion: TEAM_SESSION_SCHEMA_VERSION,
+      actor: BOB,
+      type: "session.detail",
+      sessionId: SESSION_ID,
+    });
+    expect(alice?.viewer.capabilities).toMatchObject({
+      resolveSuggestion: true,
+      enqueueDirective: true,
+    });
+    expect(bob?.viewer.capabilities).toMatchObject({
+      resolveSuggestion: false,
+      enqueueDirective: false,
+    });
   });
 
   it.skipIf(process.platform === "win32")(
