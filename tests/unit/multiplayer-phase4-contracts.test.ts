@@ -119,7 +119,8 @@ function createCompileTimeAdapter(): Runtime {
         },
       };
     },
-    async command(handle, command) {
+    async command(handle, command, signal) {
+      if (signal.aborted) throw new Error("Runtime command cancelled");
       return {
         commandId: command.commandId,
         binding: handle.binding,

@@ -1,9 +1,11 @@
 import * as fs from "fs";
 import * as path from "path";
 import Database from "better-sqlite3";
+import { RUNTIME_RECEIPT_OBSERVATION_MAX_CURSOR_CODE_POINTS } from "../runtime/runtime-receipt-observation-contract";
 
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 6;
 const PRE_RUNTIME_START_SCHEMA_VERSION = 4;
+const RUNTIME_START_SCHEMA_VERSION = 5;
 const APPLICATION_ID = 0x54585331; // "TXS1"
 
 const CONVERSATION_SCHEMA = `
@@ -2981,6 +2983,730 @@ BEGIN
 END;
 `;
 
+const RUNTIME_RECEIPT_FOLLOW_SCHEMA_V6 = `
+CREATE TRIGGER runtime_run_command_dispatch_interlock_initial_state
+BEFORE INSERT ON runtime_run_command_dispatch
+WHEN NEW.dispatch_interlock_acquired_at_ms IS NOT NULL
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime Run dispatch interlock must begin unacquired');
+END;
+
+DROP TRIGGER runtime_run_command_dispatch_valid_transition;
+
+CREATE TRIGGER runtime_run_command_dispatch_valid_transition
+BEFORE UPDATE ON runtime_run_command_dispatch
+WHEN
+  OLD.status IN ('enforced', 'rejected', 'quarantined', 'superseded', 'failed') OR
+  NEW.updated_at_ms < OLD.updated_at_ms OR
+  NOT (
+    (OLD.status = 'pending' AND NEW.status = 'processing'
+      AND NEW.attempts = OLD.attempts + 1
+      AND NEW.available_at_ms = OLD.available_at_ms
+      AND NEW.updated_at_ms >= OLD.available_at_ms
+      AND NEW.dispatch_interlock_acquired_at_ms IS NULL
+      AND (
+        OLD.attempts = 0 OR COALESCE(OLD.last_safe_error_code IN (
+            'invalid_input', 'invalid_authority', 'authority_verification_failed',
+            'binding_mismatch', 'deadline_expired', 'runtime_handle_unavailable',
+            'lease_expired_before_dispatch'
+          ), 0)
+      )) OR
+    (OLD.status = 'pending' AND NEW.status = 'pending'
+      AND NEW.attempts = OLD.attempts
+      AND NEW.available_at_ms >= OLD.available_at_ms
+      AND NEW.available_at_ms >= NEW.updated_at_ms
+      AND NEW.dispatch_interlock_acquired_at_ms IS OLD.dispatch_interlock_acquired_at_ms
+      AND (
+        OLD.attempts = 0 OR COALESCE(
+          NEW.last_safe_error_code = OLD.last_safe_error_code,
+          0
+        )
+      )) OR
+    (OLD.status = 'pending' AND NEW.status = 'failed'
+      AND NEW.attempts = OLD.attempts
+      AND NEW.available_at_ms = OLD.available_at_ms
+      AND NEW.dispatch_interlock_acquired_at_ms IS OLD.dispatch_interlock_acquired_at_ms
+      AND COALESCE(NEW.last_safe_error_code IN (
+          'invalid_input', 'invalid_authority', 'authority_verification_failed',
+          'binding_mismatch', 'deadline_expired', 'runtime_handle_unavailable',
+          'lease_expired_before_dispatch'
+        ), 0)
+      AND (
+        OLD.attempts = 0 OR COALESCE(
+          NEW.last_safe_error_code = OLD.last_safe_error_code,
+          0
+        )
+      )) OR
+    (OLD.status = 'pending' AND NEW.status = 'superseded'
+      AND NEW.attempts = OLD.attempts
+      AND NEW.available_at_ms = OLD.available_at_ms
+      AND NEW.dispatch_interlock_acquired_at_ms IS OLD.dispatch_interlock_acquired_at_ms
+      AND NEW.last_safe_error_code = 'state_fence_superseded'
+      AND (
+        OLD.attempts = 0 OR COALESCE(OLD.last_safe_error_code IN (
+            'invalid_input', 'invalid_authority', 'authority_verification_failed',
+            'binding_mismatch', 'deadline_expired', 'runtime_handle_unavailable',
+            'lease_expired_before_dispatch'
+          ), 0)
+      )) OR
+    (OLD.status = 'processing' AND NEW.status = 'processing'
+      AND NEW.attempts = OLD.attempts
+      AND NEW.available_at_ms = OLD.available_at_ms
+      AND NEW.lease_owner = OLD.lease_owner
+      AND NEW.updated_at_ms < OLD.lease_expires_at_ms
+      AND NEW.lease_expires_at_ms >= OLD.lease_expires_at_ms
+      AND OLD.dispatch_interlock_acquired_at_ms IS NULL
+      AND NEW.dispatch_interlock_acquired_at_ms = NEW.updated_at_ms
+      AND NEW.dispatch_interlock_acquired_at_ms < NEW.lease_expires_at_ms) OR
+    (OLD.status = 'processing' AND NEW.status = 'pending'
+      AND NEW.attempts = OLD.attempts
+      AND NEW.available_at_ms >= OLD.available_at_ms
+      AND NEW.available_at_ms >= NEW.updated_at_ms
+      AND NEW.dispatch_interlock_acquired_at_ms IS OLD.dispatch_interlock_acquired_at_ms
+      AND COALESCE(NEW.last_safe_error_code IN (
+          'invalid_input', 'invalid_authority', 'authority_verification_failed',
+          'binding_mismatch', 'deadline_expired', 'runtime_handle_unavailable',
+          'lease_expired_before_dispatch'
+        ), 0)
+      AND (
+        NEW.updated_at_ms < OLD.lease_expires_at_ms OR (
+          OLD.dispatch_interlock_acquired_at_ms IS NULL
+          AND NEW.last_safe_error_code IN (
+            'lease_expired_before_dispatch', 'deadline_expired'
+          )
+          AND NEW.updated_at_ms >= OLD.lease_expires_at_ms
+        )
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM runtime_run_command_receipts receipt
+        WHERE receipt.command_id = OLD.command_id
+      )) OR
+    (OLD.status = 'processing' AND NEW.status = 'superseded'
+      AND NEW.attempts = OLD.attempts
+      AND NEW.available_at_ms = OLD.available_at_ms
+      AND OLD.dispatch_interlock_acquired_at_ms IS NULL
+      AND NEW.dispatch_interlock_acquired_at_ms IS NULL
+      AND NEW.updated_at_ms < OLD.lease_expires_at_ms
+      AND NEW.last_safe_error_code = 'state_fence_superseded'
+      AND NOT EXISTS (
+        SELECT 1 FROM runtime_run_command_receipts receipt
+        WHERE receipt.command_id = OLD.command_id
+      )) OR
+    (OLD.status = 'processing' AND NEW.status = 'awaiting-receipt'
+      AND NEW.attempts = OLD.attempts
+      AND NEW.available_at_ms >= OLD.available_at_ms
+      AND NEW.available_at_ms >= NEW.updated_at_ms
+      AND OLD.dispatch_interlock_acquired_at_ms IS NOT NULL
+      AND NEW.dispatch_interlock_acquired_at_ms IS OLD.dispatch_interlock_acquired_at_ms) OR
+    (OLD.status = 'processing' AND NEW.status = 'compensating'
+      AND NEW.attempts = OLD.attempts
+      AND NEW.available_at_ms = OLD.available_at_ms
+      AND NEW.dispatch_interlock_acquired_at_ms IS OLD.dispatch_interlock_acquired_at_ms
+      AND EXISTS (
+        SELECT 1 FROM runtime_run_command_receipts receipt
+        WHERE receipt.command_id = OLD.command_id
+          AND (
+            receipt.outcome = 'enforced' OR
+            (receipt.outcome = 'duplicate' AND receipt.original_outcome = 'enforced')
+          )
+      )) OR
+    (OLD.status = 'processing' AND NEW.status IN (
+        'enforced', 'rejected', 'quarantined'
+      )
+      AND NEW.attempts = OLD.attempts
+      AND NEW.available_at_ms = OLD.available_at_ms
+      AND NEW.dispatch_interlock_acquired_at_ms IS OLD.dispatch_interlock_acquired_at_ms) OR
+    (OLD.status = 'awaiting-receipt' AND NEW.status = 'awaiting-receipt'
+      AND NEW.attempts = OLD.attempts
+      AND NEW.available_at_ms >= OLD.available_at_ms
+      AND NEW.available_at_ms >= NEW.updated_at_ms
+      AND NEW.dispatch_interlock_acquired_at_ms IS OLD.dispatch_interlock_acquired_at_ms) OR
+    (OLD.status = 'awaiting-receipt' AND NEW.status = 'compensating'
+      AND NEW.attempts = OLD.attempts
+      AND NEW.available_at_ms = OLD.available_at_ms
+      AND NEW.dispatch_interlock_acquired_at_ms IS OLD.dispatch_interlock_acquired_at_ms
+      AND EXISTS (
+        SELECT 1 FROM runtime_run_command_receipts receipt
+        WHERE receipt.command_id = OLD.command_id
+          AND (
+            receipt.outcome = 'enforced' OR
+            (receipt.outcome = 'duplicate' AND receipt.original_outcome = 'enforced')
+          )
+      )) OR
+    (OLD.status = 'awaiting-receipt' AND NEW.status IN (
+        'enforced', 'rejected', 'quarantined'
+      )
+      AND NEW.attempts = OLD.attempts
+      AND NEW.available_at_ms = OLD.available_at_ms
+      AND NEW.dispatch_interlock_acquired_at_ms IS OLD.dispatch_interlock_acquired_at_ms)
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'Invalid Runtime Run command dispatch transition');
+END;
+
+DROP TRIGGER runtime_run_command_receipts_dispatch_state;
+
+CREATE TRIGGER runtime_run_command_receipts_dispatch_state
+BEFORE INSERT ON runtime_run_command_receipts
+WHEN NOT EXISTS (
+  SELECT 1 FROM runtime_run_command_dispatch dispatch
+  WHERE dispatch.command_id = NEW.command_id
+    AND dispatch.agent_run_id = NEW.agent_run_id
+    AND (
+      (dispatch.status = 'processing'
+        AND dispatch.dispatch_interlock_acquired_at_ms IS NOT NULL) OR
+      dispatch.status = 'awaiting-receipt'
+    )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime Run command dispatch is not accepting receipts');
+END;
+
+CREATE TRIGGER sessions_runtime_lifecycle_dispatch_interlock
+BEFORE UPDATE OF status, runtime_authorization_generation, runtime_authorization_state ON sessions
+WHEN (
+  NEW.status <> OLD.status OR
+  NEW.runtime_authorization_generation <> OLD.runtime_authorization_generation OR
+  NEW.runtime_authorization_state <> OLD.runtime_authorization_state
+) AND EXISTS (
+  SELECT 1
+  FROM runtime_run_commands command
+  JOIN runtime_run_command_dispatch dispatch ON dispatch.command_id = command.id
+  WHERE command.session_id = OLD.id
+    AND dispatch.status = 'processing'
+    AND dispatch.dispatch_interlock_acquired_at_ms IS NOT NULL
+    AND NOT EXISTS (
+      SELECT 1 FROM runtime_run_command_receipts receipt
+      WHERE receipt.command_id = command.id
+    )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Session trust cannot change across an acquired Runtime dispatch interlock');
+END;
+
+CREATE TRIGGER runtime_assignments_lifecycle_dispatch_interlock
+BEFORE UPDATE OF status, runtime_authorization_generation ON runtime_assignments
+WHEN (
+  NEW.status <> OLD.status OR
+  NEW.runtime_authorization_generation <> OLD.runtime_authorization_generation
+) AND EXISTS (
+  SELECT 1
+  FROM runtime_run_commands command
+  JOIN runtime_run_command_dispatch dispatch ON dispatch.command_id = command.id
+  WHERE command.runtime_assignment_id = OLD.id
+    AND dispatch.status = 'processing'
+    AND dispatch.dispatch_interlock_acquired_at_ms IS NOT NULL
+    AND NOT EXISTS (
+      SELECT 1 FROM runtime_run_command_receipts receipt
+      WHERE receipt.command_id = command.id
+    )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime Assignment trust cannot change across an acquired dispatch interlock');
+END;
+
+CREATE TRIGGER agent_runs_lifecycle_dispatch_interlock
+BEFORE UPDATE OF lifecycle, state_version, current_policy_revision, current_goal_set_revision,
+  runtime_assignment_id, runtime_authorization_generation ON agent_runs
+WHEN (
+  NEW.lifecycle <> OLD.lifecycle OR
+  NEW.state_version <> OLD.state_version OR
+  NEW.current_policy_revision <> OLD.current_policy_revision OR
+  NEW.current_goal_set_revision <> OLD.current_goal_set_revision OR
+  NEW.runtime_assignment_id <> OLD.runtime_assignment_id OR
+  NEW.runtime_authorization_generation <> OLD.runtime_authorization_generation
+) AND EXISTS (
+  SELECT 1
+  FROM runtime_run_commands command
+  JOIN runtime_run_command_dispatch dispatch ON dispatch.command_id = command.id
+  WHERE command.agent_run_id = OLD.id
+    AND dispatch.status = 'processing'
+    AND dispatch.dispatch_interlock_acquired_at_ms IS NOT NULL
+    AND NOT EXISTS (
+      SELECT 1 FROM runtime_run_command_receipts receipt
+      WHERE receipt.command_id = command.id
+    )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Agent Run trust cannot change across an acquired Runtime dispatch interlock');
+END;
+
+CREATE TRIGGER run_policy_revisions_enforcer_set_binding
+BEFORE INSERT ON run_policy_revisions
+WHEN NEW.required_effect_enforcer_set_digest IS NULL OR NOT EXISTS (
+  SELECT 1 FROM runtime_authorization_epochs epoch
+  WHERE epoch.session_id = NEW.session_id
+    AND epoch.generation = NEW.runtime_authorization_generation
+    AND epoch.runtime_assignment_id = NEW.runtime_assignment_id
+    AND epoch.runtime_assignment_generation = NEW.runtime_assignment_generation
+    AND epoch.sandbox_id = NEW.sandbox_id
+    AND epoch.sandbox_generation = NEW.sandbox_generation
+    AND epoch.runtime_principal_id = NEW.runtime_principal_id
+    AND epoch.effect_enforcer_set_digest = NEW.required_effect_enforcer_set_digest
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Run policy effect-enforcer set does not match its authorization epoch');
+END;
+
+CREATE TRIGGER runtime_run_commands_enforcer_set_binding
+BEFORE INSERT ON runtime_run_commands
+WHEN NEW.required_effect_enforcer_set_digest IS NULL OR
+  COALESCE(
+    json_extract(NEW.command_json, '$.requiredEffectEnforcerSetDigest') =
+      NEW.required_effect_enforcer_set_digest,
+    0
+  ) = 0 OR
+  (NEW.operation = 'run.start' AND COALESCE(
+    json_extract(NEW.command_json, '$.policy.requiredEffectEnforcerSetDigest') =
+      NEW.required_effect_enforcer_set_digest,
+    0
+  ) = 0) OR NOT EXISTS (
+    SELECT 1
+    FROM run_policy_revisions policy
+    JOIN runtime_authorization_epochs epoch
+      ON epoch.session_id = policy.session_id
+     AND epoch.generation = policy.runtime_authorization_generation
+     AND epoch.runtime_assignment_id = policy.runtime_assignment_id
+     AND epoch.runtime_assignment_generation = policy.runtime_assignment_generation
+     AND epoch.sandbox_id = policy.sandbox_id
+     AND epoch.sandbox_generation = policy.sandbox_generation
+     AND epoch.runtime_principal_id = policy.runtime_principal_id
+    WHERE policy.agent_run_id = NEW.agent_run_id
+      AND policy.session_id = NEW.session_id
+      AND policy.revision = NEW.run_policy_revision
+      AND policy.runtime_assignment_id = NEW.runtime_assignment_id
+      AND policy.runtime_assignment_generation = NEW.runtime_assignment_generation
+      AND policy.sandbox_id = NEW.sandbox_id
+      AND policy.sandbox_generation = NEW.sandbox_generation
+      AND policy.runtime_principal_id = NEW.runtime_principal_id
+      AND policy.runtime_authorization_generation = NEW.runtime_authorization_generation
+      AND policy.required_effect_enforcer_set_digest =
+        NEW.required_effect_enforcer_set_digest
+      AND epoch.effect_enforcer_set_digest = NEW.required_effect_enforcer_set_digest
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime command effect-enforcer set does not match policy and epoch');
+END;
+
+CREATE TRIGGER runtime_run_command_receipts_enforcement_proof
+BEFORE INSERT ON runtime_run_command_receipts
+WHEN NOT EXISTS (
+  SELECT 1 FROM runtime_run_commands command
+  WHERE command.id = NEW.command_id
+    AND (
+      (
+        NEW.outcome = 'enforced' OR
+        (NEW.outcome = 'duplicate' AND NEW.original_outcome = 'enforced')
+      )
+      AND NEW.required_effect_enforcer_set_digest =
+        command.required_effect_enforcer_set_digest
+      AND NEW.enforcement_subject_digest IS NOT NULL
+      AND NEW.aggregate_proof_digest IS NOT NULL
+      AND NEW.proof_verified_at_ms IS NOT NULL
+      AND NEW.proof_verified_at_ms <= NEW.received_at_ms
+      AND COALESCE(
+        json_extract(
+          NEW.receipt_json,
+          CASE WHEN NEW.outcome = 'duplicate'
+            THEN '$.originalReceipt.aggregateEnforcementProof.generation'
+            ELSE '$.aggregateEnforcementProof.generation'
+          END
+        ) = NEW.runtime_authorization_generation,
+        0
+      )
+      AND COALESCE(
+        json_extract(
+          NEW.receipt_json,
+          CASE WHEN NEW.outcome = 'duplicate'
+            THEN '$.originalReceipt.aggregateEnforcementProof.requiredEffectEnforcerSetDigest'
+            ELSE '$.aggregateEnforcementProof.requiredEffectEnforcerSetDigest'
+          END
+        ) = NEW.required_effect_enforcer_set_digest,
+        0
+      )
+      AND COALESCE(
+        json_extract(
+          NEW.receipt_json,
+          CASE WHEN NEW.outcome = 'duplicate'
+            THEN '$.originalReceipt.aggregateEnforcementProof.enforcementSubjectDigest'
+            ELSE '$.aggregateEnforcementProof.enforcementSubjectDigest'
+          END
+        ) = NEW.enforcement_subject_digest,
+        0
+      )
+      AND COALESCE(
+        json_extract(
+          NEW.receipt_json,
+          CASE WHEN NEW.outcome = 'duplicate'
+            THEN '$.originalReceipt.aggregateEnforcementProof.aggregateProofDigest'
+            ELSE '$.aggregateEnforcementProof.aggregateProofDigest'
+          END
+        ) = NEW.aggregate_proof_digest,
+        0
+      )
+    ) OR (
+      NOT (
+        NEW.outcome = 'enforced' OR
+        (NEW.outcome = 'duplicate' AND NEW.original_outcome = 'enforced')
+      )
+      AND NEW.required_effect_enforcer_set_digest IS NULL
+      AND NEW.enforcement_subject_digest IS NULL
+      AND NEW.aggregate_proof_digest IS NULL
+      AND NEW.proof_verified_at_ms IS NULL
+    )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime enforced receipt lacks an exact verified aggregate proof');
+END;
+
+DROP TRIGGER runtime_run_command_effects_enforced_receipt;
+
+CREATE TRIGGER runtime_run_command_effects_enforced_receipt
+BEFORE INSERT ON runtime_run_command_effects
+WHEN NOT EXISTS (
+  SELECT 1
+  FROM runtime_run_command_receipts receipt
+  JOIN runtime_run_commands command ON command.id = receipt.command_id
+  WHERE receipt.id = NEW.receipt_id
+    AND receipt.command_id = NEW.command_id
+    AND (
+      receipt.outcome = 'enforced' OR
+      (receipt.outcome = 'duplicate' AND receipt.original_outcome = 'enforced')
+    )
+    AND receipt.required_effect_enforcer_set_digest =
+      command.required_effect_enforcer_set_digest
+    AND receipt.enforcement_subject_digest IS NOT NULL
+    AND receipt.aggregate_proof_digest IS NOT NULL
+    AND receipt.proof_verified_at_ms IS NOT NULL
+    AND receipt.proof_verified_at_ms <= receipt.received_at_ms
+    AND receipt.received_at_ms <= NEW.applied_at_ms
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime Run effect requires a verified enforced receipt');
+END;
+
+CREATE TABLE runtime_principal_observation_keys (
+  runtime_assignment_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  runtime_assignment_generation INTEGER NOT NULL CHECK (runtime_assignment_generation >= 1),
+  sandbox_id TEXT NOT NULL CHECK (length(sandbox_id) BETWEEN 1 AND 300),
+  sandbox_generation INTEGER NOT NULL CHECK (sandbox_generation >= 1),
+  runtime_principal_id TEXT NOT NULL CHECK (length(runtime_principal_id) BETWEEN 1 AND 300),
+  runtime_authorization_generation INTEGER NOT NULL
+    CHECK (runtime_authorization_generation >= 1),
+  issuer_key_id TEXT NOT NULL CHECK (length(issuer_key_id) BETWEEN 1 AND 300),
+  public_key_spki_pem TEXT NOT NULL CHECK (length(public_key_spki_pem) BETWEEN 80 AND 4000),
+  public_key_spki_digest TEXT NOT NULL CHECK (
+    length(public_key_spki_digest) = 64 AND public_key_spki_digest = lower(public_key_spki_digest)
+  ),
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  PRIMARY KEY (runtime_assignment_id, runtime_authorization_generation),
+  UNIQUE (runtime_assignment_id, runtime_authorization_generation, issuer_key_id),
+  UNIQUE (
+    runtime_assignment_id, runtime_authorization_generation, issuer_key_id,
+    public_key_spki_digest
+  ),
+  FOREIGN KEY (
+    runtime_assignment_id, session_id, runtime_assignment_generation,
+    sandbox_id, sandbox_generation, runtime_principal_id
+  ) REFERENCES runtime_assignments(
+    id, session_id, generation, sandbox_id, sandbox_generation, runtime_principal_id
+  ) ON DELETE RESTRICT,
+  FOREIGN KEY (
+    session_id, runtime_authorization_generation, runtime_assignment_id,
+    runtime_assignment_generation, sandbox_id, sandbox_generation, runtime_principal_id
+  ) REFERENCES runtime_authorization_epochs(
+    session_id, generation, runtime_assignment_id, runtime_assignment_generation,
+    sandbox_id, sandbox_generation, runtime_principal_id
+  ) ON DELETE RESTRICT
+) STRICT;
+
+CREATE TRIGGER runtime_principal_observation_keys_immutable_update
+BEFORE UPDATE ON runtime_principal_observation_keys
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime principal observation keys are immutable');
+END;
+
+CREATE TRIGGER runtime_principal_observation_keys_immutable_delete
+BEFORE DELETE ON runtime_principal_observation_keys
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime principal observation keys are immutable');
+END;
+
+CREATE TABLE runtime_receipt_follow_streams (
+  runtime_assignment_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  runtime_assignment_generation INTEGER NOT NULL CHECK (runtime_assignment_generation >= 1),
+  sandbox_id TEXT NOT NULL CHECK (length(sandbox_id) BETWEEN 1 AND 300),
+  sandbox_generation INTEGER NOT NULL CHECK (sandbox_generation >= 1),
+  runtime_principal_id TEXT NOT NULL CHECK (length(runtime_principal_id) BETWEEN 1 AND 300),
+  runtime_authorization_generation INTEGER NOT NULL
+    CHECK (runtime_authorization_generation >= 1),
+  issuer_key_id TEXT NOT NULL CHECK (length(issuer_key_id) BETWEEN 1 AND 300),
+  public_key_spki_digest TEXT NOT NULL CHECK (
+    length(public_key_spki_digest) = 64 AND public_key_spki_digest = lower(public_key_spki_digest)
+  ),
+  status TEXT NOT NULL CHECK (status IN ('pending', 'processing', 'quarantined')),
+  attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+  lease_version INTEGER NOT NULL DEFAULT 0 CHECK (lease_version >= 0),
+  available_at_ms INTEGER NOT NULL CHECK (available_at_ms >= created_at_ms),
+  lease_owner TEXT,
+  lease_expires_at_ms INTEGER,
+  cursor TEXT CHECK (
+    cursor IS NULL OR length(cursor) BETWEEN 1 AND ${RUNTIME_RECEIPT_OBSERVATION_MAX_CURSOR_CODE_POINTS}
+  ),
+  last_observation_digest TEXT CHECK (
+    last_observation_digest IS NULL OR (
+      length(last_observation_digest) = 64 AND
+      last_observation_digest = lower(last_observation_digest)
+    )
+  ),
+  receipt_sequence INTEGER NOT NULL DEFAULT 0 CHECK (receipt_sequence >= 0),
+  last_safe_error_code TEXT CHECK (
+    last_safe_error_code IS NULL OR length(last_safe_error_code) BETWEEN 1 AND 200
+  ),
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= created_at_ms),
+  PRIMARY KEY (runtime_assignment_id, runtime_authorization_generation),
+  UNIQUE (
+    runtime_assignment_id, runtime_authorization_generation, session_id,
+    runtime_assignment_generation, sandbox_id, sandbox_generation, runtime_principal_id,
+    issuer_key_id, public_key_spki_digest
+  ),
+  CHECK (
+    (status = 'processing'
+      AND lease_owner IS NOT NULL AND length(lease_owner) BETWEEN 1 AND 300
+      AND lease_expires_at_ms IS NOT NULL AND lease_expires_at_ms > updated_at_ms) OR
+    (status <> 'processing' AND lease_owner IS NULL AND lease_expires_at_ms IS NULL)
+  ),
+  CHECK (
+    (receipt_sequence = 0 AND cursor IS NULL AND last_observation_digest IS NULL) OR
+    (receipt_sequence > 0 AND cursor IS NOT NULL AND last_observation_digest IS NOT NULL)
+  ),
+  FOREIGN KEY (
+    runtime_assignment_id, runtime_authorization_generation, issuer_key_id,
+    public_key_spki_digest
+  ) REFERENCES runtime_principal_observation_keys(
+    runtime_assignment_id, runtime_authorization_generation, issuer_key_id,
+    public_key_spki_digest
+  ) ON DELETE RESTRICT
+) STRICT;
+
+CREATE INDEX runtime_receipt_follow_streams_claimable
+  ON runtime_receipt_follow_streams(status, available_at_ms, created_at_ms, runtime_assignment_id);
+
+CREATE TRIGGER runtime_receipt_follow_streams_initial_state
+BEFORE INSERT ON runtime_receipt_follow_streams
+WHEN NEW.status <> 'pending' OR NEW.attempts <> 0 OR NEW.lease_version <> 0 OR
+  NEW.available_at_ms <> NEW.created_at_ms OR NEW.lease_owner IS NOT NULL OR
+  NEW.lease_expires_at_ms IS NOT NULL OR NEW.cursor IS NOT NULL OR
+  NEW.last_observation_digest IS NOT NULL OR NEW.receipt_sequence <> 0 OR
+  NEW.last_safe_error_code IS NOT NULL OR NEW.updated_at_ms <> NEW.created_at_ms
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime receipt follow stream must begin pending');
+END;
+
+CREATE TRIGGER runtime_receipt_follow_streams_identity_immutable
+BEFORE UPDATE OF
+  runtime_assignment_id, session_id, runtime_assignment_generation, sandbox_id,
+  sandbox_generation, runtime_principal_id, runtime_authorization_generation,
+  issuer_key_id, public_key_spki_digest, created_at_ms
+ON runtime_receipt_follow_streams
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime receipt follow stream identity is immutable');
+END;
+
+CREATE TRIGGER runtime_receipt_follow_streams_immutable_delete
+BEFORE DELETE ON runtime_receipt_follow_streams
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime receipt follow streams cannot be deleted');
+END;
+
+CREATE TABLE runtime_receipt_follow_events (
+  id TEXT PRIMARY KEY,
+  runtime_assignment_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  runtime_assignment_generation INTEGER NOT NULL CHECK (runtime_assignment_generation >= 1),
+  sandbox_id TEXT NOT NULL CHECK (length(sandbox_id) BETWEEN 1 AND 300),
+  sandbox_generation INTEGER NOT NULL CHECK (sandbox_generation >= 1),
+  runtime_principal_id TEXT NOT NULL CHECK (length(runtime_principal_id) BETWEEN 1 AND 300),
+  runtime_authorization_generation INTEGER NOT NULL
+    CHECK (runtime_authorization_generation >= 1),
+  issuer_key_id TEXT NOT NULL CHECK (length(issuer_key_id) BETWEEN 1 AND 300),
+  public_key_spki_digest TEXT NOT NULL CHECK (
+    length(public_key_spki_digest) = 64 AND public_key_spki_digest = lower(public_key_spki_digest)
+  ),
+  receipt_sequence INTEGER NOT NULL CHECK (receipt_sequence >= 1),
+  cursor TEXT NOT NULL CHECK (
+    length(cursor) BETWEEN 1 AND ${RUNTIME_RECEIPT_OBSERVATION_MAX_CURSOR_CODE_POINTS}
+  ),
+  previous_cursor TEXT CHECK (
+    previous_cursor IS NULL OR
+    length(previous_cursor) BETWEEN 1 AND ${RUNTIME_RECEIPT_OBSERVATION_MAX_CURSOR_CODE_POINTS}
+  ),
+  previous_observation_digest TEXT CHECK (
+    previous_observation_digest IS NULL OR (
+      length(previous_observation_digest) = 64 AND
+      previous_observation_digest = lower(previous_observation_digest)
+    )
+  ),
+  observation_digest TEXT NOT NULL CHECK (
+    length(observation_digest) = 64 AND observation_digest = lower(observation_digest)
+  ),
+  command_id TEXT NOT NULL,
+  command_digest TEXT NOT NULL CHECK (
+    length(command_digest) = 64 AND command_digest = lower(command_digest)
+  ),
+  receipt_id TEXT NOT NULL,
+  wire_receipt_digest TEXT NOT NULL CHECK (
+    length(wire_receipt_digest) = 64 AND wire_receipt_digest = lower(wire_receipt_digest)
+  ),
+  effective_receipt_digest TEXT NOT NULL CHECK (
+    length(effective_receipt_digest) = 64 AND
+    effective_receipt_digest = lower(effective_receipt_digest)
+  ),
+  signature TEXT NOT NULL CHECK (length(signature) BETWEEN 1 AND 2000),
+  lease_owner TEXT NOT NULL CHECK (length(lease_owner) BETWEEN 1 AND 300),
+  lease_version INTEGER NOT NULL CHECK (lease_version >= 1),
+  observed_at_ms INTEGER NOT NULL CHECK (observed_at_ms >= 0),
+  received_at_ms INTEGER NOT NULL CHECK (received_at_ms >= observed_at_ms),
+  UNIQUE (runtime_assignment_id, runtime_authorization_generation, receipt_sequence),
+  UNIQUE (runtime_assignment_id, runtime_authorization_generation, cursor),
+  UNIQUE (runtime_assignment_id, runtime_authorization_generation, observation_digest),
+  FOREIGN KEY (
+    runtime_assignment_id, runtime_authorization_generation, session_id,
+    runtime_assignment_generation, sandbox_id, sandbox_generation, runtime_principal_id,
+    issuer_key_id, public_key_spki_digest
+  ) REFERENCES runtime_receipt_follow_streams(
+    runtime_assignment_id, runtime_authorization_generation, session_id,
+    runtime_assignment_generation, sandbox_id, sandbox_generation, runtime_principal_id,
+    issuer_key_id, public_key_spki_digest
+  ) ON DELETE RESTRICT,
+  FOREIGN KEY (command_id) REFERENCES runtime_run_commands(id) ON DELETE RESTRICT,
+  FOREIGN KEY (receipt_id) REFERENCES runtime_run_command_receipts(id) ON DELETE RESTRICT,
+  CHECK (
+    (receipt_sequence = 1 AND previous_cursor IS NULL AND previous_observation_digest IS NULL) OR
+    (receipt_sequence > 1 AND previous_cursor IS NOT NULL AND previous_observation_digest IS NOT NULL)
+  )
+) STRICT;
+
+CREATE TRIGGER runtime_receipt_follow_events_valid_insert
+BEFORE INSERT ON runtime_receipt_follow_events
+WHEN NOT EXISTS (
+  SELECT 1
+  FROM runtime_receipt_follow_streams stream
+  JOIN runtime_run_commands command ON command.id = NEW.command_id
+  JOIN runtime_run_command_receipts receipt ON receipt.id = NEW.receipt_id
+  WHERE stream.runtime_assignment_id = NEW.runtime_assignment_id
+    AND stream.runtime_authorization_generation = NEW.runtime_authorization_generation
+    AND stream.status = 'processing'
+    AND stream.lease_owner = NEW.lease_owner
+    AND stream.lease_version = NEW.lease_version
+    AND stream.lease_expires_at_ms > NEW.received_at_ms
+    AND NEW.receipt_sequence = stream.receipt_sequence + 1
+    AND NEW.previous_cursor IS stream.cursor
+    AND NEW.previous_observation_digest IS stream.last_observation_digest
+    AND command.session_id = NEW.session_id
+    AND command.runtime_assignment_id = NEW.runtime_assignment_id
+    AND command.runtime_assignment_generation = NEW.runtime_assignment_generation
+    AND command.sandbox_id = NEW.sandbox_id
+    AND command.sandbox_generation = NEW.sandbox_generation
+    AND command.runtime_principal_id = NEW.runtime_principal_id
+    AND command.runtime_authorization_generation = NEW.runtime_authorization_generation
+    AND command.command_digest = NEW.command_digest
+    AND receipt.command_id = NEW.command_id
+    AND receipt.receipt_digest = NEW.effective_receipt_digest
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime receipt follow event is not exact-bound to its lease and receipt');
+END;
+
+CREATE TRIGGER runtime_receipt_follow_events_immutable_update
+BEFORE UPDATE ON runtime_receipt_follow_events
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime receipt follow events are immutable');
+END;
+
+CREATE TRIGGER runtime_receipt_follow_events_immutable_delete
+BEFORE DELETE ON runtime_receipt_follow_events
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime receipt follow events cannot be deleted');
+END;
+
+CREATE TRIGGER runtime_receipt_follow_streams_valid_transition
+BEFORE UPDATE ON runtime_receipt_follow_streams
+WHEN NEW.updated_at_ms < OLD.updated_at_ms OR NOT (
+  (OLD.status = 'pending' AND NEW.status = 'processing'
+    AND NEW.attempts = OLD.attempts + 1
+    AND NEW.lease_version = OLD.lease_version + 1
+    AND NEW.available_at_ms = OLD.available_at_ms
+    AND NEW.cursor IS OLD.cursor
+    AND NEW.last_observation_digest IS OLD.last_observation_digest
+    AND NEW.receipt_sequence = OLD.receipt_sequence
+    AND NEW.updated_at_ms >= OLD.available_at_ms) OR
+  (OLD.status = 'pending' AND NEW.status = 'pending'
+    AND NEW.attempts = OLD.attempts
+    AND NEW.lease_version = OLD.lease_version
+    AND NEW.available_at_ms >= OLD.available_at_ms
+    AND NEW.available_at_ms >= NEW.updated_at_ms
+    AND NEW.cursor IS OLD.cursor
+    AND NEW.last_observation_digest IS OLD.last_observation_digest
+    AND NEW.receipt_sequence = OLD.receipt_sequence) OR
+  (OLD.status = 'processing' AND NEW.status = 'processing'
+    AND NEW.attempts = OLD.attempts
+    AND NEW.lease_version = OLD.lease_version
+    AND NEW.available_at_ms = OLD.available_at_ms
+    AND NEW.lease_owner = OLD.lease_owner
+    AND NEW.cursor IS OLD.cursor
+    AND NEW.last_observation_digest IS OLD.last_observation_digest
+    AND NEW.receipt_sequence = OLD.receipt_sequence
+    AND NEW.updated_at_ms < OLD.lease_expires_at_ms
+    AND NEW.lease_expires_at_ms >= OLD.lease_expires_at_ms) OR
+  (OLD.status = 'processing' AND NEW.status = 'pending'
+    AND NEW.attempts = OLD.attempts
+    AND NEW.lease_version = OLD.lease_version
+    AND NEW.available_at_ms >= OLD.available_at_ms
+    AND NEW.available_at_ms >= NEW.updated_at_ms
+    AND (
+      (NEW.cursor IS OLD.cursor
+        AND NEW.last_observation_digest IS OLD.last_observation_digest
+        AND NEW.receipt_sequence = OLD.receipt_sequence) OR
+      (NEW.cursor IS NOT NULL
+        AND NEW.last_observation_digest IS NOT NULL
+        AND NEW.receipt_sequence = OLD.receipt_sequence + 1
+        AND EXISTS (
+          SELECT 1 FROM runtime_receipt_follow_events event
+          WHERE event.runtime_assignment_id = OLD.runtime_assignment_id
+            AND event.runtime_authorization_generation = OLD.runtime_authorization_generation
+            AND event.receipt_sequence = NEW.receipt_sequence
+            AND event.cursor = NEW.cursor
+            AND event.observation_digest = NEW.last_observation_digest
+            AND event.lease_owner = OLD.lease_owner
+            AND event.lease_version = OLD.lease_version
+        ))
+    )) OR
+  (OLD.status IN ('pending', 'processing') AND NEW.status = 'quarantined'
+    AND NEW.attempts = OLD.attempts
+    AND NEW.lease_version = OLD.lease_version
+    AND NEW.available_at_ms = OLD.available_at_ms
+    AND NEW.cursor IS OLD.cursor
+    AND NEW.last_observation_digest IS OLD.last_observation_digest
+    AND NEW.receipt_sequence = OLD.receipt_sequence
+    AND NEW.last_safe_error_code IS NOT NULL) OR
+  (OLD.status = 'quarantined' AND NEW.status = 'quarantined'
+    AND NEW.attempts = OLD.attempts
+    AND NEW.lease_version = OLD.lease_version
+    AND NEW.available_at_ms = OLD.available_at_ms
+    AND NEW.cursor IS OLD.cursor
+    AND NEW.last_observation_digest IS OLD.last_observation_digest
+    AND NEW.receipt_sequence = OLD.receipt_sequence
+    AND NEW.last_safe_error_code = OLD.last_safe_error_code)
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Invalid Runtime receipt follow stream transition');
+END;
+`;
+
 const SCHEMA = `
 CREATE TABLE teams (
   id TEXT PRIMARY KEY,
@@ -3293,6 +4019,7 @@ export function openTeamSessionDatabase(
       }
       if (
         migratedVersion !== PRE_RUNTIME_START_SCHEMA_VERSION &&
+        migratedVersion !== RUNTIME_START_SCHEMA_VERSION &&
         migratedVersion !== SCHEMA_VERSION
       ) {
         throw new Error(
@@ -3307,6 +4034,10 @@ export function openTeamSessionDatabase(
     const preparedVersion = initializeOrPrepare.immediate();
     if (preparedVersion === PRE_RUNTIME_START_SCHEMA_VERSION) {
       migrateRuntimeStartSchemaV5(db);
+    }
+    const receiptFollowPreparedVersion = db.pragma("user_version", { simple: true }) as number;
+    if (receiptFollowPreparedVersion === RUNTIME_START_SCHEMA_VERSION) {
+      migrateRuntimeReceiptFollowSchemaV6(db);
     }
 
     const applicationId = db.pragma("application_id", { simple: true }) as number;
@@ -3381,10 +4112,12 @@ function migrateRuntimeStartSchemaV5(db: Database.Database): void {
       if (applicationId !== APPLICATION_ID) {
         throw new Error("File is not a recognized Team Session database");
       }
-      if (currentVersion === SCHEMA_VERSION) return;
+      if (currentVersion === RUNTIME_START_SCHEMA_VERSION || currentVersion === SCHEMA_VERSION) {
+        return;
+      }
       if (currentVersion !== PRE_RUNTIME_START_SCHEMA_VERSION) {
         throw new Error(
-          `Unsupported Team Session database schema ${currentVersion}; expected ${SCHEMA_VERSION}`
+          `Unsupported Team Session database schema ${currentVersion}; expected ${RUNTIME_START_SCHEMA_VERSION}`
         );
       }
 
@@ -3393,7 +4126,7 @@ function migrateRuntimeStartSchemaV5(db: Database.Database): void {
       if (violations.length > 0) {
         throw new Error("Team Session v5 migration failed its foreign key check");
       }
-      db.pragma(`user_version = ${SCHEMA_VERSION}`);
+      db.pragma(`user_version = ${RUNTIME_START_SCHEMA_VERSION}`);
     });
     migrate.exclusive();
   } finally {
@@ -3403,6 +4136,110 @@ function migrateRuntimeStartSchemaV5(db: Database.Database): void {
   if (foreignKeys !== 1) {
     throw new Error("Team Session database requires SQLite foreign key enforcement");
   }
+}
+
+function migrateRuntimeReceiptFollowSchemaV6(db: Database.Database): void {
+  const migrate = db.transaction(() => {
+    const currentVersion = db.pragma("user_version", { simple: true }) as number;
+    const applicationId = db.pragma("application_id", { simple: true }) as number;
+    if (applicationId !== APPLICATION_ID) {
+      throw new Error("File is not a recognized Team Session database");
+    }
+    if (currentVersion === SCHEMA_VERSION) return;
+    if (currentVersion !== RUNTIME_START_SCHEMA_VERSION) {
+      throw new Error(
+        `Unsupported Team Session database schema ${currentVersion}; expected ${SCHEMA_VERSION}`
+      );
+    }
+    addRuntimeReceiptFollowV6Columns(db);
+    parkLegacyRuntimeDispatchesForV6Migration(db);
+    db.exec(RUNTIME_RECEIPT_FOLLOW_SCHEMA_V6);
+    const violations = db.pragma("foreign_key_check") as unknown[];
+    if (violations.length > 0) {
+      throw new Error("Team Session v6 migration failed its foreign key check");
+    }
+    db.pragma(`user_version = ${SCHEMA_VERSION}`);
+  });
+  migrate.immediate();
+}
+
+function parkLegacyRuntimeDispatchesForV6Migration(db: Database.Database): void {
+  // Schema v5 had no durable pre-dispatch marker, so a processing lease cannot
+  // prove whether Runtime observed the command. Preserve that uncertainty
+  // across upgrade instead of letting v6 reconcile it as safely retryable.
+  db.prepare(
+    `UPDATE runtime_run_command_dispatch
+     SET status = 'awaiting-receipt',
+         available_at_ms = MAX(available_at_ms, updated_at_ms),
+         lease_owner = NULL, lease_expires_at_ms = NULL,
+         dispatch_interlock_acquired_at_ms = NULL,
+         last_safe_error_code = 'migration_dispatch_uncertain'
+     WHERE status = 'processing'`
+  ).run();
+}
+
+function addRuntimeReceiptFollowV6Columns(db: Database.Database): void {
+  addColumnIfMissing(
+    db,
+    "runtime_run_command_dispatch",
+    "dispatch_interlock_acquired_at_ms",
+    `ALTER TABLE runtime_run_command_dispatch
+       ADD COLUMN dispatch_interlock_acquired_at_ms INTEGER CHECK (
+         dispatch_interlock_acquired_at_ms IS NULL OR
+         dispatch_interlock_acquired_at_ms >= created_at_ms
+       )`
+  );
+  addColumnIfMissing(
+    db,
+    "runtime_authorization_epochs",
+    "effect_enforcer_set_digest",
+    `ALTER TABLE runtime_authorization_epochs
+       ADD COLUMN effect_enforcer_set_digest TEXT CHECK (
+         effect_enforcer_set_digest IS NULL OR (
+           length(effect_enforcer_set_digest) = 64 AND
+           effect_enforcer_set_digest = lower(effect_enforcer_set_digest) AND
+           effect_enforcer_set_digest NOT GLOB '*[^0-9a-f]*'
+         )
+       )`
+  );
+  for (const [table, column] of [
+    ["run_policy_revisions", "required_effect_enforcer_set_digest"],
+    ["runtime_run_commands", "required_effect_enforcer_set_digest"],
+    ["runtime_run_command_receipts", "required_effect_enforcer_set_digest"],
+    ["runtime_run_command_receipts", "enforcement_subject_digest"],
+    ["runtime_run_command_receipts", "aggregate_proof_digest"],
+  ] as const) {
+    addColumnIfMissing(
+      db,
+      table,
+      column,
+      `ALTER TABLE ${table} ADD COLUMN ${column} TEXT CHECK (
+         ${column} IS NULL OR (
+           length(${column}) = 64 AND ${column} = lower(${column}) AND
+           ${column} NOT GLOB '*[^0-9a-f]*'
+         )
+       )`
+    );
+  }
+  addColumnIfMissing(
+    db,
+    "runtime_run_command_receipts",
+    "proof_verified_at_ms",
+    `ALTER TABLE runtime_run_command_receipts
+       ADD COLUMN proof_verified_at_ms INTEGER CHECK (
+         proof_verified_at_ms IS NULL OR proof_verified_at_ms >= 0
+       )`
+  );
+}
+
+function addColumnIfMissing(
+  db: Database.Database,
+  table: string,
+  column: string,
+  statement: string
+): void {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  if (!columns.some((entry) => entry.name === column)) db.exec(statement);
 }
 
 interface ConversationMigrationEvent {

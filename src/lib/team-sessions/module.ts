@@ -4,13 +4,18 @@ import type Database from "better-sqlite3";
 import { openTeamSessionDatabase } from "./sqlite";
 import { isValidTmuxSessionName } from "../tmux";
 import { projectPublicSessionRunState } from "./public-run-state";
-import type { RuntimeLifecycleCommand } from "../runtime/contracts";
+import type { RuntimeAuthorizationSnapshot, RuntimeLifecycleCommand } from "../runtime/contracts";
 import type { RuntimeCommandAuthorityIssuer } from "../runtime/runtime-command-authority";
+import type { SynchronousRuntimeEnforcementProofVerifier } from "../runtime/runtime-enforcement-proof";
 import type { RuntimeLifecycleJournal } from "../runtime/runtime-lifecycle-supervisor";
 import {
   createSqliteRuntimeLifecycleJournal,
   type SqliteRuntimeLifecycleJournal,
 } from "./sqlite-runtime-lifecycle-journal";
+import {
+  createSqliteRuntimeReceiptFollowJournal,
+  type SqliteRuntimeReceiptFollowJournal,
+} from "./sqlite-runtime-receipt-follow-journal";
 import {
   assertValidRunPolicyCommit,
   isRunPolicyWidening,
@@ -70,6 +75,7 @@ import {
   type GoalItem,
   type GoalSet,
   type RunPolicyDraft,
+  type RuntimeBinding,
 } from "./types";
 
 type SqlValue = string | number | null;
@@ -82,13 +88,35 @@ export interface CreateTeamSessionsOptions {
   invitationTokenGenerator?: () => string;
   /** Required before any ordinary Runtime-backed Run lifecycle intent is accepted. */
   runtimeCommandAuthorityIssuer?: RuntimeCommandAuthorityIssuer;
+  /**
+   * Trusted, control-plane-owned Runtime authorization state. Runtime/provider
+   * payloads must never implement this seam.
+   */
+  runtimeAuthorizationSnapshotSource?: RuntimeAuthorizationSnapshotSource;
+  /**
+   * Synchronously authenticates every effect-enforcer acknowledgement before
+   * the SQLite journal may change lifecycle truth.
+   */
+  runtimeEnforcementProofVerifier?: SynchronousRuntimeEnforcementProofVerifier;
   runtimeLifecycleCommandTtlMs?: number;
+}
+
+export interface RuntimeAuthorizationSnapshotQuery {
+  readonly binding: RuntimeBinding;
+  readonly runtimeAuthorizationGeneration: number;
+}
+
+/** Synchronous because authorization is captured inside the command transaction. */
+export interface RuntimeAuthorizationSnapshotSource {
+  resolve(query: RuntimeAuthorizationSnapshotQuery): RuntimeAuthorizationSnapshot | undefined;
 }
 
 /** Security-sensitive composition result used only by the Runtime worker root. */
 export interface TeamSessionKernel {
   readonly teamSessions: TeamSessions;
   readonly runtimeLifecycleJournal: RuntimeLifecycleJournal;
+  /** Private worker seam; never project this journal through HTTP or browser state. */
+  readonly runtimeReceiptFollowJournal: SqliteRuntimeReceiptFollowJournal;
 }
 
 const ROLE_RANK: Record<TeamRole, number> = {
@@ -111,6 +139,15 @@ const MAX_PENDING_DIRECTIVES_PER_AUTHOR = 64;
 const MAX_PENDING_DIRECTIVES_PER_SESSION = 256;
 const DEFAULT_RUNTIME_LIFECYCLE_COMMAND_TTL_MS = 30_000;
 const MAX_RUNTIME_LIFECYCLE_COMMAND_TTL_MS = 5 * 60_000;
+const SHA256_DIGEST = /^[0-9a-f]{64}$/;
+const RUNTIME_AUTHORIZATION_SNAPSHOT_FIELDS = [
+  "credentialPolicyDigest",
+  "credentialPolicyRef",
+  "effectEnforcerSetDigest",
+  "generation",
+  "networkPolicyDigest",
+  "networkPolicyRef",
+] as const;
 const LOCAL_TMUX_PROJECT_CEILING_REVISION = "local-tmux-ceiling:v1";
 const LOCAL_TMUX_PROJECT_CEILING_DIGEST = sha256(
   "terminalx:local-tmux:trusted-shared-host:no-yolo:v1"
@@ -153,6 +190,7 @@ export function createTeamSessionKernel(
   return Object.freeze({
     teamSessions,
     runtimeLifecycleJournal: teamSessions.runtimeJournalForSupervisor(),
+    runtimeReceiptFollowJournal: teamSessions.runtimeReceiptFollowJournalForSupervisor(),
   });
 }
 
@@ -163,11 +201,36 @@ class SqliteTeamSessions implements TeamSessions {
   private readonly idGenerator: () => string;
   private readonly invitationTokenGenerator: () => string;
   private readonly runtimeCommandAuthorityIssuer?: RuntimeCommandAuthorityIssuer;
+  private readonly runtimeAuthorizationSnapshotSource?: RuntimeAuthorizationSnapshotSource;
+  private readonly runtimeEnforcementProofVerifier?: SynchronousRuntimeEnforcementProofVerifier;
   private readonly runtimeLifecycleCommandTtlMs: number;
   private readonly runtimeLifecycle: SqliteRuntimeLifecycleJournal;
+  private readonly runtimeReceiptFollow: SqliteRuntimeReceiptFollowJournal;
   private closed = false;
 
   constructor(options: CreateTeamSessionsOptions) {
+    const runtimeSecurityComponentCount = [
+      options.runtimeCommandAuthorityIssuer,
+      options.runtimeAuthorizationSnapshotSource,
+      options.runtimeEnforcementProofVerifier,
+    ].filter((component) => component !== undefined).length;
+    if (runtimeSecurityComponentCount !== 0 && runtimeSecurityComponentCount !== 3) {
+      throw new TypeError(
+        "Runtime lifecycle authority, authorization snapshots, and enforcement proof verification must be configured together"
+      );
+    }
+    if (
+      options.runtimeAuthorizationSnapshotSource !== undefined &&
+      typeof options.runtimeAuthorizationSnapshotSource.resolve !== "function"
+    ) {
+      throw new TypeError("Runtime Authorization snapshot source is invalid");
+    }
+    if (
+      options.runtimeEnforcementProofVerifier !== undefined &&
+      typeof options.runtimeEnforcementProofVerifier !== "function"
+    ) {
+      throw new TypeError("Runtime enforcement proof verifier is invalid");
+    }
     this.database = openTeamSessionDatabase({
       filename:
         options.filename ??
@@ -180,6 +243,8 @@ class SqliteTeamSessions implements TeamSessions {
     this.invitationTokenGenerator =
       options.invitationTokenGenerator ?? (() => crypto.randomBytes(32).toString("base64url"));
     this.runtimeCommandAuthorityIssuer = options.runtimeCommandAuthorityIssuer;
+    this.runtimeAuthorizationSnapshotSource = options.runtimeAuthorizationSnapshotSource;
+    this.runtimeEnforcementProofVerifier = options.runtimeEnforcementProofVerifier;
     this.runtimeLifecycleCommandTtlMs = boundedIntegerOption(
       options.runtimeLifecycleCommandTtlMs ?? DEFAULT_RUNTIME_LIFECYCLE_COMMAND_TTL_MS,
       1,
@@ -189,11 +254,24 @@ class SqliteTeamSessions implements TeamSessions {
     this.runtimeLifecycle = createSqliteRuntimeLifecycleJournal({
       db: this.db,
       idGenerator: () => this.nextId("runtime-journal"),
+      ...(this.runtimeEnforcementProofVerifier === undefined
+        ? {}
+        : { verifyEnforcementProof: this.runtimeEnforcementProofVerifier }),
+    });
+    this.runtimeReceiptFollow = createSqliteRuntimeReceiptFollowJournal({
+      db: this.db,
+      idGenerator: () => this.nextId("runtime-follow-event"),
+      settleVerifiedReceiptInTransaction: (input) =>
+        this.runtimeLifecycle.settleVerifiedReceiptInTransaction(input),
     });
   }
 
   runtimeJournalForSupervisor(): RuntimeLifecycleJournal {
     return this.runtimeLifecycle;
+  }
+
+  runtimeReceiptFollowJournalForSupervisor(): SqliteRuntimeReceiptFollowJournal {
+    return this.runtimeReceiptFollow;
   }
 
   async dispatch(command: SessionCommand): Promise<CommandResult> {
@@ -2699,6 +2777,7 @@ class SqliteTeamSessions implements TeamSessions {
       binding: policySnapshot.binding,
       projectCeilingRevision: policySnapshot.projectCeilingRevision,
       runtimeAuthorizationGeneration: policySnapshot.runtimeAuthorizationGeneration,
+      requiredEffectEnforcerSetDigest: policySnapshot.requiredEffectEnforcerSetDigest,
       causationId: requestEvent.eventId,
       actor: { kind: command.actor.kind, actorRef: command.actor.userId },
       issuedAtMs: now,
@@ -2781,7 +2860,7 @@ class SqliteTeamSessions implements TeamSessions {
       .prepare(
         `SELECT policy_body_digest, runtime_assignment_id, runtime_assignment_generation,
                 sandbox_id, sandbox_generation, runtime_principal_id,
-                runtime_authorization_generation
+                runtime_authorization_generation, required_effect_enforcer_set_digest
          FROM run_policy_revisions WHERE agent_run_id = ? AND revision = ?`
       )
       .get(command.agentRunId, run.current_policy_revision) as SqlRow | undefined;
@@ -2927,7 +3006,7 @@ class SqliteTeamSessions implements TeamSessions {
       .prepare(
         `SELECT runtime_assignment_id, runtime_assignment_generation,
                 sandbox_id, sandbox_generation, runtime_principal_id,
-                runtime_authorization_generation
+                runtime_authorization_generation, required_effect_enforcer_set_digest
          FROM run_policy_revisions WHERE agent_run_id = ? AND revision = ?`
       )
       .get(run.id, run.current_policy_revision) as SqlRow | undefined;
@@ -5123,7 +5202,7 @@ class SqliteTeamSessions implements TeamSessions {
       .prepare(
         `SELECT runtime_assignment_id, runtime_assignment_generation,
                 sandbox_id, sandbox_generation, runtime_principal_id,
-                runtime_authorization_generation
+                runtime_authorization_generation, required_effect_enforcer_set_digest
          FROM run_policy_revisions WHERE agent_run_id = ? AND revision = ?`
       )
       .get(run.id, run.current_policy_revision) as SqlRow | undefined;
@@ -5551,12 +5630,18 @@ class SqliteTeamSessions implements TeamSessions {
     generation: number,
     now: number
   ): void {
+    const authorization = this.resolveRuntimeAuthorizationSnapshot(
+      sessionId,
+      assignment,
+      generation
+    );
     this.db
       .prepare(
         `INSERT INTO runtime_authorization_epochs
            (session_id, generation, runtime_assignment_id, runtime_assignment_generation,
-            sandbox_id, sandbox_generation, runtime_principal_id, created_at_ms)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            sandbox_id, sandbox_generation, runtime_principal_id,
+            effect_enforcer_set_digest, created_at_ms)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(session_id, generation) DO NOTHING`
       )
       .run(
@@ -5567,11 +5652,94 @@ class SqliteTeamSessions implements TeamSessions {
         assignment.sandbox_id,
         assignment.sandbox_generation,
         assignment.runtime_principal_id,
+        authorization?.effectEnforcerSetDigest ?? null,
         now
       );
     const exact = this.db
       .prepare(
         `SELECT 1 FROM runtime_authorization_epochs
+         WHERE session_id = ? AND generation = ? AND runtime_assignment_id = ?
+           AND runtime_assignment_generation = ? AND sandbox_id = ?
+           AND sandbox_generation = ? AND runtime_principal_id = ?
+           AND effect_enforcer_set_digest IS ?`
+      )
+      .get(
+        sessionId,
+        generation,
+        assignment.id,
+        assignment.generation,
+        assignment.sandbox_id,
+        assignment.sandbox_generation,
+        assignment.runtime_principal_id,
+        authorization?.effectEnforcerSetDigest ?? null
+      );
+    if (!exact) {
+      throw new TeamSessionError("conflict", "Runtime Authorization epoch binding is immutable");
+    }
+  }
+
+  private resolveRuntimeAuthorizationSnapshot(
+    sessionId: string,
+    assignment: SqlRow,
+    generation: number
+  ): RuntimeAuthorizationSnapshot | undefined {
+    if (!this.runtimeAuthorizationSnapshotSource) return undefined;
+    if (
+      assignment.session_id !== sessionId ||
+      assignment.runtime_authorization_generation !== generation ||
+      !Number.isSafeInteger(generation) ||
+      generation < 1
+    ) {
+      throw new TeamSessionError("conflict", "Runtime Authorization binding is invalid");
+    }
+    const binding: RuntimeBinding = Object.freeze({
+      teamId: assignment.team_id as string,
+      projectId: assignment.project_id as string,
+      sessionId,
+      runtimeAssignmentId: assignment.id as string,
+      runtimeAssignmentGeneration: assignment.generation as number,
+      sandboxId: assignment.sandbox_id as string,
+      sandboxGeneration: assignment.sandbox_generation as number,
+      runtimePrincipalId: assignment.runtime_principal_id as string,
+    });
+    try {
+      return snapshotTrustedRuntimeAuthorization(
+        this.runtimeAuthorizationSnapshotSource.resolve(
+          Object.freeze({ binding, runtimeAuthorizationGeneration: generation })
+        ),
+        generation
+      );
+    } catch {
+      throw new TeamSessionError(
+        "conflict",
+        "Trusted Runtime Authorization snapshot is unavailable"
+      );
+    }
+  }
+
+  private requireRuntimeAuthorizationEpochDigest(
+    sessionId: string,
+    assignment: SqlRow,
+    generation: number
+  ): string {
+    const digest = this.runtimeAuthorizationEpochDigest(sessionId, assignment, generation);
+    if (!digest) {
+      throw new TeamSessionError(
+        "conflict",
+        "Trusted Runtime Authorization snapshot is unavailable"
+      );
+    }
+    return digest;
+  }
+
+  private runtimeAuthorizationEpochDigest(
+    sessionId: string,
+    assignment: SqlRow,
+    generation: number
+  ): string | undefined {
+    const epoch = this.db
+      .prepare(
+        `SELECT effect_enforcer_set_digest FROM runtime_authorization_epochs
          WHERE session_id = ? AND generation = ? AND runtime_assignment_id = ?
            AND runtime_assignment_generation = ? AND sandbox_id = ?
            AND sandbox_generation = ? AND runtime_principal_id = ?`
@@ -5584,10 +5752,11 @@ class SqliteTeamSessions implements TeamSessions {
         assignment.sandbox_id,
         assignment.sandbox_generation,
         assignment.runtime_principal_id
-      );
-    if (!exact) {
-      throw new TeamSessionError("conflict", "Runtime Authorization epoch binding is immutable");
+      ) as SqlRow | undefined;
+    if (!epoch || !isSha256Digest(epoch.effect_enforcer_set_digest)) {
+      return undefined;
     }
+    return epoch.effect_enforcer_set_digest;
   }
 
   private assertRunPolicyCommit(
@@ -5628,6 +5797,11 @@ class SqliteTeamSessions implements TeamSessions {
     yoloConfirmationRef?: string;
     now: number;
   }): AgentRunPolicySnapshot {
+    const requiredEffectEnforcerSetDigest = this.requireRuntimeAuthorizationEpochDigest(
+      input.sessionId,
+      input.assignment,
+      input.assignment.runtime_authorization_generation as number
+    );
     const initialGoalSet: GoalSet = {
       goalSetId: input.goalSetId,
       agentRunId: input.agentRunId,
@@ -5661,6 +5835,7 @@ class SqliteTeamSessions implements TeamSessions {
         runtimePrincipalId: input.assignment.runtime_principal_id as string,
       },
       runtimeAuthorizationGeneration: input.assignment.runtime_authorization_generation as number,
+      requiredEffectEnforcerSetDigest,
       ...(input.yoloConfirmationRef === undefined
         ? {}
         : { yoloConfirmationRef: input.yoloConfirmationRef }),
@@ -5680,8 +5855,9 @@ class SqliteTeamSessions implements TeamSessions {
             project_ceiling_revision, project_ceiling_digest,
             runtime_assignment_id, runtime_assignment_generation,
             sandbox_id, sandbox_generation, runtime_principal_id,
-            runtime_authorization_generation, yolo_confirmation_ref, created_at_ms)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            runtime_authorization_generation, required_effect_enforcer_set_digest,
+            yolo_confirmation_ref, created_at_ms)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         input.agentRunId,
@@ -5704,6 +5880,7 @@ class SqliteTeamSessions implements TeamSessions {
         input.assignment.sandbox_generation,
         input.assignment.runtime_principal_id,
         input.assignment.runtime_authorization_generation,
+        requiredEffectEnforcerSetDigest,
         input.yoloConfirmationRef ?? null,
         input.now
       );
@@ -5733,6 +5910,11 @@ class SqliteTeamSessions implements TeamSessions {
     assignment: SqlRow,
     runtimeAuthorizationGeneration: number
   ): boolean {
+    const epochDigest = this.runtimeAuthorizationEpochDigest(
+      assignment.session_id as string,
+      assignment,
+      runtimeAuthorizationGeneration
+    );
     return (
       snapshot.runtime_assignment_id === assignment.id &&
       snapshot.runtime_assignment_generation === assignment.generation &&
@@ -5740,7 +5922,9 @@ class SqliteTeamSessions implements TeamSessions {
       snapshot.sandbox_generation === assignment.sandbox_generation &&
       snapshot.runtime_principal_id === assignment.runtime_principal_id &&
       snapshot.runtime_authorization_generation === runtimeAuthorizationGeneration &&
-      assignment.runtime_authorization_generation === runtimeAuthorizationGeneration
+      assignment.runtime_authorization_generation === runtimeAuthorizationGeneration &&
+      epochDigest !== undefined &&
+      snapshot.required_effect_enforcer_set_digest === epochDigest
     );
   }
 
@@ -5762,7 +5946,7 @@ class SqliteTeamSessions implements TeamSessions {
       .prepare(
         `SELECT runtime_assignment_id, runtime_assignment_generation,
                 sandbox_id, sandbox_generation, runtime_principal_id,
-                runtime_authorization_generation
+                runtime_authorization_generation, required_effect_enforcer_set_digest
          FROM run_policy_revisions WHERE agent_run_id = ? AND revision = ?`
       )
       .get(run.id, run.current_policy_revision) as SqlRow | undefined;
@@ -5983,12 +6167,24 @@ class SqliteTeamSessions implements TeamSessions {
     }
     const policy = this.db
       .prepare(
-        `SELECT project_ceiling_revision FROM run_policy_revisions
+        `SELECT project_ceiling_revision, required_effect_enforcer_set_digest
+         FROM run_policy_revisions
          WHERE agent_run_id = ? AND revision = ?`
       )
       .get(run.id, run.current_policy_revision) as SqlRow | undefined;
     if (!policy) {
       throw new TeamSessionError("conflict", "Run policy revision is unavailable");
+    }
+    const requiredEffectEnforcerSetDigest = this.requireRuntimeAuthorizationEpochDigest(
+      command.sessionId,
+      assignment,
+      run.runtime_authorization_generation as number
+    );
+    if (policy.required_effect_enforcer_set_digest !== requiredEffectEnforcerSetDigest) {
+      throw new TeamSessionError(
+        "conflict",
+        "Run policy Runtime Authorization snapshot is unavailable"
+      );
     }
     const runtimeCommandId = this.nextId("runtime-command");
     const targetLifecycle =
@@ -6032,6 +6228,7 @@ class SqliteTeamSessions implements TeamSessions {
       },
       projectCeilingRevision: policy.project_ceiling_revision as string,
       runtimeAuthorizationGeneration: run.runtime_authorization_generation as number,
+      requiredEffectEnforcerSetDigest,
       causationId: requestEvent.eventId,
       actor: { kind: command.actor.kind, actorRef: command.actor.userId },
       issuedAtMs: now,
@@ -7574,6 +7771,64 @@ function runtimeLifecycleProjectionStatus(
     default:
       throw new TeamSessionError("conflict", "Runtime lifecycle dispatch state is invalid");
   }
+}
+
+function snapshotTrustedRuntimeAuthorization(
+  value: RuntimeAuthorizationSnapshot | undefined,
+  expectedGeneration: number
+): RuntimeAuthorizationSnapshot {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError("Runtime Authorization snapshot is invalid");
+  }
+  const prototype = Object.getPrototypeOf(value);
+  const ownNames = Object.getOwnPropertyNames(value).sort();
+  if (
+    (prototype !== Object.prototype && prototype !== null) ||
+    Object.getOwnPropertySymbols(value).length !== 0 ||
+    ownNames.length !== RUNTIME_AUTHORIZATION_SNAPSHOT_FIELDS.length ||
+    ownNames.some((field, index) => field !== RUNTIME_AUTHORIZATION_SNAPSHOT_FIELDS[index])
+  ) {
+    throw new TypeError("Runtime Authorization snapshot is invalid");
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  if (
+    RUNTIME_AUTHORIZATION_SNAPSHOT_FIELDS.some((field) => {
+      const descriptor = descriptors[field];
+      return !descriptor || !("value" in descriptor) || descriptor.enumerable !== true;
+    })
+  ) {
+    throw new TypeError("Runtime Authorization snapshot is invalid");
+  }
+  const snapshot = Object.fromEntries(
+    RUNTIME_AUTHORIZATION_SNAPSHOT_FIELDS.map((field) => [field, descriptors[field]!.value])
+  ) as unknown as RuntimeAuthorizationSnapshot;
+  if (
+    !Number.isSafeInteger(snapshot.generation) ||
+    snapshot.generation < 1 ||
+    snapshot.generation !== expectedGeneration ||
+    !isSafeRuntimeAuthorizationRef(snapshot.networkPolicyRef) ||
+    !isSha256Digest(snapshot.networkPolicyDigest) ||
+    !isSafeRuntimeAuthorizationRef(snapshot.credentialPolicyRef) ||
+    !isSha256Digest(snapshot.credentialPolicyDigest) ||
+    !isSha256Digest(snapshot.effectEnforcerSetDigest)
+  ) {
+    throw new TypeError("Runtime Authorization snapshot is invalid");
+  }
+  return Object.freeze({ ...snapshot });
+}
+
+function isSafeRuntimeAuthorizationRef(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length >= 1 &&
+    value.length <= 300 &&
+    value === value.trim() &&
+    !/[\u0000-\u001f\u007f]/.test(value)
+  );
+}
+
+function isSha256Digest(value: unknown): value is string {
+  return typeof value === "string" && SHA256_DIGEST.test(value);
 }
 
 function commandDigest(command: SessionCommand): string {

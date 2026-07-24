@@ -17,11 +17,16 @@ import {
 import { digestRunPolicyDraft } from "@/lib/team-sessions/run-policy";
 import {
   canonicalRuntimeJson,
+  commitRuntimeEffectRef,
+  digestAggregateEnforcementProof,
   digestNonDuplicateRuntimeReceipt,
+  digestRuntimeEnforcementSubject,
   type NonDuplicateRuntimeReceipt,
   type RuntimeLifecycleDelivery,
   type RuntimeReceipt,
+  type SynchronousRuntimeEnforcementProofVerifier,
 } from "@/lib/runtime";
+import { verifyPersistedRuntimeReceiptEnforcementProofSynchronously } from "@/lib/runtime/runtime-command-execution";
 import { createTestRuntimeCommandAuthorityIssuer } from "../helpers/runtime-authority";
 
 const TEAM_ID = "11111111-1111-4111-8111-111111111111";
@@ -34,6 +39,7 @@ const RUNTIME: ActorContext = {
   displayName: "Runtime Lifecycle Worker",
 };
 const unconfigured = { kind: "unconfigured" } as const;
+const EFFECT_ENFORCER_SET_DIGEST = "b".repeat(64);
 
 describe("SQLite Runtime lifecycle journal", () => {
   let directory: string;
@@ -89,7 +95,9 @@ describe("SQLite Runtime lifecycle journal", () => {
     fs.rmSync(directory, { recursive: true, force: true });
   });
 
-  function openKernel(): void {
+  function openKernel(
+    verifyEnforcementProof: SynchronousRuntimeEnforcementProofVerifier = () => true
+  ): void {
     kernel = createTeamSessionKernel({
       filename,
       clock: () => now,
@@ -98,6 +106,17 @@ describe("SQLite Runtime lifecycle journal", () => {
         return `00000000-0000-4000-8000-${String(generated).padStart(12, "0")}`;
       },
       runtimeCommandAuthorityIssuer: createTestRuntimeCommandAuthorityIssuer(),
+      runtimeAuthorizationSnapshotSource: {
+        resolve: ({ runtimeAuthorizationGeneration }) => ({
+          generation: runtimeAuthorizationGeneration,
+          networkPolicyRef: "test-network-policy:v1",
+          networkPolicyDigest: "c".repeat(64),
+          credentialPolicyRef: "test-credential-policy:v1",
+          credentialPolicyDigest: "d".repeat(64),
+          effectEnforcerSetDigest: EFFECT_ENFORCER_SET_DIGEST,
+        }),
+      },
+      runtimeEnforcementProofVerifier: verifyEnforcementProof,
     });
     sessions = kernel.teamSessions;
   }
@@ -180,6 +199,7 @@ describe("SQLite Runtime lifecycle journal", () => {
     outcome: "accepted" | "enforced" | "rejected" | "quarantined",
     providerText = "provider-effect"
   ): RuntimeReceipt {
+    const requiredEffectEnforcerSetDigest = requiredEnforcerDigest(delivery);
     const base = {
       commandId: delivery.command.commandId,
       binding: delivery.command.binding,
@@ -189,11 +209,37 @@ describe("SQLite Runtime lifecycle journal", () => {
       case "accepted":
         return { ...base, outcome, effectRef: providerText };
       case "enforced":
+        const enforcementSubjectDigest = digestRuntimeEnforcementSubject({
+          version: 1,
+          commandId: delivery.command.commandId,
+          commandClaimsDigest: delivery.command.authority.claimsDigest,
+          binding: delivery.command.binding,
+          runtimeAuthorizationGeneration: delivery.command.runtimeAuthorizationGeneration,
+          requiredEffectEnforcerSetDigest,
+          effectRefCommitment: commitRuntimeEffectRef(providerText),
+          enforcedFence: delivery.command.toRunStateVersion,
+        });
+        const proofPayload = {
+          generation: delivery.command.runtimeAuthorizationGeneration,
+          requiredEffectEnforcerSetDigest,
+          enforcementSubjectDigest,
+          acknowledgements: [
+            {
+              enforcerRef: "test-runtime-enforcer",
+              enforcerKind: "runtime" as const,
+              acknowledgementDigest: "e".repeat(64),
+            },
+          ],
+        };
         return {
           ...base,
           outcome,
           effectRef: providerText,
           enforcedFence: delivery.command.toRunStateVersion,
+          aggregateEnforcementProof: {
+            ...proofPayload,
+            aggregateProofDigest: digestAggregateEnforcementProof(proofPayload),
+          },
         };
       case "rejected":
         return { ...base, outcome, code: "not_ready", safeDetail: providerText };
@@ -202,15 +248,42 @@ describe("SQLite Runtime lifecycle journal", () => {
     }
   }
 
+  function requiredEnforcerDigest(delivery: RuntimeLifecycleDelivery): string {
+    const digest = delivery.command.requiredEffectEnforcerSetDigest;
+    expect(digest).toBe(EFFECT_ENFORCER_SET_DIGEST);
+    if (!digest) throw new Error("Expected a trusted effect-enforcer-set digest");
+    return digest;
+  }
+
   async function complete(
     delivery: RuntimeLifecycleDelivery,
     outcome: RuntimeReceipt
   ): Promise<void> {
+    const dispatch = readOne<{ dispatch_interlock_acquired_at_ms: number | null }>(
+      `SELECT dispatch_interlock_acquired_at_ms
+       FROM runtime_run_command_dispatch WHERE command_id = ?`,
+      delivery.command.commandId
+    );
+    let dispatchDelivery = delivery;
+    if (dispatch.dispatch_interlock_acquired_at_ms === null && now < delivery.leaseExpiresAtMs) {
+      const renewal = await kernel.runtimeLifecycleJournal.renew({
+        commandId: delivery.command.commandId,
+        workerId: RUNTIME.userId,
+        expectedAttempt: delivery.attempt,
+        expectedLeaseExpiresAtMs: delivery.leaseExpiresAtMs,
+        leaseDurationMs: delivery.leaseExpiresAtMs - now,
+        nowMs: now,
+      });
+      if (renewal.kind !== "renewed") {
+        throw new Error("Expected the dispatch interlock to be acquired before receipt completion");
+      }
+      dispatchDelivery = { ...delivery, leaseExpiresAtMs: renewal.leaseExpiresAtMs };
+    }
     await kernel.runtimeLifecycleJournal.complete({
-      commandId: delivery.command.commandId,
+      commandId: dispatchDelivery.command.commandId,
       workerId: RUNTIME.userId,
-      expectedAttempt: delivery.attempt,
-      expectedLeaseExpiresAtMs: delivery.leaseExpiresAtMs,
+      expectedAttempt: dispatchDelivery.attempt,
+      expectedLeaseExpiresAtMs: dispatchDelivery.leaseExpiresAtMs,
       observedAtMs: now,
       outcome: { kind: "receipt", receipt: outcome },
     });
@@ -276,6 +349,21 @@ describe("SQLite Runtime lifecycle journal", () => {
         delivery.command.commandId
       )
     ).toEqual({ count: 1 });
+    sessions.close();
+    openKernel();
+    const durableReceipt = JSON.parse(
+      readOne<{ receipt_json: string }>(
+        `SELECT receipt_json FROM runtime_run_command_receipts WHERE command_id = ?`,
+        delivery.command.commandId
+      ).receipt_json
+    ) as RuntimeReceipt;
+    expect(() =>
+      verifyPersistedRuntimeReceiptEnforcementProofSynchronously(
+        delivery.command,
+        durableReceipt,
+        () => true
+      )
+    ).not.toThrow();
     expect(
       readOne<{ count: number }>(
         `SELECT COUNT(*) AS count FROM session_events
@@ -283,6 +371,34 @@ describe("SQLite Runtime lifecycle journal", () => {
         SESSION_ID
       )
     ).toEqual({ count: 1 });
+  });
+
+  it("re-commits provider refs that mimic the persisted commitment syntax", async () => {
+    await requestStart();
+    const delivery = await claimStart();
+    const providerRef = commitRuntimeEffectRef("provider-original");
+    const expectedPersistedCommitment = commitRuntimeEffectRef(providerRef);
+
+    await complete(delivery, receipt(delivery, "enforced", providerRef));
+
+    const durableReceipt = JSON.parse(
+      readOne<{ receipt_json: string }>(
+        `SELECT receipt_json FROM runtime_run_command_receipts WHERE command_id = ?`,
+        delivery.command.commandId
+      ).receipt_json
+    ) as RuntimeReceipt;
+    expect(durableReceipt).toMatchObject({
+      outcome: "enforced",
+      effectRef: expectedPersistedCommitment,
+    });
+    expect(expectedPersistedCommitment).not.toBe(providerRef);
+    expect(() =>
+      verifyPersistedRuntimeReceiptEnforcementProofSynchronously(
+        delivery.command,
+        durableReceipt,
+        () => true
+      )
+    ).not.toThrow();
   });
 
   it("parks accepted work, never reclaims it, and keeps normalized receipt digests consistent", async () => {
@@ -317,6 +433,273 @@ describe("SQLite Runtime lifecycle journal", () => {
         .update(canonicalRuntimeJson(JSON.parse(persisted.receipt_json)), "utf8")
         .digest("hex")
     );
+  });
+
+  it("renews only the exact live pre-dispatch lease and fences the previous expiry", async () => {
+    await requestStart();
+    const delivery = await claimStart(1_000);
+    await expect(
+      kernel.runtimeLifecycleJournal.renew({
+        commandId: delivery.command.commandId,
+        workerId: "another-worker",
+        expectedAttempt: delivery.attempt,
+        expectedLeaseExpiresAtMs: delivery.leaseExpiresAtMs,
+        leaseDurationMs: 1_000,
+        nowMs: now,
+      })
+    ).rejects.toMatchObject({ code: "stale_completion" });
+
+    now += 100;
+    const renewed = await kernel.runtimeLifecycleJournal.renew({
+      commandId: delivery.command.commandId,
+      workerId: RUNTIME.userId,
+      expectedAttempt: delivery.attempt,
+      expectedLeaseExpiresAtMs: delivery.leaseExpiresAtMs,
+      leaseDurationMs: 1_000,
+      nowMs: now,
+    });
+    expect(renewed.kind).toBe("renewed");
+    if (renewed.kind !== "renewed") throw new Error("Expected a renewed lifecycle lease");
+    expect(renewed.leaseExpiresAtMs).toBe(now + 1_000);
+    await expect(complete(delivery, receipt(delivery, "accepted"))).rejects.toMatchObject({
+      code: "stale_completion",
+    });
+
+    const renewedDelivery = { ...delivery, leaseExpiresAtMs: renewed.leaseExpiresAtMs };
+    await complete(renewedDelivery, receipt(renewedDelivery, "accepted"));
+    await expect(runState()).resolves.toMatchObject({
+      lifecycle: "starting",
+      pendingLifecycleOperation: { kind: "start", status: "awaiting-runtime" },
+    });
+  });
+
+  it("rejects dispatch outcomes before the durable interlock is acquired", async () => {
+    await requestStart();
+    const delivery = await claimStart();
+    const completionFence = {
+      commandId: delivery.command.commandId,
+      workerId: RUNTIME.userId,
+      expectedAttempt: delivery.attempt,
+      expectedLeaseExpiresAtMs: delivery.leaseExpiresAtMs,
+      observedAtMs: now,
+    } as const;
+
+    await expect(
+      kernel.runtimeLifecycleJournal.complete({
+        ...completionFence,
+        outcome: { kind: "receipt", receipt: receipt(delivery, "accepted") },
+      })
+    ).rejects.toMatchObject({ code: "stale_completion" });
+    await expect(
+      kernel.runtimeLifecycleJournal.complete({
+        ...completionFence,
+        outcome: {
+          kind: "failure",
+          code: "runtime_command_failed",
+          dispatchCertainty: "dispatch-uncertain",
+        },
+      })
+    ).rejects.toMatchObject({ code: "stale_completion" });
+    expect(
+      readOne<{
+        status: string;
+        dispatch_interlock_acquired_at_ms: number | null;
+        receipts: number;
+      }>(
+        `SELECT dispatch.status, dispatch.dispatch_interlock_acquired_at_ms,
+                (SELECT COUNT(*) FROM runtime_run_command_receipts receipt
+                 WHERE receipt.command_id = dispatch.command_id) AS receipts
+         FROM runtime_run_command_dispatch dispatch WHERE dispatch.command_id = ?`,
+        delivery.command.commandId
+      )
+    ).toEqual({
+      status: "processing",
+      dispatch_interlock_acquired_at_ms: null,
+      receipts: 0,
+    });
+
+    await expect(
+      kernel.runtimeLifecycleJournal.complete({
+        ...completionFence,
+        outcome: {
+          kind: "failure",
+          code: "invalid_input",
+          dispatchCertainty: "not-dispatched",
+        },
+      })
+    ).resolves.toBeUndefined();
+  });
+
+  it("supersedes the exact pre-dispatch attempt when trust changes during handle resolution", async () => {
+    await requestStart();
+    const delivery = await claimStart(5_000);
+    const db = new Database(filename);
+    try {
+      db.prepare(
+        `UPDATE runtime_assignments SET status = 'recovering'
+         WHERE id = ? AND status = 'ready'`
+      ).run(delivery.command.binding.runtimeAssignmentId);
+    } finally {
+      db.close();
+    }
+
+    await expect(
+      kernel.runtimeLifecycleJournal.renew({
+        commandId: delivery.command.commandId,
+        workerId: RUNTIME.userId,
+        expectedAttempt: delivery.attempt,
+        expectedLeaseExpiresAtMs: delivery.leaseExpiresAtMs,
+        leaseDurationMs: 5_000,
+        nowMs: now,
+      })
+    ).resolves.toEqual({ kind: "superseded" });
+    expect(
+      readOne<{
+        status: string;
+        last_safe_error_code: string;
+        dispatch_interlock_acquired_at_ms: number | null;
+      }>(
+        `SELECT status, last_safe_error_code, dispatch_interlock_acquired_at_ms
+         FROM runtime_run_command_dispatch WHERE command_id = ?`,
+        delivery.command.commandId
+      )
+    ).toEqual({
+      status: "superseded",
+      last_safe_error_code: "state_fence_superseded",
+      dispatch_interlock_acquired_at_ms: null,
+    });
+    await expect(
+      kernel.runtimeLifecycleJournal.complete({
+        commandId: delivery.command.commandId,
+        workerId: RUNTIME.userId,
+        expectedAttempt: delivery.attempt,
+        expectedLeaseExpiresAtMs: delivery.leaseExpiresAtMs,
+        observedAtMs: now,
+        outcome: {
+          kind: "failure",
+          code: "runtime_handle_unavailable",
+          dispatchCertainty: "not-dispatched",
+        },
+      })
+    ).rejects.toMatchObject({ code: "stale_completion" });
+  });
+
+  it("holds the trust fence after renewal, then releases it after an uncertain timeout", async () => {
+    await requestStart();
+    const delivery = await claimStart(1_000);
+    now += 100;
+    const renewed = await kernel.runtimeLifecycleJournal.renew({
+      commandId: delivery.command.commandId,
+      workerId: RUNTIME.userId,
+      expectedAttempt: delivery.attempt,
+      expectedLeaseExpiresAtMs: delivery.leaseExpiresAtMs,
+      leaseDurationMs: 1_000,
+      nowMs: now,
+    });
+    expect(renewed.kind).toBe("renewed");
+    if (renewed.kind !== "renewed") throw new Error("Expected a renewed lifecycle lease");
+
+    const db = new Database(filename);
+    try {
+      expect(() =>
+        db
+          .prepare(`UPDATE sessions SET runtime_authorization_state = 'quarantined' WHERE id = ?`)
+          .run(SESSION_ID)
+      ).toThrow(/acquired Runtime dispatch interlock/);
+      expect(() =>
+        db
+          .prepare(`UPDATE runtime_assignments SET status = 'recovering' WHERE id = ?`)
+          .run(delivery.command.binding.runtimeAssignmentId)
+      ).toThrow(/acquired dispatch interlock/);
+      expect(() =>
+        db
+          .prepare(`UPDATE agent_runs SET state_version = state_version + 1 WHERE id = ?`)
+          .run(delivery.command.agentRunId)
+      ).toThrow(/acquired Runtime dispatch interlock/);
+    } finally {
+      db.close();
+    }
+
+    await expect(
+      dispatch({ type: "comment.add", sessionId: SESSION_ID, body: "Still observable" })
+    ).resolves.toMatchObject({ data: { sessionId: SESSION_ID } });
+
+    now = renewed.leaseExpiresAtMs;
+    await kernel.runtimeLifecycleJournal.reconcile({ nowMs: now });
+    const afterTimeout = new Database(filename);
+    try {
+      expect(() =>
+        afterTimeout
+          .prepare(`UPDATE sessions SET runtime_authorization_state = 'quarantined' WHERE id = ?`)
+          .run(SESSION_ID)
+      ).not.toThrow();
+      expect(() =>
+        afterTimeout
+          .prepare(`UPDATE runtime_assignments SET status = 'recovering' WHERE id = ?`)
+          .run(delivery.command.binding.runtimeAssignmentId)
+      ).not.toThrow();
+      expect(() =>
+        afterTimeout
+          .prepare(`UPDATE agent_runs SET state_version = state_version + 1 WHERE id = ?`)
+          .run(delivery.command.agentRunId)
+      ).not.toThrow();
+    } finally {
+      afterTimeout.close();
+    }
+    expect(
+      readOne<{ status: string }>(
+        `SELECT status FROM runtime_run_command_dispatch WHERE command_id = ?`,
+        delivery.command.commandId
+      )
+    ).toEqual({ status: "awaiting-receipt" });
+  });
+
+  it("retries an expired attempt that never acquired the dispatch interlock", async () => {
+    await requestStart();
+    const delivery = await claimStart(1_000);
+    now = delivery.leaseExpiresAtMs;
+
+    await kernel.runtimeLifecycleJournal.reconcile({ nowMs: now });
+    expect(
+      readOne<{
+        status: string;
+        last_safe_error_code: string;
+        dispatch_interlock_acquired_at_ms: number | null;
+      }>(
+        `SELECT status, last_safe_error_code, dispatch_interlock_acquired_at_ms
+         FROM runtime_run_command_dispatch WHERE command_id = ?`,
+        delivery.command.commandId
+      )
+    ).toEqual({
+      status: "pending",
+      last_safe_error_code: "lease_expired_before_dispatch",
+      dispatch_interlock_acquired_at_ms: null,
+    });
+    const replacement = await claimStart(1_000);
+    expect(replacement).toMatchObject({ attempt: delivery.attempt + 1 });
+  });
+
+  it("supersedes stale pending work using the complete trust fence", async () => {
+    const started = await requestStart();
+    const commandId = String((started.data as { runtimeCommandId: string }).runtimeCommandId);
+    const db = new Database(filename);
+    try {
+      db.prepare(
+        `UPDATE runtime_assignments SET status = 'recovering'
+         WHERE session_id = ? AND status = 'ready'`
+      ).run(SESSION_ID);
+    } finally {
+      db.close();
+    }
+
+    await kernel.runtimeLifecycleJournal.reconcile({ nowMs: now });
+    expect(
+      readOne<{ status: string; last_safe_error_code: string }>(
+        `SELECT status, last_safe_error_code
+         FROM runtime_run_command_dispatch WHERE command_id = ?`,
+        commandId
+      )
+    ).toEqual({ status: "superseded", last_safe_error_code: "state_fence_superseded" });
   });
 
   it("rejects hostile certainty downgrades and terminalizes a proven pre-dispatch failure", async () => {
@@ -402,7 +785,67 @@ describe("SQLite Runtime lifecycle journal", () => {
     });
   });
 
-  it("contains stale enforced effects and leaves them explicitly compensating", async () => {
+  it.each(["never-settling", "resolves-after-expiry"] as const)(
+    "fails closed immediately when the journal proof verifier %s",
+    async (mode) => {
+      await requestStart();
+      const delivery = await claimStart(1_000);
+      let resolveVerifier: ((verified: boolean) => void) | undefined;
+      const asynchronousDecision = new Promise<boolean>((resolve) => {
+        if (mode === "resolves-after-expiry") resolveVerifier = resolve;
+      });
+      const asynchronousVerifier = (() =>
+        asynchronousDecision) as unknown as SynchronousRuntimeEnforcementProofVerifier;
+
+      sessions.close();
+      openKernel(asynchronousVerifier);
+      await expect(complete(delivery, receipt(delivery, "enforced"))).rejects.toMatchObject({
+        code: "invalid_input",
+      });
+
+      const stateBeforeLateDecision = readOne<{
+        status: string;
+        lease_owner: string | null;
+        lease_expires_at_ms: number | null;
+        receipts: number;
+        effects: number;
+      }>(
+        `SELECT dispatch.status, dispatch.lease_owner, dispatch.lease_expires_at_ms,
+                (SELECT COUNT(*) FROM runtime_run_command_receipts receipt
+                  WHERE receipt.command_id = dispatch.command_id) AS receipts,
+                (SELECT COUNT(*) FROM runtime_run_command_effects effect
+                  WHERE effect.command_id = dispatch.command_id) AS effects
+         FROM runtime_run_command_dispatch dispatch WHERE dispatch.command_id = ?`,
+        delivery.command.commandId
+      );
+      expect(stateBeforeLateDecision).toEqual({
+        status: "processing",
+        lease_owner: RUNTIME.userId,
+        lease_expires_at_ms: delivery.leaseExpiresAtMs,
+        receipts: 0,
+        effects: 0,
+      });
+
+      if (resolveVerifier) {
+        now = delivery.leaseExpiresAtMs;
+        resolveVerifier(true);
+        await Promise.resolve();
+        expect(
+          readOne<{ status: string; receipts: number; effects: number }>(
+            `SELECT dispatch.status,
+                    (SELECT COUNT(*) FROM runtime_run_command_receipts receipt
+                      WHERE receipt.command_id = dispatch.command_id) AS receipts,
+                    (SELECT COUNT(*) FROM runtime_run_command_effects effect
+                      WHERE effect.command_id = dispatch.command_id) AS effects
+             FROM runtime_run_command_dispatch dispatch WHERE dispatch.command_id = ?`,
+            delivery.command.commandId
+          )
+        ).toEqual({ status: "processing", receipts: 0, effects: 0 });
+      }
+    }
+  );
+
+  it("supersedes pre-dispatch drift before a stale effect can be persisted", async () => {
     await requestStart();
     const delivery = await claimStart();
     const db = new Database(filename);
@@ -415,19 +858,37 @@ describe("SQLite Runtime lifecycle journal", () => {
       db.close();
     }
 
-    await complete(delivery, receipt(delivery, "enforced"));
-    expect(await runState()).toMatchObject({
-      lifecycle: "starting",
-      stateVersion: 1,
-      sandboxState: "quarantined",
-      pendingLifecycleOperation: { kind: "start", status: "compensating" },
-    });
+    await expect(
+      kernel.runtimeLifecycleJournal.renew({
+        commandId: delivery.command.commandId,
+        workerId: RUNTIME.userId,
+        expectedAttempt: delivery.attempt,
+        expectedLeaseExpiresAtMs: delivery.leaseExpiresAtMs,
+        leaseDurationMs: 30_000,
+        nowMs: now,
+      })
+    ).resolves.toEqual({ kind: "superseded" });
+    await expect(
+      kernel.runtimeLifecycleJournal.complete({
+        commandId: delivery.command.commandId,
+        workerId: RUNTIME.userId,
+        expectedAttempt: delivery.attempt,
+        expectedLeaseExpiresAtMs: delivery.leaseExpiresAtMs,
+        observedAtMs: now,
+        outcome: { kind: "receipt", receipt: receipt(delivery, "enforced") },
+      })
+    ).rejects.toMatchObject({ code: "stale_completion" });
     expect(
-      readOne<{ status: string }>(
-        `SELECT status FROM runtime_run_command_dispatch WHERE command_id = ?`,
+      readOne<{ status: string; receipts: number; effects: number }>(
+        `SELECT dispatch.status,
+                (SELECT COUNT(*) FROM runtime_run_command_receipts receipt
+                 WHERE receipt.command_id = dispatch.command_id) AS receipts,
+                (SELECT COUNT(*) FROM runtime_run_command_effects effect
+                 WHERE effect.command_id = dispatch.command_id) AS effects
+         FROM runtime_run_command_dispatch dispatch WHERE dispatch.command_id = ?`,
         delivery.command.commandId
       )
-    ).toEqual({ status: "compensating" });
+    ).toEqual({ status: "superseded", receipts: 0, effects: 0 });
     await expect(
       kernel.runtimeLifecycleJournal.claim({
         workerId: "replacement-worker",
@@ -441,6 +902,7 @@ describe("SQLite Runtime lifecycle journal", () => {
   it("rejects a duplicate whose original receipt is bound to another command and tenant", async () => {
     await requestStart();
     const delivery = await claimStart();
+    const requiredEffectEnforcerSetDigest = requiredEnforcerDigest(delivery);
     const forgedOriginal = {
       commandId: "another-command",
       binding: {
@@ -452,6 +914,24 @@ describe("SQLite Runtime lifecycle journal", () => {
       outcome: "enforced",
       effectRef: "forged-effect",
       enforcedFence: delivery.command.toRunStateVersion,
+      aggregateEnforcementProof: (() => {
+        const proofPayload = {
+          generation: delivery.command.runtimeAuthorizationGeneration,
+          requiredEffectEnforcerSetDigest,
+          enforcementSubjectDigest: "f".repeat(64),
+          acknowledgements: [
+            {
+              enforcerRef: "test-runtime-enforcer",
+              enforcerKind: "runtime" as const,
+              acknowledgementDigest: "e".repeat(64),
+            },
+          ],
+        };
+        return {
+          ...proofPayload,
+          aggregateProofDigest: digestAggregateEnforcementProof(proofPayload),
+        };
+      })(),
     } as const satisfies NonDuplicateRuntimeReceipt;
     const duplicate = {
       commandId: delivery.command.commandId,
@@ -484,6 +964,16 @@ describe("SQLite Runtime lifecycle journal", () => {
     sessions.close();
     openKernel();
     const delivery = await claimStart(1_000);
+    const renewed = await kernel.runtimeLifecycleJournal.renew({
+      commandId: delivery.command.commandId,
+      workerId: RUNTIME.userId,
+      expectedAttempt: delivery.attempt,
+      expectedLeaseExpiresAtMs: delivery.leaseExpiresAtMs,
+      leaseDurationMs: 1_000,
+      nowMs: now,
+    });
+    expect(renewed.kind).toBe("renewed");
+    if (renewed.kind !== "renewed") throw new Error("Expected a renewed lifecycle lease");
     const revisionBefore = (
       await sessions.inspect({
         schemaVersion: TEAM_SESSION_SCHEMA_VERSION,
@@ -493,7 +983,7 @@ describe("SQLite Runtime lifecycle journal", () => {
       })
     )?.runStateRevision;
 
-    now = delivery.leaseExpiresAtMs;
+    now = renewed.leaseExpiresAtMs;
     await kernel.runtimeLifecycleJournal.reconcile({ nowMs: now });
     expect(await runState()).toMatchObject({
       lifecycle: "starting",

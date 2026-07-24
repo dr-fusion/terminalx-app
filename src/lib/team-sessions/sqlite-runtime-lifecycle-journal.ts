@@ -9,14 +9,30 @@ import {
   canonicalRuntimeJson,
   digestRuntimeCommandClaims,
 } from "../runtime/runtime-command-canonical";
-import { snapshotRuntimeReceiptForCommand } from "../runtime/runtime-command-execution";
+import {
+  RuntimeCommandExecutionError,
+  snapshotRuntimeReceiptForCommand,
+  verifyRuntimeReceiptEnforcementProofSynchronously,
+} from "../runtime/runtime-command-execution";
+import {
+  commitRuntimeEffectRef,
+  type SynchronousRuntimeEnforcementProofVerifier,
+} from "../runtime/runtime-enforcement-proof";
 import type {
   RuntimeLifecycleClaimOptions,
   RuntimeLifecycleCompletion,
   RuntimeLifecycleDelivery,
   RuntimeLifecycleJournal,
   RuntimeLifecycleReconcileOptions,
+  RuntimeLifecycleRenewal,
+  RuntimeLifecycleRenewalOptions,
 } from "../runtime/runtime-lifecycle-supervisor";
+import {
+  RuntimeReceiptFollowSettlementRejection,
+  type RuntimeReceiptFollowSettlementInput,
+  type RuntimeReceiptFollowSettlementResult,
+} from "./sqlite-runtime-receipt-follow-journal";
+import { isVerifiedRuntimeLifecycleReceiptObservation } from "../runtime/runtime-receipt-observation";
 
 type SqlValue = string | number | null;
 type SqlRow = Record<string, SqlValue>;
@@ -24,8 +40,97 @@ type SqlRow = Record<string, SqlValue>;
 const MAX_WORKER_ID_LENGTH = 128;
 const MAX_IDENTIFIER_LENGTH = 300;
 const MAX_SAFE_ERROR_CODE_LENGTH = 200;
+const SHA256_DIGEST = /^[0-9a-f]{64}$/;
 const DEFAULT_RETRY_DELAY_MS = 1_000;
 const MAX_RETRY_DELAY_MS = 60_000;
+
+/**
+ * Complete persisted trust fence for a lifecycle command immediately before
+ * dispatch. Keep this one predicate shared by reconciliation, claim, and
+ * renewal so a new authority input cannot be checked at only one stage.
+ * Callers must bind the named `nowMs` parameter.
+ */
+const CURRENT_RUNTIME_LIFECYCLE_DISPATCH_FENCE_SQL = `
+  command.deadline_at_ms > @nowMs
+  AND COALESCE(
+    json_extract(command.command_json, '$.authority.expiresAtMs') > @nowMs,
+    0
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM runtime_run_command_receipts receipt
+    WHERE receipt.command_id = command.id
+  )
+  AND EXISTS (
+    SELECT 1
+    FROM agent_runs run
+    JOIN sessions session
+      ON session.id = run.session_id
+    JOIN runtime_assignments assignment
+      ON assignment.id = run.runtime_assignment_id
+     AND assignment.session_id = run.session_id
+    JOIN run_policy_revisions policy
+      ON policy.agent_run_id = run.id
+     AND policy.session_id = run.session_id
+     AND policy.revision = run.current_policy_revision
+    JOIN goal_sets goal_set
+      ON goal_set.agent_run_id = run.id
+     AND goal_set.revision = run.current_goal_set_revision
+    JOIN runtime_authorization_epochs epoch
+      ON epoch.session_id = session.id
+     AND epoch.generation = session.runtime_authorization_generation
+    WHERE run.id = command.agent_run_id
+      AND run.session_id = command.session_id
+      AND run.team_id = session.team_id
+      AND run.project_id = session.project_id
+      AND session.status = 'active'
+      AND json_extract(command.command_json, '$.binding.teamId') = session.team_id
+      AND json_extract(command.command_json, '$.binding.projectId') = session.project_id
+      AND run.state_version = command.expected_run_state_version
+      AND run.current_policy_revision = command.run_policy_revision
+      AND run.current_goal_set_revision = command.goal_set_revision
+      AND goal_set.goal_set_id = command.goal_set_id
+      AND run.runtime_assignment_id = command.runtime_assignment_id
+      AND run.runtime_authorization_generation = command.runtime_authorization_generation
+      AND session.runtime_authorization_generation = command.runtime_authorization_generation
+      AND session.runtime_authorization_state = 'enforced'
+      AND assignment.team_id = session.team_id
+      AND assignment.project_id = session.project_id
+      AND assignment.id = command.runtime_assignment_id
+      AND assignment.generation = command.runtime_assignment_generation
+      AND assignment.sandbox_id = command.sandbox_id
+      AND assignment.sandbox_generation = command.sandbox_generation
+      AND assignment.runtime_principal_id = command.runtime_principal_id
+      AND assignment.runtime_authorization_generation =
+        command.runtime_authorization_generation
+      AND assignment.status = 'ready'
+      AND policy.runtime_assignment_id = command.runtime_assignment_id
+      AND policy.runtime_assignment_generation = command.runtime_assignment_generation
+      AND policy.sandbox_id = command.sandbox_id
+      AND policy.sandbox_generation = command.sandbox_generation
+      AND policy.runtime_principal_id = command.runtime_principal_id
+      AND policy.runtime_authorization_generation = command.runtime_authorization_generation
+      AND policy.project_ceiling_revision =
+        json_extract(command.command_json, '$.projectCeilingRevision')
+      AND command.required_effect_enforcer_set_digest IS NOT NULL
+      AND policy.required_effect_enforcer_set_digest =
+        command.required_effect_enforcer_set_digest
+      AND epoch.runtime_assignment_id = command.runtime_assignment_id
+      AND epoch.runtime_assignment_generation = command.runtime_assignment_generation
+      AND epoch.sandbox_id = command.sandbox_id
+      AND epoch.sandbox_generation = command.sandbox_generation
+      AND epoch.runtime_principal_id = command.runtime_principal_id
+      AND epoch.effect_enforcer_set_digest = command.required_effect_enforcer_set_digest
+      AND (command.operation <> 'run.start' OR run.start_command_id = command.id)
+      AND (
+        (command.operation = 'run.start' AND run.lifecycle = 'starting') OR
+        (command.operation = 'run.pause' AND run.lifecycle = 'active') OR
+        (command.operation = 'run.resume'
+          AND run.lifecycle IN ('paused', 'agent-work-finished')) OR
+        (command.operation = 'run.stop'
+          AND run.lifecycle IN ('active', 'paused', 'agent-work-finished'))
+      )
+  )`;
+
 const FAILURE_DISPATCH_CERTAINTY = Object.freeze({
   invalid_input: "not-dispatched",
   invalid_authority: "not-dispatched",
@@ -36,6 +141,7 @@ const FAILURE_DISPATCH_CERTAINTY = Object.freeze({
   lease_expired_before_dispatch: "not-dispatched",
   runtime_command_failed: "dispatch-uncertain",
   invalid_receipt: "dispatch-uncertain",
+  enforcement_proof_verification_failed: "dispatch-uncertain",
   runtime_internal: "dispatch-uncertain",
 } as const);
 
@@ -64,6 +170,8 @@ export interface CreateSqliteRuntimeLifecycleJournalOptions {
   readonly db: Database.Database;
   readonly idGenerator: () => string;
   readonly retryDelayMs?: number;
+  /** Required synchronously to settle enforced receipts; absence always fails closed. */
+  readonly verifyEnforcementProof?: SynchronousRuntimeEnforcementProofVerifier;
 }
 
 export interface RuntimeLifecycleIntent {
@@ -96,6 +204,7 @@ interface CommandJournalRow extends SqlRow {
   sandbox_generation: number;
   runtime_principal_id: string;
   runtime_authorization_generation: number;
+  required_effect_enforcer_set_digest: string;
   source_session_sequence: number;
   command_json: string;
   command_digest: string;
@@ -132,9 +241,24 @@ interface CompletionRow extends CommandJournalRow {
   available_at_ms: number;
   lease_owner: string | null;
   lease_expires_at_ms: number | null;
+  dispatch_interlock_acquired_at_ms: number | null;
   run_lifecycle: string;
   run_state_version: number;
   session_run_state_revision: number;
+}
+
+type ReceiptSettlementFence =
+  | {
+      readonly kind: "dispatch";
+      readonly expectedAttempt: number;
+      readonly expectedLeaseExpiresAtMs: number;
+    }
+  | { readonly kind: "follow" };
+
+interface ReceiptSettlementContext {
+  readonly actorRef: string;
+  readonly observedAtMs: number;
+  readonly fence: ReceiptSettlementFence;
 }
 
 /**
@@ -148,6 +272,7 @@ export class SqliteRuntimeLifecycleJournal implements RuntimeLifecycleJournal {
   private readonly db: Database.Database;
   private readonly idGenerator: () => string;
   private readonly retryDelayMs: number;
+  private readonly verifyEnforcementProof?: SynchronousRuntimeEnforcementProofVerifier;
 
   constructor(options: CreateSqliteRuntimeLifecycleJournalOptions) {
     if (
@@ -159,6 +284,13 @@ export class SqliteRuntimeLifecycleJournal implements RuntimeLifecycleJournal {
     }
     this.db = options.db;
     this.idGenerator = options.idGenerator;
+    if (
+      options.verifyEnforcementProof !== undefined &&
+      typeof options.verifyEnforcementProof !== "function"
+    ) {
+      fail("invalid_input");
+    }
+    this.verifyEnforcementProof = options.verifyEnforcementProof;
     this.retryDelayMs = boundedInteger(
       options.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS,
       1,
@@ -208,9 +340,10 @@ export class SqliteRuntimeLifecycleJournal implements RuntimeLifecycleJournal {
               target_run_state_version, run_policy_revision, goal_set_id,
               goal_set_revision, runtime_assignment_id, runtime_assignment_generation,
               sandbox_id, sandbox_generation, runtime_principal_id,
-              runtime_authorization_generation, source_session_sequence, command_json,
-              command_digest, authority_digest, created_at_ms, deadline_at_ms)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+              runtime_authorization_generation, required_effect_enforcer_set_digest,
+              source_session_sequence, command_json, command_digest, authority_digest,
+              created_at_ms, deadline_at_ms)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         )
         .run(
           command.commandId,
@@ -231,6 +364,7 @@ export class SqliteRuntimeLifecycleJournal implements RuntimeLifecycleJournal {
           command.binding.sandboxGeneration,
           command.binding.runtimePrincipalId,
           command.runtimeAuthorizationGeneration,
+          command.requiredEffectEnforcerSetDigest,
           sourceSessionSequence,
           JSON.stringify(command),
           commandDigest,
@@ -268,16 +402,48 @@ export class SqliteRuntimeLifecycleJournal implements RuntimeLifecycleJournal {
   async reconcile(options: RuntimeLifecycleReconcileOptions): Promise<void> {
     const nowMs = nonNegativeInteger(options?.nowMs);
     const reconcile = this.db.transaction(() => {
-      const expiredLeases = this.db
+      const expiredPredispatchLeases = this.db
         .prepare(
           `SELECT command.*
            FROM runtime_run_commands command
            JOIN runtime_run_command_dispatch dispatch ON dispatch.command_id = command.id
            WHERE dispatch.status = 'processing' AND dispatch.lease_expires_at_ms <= ?
+             AND dispatch.dispatch_interlock_acquired_at_ms IS NULL
            ORDER BY dispatch.created_at_ms ASC, command.id ASC`
         )
         .all(nowMs) as CommandJournalRow[];
-      for (const row of expiredLeases) {
+      for (const row of expiredPredispatchLeases) {
+        const safeCode =
+          row.deadline_at_ms <= nowMs ? "deadline_expired" : "lease_expired_before_dispatch";
+        const updated = this.db
+          .prepare(
+            `UPDATE runtime_run_command_dispatch
+             SET status = 'pending', lease_owner = NULL, lease_expires_at_ms = NULL,
+                 last_safe_error_code = ?,
+                 available_at_ms = MAX(available_at_ms, ?), updated_at_ms = ?
+             WHERE command_id = ? AND status = 'processing'
+               AND lease_expires_at_ms <= ?
+               AND dispatch_interlock_acquired_at_ms IS NULL
+               AND NOT EXISTS (
+                 SELECT 1 FROM runtime_run_command_receipts receipt
+                 WHERE receipt.command_id = runtime_run_command_dispatch.command_id
+               )`
+          )
+          .run(safeCode, nowMs, nowMs, row.id, nowMs);
+        if (updated.changes > 1) fail("journal_conflict");
+      }
+
+      const expiredDispatchedLeases = this.db
+        .prepare(
+          `SELECT command.*
+           FROM runtime_run_commands command
+           JOIN runtime_run_command_dispatch dispatch ON dispatch.command_id = command.id
+           WHERE dispatch.status = 'processing' AND dispatch.lease_expires_at_ms <= ?
+             AND dispatch.dispatch_interlock_acquired_at_ms IS NOT NULL
+           ORDER BY dispatch.created_at_ms ASC, command.id ASC`
+        )
+        .all(nowMs) as CommandJournalRow[];
+      for (const row of expiredDispatchedLeases) {
         const updated = this.db
           .prepare(
             `UPDATE runtime_run_command_dispatch
@@ -286,7 +452,8 @@ export class SqliteRuntimeLifecycleJournal implements RuntimeLifecycleJournal {
                  last_safe_error_code = 'lease_expired_dispatch_uncertain',
                  available_at_ms = MAX(available_at_ms, ?), updated_at_ms = ?
              WHERE command_id = ? AND status = 'processing'
-               AND lease_expires_at_ms <= ?`
+               AND lease_expires_at_ms <= ?
+               AND dispatch_interlock_acquired_at_ms IS NOT NULL`
           )
           .run(nowMs, nowMs, row.id, nowMs);
         if (updated.changes === 1) {
@@ -329,28 +496,11 @@ export class SqliteRuntimeLifecycleJournal implements RuntimeLifecycleJournal {
           `SELECT command.*
            FROM runtime_run_commands command
            JOIN runtime_run_command_dispatch dispatch ON dispatch.command_id = command.id
-           WHERE dispatch.status = 'pending' AND command.deadline_at_ms > ?
-             AND NOT EXISTS (
-               SELECT 1 FROM agent_runs run
-               WHERE run.id = command.agent_run_id
-                 AND run.session_id = command.session_id
-                 AND run.state_version = command.expected_run_state_version
-                 AND run.current_policy_revision = command.run_policy_revision
-                 AND run.current_goal_set_revision = command.goal_set_revision
-                 AND run.runtime_assignment_id = command.runtime_assignment_id
-                 AND run.runtime_authorization_generation = command.runtime_authorization_generation
-                 AND (
-                   (command.operation = 'run.start' AND run.lifecycle = 'starting') OR
-                   (command.operation = 'run.pause' AND run.lifecycle = 'active') OR
-                   (command.operation = 'run.resume'
-                     AND run.lifecycle IN ('paused', 'agent-work-finished')) OR
-                   (command.operation = 'run.stop'
-                     AND run.lifecycle IN ('active', 'paused', 'agent-work-finished'))
-                 )
-             )
+           WHERE dispatch.status = 'pending'
+             AND NOT (${CURRENT_RUNTIME_LIFECYCLE_DISPATCH_FENCE_SQL})
            ORDER BY command.created_at_ms ASC, command.id ASC`
         )
-        .all(nowMs) as CommandJournalRow[];
+        .all({ nowMs }) as CommandJournalRow[];
       for (const command of stalePending) {
         this.supersedeUndispatchedCommand(command, nowMs, "runtime-lifecycle-reconciler");
       }
@@ -373,42 +523,12 @@ export class SqliteRuntimeLifecycleJournal implements RuntimeLifecycleJournal {
           `SELECT command.*
            FROM runtime_run_commands command
            JOIN runtime_run_command_dispatch dispatch ON dispatch.command_id = command.id
-           JOIN agent_runs run ON run.id = command.agent_run_id
-           JOIN sessions session ON session.id = command.session_id
-           JOIN runtime_assignments assignment ON assignment.id = command.runtime_assignment_id
-           WHERE dispatch.status = 'pending' AND dispatch.available_at_ms <= ?
-             AND command.deadline_at_ms > ?
-             AND NOT EXISTS (
-               SELECT 1 FROM runtime_run_command_receipts receipt
-               WHERE receipt.command_id = command.id
-             )
-             AND run.session_id = command.session_id
-             AND run.state_version = command.expected_run_state_version
-             AND run.current_policy_revision = command.run_policy_revision
-             AND run.current_goal_set_revision = command.goal_set_revision
-             AND run.runtime_assignment_id = command.runtime_assignment_id
-             AND run.runtime_authorization_generation = command.runtime_authorization_generation
-             AND session.runtime_authorization_generation = command.runtime_authorization_generation
-             AND session.runtime_authorization_state = 'enforced'
-             AND assignment.session_id = command.session_id
-             AND assignment.generation = command.runtime_assignment_generation
-             AND assignment.sandbox_id = command.sandbox_id
-             AND assignment.sandbox_generation = command.sandbox_generation
-             AND assignment.runtime_principal_id = command.runtime_principal_id
-             AND assignment.runtime_authorization_generation = command.runtime_authorization_generation
-             AND assignment.status = 'ready'
-             AND (
-               (command.operation = 'run.start' AND run.lifecycle = 'starting') OR
-               (command.operation = 'run.pause' AND run.lifecycle = 'active') OR
-               (command.operation = 'run.resume'
-                 AND run.lifecycle IN ('paused', 'agent-work-finished')) OR
-               (command.operation = 'run.stop'
-                 AND run.lifecycle IN ('active', 'paused', 'agent-work-finished'))
-             )
+           WHERE dispatch.status = 'pending' AND dispatch.available_at_ms <= @nowMs
+             AND ${CURRENT_RUNTIME_LIFECYCLE_DISPATCH_FENCE_SQL}
            ORDER BY dispatch.available_at_ms ASC, command.created_at_ms ASC, command.id ASC
-           LIMIT ?`
+           LIMIT @limit`
         )
-        .all(nowMs, nowMs, limit) as CommandJournalRow[];
+        .all({ nowMs, limit }) as CommandJournalRow[];
       const deliveries: RuntimeLifecycleDelivery[] = [];
       for (const row of rows) {
         let command: RuntimeLifecycleCommand;
@@ -423,7 +543,7 @@ export class SqliteRuntimeLifecycleJournal implements RuntimeLifecycleJournal {
             `UPDATE runtime_run_command_dispatch
              SET status = 'processing', attempts = attempts + 1,
                  lease_owner = ?, lease_expires_at_ms = ?, updated_at_ms = ?,
-                 last_safe_error_code = NULL
+                 last_safe_error_code = NULL, dispatch_interlock_acquired_at_ms = NULL
              WHERE command_id = ? AND status = 'pending' AND available_at_ms <= ?
              RETURNING attempts`
           )
@@ -444,8 +564,110 @@ export class SqliteRuntimeLifecycleJournal implements RuntimeLifecycleJournal {
     return Object.freeze(claim.immediate());
   }
 
+  async renew(options: RuntimeLifecycleRenewalOptions): Promise<RuntimeLifecycleRenewal> {
+    const commandId = safeIdentifier(options?.commandId, MAX_IDENTIFIER_LENGTH);
+    const workerId = safeIdentifier(options?.workerId, MAX_WORKER_ID_LENGTH);
+    const expectedAttempt = positiveInteger(options?.expectedAttempt);
+    const expectedLeaseExpiresAtMs = nonNegativeInteger(options?.expectedLeaseExpiresAtMs);
+    const leaseDurationMs = boundedInteger(options?.leaseDurationMs, 1, 300_000);
+    const nowMs = nonNegativeInteger(options?.nowMs);
+    if (nowMs >= expectedLeaseExpiresAtMs) fail("stale_completion");
+    const requestedExpiry = safeAdd(nowMs, leaseDurationMs);
+    const leaseExpiresAtMs = Math.max(expectedLeaseExpiresAtMs, requestedExpiry);
+    const renew = this.db.transaction((): RuntimeLifecycleRenewal => {
+      const row = this.db
+        .prepare(
+          `SELECT command.*
+           FROM runtime_run_commands command
+           JOIN runtime_run_command_dispatch dispatch ON dispatch.command_id = command.id
+           WHERE command.id = @commandId
+             AND dispatch.status = 'processing' AND dispatch.attempts = @expectedAttempt
+             AND dispatch.lease_owner = @workerId
+             AND dispatch.lease_expires_at_ms = @expectedLeaseExpiresAtMs
+             AND dispatch.lease_expires_at_ms > @nowMs
+             AND dispatch.dispatch_interlock_acquired_at_ms IS NULL
+             AND NOT EXISTS (
+               SELECT 1 FROM runtime_run_command_receipts receipt
+               WHERE receipt.command_id = command.id
+             )`
+        )
+        .get({
+          commandId,
+          expectedAttempt,
+          workerId,
+          expectedLeaseExpiresAtMs,
+          nowMs,
+        }) as CommandJournalRow | undefined;
+      if (!row) fail("stale_completion");
+
+      const current = this.db
+        .prepare(
+          `SELECT 1 FROM runtime_run_commands command
+           WHERE command.id = @commandId
+             AND ${CURRENT_RUNTIME_LIFECYCLE_DISPATCH_FENCE_SQL}`
+        )
+        .get({ commandId, nowMs });
+      if (!current) {
+        this.supersedeClaimedUndispatchedCommand(row, {
+          workerId,
+          expectedAttempt,
+          expectedLeaseExpiresAtMs,
+          nowMs,
+        });
+        return Object.freeze({ kind: "superseded" as const });
+      }
+
+      const updated = this.db
+        .prepare(
+          `UPDATE runtime_run_command_dispatch
+           SET lease_expires_at_ms = ?, updated_at_ms = ?,
+               dispatch_interlock_acquired_at_ms = ?
+           WHERE command_id = ? AND status = 'processing' AND attempts = ?
+             AND lease_owner = ? AND lease_expires_at_ms = ?
+             AND lease_expires_at_ms > ?
+             AND dispatch_interlock_acquired_at_ms IS NULL
+             AND NOT EXISTS (
+               SELECT 1 FROM runtime_run_command_receipts receipt
+               WHERE receipt.command_id = runtime_run_command_dispatch.command_id
+             )`
+        )
+        .run(
+          leaseExpiresAtMs,
+          nowMs,
+          nowMs,
+          commandId,
+          expectedAttempt,
+          workerId,
+          expectedLeaseExpiresAtMs,
+          nowMs
+        );
+      if (updated.changes !== 1) fail("stale_completion");
+      return Object.freeze({ kind: "renewed" as const, leaseExpiresAtMs });
+    });
+    return renew.immediate();
+  }
+
   async complete(completion: RuntimeLifecycleCompletion): Promise<void> {
-    const input = validateCompletion(completion);
+    let input = validateCompletion(completion);
+    if (input.outcome.kind === "receipt") {
+      const row = this.completionRow(input.commandId);
+      if (!row) fail("stale_completion");
+      const command = parsePersistedCommand(row);
+      const receipt = validateReceiptForCommand(input.outcome.receipt, row);
+      try {
+        verifyRuntimeReceiptEnforcementProofSynchronously(
+          command,
+          receipt,
+          this.verifyEnforcementProof
+        );
+      } catch {
+        fail("invalid_input");
+      }
+      input = Object.freeze({
+        ...input,
+        outcome: Object.freeze({ kind: "receipt" as const, receipt }),
+      });
+    }
     const settle = this.db.transaction(() => {
       const row = this.completionRow(input.commandId);
       if (!row) fail("stale_completion");
@@ -470,11 +692,81 @@ export class SqliteRuntimeLifecycleJournal implements RuntimeLifecycleJournal {
     settle.immediate();
   }
 
+  /**
+   * Settle one receipt that was authenticated by the private Runtime follow
+   * channel. The caller must already hold the follow journal's IMMEDIATE
+   * transaction so receipt evidence, lifecycle truth, cursor advancement, and
+   * the follow event either commit together or all roll back.
+   */
+  settleVerifiedReceiptInTransaction(
+    unsafeInput: RuntimeReceiptFollowSettlementInput
+  ): RuntimeReceiptFollowSettlementResult {
+    if (!this.db.inTransaction) fail("journal_conflict");
+    if (!unsafeInput || typeof unsafeInput !== "object") fail("invalid_input");
+
+    let actorRef: string;
+    let receivedAtMs: number;
+    let command: RuntimeLifecycleCommand;
+    let observation: RuntimeReceiptFollowSettlementInput["observation"];
+    try {
+      actorRef = safeIdentifier(unsafeInput.actorRef, MAX_WORKER_ID_LENGTH);
+      receivedAtMs = nonNegativeInteger(unsafeInput.receivedAtMs);
+      command = validateLifecycleCommand(unsafeInput.command);
+      observation = unsafeInput.observation;
+    } catch {
+      fail("invalid_input");
+    }
+    if (!isVerifiedRuntimeLifecycleReceiptObservation(observation)) fail("invalid_input");
+
+    const row = this.completionRow(command.commandId);
+    if (!row || row.dispatch_status !== "awaiting-receipt") fail("stale_completion");
+    const persistedCommand = parsePersistedCommand(row);
+    if (
+      canonicalCommandJson(command) !== canonicalCommandJson(persistedCommand) ||
+      digestRuntimeCommandClaims(command) !== command.authority.claimsDigest
+    ) {
+      fail("invalid_command");
+    }
+
+    let receipt: RuntimeReceipt;
+    try {
+      receipt = validateReceiptForCommand(observation.receipt, row);
+    } catch {
+      throw new RuntimeReceiptFollowSettlementRejection("enforcement_proof_verification_failed");
+    }
+    try {
+      verifyRuntimeReceiptEnforcementProofSynchronously(
+        persistedCommand,
+        receipt,
+        this.verifyEnforcementProof
+      );
+    } catch (error) {
+      if (
+        error instanceof RuntimeCommandExecutionError &&
+        (error.code === "invalid_receipt" || error.code === "enforcement_proof_verification_failed")
+      ) {
+        throw new RuntimeReceiptFollowSettlementRejection("enforcement_proof_verification_failed");
+      }
+      fail("invalid_input");
+    }
+
+    return this.settleReceipt(
+      row,
+      Object.freeze({
+        actorRef,
+        observedAtMs: receivedAtMs,
+        fence: Object.freeze({ kind: "follow" as const }),
+      }),
+      receipt
+    );
+  }
+
   private completionRow(commandId: string): CompletionRow | undefined {
     return this.db
       .prepare(
         `SELECT command.*, dispatch.status AS dispatch_status, dispatch.attempts,
                 dispatch.available_at_ms, dispatch.lease_owner, dispatch.lease_expires_at_ms,
+                dispatch.dispatch_interlock_acquired_at_ms,
                 run.lifecycle AS run_lifecycle, run.state_version AS run_state_version,
                 session.run_state_revision AS session_run_state_revision
          FROM runtime_run_commands command
@@ -490,12 +782,16 @@ export class SqliteRuntimeLifecycleJournal implements RuntimeLifecycleJournal {
     row: CompletionRow,
     completion: ReturnType<typeof validateCompletion>
   ): boolean {
+    const requiresDispatchInterlock =
+      completion.outcome.kind === "receipt" ||
+      completion.outcome.dispatchCertainty === "dispatch-uncertain";
     return (
       row.dispatch_status === "processing" &&
       row.attempts === completion.expectedAttempt &&
       row.lease_owner === completion.workerId &&
       row.lease_expires_at_ms === completion.expectedLeaseExpiresAtMs &&
-      completion.observedAtMs < completion.expectedLeaseExpiresAtMs
+      completion.observedAtMs < completion.expectedLeaseExpiresAtMs &&
+      (!requiresDispatchInterlock || row.dispatch_interlock_acquired_at_ms !== null)
     );
   }
 
@@ -569,16 +865,37 @@ export class SqliteRuntimeLifecycleJournal implements RuntimeLifecycleJournal {
     row: CompletionRow,
     completion: ReturnType<typeof validateCompletion>,
     receipt: RuntimeReceipt
-  ): void {
+  ): RuntimeReceiptFollowSettlementResult {
+    return this.settleReceipt(
+      row,
+      {
+        actorRef: completion.workerId,
+        observedAtMs: completion.observedAtMs,
+        fence: {
+          kind: "dispatch",
+          expectedAttempt: completion.expectedAttempt,
+          expectedLeaseExpiresAtMs: completion.expectedLeaseExpiresAtMs,
+        },
+      },
+      receipt
+    );
+  }
+
+  private settleReceipt(
+    row: CompletionRow,
+    settlement: ReceiptSettlementContext,
+    receipt: RuntimeReceipt
+  ): RuntimeReceiptFollowSettlementResult {
     const persisted = validateReceiptForCommand(receipt, row);
-    const receiptId = this.insertReceipt(row, persisted, completion.observedAtMs);
+    const receiptId = this.insertReceipt(row, persisted, settlement.observedAtMs);
+    const effectiveReceiptDigest = digestReceipt(persisted);
     const effective = persisted.outcome === "duplicate" ? persisted.originalReceipt : persisted;
 
     if (effective.outcome === "accepted") {
       this.recordJournalEvent(
         row,
-        completion.observedAtMs,
-        completion.workerId,
+        settlement.observedAtMs,
+        settlement.actorRef,
         "run.runtime-command.accepted",
         {
           commandId: row.id,
@@ -587,35 +904,52 @@ export class SqliteRuntimeLifecycleJournal implements RuntimeLifecycleJournal {
           stateVersion: row.run_state_version,
         }
       );
-      this.db
-        .prepare(
-          `UPDATE runtime_run_command_dispatch
-           SET status = 'awaiting-receipt', available_at_ms = MAX(available_at_ms, ?),
-               lease_owner = NULL, lease_expires_at_ms = NULL,
-               last_safe_error_code = NULL, updated_at_ms = ?
-           WHERE command_id = ? AND status = 'processing' AND attempts = ?
-             AND lease_owner = ? AND lease_expires_at_ms = ?`
-        )
-        .run(
-          completion.observedAtMs,
-          completion.observedAtMs,
-          row.id,
-          completion.expectedAttempt,
-          completion.workerId,
-          completion.expectedLeaseExpiresAtMs
-        );
-      return;
+      this.parkAcceptedDispatch(row, settlement);
+      return Object.freeze({ receiptId, effectiveReceiptDigest });
     }
 
     if (effective.outcome === "enforced") {
-      this.applyEnforcedReceipt(row, completion, persisted, receiptId);
-      return;
+      this.applyEnforcedReceipt(row, settlement, persisted, receiptId);
+      return Object.freeze({ receiptId, effectiveReceiptDigest });
     }
     if (effective.outcome === "rejected") {
-      this.applyRejectedReceipt(row, completion, persisted, effective);
-      return;
+      this.applyRejectedReceipt(row, settlement, persisted, effective);
+      return Object.freeze({ receiptId, effectiveReceiptDigest });
     }
-    this.applyQuarantinedReceipt(row, completion, persisted, effective);
+    this.applyQuarantinedReceipt(row, settlement, persisted, effective);
+    return Object.freeze({ receiptId, effectiveReceiptDigest });
+  }
+
+  private parkAcceptedDispatch(row: CompletionRow, settlement: ReceiptSettlementContext): void {
+    const baseSql = `UPDATE runtime_run_command_dispatch
+      SET status = 'awaiting-receipt', available_at_ms = MAX(available_at_ms, ?),
+          lease_owner = NULL, lease_expires_at_ms = NULL,
+          last_safe_error_code = NULL, updated_at_ms = ?
+      WHERE command_id = ?`;
+    const updated =
+      settlement.fence.kind === "dispatch"
+        ? this.db
+            .prepare(
+              `${baseSql} AND status = 'processing' AND attempts = ?
+                 AND lease_owner = ? AND lease_expires_at_ms = ?`
+            )
+            .run(
+              settlement.observedAtMs,
+              settlement.observedAtMs,
+              row.id,
+              settlement.fence.expectedAttempt,
+              settlement.actorRef,
+              settlement.fence.expectedLeaseExpiresAtMs
+            )
+        : this.db
+            .prepare(
+              `${baseSql} AND status = 'awaiting-receipt'
+                 AND lease_owner IS NULL AND lease_expires_at_ms IS NULL`
+            )
+            .run(settlement.observedAtMs, settlement.observedAtMs, row.id);
+    if (updated.changes !== 1) {
+      fail(settlement.fence.kind === "dispatch" ? "stale_completion" : "journal_conflict");
+    }
   }
 
   private insertReceipt(row: CompletionRow, receipt: RuntimeReceipt, observedAtMs: number): string {
@@ -642,6 +976,15 @@ export class SqliteRuntimeLifecycleJournal implements RuntimeLifecycleJournal {
       persistedReceipt.outcome === "duplicate" ? persistedReceipt.originalReceipt.outcome : null;
     const originalReceiptDigest =
       persistedReceipt.outcome === "duplicate" ? persistedReceipt.originalReceiptDigest : null;
+    const effectiveReceipt =
+      persistedReceipt.outcome === "duplicate"
+        ? persistedReceipt.originalReceipt
+        : persistedReceipt;
+    const aggregateProof =
+      effectiveReceipt.outcome === "enforced"
+        ? effectiveReceipt.aggregateEnforcementProof
+        : undefined;
+    if (effectiveReceipt.outcome === "enforced" && !aggregateProof) fail("invalid_input");
 
     try {
       this.db
@@ -653,8 +996,10 @@ export class SqliteRuntimeLifecycleJournal implements RuntimeLifecycleJournal {
               sandbox_generation, runtime_principal_id, runtime_authorization_generation,
               expected_run_state_version, target_run_state_version, source_session_sequence,
               command_digest, outcome, original_outcome, original_receipt_digest,
-              receipt_json, receipt_digest, received_at_ms)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+              receipt_json, receipt_digest, received_at_ms,
+              required_effect_enforcer_set_digest, enforcement_subject_digest,
+              aggregate_proof_digest, proof_verified_at_ms)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         )
         .run(
           receiptId,
@@ -682,7 +1027,11 @@ export class SqliteRuntimeLifecycleJournal implements RuntimeLifecycleJournal {
           originalReceiptDigest,
           JSON.stringify(persistedReceipt),
           receiptDigest,
-          observedAtMs
+          observedAtMs,
+          aggregateProof?.requiredEffectEnforcerSetDigest ?? null,
+          aggregateProof?.enforcementSubjectDigest ?? null,
+          aggregateProof?.aggregateProofDigest ?? null,
+          aggregateProof ? observedAtMs : null
         );
     } catch {
       fail("journal_conflict");
@@ -692,12 +1041,12 @@ export class SqliteRuntimeLifecycleJournal implements RuntimeLifecycleJournal {
 
   private applyEnforcedReceipt(
     row: CompletionRow,
-    completion: ReturnType<typeof validateCompletion>,
+    settlement: ReceiptSettlementContext,
     receipt: RuntimeReceipt,
     receiptId: string
   ): void {
     if (!this.commandStillCurrent(row)) {
-      this.invalidateRunGrants(row.agent_run_id, completion.observedAtMs, "runtime-compensation");
+      this.invalidateRunGrants(row.agent_run_id, settlement.observedAtMs, "runtime-authorization");
       this.db
         .prepare(
           `UPDATE runtime_assignments SET status = 'quarantined'
@@ -713,8 +1062,8 @@ export class SqliteRuntimeLifecycleJournal implements RuntimeLifecycleJournal {
         .run(row.session_id, row.runtime_authorization_generation);
       this.recordJournalEvent(
         row,
-        completion.observedAtMs,
-        completion.workerId,
+        settlement.observedAtMs,
+        settlement.actorRef,
         "run.runtime-command.compensating",
         {
           commandId: row.id,
@@ -724,35 +1073,19 @@ export class SqliteRuntimeLifecycleJournal implements RuntimeLifecycleJournal {
           stateVersion: row.run_state_version,
         }
       );
-      const updated = this.db
-        .prepare(
-          `UPDATE runtime_run_command_dispatch
-           SET status = 'compensating', lease_owner = NULL, lease_expires_at_ms = NULL,
-               last_safe_error_code = 'stale_enforced_effect', updated_at_ms = ?,
-               terminal_at_ms = NULL
-           WHERE command_id = ? AND status = 'processing' AND attempts = ?
-             AND lease_owner = ? AND lease_expires_at_ms = ?`
-        )
-        .run(
-          completion.observedAtMs,
-          row.id,
-          completion.expectedAttempt,
-          completion.workerId,
-          completion.expectedLeaseExpiresAtMs
-        );
-      if (updated.changes !== 1) fail("stale_completion");
+      this.markDispatchCompensating(row, settlement);
       return;
     }
 
     const nextRunStateRevision = row.session_run_state_revision + 1;
     const invalidatedGrantCount =
       row.operation === "run.stop"
-        ? this.invalidateRunGrants(row.agent_run_id, completion.observedAtMs, "run-terminal")
+        ? this.invalidateRunGrants(row.agent_run_id, settlement.observedAtMs, "run-terminal")
         : 0;
     const appliedSequence = this.appendSystemEvent(
       row.session_id,
-      completion.observedAtMs,
-      completion.workerId,
+      settlement.observedAtMs,
+      settlement.actorRef,
       eventTypeFor(row.operation),
       {
         commandId: row.id,
@@ -796,7 +1129,7 @@ export class SqliteRuntimeLifecycleJournal implements RuntimeLifecycleJournal {
         row.source_session_sequence,
         appliedSequence,
         effectDigest,
-        completion.observedAtMs
+        settlement.observedAtMs
       );
     const updated = this.db
       .prepare(
@@ -809,9 +1142,9 @@ export class SqliteRuntimeLifecycleJournal implements RuntimeLifecycleJournal {
       .run(
         row.target_lifecycle,
         row.target_run_state_version,
-        completion.observedAtMs,
+        settlement.observedAtMs,
         row.target_lifecycle,
-        completion.observedAtMs,
+        settlement.observedAtMs,
         row.agent_run_id,
         row.session_id,
         row.expected_run_state_version,
@@ -819,19 +1152,19 @@ export class SqliteRuntimeLifecycleJournal implements RuntimeLifecycleJournal {
       );
     if (updated.changes !== 1) fail("journal_conflict");
     this.advanceRunStateRevision(row.session_id, row.session_run_state_revision);
-    this.terminalizeDispatch(row, completion, "enforced", null);
+    this.terminalizeDispatch(row, settlement, "enforced", null);
   }
 
   private applyRejectedReceipt(
     row: CompletionRow,
-    completion: ReturnType<typeof validateCompletion>,
+    settlement: ReceiptSettlementContext,
     receipt: RuntimeReceipt,
     effective: Extract<NonDuplicateRuntimeReceipt, { outcome: "rejected" }>
   ): void {
     this.recordJournalEvent(
       row,
-      completion.observedAtMs,
-      completion.workerId,
+      settlement.observedAtMs,
+      settlement.actorRef,
       "run.runtime-command.rejected",
       {
         commandId: row.id,
@@ -843,22 +1176,22 @@ export class SqliteRuntimeLifecycleJournal implements RuntimeLifecycleJournal {
       },
       digestReceipt(receipt)
     );
-    this.terminalizeDispatch(row, completion, "rejected", effective.code);
+    this.terminalizeDispatch(row, settlement, "rejected", effective.code);
     if (row.operation === "run.start" && this.startStillPending(row)) {
-      this.failStartingRun(row, completion.observedAtMs);
+      this.failStartingRun(row, settlement.observedAtMs);
     }
   }
 
   private applyQuarantinedReceipt(
     row: CompletionRow,
-    completion: ReturnType<typeof validateCompletion>,
+    settlement: ReceiptSettlementContext,
     receipt: RuntimeReceipt,
     effective: Extract<NonDuplicateRuntimeReceipt, { outcome: "quarantined" }>
   ): void {
     this.recordJournalEvent(
       row,
-      completion.observedAtMs,
-      completion.workerId,
+      settlement.observedAtMs,
+      settlement.actorRef,
       "run.runtime-command.quarantined",
       {
         commandId: row.id,
@@ -869,8 +1202,8 @@ export class SqliteRuntimeLifecycleJournal implements RuntimeLifecycleJournal {
       },
       digestReceipt(receipt)
     );
-    this.terminalizeDispatch(row, completion, "quarantined", effective.reason);
-    this.invalidateRunGrants(row.agent_run_id, completion.observedAtMs, "runtime-quarantine");
+    this.terminalizeDispatch(row, settlement, "quarantined", effective.reason);
+    this.invalidateRunGrants(row.agent_run_id, settlement.observedAtMs, "runtime-authorization");
     this.db
       .prepare(
         `UPDATE runtime_assignments SET status = 'quarantined'
@@ -885,7 +1218,7 @@ export class SqliteRuntimeLifecycleJournal implements RuntimeLifecycleJournal {
       )
       .run(row.session_id, row.runtime_authorization_generation);
     if (row.operation === "run.start" && this.startStillPending(row)) {
-      this.failStartingRun(row, completion.observedAtMs);
+      this.failStartingRun(row, settlement.observedAtMs);
       return;
     }
     if (
@@ -899,7 +1232,7 @@ export class SqliteRuntimeLifecycleJournal implements RuntimeLifecycleJournal {
            WHERE id = ? AND session_id = ? AND lifecycle = 'active' AND state_version = ?`
         )
         .run(
-          completion.observedAtMs,
+          settlement.observedAtMs,
           row.agent_run_id,
           row.session_id,
           row.expected_run_state_version
@@ -909,29 +1242,71 @@ export class SqliteRuntimeLifecycleJournal implements RuntimeLifecycleJournal {
 
   private terminalizeDispatch(
     row: CompletionRow,
-    completion: ReturnType<typeof validateCompletion>,
+    settlement: ReceiptSettlementContext,
     status: "enforced" | "rejected" | "quarantined" | "superseded",
     safeCode: string | null
   ): void {
-    const updated = this.db
-      .prepare(
-        `UPDATE runtime_run_command_dispatch
-         SET status = ?, lease_owner = NULL, lease_expires_at_ms = NULL,
-             last_safe_error_code = ?, updated_at_ms = ?, terminal_at_ms = ?
-         WHERE command_id = ? AND status = 'processing' AND attempts = ?
-           AND lease_owner = ? AND lease_expires_at_ms = ?`
-      )
-      .run(
-        status,
-        safeCode,
-        completion.observedAtMs,
-        completion.observedAtMs,
-        row.id,
-        completion.expectedAttempt,
-        completion.workerId,
-        completion.expectedLeaseExpiresAtMs
-      );
-    if (updated.changes !== 1) fail("stale_completion");
+    const baseSql = `UPDATE runtime_run_command_dispatch
+      SET status = ?, lease_owner = NULL, lease_expires_at_ms = NULL,
+          last_safe_error_code = ?, updated_at_ms = ?, terminal_at_ms = ?
+      WHERE command_id = ?`;
+    const updated =
+      settlement.fence.kind === "dispatch"
+        ? this.db
+            .prepare(
+              `${baseSql} AND status = 'processing' AND attempts = ?
+                 AND lease_owner = ? AND lease_expires_at_ms = ?`
+            )
+            .run(
+              status,
+              safeCode,
+              settlement.observedAtMs,
+              settlement.observedAtMs,
+              row.id,
+              settlement.fence.expectedAttempt,
+              settlement.actorRef,
+              settlement.fence.expectedLeaseExpiresAtMs
+            )
+        : this.db
+            .prepare(
+              `${baseSql} AND status = 'awaiting-receipt'
+                 AND lease_owner IS NULL AND lease_expires_at_ms IS NULL`
+            )
+            .run(status, safeCode, settlement.observedAtMs, settlement.observedAtMs, row.id);
+    if (updated.changes !== 1) {
+      fail(settlement.fence.kind === "dispatch" ? "stale_completion" : "journal_conflict");
+    }
+  }
+
+  private markDispatchCompensating(row: CompletionRow, settlement: ReceiptSettlementContext): void {
+    const baseSql = `UPDATE runtime_run_command_dispatch
+      SET status = 'compensating', lease_owner = NULL, lease_expires_at_ms = NULL,
+          last_safe_error_code = 'stale_enforced_effect', updated_at_ms = ?,
+          terminal_at_ms = NULL
+      WHERE command_id = ?`;
+    const updated =
+      settlement.fence.kind === "dispatch"
+        ? this.db
+            .prepare(
+              `${baseSql} AND status = 'processing' AND attempts = ?
+                 AND lease_owner = ? AND lease_expires_at_ms = ?`
+            )
+            .run(
+              settlement.observedAtMs,
+              row.id,
+              settlement.fence.expectedAttempt,
+              settlement.actorRef,
+              settlement.fence.expectedLeaseExpiresAtMs
+            )
+        : this.db
+            .prepare(
+              `${baseSql} AND status = 'awaiting-receipt'
+                 AND lease_owner IS NULL AND lease_expires_at_ms IS NULL`
+            )
+            .run(settlement.observedAtMs, row.id);
+    if (updated.changes !== 1) {
+      fail(settlement.fence.kind === "dispatch" ? "stale_completion" : "journal_conflict");
+    }
   }
 
   private failUndispatchedCommand(
@@ -984,6 +1359,48 @@ export class SqliteRuntimeLifecycleJournal implements RuntimeLifecycleJournal {
       .run(nowMs, nowMs, row.id);
     if (updated.changes !== 1) fail("journal_conflict");
     this.recordJournalEvent(row, nowMs, actorRef, "run.runtime-command.superseded", {
+      commandId: row.id,
+      agentRunId: row.agent_run_id,
+      operation: row.operation,
+      observedOutcome: "not-dispatched",
+      stateVersion: row.expected_run_state_version,
+    });
+  }
+
+  private supersedeClaimedUndispatchedCommand(
+    row: CommandJournalRow,
+    fence: {
+      readonly workerId: string;
+      readonly expectedAttempt: number;
+      readonly expectedLeaseExpiresAtMs: number;
+      readonly nowMs: number;
+    }
+  ): void {
+    const updated = this.db
+      .prepare(
+        `UPDATE runtime_run_command_dispatch
+         SET status = 'superseded', lease_owner = NULL, lease_expires_at_ms = NULL,
+             last_safe_error_code = 'state_fence_superseded', updated_at_ms = ?, terminal_at_ms = ?
+         WHERE command_id = ? AND status = 'processing' AND attempts = ?
+           AND lease_owner = ? AND lease_expires_at_ms = ?
+           AND lease_expires_at_ms > ?
+           AND dispatch_interlock_acquired_at_ms IS NULL
+           AND NOT EXISTS (
+             SELECT 1 FROM runtime_run_command_receipts receipt
+             WHERE receipt.command_id = runtime_run_command_dispatch.command_id
+           )`
+      )
+      .run(
+        fence.nowMs,
+        fence.nowMs,
+        row.id,
+        fence.expectedAttempt,
+        fence.workerId,
+        fence.expectedLeaseExpiresAtMs,
+        fence.nowMs
+      );
+    if (updated.changes !== 1) fail("stale_completion");
+    this.recordJournalEvent(row, fence.nowMs, fence.workerId, "run.runtime-command.superseded", {
       commandId: row.id,
       agentRunId: row.agent_run_id,
       operation: row.operation,
@@ -1136,7 +1553,7 @@ export class SqliteRuntimeLifecycleJournal implements RuntimeLifecycleJournal {
     >,
     nowMs: number
   ): void {
-    this.invalidateRunGrants(row.agent_run_id, nowMs, "start-failed");
+    this.invalidateRunGrants(row.agent_run_id, nowMs, "run-terminal");
     const updated = this.db
       .prepare(
         `UPDATE agent_runs SET lifecycle = 'failed', state_version = ?,
@@ -1159,7 +1576,7 @@ export class SqliteRuntimeLifecycleJournal implements RuntimeLifecycleJournal {
   private invalidateRunGrants(
     agentRunId: string,
     nowMs: number,
-    reason: "run-terminal" | "start-failed" | "runtime-quarantine" | "runtime-compensation"
+    reason: "run-terminal" | "runtime-authorization"
   ): number {
     const grants = this.db
       .prepare(
@@ -1310,6 +1727,7 @@ function validateLifecycleCommand(value: unknown): RuntimeLifecycleCommand {
   positiveInteger(command.binding.runtimeAssignmentGeneration);
   positiveInteger(command.binding.sandboxGeneration);
   positiveInteger(command.runtimeAuthorizationGeneration);
+  sha256Digest(command.requiredEffectEnforcerSetDigest);
   if (!command.authority || typeof command.authority !== "object") fail("invalid_command");
   safeIdentifier(command.authority.claimsDigest, 64);
   return command as RuntimeLifecycleCommand;
@@ -1389,14 +1807,25 @@ function sanitizeReceiptForPersistence(receipt: RuntimeReceipt): RuntimeReceipt 
         return {
           ...base,
           outcome: "accepted",
-          effectRef: `effect:${sha256(value.effectRef)}`,
+          effectRef: commitRuntimeEffectRef(value.effectRef),
         };
       case "enforced":
+        if (!value.aggregateEnforcementProof) fail("invalid_input");
         return {
           ...base,
           outcome: "enforced",
-          effectRef: `effect:${sha256(value.effectRef)}`,
+          effectRef: commitRuntimeEffectRef(value.effectRef),
           enforcedFence: value.enforcedFence,
+          aggregateEnforcementProof: {
+            generation: value.aggregateEnforcementProof.generation,
+            requiredEffectEnforcerSetDigest:
+              value.aggregateEnforcementProof.requiredEffectEnforcerSetDigest,
+            enforcementSubjectDigest: value.aggregateEnforcementProof.enforcementSubjectDigest,
+            acknowledgements: value.aggregateEnforcementProof.acknowledgements.map(
+              (acknowledgement) => ({ ...acknowledgement })
+            ),
+            aggregateProofDigest: value.aggregateEnforcementProof.aggregateProofDigest,
+          },
         };
       case "rejected":
         return {
@@ -1410,7 +1839,7 @@ function sanitizeReceiptForPersistence(receipt: RuntimeReceipt): RuntimeReceipt 
           ...base,
           outcome: "quarantined",
           reason: value.reason,
-          effectRef: `effect:${sha256(value.effectRef)}`,
+          effectRef: commitRuntimeEffectRef(value.effectRef),
         };
     }
   };
@@ -1507,6 +1936,11 @@ function safeAdd(left: number, right: number): number {
 
 function sha256(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function sha256Digest(value: unknown): string {
+  if (typeof value !== "string" || !SHA256_DIGEST.test(value)) fail("invalid_command");
+  return value;
 }
 
 function fail(code: RuntimeLifecycleJournalErrorCode): never {

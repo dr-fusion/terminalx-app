@@ -27,6 +27,7 @@ const command = {
   binding,
   projectCeilingRevision: "ceiling-1",
   runtimeAuthorizationGeneration: 7,
+  requiredEffectEnforcerSetDigest: "b".repeat(64),
   causationId: "cause-1",
   actor: { kind: "human", actorRef: "user-1" },
   issuedAtMs: 50,
@@ -73,7 +74,8 @@ describe("RuntimeLifecycleSupervisor", () => {
     const order: string[] = [];
     const journal = journalReturning([delivery()], order);
     const handles: RuntimeLifecycleHandleResolver = {
-      resolve: vi.fn(async () => {
+      resolve: vi.fn(async (_command, signal) => {
+        expect(signal.aborted).toBe(false);
         order.push("resolve");
         return handle;
       }),
@@ -84,6 +86,7 @@ describe("RuntimeLifecycleSupervisor", () => {
       runtime,
       handles,
       verifyAuthority: () => true,
+      verifyEnforcementProof: () => true,
       workerId: "worker-1",
       clock: () => 100,
     });
@@ -94,7 +97,13 @@ describe("RuntimeLifecycleSupervisor", () => {
       failedBeforeDispatch: 0,
       dispatchUncertain: 0,
     });
-    expect(order).toEqual(["reconcile", "claim", "resolve", "runtime", "complete"]);
+    expect(order).toEqual(["reconcile", "claim", "resolve", "renew", "runtime", "complete"]);
+    expect(handles.resolve).toHaveBeenCalledWith(command, expect.any(AbortSignal));
+    expect(runtime.command).toHaveBeenCalledWith(
+      expect.objectContaining({ binding }),
+      expect.objectContaining({ commandId: command.commandId }),
+      expect.any(AbortSignal)
+    );
     expect(journal.reconcile).toHaveBeenCalledWith({ nowMs: 100 });
     expect(journal.claim).toHaveBeenCalledWith({
       workerId: "worker-1",
@@ -106,7 +115,7 @@ describe("RuntimeLifecycleSupervisor", () => {
       commandId: command.commandId,
       workerId: "worker-1",
       expectedAttempt: 1,
-      expectedLeaseExpiresAtMs: 200,
+      expectedLeaseExpiresAtMs: 30_100,
       observedAtMs: 100,
       outcome: { kind: "receipt", receipt: accepted },
     });
@@ -121,6 +130,7 @@ describe("RuntimeLifecycleSupervisor", () => {
       runtime,
       handles: { resolve: vi.fn(async () => null) },
       verifyAuthority: verifier,
+      verifyEnforcementProof: () => true,
       workerId: "worker-1",
       clock: () => 100,
     });
@@ -132,6 +142,7 @@ describe("RuntimeLifecycleSupervisor", () => {
       dispatchUncertain: 0,
     });
     expect(runtime.command).not.toHaveBeenCalled();
+    expect(journal.renew).not.toHaveBeenCalled();
     expect(verifier).not.toHaveBeenCalled();
     expect(journal.complete).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -142,6 +153,87 @@ describe("RuntimeLifecycleSupervisor", () => {
         },
       })
     );
+  });
+
+  it("skips Runtime dispatch and completion after renewal durably supersedes stale trust", async () => {
+    const journal = journalReturning([delivery()]);
+    vi.mocked(journal.renew).mockResolvedValueOnce({ kind: "superseded" });
+    const runtime = runtimeReturning(accepted);
+    const supervisor = supervisorWith(journal, runtime);
+
+    await expect(supervisor.runOnce()).resolves.toEqual({
+      claimed: 1,
+      receipts: 0,
+      failedBeforeDispatch: 1,
+      dispatchUncertain: 0,
+    });
+    expect(journal.renew).toHaveBeenCalledTimes(1);
+    expect(runtime.command).not.toHaveBeenCalled();
+    expect(journal.complete).not.toHaveBeenCalled();
+  });
+
+  it("actively cancels a timed-out handle lookup before recording a pre-dispatch failure", async () => {
+    vi.useFakeTimers();
+    try {
+      const journal = journalReturning([{ ...delivery(), leaseExpiresAtMs: 400 }]);
+      let resolverSignal: AbortSignal | undefined;
+      let cancellationObserved = false;
+      const handles: RuntimeLifecycleHandleResolver = {
+        resolve: vi.fn(
+          (_command, signal) =>
+            new Promise<RuntimeHandle | null>((_resolve, reject) => {
+              resolverSignal = signal;
+              signal.addEventListener(
+                "abort",
+                () => {
+                  cancellationObserved = true;
+                  reject(new Error("cancelled handle transport"));
+                },
+                { once: true }
+              );
+            })
+        ),
+      };
+      const runtime = runtimeReturning(accepted);
+      const supervisor = new RuntimeLifecycleSupervisor({
+        journal,
+        runtime,
+        handles,
+        verifyAuthority: () => true,
+        verifyEnforcementProof: () => true,
+        workerId: "worker-1",
+        clock: () => 100,
+        handleResolveTimeoutMs: 100,
+      });
+
+      const running = supervisor.runOnce();
+      // The live lease leaves only 50ms after the completion margin, even
+      // though the configured resolver timeout is 100ms.
+      await vi.advanceTimersByTimeAsync(49);
+      expect(cancellationObserved).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(running).resolves.toEqual({
+        claimed: 1,
+        receipts: 0,
+        failedBeforeDispatch: 1,
+        dispatchUncertain: 0,
+      });
+      expect(resolverSignal?.aborted).toBe(true);
+      expect(cancellationObserved).toBe(true);
+      expect(runtime.command).not.toHaveBeenCalled();
+      expect(journal.renew).not.toHaveBeenCalled();
+      expect(journal.complete).toHaveBeenCalledWith(
+        expect.objectContaining({
+          outcome: {
+            kind: "failure",
+            code: "runtime_handle_unavailable",
+            dispatchCertainty: "not-dispatched",
+          },
+        })
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("records provider and invalid-receipt failures as dispatch uncertain without raw errors", async () => {
@@ -181,7 +273,7 @@ describe("RuntimeLifecycleSupervisor", () => {
     );
   });
 
-  it("does not reinterpret resolver or journal failures as Runtime outcomes", async () => {
+  it("classifies resolver failures before dispatch but preserves journal failures", async () => {
     const resolverJournal = journalReturning([delivery()]);
     const resolverSupervisor = new RuntimeLifecycleSupervisor({
       journal: resolverJournal,
@@ -192,11 +284,24 @@ describe("RuntimeLifecycleSupervisor", () => {
         }),
       },
       verifyAuthority: () => true,
+      verifyEnforcementProof: () => true,
       workerId: "worker-1",
       clock: () => 100,
     });
-    await expect(resolverSupervisor.runOnce()).rejects.toThrow("database unavailable");
-    expect(resolverJournal.complete).not.toHaveBeenCalled();
+    await expect(resolverSupervisor.runOnce()).resolves.toMatchObject({
+      failedBeforeDispatch: 1,
+      dispatchUncertain: 0,
+    });
+    expect(resolverJournal.renew).not.toHaveBeenCalled();
+    expect(resolverJournal.complete).toHaveBeenCalledWith(
+      expect.objectContaining({
+        outcome: {
+          kind: "failure",
+          code: "runtime_handle_unavailable",
+          dispatchCertainty: "not-dispatched",
+        },
+      })
+    );
 
     const completionJournal = journalReturning([delivery()]);
     vi.mocked(completionJournal.complete).mockRejectedValueOnce(new Error("lease fence changed"));
@@ -204,6 +309,18 @@ describe("RuntimeLifecycleSupervisor", () => {
       supervisorWith(completionJournal, runtimeReturning(accepted)).runOnce()
     ).rejects.toThrow("lease fence changed");
     expect(completionJournal.complete).toHaveBeenCalledTimes(1);
+  });
+
+  it("never dispatches or completes when durable pre-dispatch renewal fails", async () => {
+    const journal = journalReturning([delivery()]);
+    vi.mocked(journal.renew).mockRejectedValueOnce(new Error("renewal store unavailable"));
+    const runtime = runtimeReturning(accepted);
+
+    await expect(supervisorWith(journal, runtime).runOnce()).rejects.toThrow(
+      "renewal store unavailable"
+    );
+    expect(runtime.command).not.toHaveBeenCalled();
+    expect(journal.complete).not.toHaveBeenCalled();
   });
 
   it("serializes concurrent batches and rejects an invalid delivery fence", async () => {
@@ -252,6 +369,7 @@ describe("RuntimeLifecycleSupervisor", () => {
       runtime,
       handles,
       verifyAuthority: () => true,
+      verifyEnforcementProof: () => true,
       workerId: "worker-1",
       clock: () => command.deadlineAtMs,
     });
@@ -277,12 +395,144 @@ describe("RuntimeLifecycleSupervisor", () => {
     expect(supervisor.running).toBe(false);
   });
 
+  it("propagates stop cancellation into an in-flight Runtime transport", async () => {
+    const journal = journalReturning([delivery()]);
+    const runtime = runtimeReturning(accepted);
+    let runtimeSignal: AbortSignal | undefined;
+    let commandStarted: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => {
+      commandStarted = resolve;
+    });
+    vi.mocked(runtime.command).mockImplementationOnce(
+      (_handle, _command, signal) =>
+        new Promise<RuntimeReceipt>((_resolve, reject) => {
+          runtimeSignal = signal;
+          commandStarted?.();
+          signal.addEventListener("abort", () => reject(new Error("Runtime stopped")), {
+            once: true,
+          });
+        })
+    );
+    const supervisor = supervisorWith(journal, runtime);
+
+    supervisor.start();
+    await started;
+    await supervisor.stop();
+
+    expect(runtimeSignal?.aborted).toBe(true);
+    expect(supervisor.running).toBe(false);
+    expect(journal.complete).toHaveBeenCalledWith(
+      expect.objectContaining({
+        outcome: {
+          kind: "failure",
+          code: "runtime_internal",
+          dispatchCertainty: "dispatch-uncertain",
+        },
+      })
+    );
+  });
+
+  it("bounds a hung Runtime call below the renewed lease and records uncertainty", async () => {
+    vi.useFakeTimers();
+    try {
+      const journal = journalReturning([delivery()]);
+      const runtime = runtimeReturning(accepted);
+      let runtimeSignal: AbortSignal | undefined;
+      let cancellationObserved = false;
+      vi.mocked(runtime.command).mockImplementationOnce(
+        (_handle, _command, signal) =>
+          new Promise<RuntimeReceipt>((_resolve, reject) => {
+            runtimeSignal = signal;
+            signal.addEventListener(
+              "abort",
+              () => {
+                cancellationObserved = true;
+                reject(new Error("cancelled Runtime transport"));
+              },
+              { once: true }
+            );
+          })
+      );
+      const supervisor = new RuntimeLifecycleSupervisor({
+        journal,
+        runtime,
+        handles: { resolve: vi.fn(async () => handle) },
+        verifyAuthority: () => true,
+        verifyEnforcementProof: () => true,
+        workerId: "worker-1",
+        clock: () => 100,
+        runtimeCommandTimeoutMs: 100,
+      });
+
+      const running = supervisor.runOnce();
+      await vi.advanceTimersByTimeAsync(100);
+      await expect(running).resolves.toEqual({
+        claimed: 1,
+        receipts: 0,
+        failedBeforeDispatch: 0,
+        dispatchUncertain: 1,
+      });
+      expect(runtimeSignal?.aborted).toBe(true);
+      expect(cancellationObserved).toBe(true);
+      expect(journal.complete).toHaveBeenCalledWith(
+        expect.objectContaining({
+          expectedLeaseExpiresAtMs: 30_100,
+          outcome: {
+            kind: "failure",
+            code: "runtime_internal",
+            dispatchCertainty: "dispatch-uncertain",
+          },
+        })
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not dispatch later when authority verification resumes after its transport deadline", async () => {
+    vi.useFakeTimers();
+    try {
+      let releaseVerifier: (() => void) | undefined;
+      const verifierGate = new Promise<void>((resolve) => {
+        releaseVerifier = resolve;
+      });
+      const journal = journalReturning([delivery()]);
+      const runtime = runtimeReturning(accepted);
+      const supervisor = new RuntimeLifecycleSupervisor({
+        journal,
+        runtime,
+        handles: { resolve: vi.fn(async () => handle) },
+        verifyAuthority: async () => {
+          await verifierGate;
+          return true;
+        },
+        verifyEnforcementProof: () => true,
+        workerId: "worker-1",
+        clock: () => 100,
+        runtimeCommandTimeoutMs: 100,
+      });
+
+      const running = supervisor.runOnce();
+      await vi.advanceTimersByTimeAsync(100);
+      await expect(running).resolves.toMatchObject({ dispatchUncertain: 1 });
+      expect(runtime.command).not.toHaveBeenCalled();
+
+      releaseVerifier?.();
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(runtime.command).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("validates worker identity and every configured bound", () => {
     const base = {
       journal: journalReturning([]),
       runtime: runtimeReturning(accepted),
       handles: { resolve: vi.fn(async () => handle) },
       verifyAuthority: () => true,
+      verifyEnforcementProof: () => true,
       workerId: "worker-1",
     } satisfies ConstructorParameters<typeof RuntimeLifecycleSupervisor>[0];
 
@@ -292,12 +542,23 @@ describe("RuntimeLifecycleSupervisor", () => {
     expect(() => new RuntimeLifecycleSupervisor({ ...base, claimLimit: 0 })).toThrow(
       "Invalid Runtime lifecycle supervisor bound"
     );
+    expect(() => new RuntimeLifecycleSupervisor({ ...base, claimLimit: 2 })).toThrow(
+      "Invalid Runtime lifecycle supervisor bound"
+    );
     expect(() => new RuntimeLifecycleSupervisor({ ...base, leaseDurationMs: 999 })).toThrow(
       "Invalid Runtime lifecycle supervisor bound"
     );
     expect(() => new RuntimeLifecycleSupervisor({ ...base, errorDelayMs: 60_001 })).toThrow(
       "Invalid Runtime lifecycle supervisor bound"
     );
+    expect(
+      () =>
+        new RuntimeLifecycleSupervisor({
+          ...base,
+          leaseDurationMs: 1_000,
+          runtimeCommandTimeoutMs: 501,
+        })
+    ).toThrow("Invalid Runtime lifecycle supervisor bound");
   });
 });
 
@@ -306,7 +567,7 @@ function delivery(): RuntimeLifecycleDelivery {
     command,
     attempt: 1,
     leaseOwner: "worker-1",
-    leaseExpiresAtMs: 200,
+    leaseExpiresAtMs: 30_100,
     priorDispatchCertainty: "not-dispatched",
   };
 }
@@ -323,6 +584,10 @@ function journalReturning(
       order?.push("claim");
       return deliveries;
     }),
+    renew: vi.fn(async (options) => {
+      order?.push("renew");
+      return { kind: "renewed" as const, leaseExpiresAtMs: options.expectedLeaseExpiresAtMs };
+    }),
     complete: vi.fn(async () => {
       order?.push("complete");
     }),
@@ -332,7 +597,8 @@ function journalReturning(
 function runtimeReturning(result: RuntimeReceipt, order?: string[]): Runtime {
   return {
     ensure: vi.fn(async () => handle),
-    command: vi.fn(async () => {
+    command: vi.fn(async (_handle, _command, signal) => {
+      if (signal.aborted) throw new Error("Runtime command was cancelled");
       order?.push("runtime");
       return result;
     }),
@@ -352,6 +618,7 @@ function supervisorWith(
     runtime,
     handles: { resolve: vi.fn(async () => handle) },
     verifyAuthority: () => true,
+    verifyEnforcementProof: () => true,
     workerId: "worker-1",
     clock: () => 100,
   });

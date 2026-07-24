@@ -36,6 +36,7 @@ const pauseClaims = {
   binding,
   projectCeilingRevision: "ceiling-1",
   runtimeAuthorizationGeneration: 4,
+  requiredEffectEnforcerSetDigest: "b".repeat(64),
   causationId: "event-1",
   actor: { kind: "human", actorRef: "user-1" },
   issuedAtMs: 100,
@@ -59,6 +60,7 @@ describe("Runtime command canonical claims", () => {
       issuedAtMs: pauseClaims.issuedAtMs,
       actor: { actorRef: "user-1", kind: "human" },
       causationId: pauseClaims.causationId,
+      requiredEffectEnforcerSetDigest: pauseClaims.requiredEffectEnforcerSetDigest,
       runtimeAuthorizationGeneration: pauseClaims.runtimeAuthorizationGeneration,
       projectCeilingRevision: pauseClaims.projectCeilingRevision,
       binding: {
@@ -197,6 +199,7 @@ describe("Ed25519 Runtime command authority", () => {
     const authority = command.authority;
     const attempts = [
       { ...command, reason: "safety" },
+      { ...command, requiredEffectEnforcerSetDigest: "c".repeat(64) },
       { ...command, authority: { ...authority, capability: "run.stop" } },
       { ...command, authority: { ...authority, audience: "other" as "runtime" } },
       {
