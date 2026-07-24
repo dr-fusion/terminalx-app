@@ -15,6 +15,7 @@ beforeAll(() => {
     "data",
     "telegram-audit.sqlite"
   );
+  process.env.TERMINALX_TEAM_SESSION_DB_PATH = path.join(TEST_ROOT, "data", "team-sessions.sqlite");
 
   // Create test fixtures
   fs.mkdirSync(path.join(TEST_ROOT, "subdir"), { recursive: true });
@@ -24,6 +25,12 @@ beforeAll(() => {
   fs.mkdirSync(path.join(TEST_ROOT, "data"), { recursive: true });
   fs.writeFileSync(path.join(TEST_ROOT, "data", "users.json"), "[]");
   fs.writeFileSync(path.join(TEST_ROOT, "data", "telegram-audit.sqlite"), "private messages");
+  for (const suffix of ["", "-wal", "-shm", "-journal"]) {
+    fs.writeFileSync(
+      path.join(TEST_ROOT, "data", `team-sessions.sqlite${suffix}`),
+      "private Team state"
+    );
+  }
   fs.writeFileSync(
     path.join(TEST_ROOT, "large.txt"),
     "x".repeat(2 * 1024 * 1024) // 2MB file
@@ -35,6 +42,7 @@ afterAll(() => {
   delete process.env.TERMINUS_ROOT;
   delete process.env.TERMINALX_ALLOW_SENSITIVE_FILE_ACCESS;
   delete process.env.TERMINALX_TELEGRAM_MESSAGE_DB_PATH;
+  delete process.env.TERMINALX_TEAM_SESSION_DB_PATH;
 });
 
 describe("resolveSafePath", () => {
@@ -128,6 +136,9 @@ describe("readFile", () => {
     expect(() => readFile(".env")).toThrow("sensitive path");
     expect(() => readFile("data/users.json")).toThrow("sensitive path");
     expect(() => readFile("data/telegram-audit.sqlite")).toThrow("sensitive path");
+    for (const suffix of ["", "-wal", "-shm", "-journal"]) {
+      expect(() => readFile(`data/team-sessions.sqlite${suffix}`)).toThrow("sensitive path");
+    }
   });
 
   it("throws for directory", () => {
