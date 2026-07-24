@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  RuntimeCommandExecutionError,
   RuntimeLifecycleSupervisor,
   type Runtime,
   type RuntimeHandle,
@@ -70,6 +71,112 @@ const accepted = {
 } as const satisfies RuntimeReceipt;
 
 describe("RuntimeLifecycleSupervisor", () => {
+  it("rejects an accessor-backed handle resolver without invoking provider code", () => {
+    const journal = journalReturning([delivery()]);
+    let getterCalls = 0;
+    const handles = Object.defineProperty({}, "resolve", {
+      enumerable: true,
+      get() {
+        getterCalls += 1;
+        throw new Error("provider-secret-handle-getter");
+      },
+    }) as RuntimeLifecycleHandleResolver;
+
+    expect(
+      () =>
+        new RuntimeLifecycleSupervisor({
+          journal,
+          runtime: runtimeReturning(accepted),
+          handles,
+          verifyAuthority: () => true,
+          verifyEnforcementProof: () => true,
+          workerId: "worker-1",
+          clock: () => 100,
+        })
+    ).toThrow("Invalid Runtime handle resolver");
+    expect(getterCalls).toBe(0);
+    expect(journal.claim).not.toHaveBeenCalled();
+  });
+
+  it("rejects a descriptor-hostile resolved handle before the dispatch interlock", async () => {
+    const journal = journalReturning([delivery()]);
+    const runtime = runtimeReturning(accepted);
+    let getterCalls = 0;
+    const hostileHandle = Object.defineProperty(
+      {
+        opaqueHandleRef: "opaque-hostile",
+        capabilities: handle.capabilities,
+      },
+      "binding",
+      {
+        enumerable: true,
+        get() {
+          getterCalls += 1;
+          throw new Error("provider-secret-binding-getter");
+        },
+      }
+    ) as RuntimeHandle;
+    const supervisor = new RuntimeLifecycleSupervisor({
+      journal,
+      runtime,
+      handles: { resolve: async () => hostileHandle },
+      verifyAuthority: () => true,
+      verifyEnforcementProof: () => true,
+      workerId: "worker-1",
+      clock: () => 100,
+    });
+
+    await expect(supervisor.runOnce()).resolves.toMatchObject({
+      claimed: 1,
+      failedBeforeDispatch: 1,
+      dispatchUncertain: 0,
+    });
+    expect(getterCalls).toBe(0);
+    expect(journal.renew).not.toHaveBeenCalled();
+    expect(runtime.command).not.toHaveBeenCalled();
+  });
+
+  it("rejects an accessor-backed Runtime before any journal interlock without invoking it", () => {
+    const journal = journalReturning([delivery()]);
+    let getterCalls = 0;
+    const runtime = {
+      ensure: vi.fn(async () => handle),
+      get command(): Runtime["command"] {
+        getterCalls += 1;
+        throw new Error("provider getter must never run");
+      },
+      follow: vi.fn(async function* () {
+        return;
+      }),
+      retire: vi.fn(async () => undefined),
+    } satisfies Runtime;
+
+    let failure: unknown;
+    try {
+      new RuntimeLifecycleSupervisor({
+        journal,
+        runtime,
+        handles: { resolve: vi.fn(async () => handle) },
+        verifyAuthority: () => true,
+        verifyEnforcementProof: () => true,
+        workerId: "worker-1",
+        clock: () => 100,
+      });
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toBeInstanceOf(RuntimeCommandExecutionError);
+    expect(failure).toMatchObject({
+      code: "invalid_input",
+      dispatchCertainty: "not-dispatched",
+    });
+    expect(getterCalls).toBe(0);
+    expect(journal.reconcile).not.toHaveBeenCalled();
+    expect(journal.claim).not.toHaveBeenCalled();
+    expect(journal.renew).not.toHaveBeenCalled();
+    expect(journal.complete).not.toHaveBeenCalled();
+  });
+
   it("reconciles, claims, executes, and durably completes an exact leased command", async () => {
     const order: string[] = [];
     const journal = journalReturning([delivery()], order);
@@ -430,6 +537,39 @@ describe("RuntimeLifecycleSupervisor", () => {
         },
       })
     );
+  });
+
+  it("cancels and awaits an in-flight manual runOnce even when its loop was never started", async () => {
+    const journal = journalReturning([delivery()]);
+    const runtime = runtimeReturning(accepted);
+    let runtimeSignal: AbortSignal | undefined;
+    let commandStarted: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => {
+      commandStarted = resolve;
+    });
+    vi.mocked(runtime.command).mockImplementationOnce(
+      (_handle, _command, signal) =>
+        new Promise<RuntimeReceipt>((_resolve, reject) => {
+          runtimeSignal = signal;
+          commandStarted?.();
+          signal.addEventListener("abort", () => reject(new Error("Runtime stopped")), {
+            once: true,
+          });
+        })
+    );
+    const supervisor = supervisorWith(journal, runtime);
+
+    const run = supervisor.runOnce();
+    await started;
+    await supervisor.stop();
+
+    expect(runtimeSignal?.aborted).toBe(true);
+    await expect(run).resolves.toMatchObject({
+      claimed: 1,
+      dispatchUncertain: 1,
+    });
+    expect(journal.complete).toHaveBeenCalledOnce();
+    expect(supervisor.running).toBe(false);
   });
 
   it("bounds a hung Runtime call below the renewed lease and records uncertainty", async () => {

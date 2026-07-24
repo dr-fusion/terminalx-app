@@ -306,8 +306,37 @@ export type RuntimeCommand =
       readonly agentRunId?: string;
       readonly reason: CheckpointReason;
     })
-  | (RuntimeCommandBase<"safety.quarantine"> & {
+  | (Omit<
+      EmergencyRuntimeCommandBase<"safety.quarantine">,
+      "actor" | "authority" | "projectCeilingRevision" | "requiredEffectEnforcerSetDigest"
+    > & {
       readonly kind: "safety.quarantine";
+      readonly compensationId: string;
+      readonly actor: { readonly kind: "system"; readonly actorRef: "platform-security" };
+      readonly authority: PlatformSecurityRuntimeAuthorityEnvelope<"safety.quarantine">;
+      /**
+       * Exact proof-backed lifecycle effect that made containment necessary.
+       * The source and containment enforcer sets are intentionally distinct.
+       */
+      readonly source: {
+        readonly lifecycleCommandId: string;
+        readonly lifecycleCommandClaimsDigest: string;
+        readonly lifecycleReceiptDigest: string;
+        readonly lifecycleEnforcementSubjectDigest: string;
+        readonly lifecycleAggregateProofDigest: string;
+        readonly sourceRequiredEffectEnforcerSetDigest: string;
+      };
+      readonly platformSecurityPolicyRevision: string;
+      readonly requiredContainmentEnforcerSetDigest: string;
+      readonly containment: {
+        readonly revokeTerminalWrites: true;
+        readonly stopProcessExecution: true;
+        readonly quarantineRuntime: true;
+      };
+      /** Exact monotonic fence the Runtime must atomically enforce for containment. */
+      readonly safetyFence: number;
+      readonly advanceBeyondCurrentFences: true;
+      readonly exactBindingOnly: true;
       readonly reasonRef: string;
     });
 
@@ -315,6 +344,15 @@ export type RuntimeLifecycleCommand = Extract<
   RuntimeCommand,
   { readonly kind: "run.start" | "run.pause" | "run.resume" | "run.stop" }
 >;
+
+/** Platform-security command used to contain a proof-backed stale lifecycle effect. */
+export type RuntimeCompensationCommand = Extract<
+  RuntimeCommand,
+  { readonly kind: "safety.quarantine" }
+>;
+
+/** Commands whose accepted effects require durable receipt reconciliation. */
+export type RuntimeReceiptBackedCommand = RuntimeLifecycleCommand | RuntimeCompensationCommand;
 
 /** Existing-Run transitions currently supported by the fail-closed execution Module. */
 export type RuntimePostStartLifecycleCommand = Extract<
@@ -404,6 +442,63 @@ export type RuntimeReceipt =
       /** Lowercase SHA-256 of the strict canonical JSON form of `originalReceipt`. */
       readonly originalReceiptDigest: string;
     });
+
+interface RuntimeCompensationReceiptBase {
+  readonly receiptKind: "runtime.compensation";
+  readonly compensationId: string;
+  readonly commandId: string;
+  readonly binding: RuntimeBinding;
+  readonly observedRuntimeAuthorizationGeneration: number;
+}
+
+export type NonDuplicateRuntimeCompensationReceipt = RuntimeCompensationReceiptBase &
+  (
+    | { readonly outcome: "accepted"; readonly effectRef: string }
+    | {
+        readonly outcome: "enforced";
+        readonly effectRef: string;
+        /** Must equal the signed command safety fence; older fences fail closed. */
+        readonly enforcedSafetyFence: number;
+        readonly containment: {
+          readonly terminalWritesRevoked: true;
+          readonly processExecutionStopped: true;
+          readonly runtimeQuarantined: true;
+        };
+        readonly aggregateEnforcementProof?: AggregateEnforcementProof;
+      }
+    | {
+        readonly outcome: "rejected";
+        readonly code:
+          | "invalid_authority"
+          | "expired"
+          | "stale_binding"
+          | "stale_fence"
+          | "conflicting_duplicate"
+          | "forbidden"
+          | "not_ready";
+        readonly safeDetail: string;
+      }
+    | {
+        readonly outcome: "quarantined";
+        readonly reason:
+          | "authorization_ack_failed"
+          | "effect_enforcer_set_mismatch"
+          | "isolation_failure"
+          | "kill_failure";
+        readonly effectRef: string;
+      }
+  );
+
+/** Receipt profile for the separate platform-security containment domain. */
+export type RuntimeCompensationReceipt =
+  | NonDuplicateRuntimeCompensationReceipt
+  | (RuntimeCompensationReceiptBase & {
+      readonly outcome: "duplicate";
+      readonly originalReceipt: NonDuplicateRuntimeCompensationReceipt;
+      readonly originalReceiptDigest: string;
+    });
+
+export type RuntimeCommandReceipt = RuntimeReceipt | RuntimeCompensationReceipt;
 
 export interface UsageSnapshot {
   readonly usage: ResourceEffect;
@@ -681,7 +776,7 @@ export interface Runtime {
     handle: RuntimeHandle,
     command: RuntimeCommand,
     signal: AbortSignal
-  ): Promise<RuntimeReceipt>;
+  ): Promise<RuntimeCommandReceipt>;
   follow(handle: RuntimeHandle, cursor?: RuntimeCursor): AsyncIterable<RuntimeEvent>;
   retire(handle: RuntimeHandle, request: RuntimeRetireRequest): Promise<void>;
 }

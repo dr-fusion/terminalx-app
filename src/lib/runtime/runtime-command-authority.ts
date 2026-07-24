@@ -1,6 +1,7 @@
 import { constants as fsConstants, closeSync, fstatSync, openSync, readFileSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import {
+  createHash,
   createPrivateKey,
   createPublicKey,
   sign as signEd25519,
@@ -351,6 +352,7 @@ function loadPinnedPublicKeys(
     authorityError("invalid_public_key");
   }
   const result = new Map<string, KeyObject>();
+  const fingerprintIssuers = new Map<string, RuntimeAuthorityIssuerName>();
   for (const pin of pins) {
     const record = dataRecord(pin, "invalid_public_key");
     const issuer = requiredIssuer(dataField(record, "issuer", "invalid_public_key"));
@@ -376,6 +378,19 @@ function loadPinnedPublicKeys(
     if (key.type !== "public" || key.asymmetricKeyType !== "ed25519") {
       authorityError("invalid_public_key");
     }
+    let fingerprint: string;
+    try {
+      fingerprint = createHash("sha256")
+        .update(key.export({ type: "spki", format: "der" }))
+        .digest("hex");
+    } catch {
+      authorityError("invalid_public_key");
+    }
+    const fingerprintIssuer = fingerprintIssuers.get(fingerprint);
+    if (fingerprintIssuer !== undefined && fingerprintIssuer !== issuer) {
+      authorityError("invalid_public_key");
+    }
+    fingerprintIssuers.set(fingerprint, issuer);
     result.set(id, key);
   }
   return result;
@@ -408,6 +423,9 @@ function commandCapability(command: Record<string, unknown>): string {
 }
 
 function assertIssuerCapability(issuer: RuntimeAuthorityIssuerName, capability: string): void {
+  if (capability === "safety.quarantine" && issuer !== "platform-security") {
+    authorityError("invalid_command");
+  }
   if (issuer === "platform-security" && !PLATFORM_SECURITY_CAPABILITIES.has(capability)) {
     authorityError("invalid_command");
   }

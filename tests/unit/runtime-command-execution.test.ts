@@ -92,6 +92,59 @@ describe("Runtime command execution", () => {
     );
   });
 
+  it("captures a non-enumerable Runtime command data-method from its prototype", async () => {
+    const dispatch = vi.fn(async () => receipt({ outcome: "accepted", effectRef: "effect-1" }));
+    const prototype = Object.create(null) as Record<string, unknown>;
+    Object.defineProperty(prototype, "command", {
+      value: dispatch,
+      enumerable: false,
+      writable: true,
+      configurable: true,
+    });
+    const adapter = Object.assign(Object.create(prototype) as object, {
+      ensure: vi.fn(async () => handle),
+      follow: vi.fn(async function* () {
+        return;
+      }),
+      retire: vi.fn(async () => undefined),
+    }) as unknown as Runtime;
+
+    expect(Object.hasOwn(adapter, "command")).toBe(false);
+    await expect(
+      executeRuntimeCommand(
+        adapter,
+        handle,
+        command,
+        () => true,
+        () => 100
+      )
+    ).resolves.toMatchObject({ outcome: "accepted", commandId: command.commandId });
+    expect(dispatch).toHaveBeenCalledOnce();
+  });
+
+  it("rejects a proxied Runtime capability without invoking its descriptor traps", async () => {
+    const target = runtimeReturning(receipt({ outcome: "accepted", effectRef: "effect-1" }));
+    let descriptorTrapCalls = 0;
+    const proxy = new Proxy(target, {
+      getOwnPropertyDescriptor() {
+        descriptorTrapCalls += 1;
+        throw new Error("provider-secret-runtime-proxy");
+      },
+    });
+
+    await expect(
+      executeRuntimeCommand(
+        proxy,
+        handle,
+        command,
+        () => true,
+        () => 100
+      )
+    ).rejects.toMatchObject({ code: "invalid_input", dispatchCertainty: "not-dispatched" });
+    expect(descriptorTrapCalls).toBe(0);
+    expect(target.command).not.toHaveBeenCalled();
+  });
+
   it("propagates cancellation to Runtime and never accepts a response after abort", async () => {
     const accepted = receipt({ outcome: "accepted", effectRef: "effect-1" });
     const adapter = runtimeReturning(accepted);
@@ -210,7 +263,7 @@ describe("Runtime command execution", () => {
     ).rejects.toMatchObject({ code: "invalid_authority" });
   });
 
-  it("isolates dispatch from caller, verifier, and Runtime-getter mutation", async () => {
+  it("isolates dispatch from caller and verifier mutation", async () => {
     const callerCommand = structuredClone(command) as unknown as {
       commandId: string;
       binding: { sandboxId: string };
@@ -231,11 +284,7 @@ describe("Runtime command execution", () => {
     const dispatch = vi.fn(async () => accepted);
     const adapter = {
       ensure: vi.fn(async () => handle),
-      get command() {
-        callerCommand.commandId = "getter-redirect";
-        callerCommand.binding.sandboxId = "getter-sandbox";
-        return dispatch;
-      },
+      command: dispatch,
       follow: vi.fn(async function* () {
         return;
       }),
@@ -980,21 +1029,47 @@ describe("Runtime command execution", () => {
       )
     ).rejects.toEqual(new RuntimeCommandExecutionError("invalid_receipt"));
 
-    const hostileRuntime = {
-      ...runtimeReturning(receipt({ outcome: "accepted", effectRef: "effect-1" })),
-      get command(): Runtime["command"] {
+    let runtimeGetterCalls = 0;
+    const shadowedRuntime = runtimeReturning(
+      receipt({ outcome: "accepted", effectRef: "effect-1" })
+    );
+    const hostileRuntime = Object.create(shadowedRuntime) as Runtime;
+    Object.defineProperty(hostileRuntime, "command", {
+      configurable: true,
+      enumerable: true,
+      get() {
+        runtimeGetterCalls += 1;
         throw new Error("secret runtime getter");
       },
-    };
+    });
+    const hostileRuntimeFailure = executeRuntimeCommand(
+      hostileRuntime,
+      handle,
+      command,
+      () => true,
+      () => 100
+    );
+    await expect(hostileRuntimeFailure).rejects.toMatchObject({
+      code: "invalid_input",
+      dispatchCertainty: "not-dispatched",
+    });
+    await expect(hostileRuntimeFailure).rejects.toEqual(
+      new RuntimeCommandExecutionError("invalid_input")
+    );
+    expect(runtimeGetterCalls).toBe(0);
+    expect(shadowedRuntime.command).not.toHaveBeenCalled();
+
+    const inheritedGetter = Object.create(hostileRuntime) as Runtime;
     await expect(
       executeRuntimeCommand(
-        hostileRuntime,
+        inheritedGetter,
         handle,
         command,
         () => true,
         () => 100
       )
     ).rejects.toEqual(new RuntimeCommandExecutionError("invalid_input"));
+    expect(runtimeGetterCalls).toBe(0);
 
     const revokedDigestInput = Proxy.revocable(
       receipt({ outcome: "accepted", effectRef: "effect-1" }),

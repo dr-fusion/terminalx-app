@@ -14,7 +14,10 @@ describe("Runtime authority binding", () => {
       expect(() =>
         assertRuntimeCommandAuthorityBinding({
           kind,
-          authority: authority("team-session", capability),
+          authority: authority(
+            kind === "safety.quarantine" ? "platform-security" : "team-session",
+            capability
+          ),
         })
       ).not.toThrow();
     }
@@ -46,6 +49,15 @@ describe("Runtime authority binding", () => {
     expectTypeOf<
       Extract<RuntimeCommand, { kind: "run.emergency-stop" }>["authority"]["issuer"]
     >().toEqualTypeOf<"team-session" | "platform-security">();
+    expectTypeOf<
+      Extract<RuntimeCommand, { kind: "safety.quarantine" }>["authority"]["issuer"]
+    >().toEqualTypeOf<"platform-security">();
+    expect(() =>
+      assertRuntimeCommandAuthorityBinding({
+        kind: "safety.quarantine",
+        authority: authority("team-session", "safety.quarantine"),
+      })
+    ).toThrow(RuntimeAuthorityBindingError);
   });
 
   it("rejects capability substitution and unauthorized issuers", () => {

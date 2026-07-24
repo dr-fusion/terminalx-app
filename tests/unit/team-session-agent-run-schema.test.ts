@@ -15,6 +15,9 @@ const OTHER_ASSIGNMENT_ID = "66666666-6666-4666-8666-666666666666";
 const EFFECT_ENFORCER_SET_DIGEST = "e".repeat(64);
 const ENFORCEMENT_SUBJECT_DIGEST = "f".repeat(64);
 const AGGREGATE_PROOF_DIGEST = "a".repeat(64);
+const CONTAINMENT_ENFORCER_SET_DIGEST = "c".repeat(64);
+const COMPENSATION_ENFORCEMENT_SUBJECT_DIGEST = "d".repeat(64);
+const COMPENSATION_AGGREGATE_PROOF_DIGEST = "9".repeat(64);
 
 describe("Team Session Agent Run schema", () => {
   let directory: string;
@@ -31,10 +34,10 @@ describe("Team Session Agent Run schema", () => {
     fs.rmSync(directory, { recursive: true, force: true });
   });
 
-  it("initializes the Agent Run journal and receipt-follow record set at schema v6", () => {
+  it("initializes the Agent Run, receipt-follow, and compensation record set at schema v7", () => {
     database = openTeamSessionDatabase({ filename });
 
-    expect(database.db.pragma("user_version", { simple: true })).toBe(6);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(7);
     const tables = database.db
       .prepare(
         `SELECT name FROM sqlite_schema
@@ -64,6 +67,13 @@ describe("Team Session Agent Run schema", () => {
         "runtime_principal_observation_keys",
         "runtime_receipt_follow_streams",
         "runtime_receipt_follow_events",
+        "runtime_binding_safety_fences",
+        "runtime_compensation_incidents",
+        "runtime_compensation_commands",
+        "runtime_compensation_dispatch",
+        "runtime_compensation_receipts",
+        "runtime_compensation_effects",
+        "runtime_compensation_follow_events",
       ])
     );
     const sessionColumns = database.db.prepare("PRAGMA table_info(sessions)").all() as Array<{
@@ -105,12 +115,12 @@ describe("Team Session Agent Run schema", () => {
     expect(commandTable.sql).toContain("target_run_state_version = 2");
   });
 
-  it("migrates a genuine v2 Session schema through v3, v4, v5, and v6 in one open", () => {
+  it("migrates a genuine v2 Session schema through v3, v4, v5, v6, and v7 in one open", () => {
     createAgentRunSchemaV2Fixture(filename);
 
     database = openTeamSessionDatabase({ filename });
 
-    expect(database.db.pragma("user_version", { simple: true })).toBe(6);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(7);
     expect(
       database.db
         .prepare(`SELECT name FROM sqlite_schema WHERE type = 'table' AND name = 'agent_runs'`)
@@ -132,7 +142,7 @@ describe("Team Session Agent Run schema", () => {
     expect(database.db.pragma("foreign_key_check")).toEqual([]);
   });
 
-  it("accepts schema v6 when a peer finishes migration after this opener prepared v4", () => {
+  it("accepts schema v7 when a peer finishes migration after this opener prepared v4", () => {
     createRuntimeRunSchemaV4Fixture(filename);
     const pragmaDescriptor = Object.getOwnPropertyDescriptor(Database.prototype, "pragma");
     if (!pragmaDescriptor?.value) throw new Error("Expected better-sqlite3 pragma method");
@@ -145,7 +155,7 @@ describe("Team Session Agent Run schema", () => {
           peerAdvanceStarted = true;
           const peer = openTeamSessionDatabase({ filename });
           try {
-            expect(peer.db.pragma("user_version", { simple: true })).toBe(6);
+            expect(peer.db.pragma("user_version", { simple: true })).toBe(7);
             peerAdvanced = true;
           } finally {
             peer.close();
@@ -162,12 +172,47 @@ describe("Team Session Agent Run schema", () => {
 
     expect(peerAdvanceStarted).toBe(true);
     expect(peerAdvanced).toBe(true);
-    expect(database.db.pragma("user_version", { simple: true })).toBe(6);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(7);
     expect(database.db.pragma("foreign_key_check")).toEqual([]);
     expect(database.db.pragma("quick_check", { simple: true })).toBe("ok");
   });
 
-  it("migrates genuine v5 to v6 without fabricating observation trust", () => {
+  it("accepts schema v7 when a peer wins the v6 to v7 migration race", () => {
+    createRuntimeCompensationSchemaV6Fixture(filename);
+    const pragmaDescriptor = Object.getOwnPropertyDescriptor(Database.prototype, "pragma");
+    if (!pragmaDescriptor?.value) throw new Error("Expected better-sqlite3 pragma method");
+    let versionReads = 0;
+    let peerAdvanced = false;
+    Object.defineProperty(Database.prototype, "pragma", {
+      ...pragmaDescriptor,
+      value(this: Database.Database, source: string, ...args: unknown[]) {
+        if (source === "user_version") {
+          versionReads += 1;
+          if (versionReads === 2) {
+            const peer = openTeamSessionDatabase({ filename });
+            try {
+              expect(peer.db.pragma("user_version", { simple: true })).toBe(7);
+              peerAdvanced = true;
+            } finally {
+              peer.close();
+            }
+          }
+        }
+        return Reflect.apply(pragmaDescriptor.value, this, [source, ...args]);
+      },
+    });
+    try {
+      database = openTeamSessionDatabase({ filename });
+    } finally {
+      Object.defineProperty(Database.prototype, "pragma", pragmaDescriptor);
+    }
+
+    expect(peerAdvanced).toBe(true);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(7);
+    expect(database.db.pragma("foreign_key_check")).toEqual([]);
+  });
+
+  it("migrates genuine v5 through v6 and v7 without fabricating observation trust", () => {
     createRuntimeReceiptFollowSchemaV5Fixture(filename);
     const before = new Database(filename, { readonly: true });
     try {
@@ -185,7 +230,7 @@ describe("Team Session Agent Run schema", () => {
     }
 
     database = openTeamSessionDatabase({ filename });
-    expect(database.db.pragma("user_version", { simple: true })).toBe(6);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(7);
     expect(
       database.db.prepare(`SELECT COUNT(*) AS count FROM runtime_principal_observation_keys`).get()
     ).toEqual({ count: 0 });
@@ -193,6 +238,227 @@ describe("Team Session Agent Run schema", () => {
       database.db.prepare(`SELECT COUNT(*) AS count FROM runtime_receipt_follow_streams`).get()
     ).toEqual({ count: 0 });
     expect(database.db.pragma("foreign_key_check")).toEqual([]);
+  });
+
+  it("backfills one verified unsigned incident from an exact v6 compensating receipt", () => {
+    createRuntimeCompensationSchemaV6Fixture(filename);
+    const legacy = new Database(filename);
+    try {
+      legacy.pragma("foreign_keys = ON");
+      seedRuntimeRunCommand(legacy);
+      claimRuntimeRunDispatch(legacy, "runtime-command-1");
+      insertRuntimeRunReceipt(legacy);
+      legacy
+        .prepare(
+          `UPDATE runtime_run_command_dispatch
+           SET status = 'compensating', lease_owner = NULL, lease_expires_at_ms = NULL,
+               updated_at_ms = 110
+           WHERE command_id = 'runtime-command-1'`
+        )
+        .run();
+    } finally {
+      legacy.close();
+    }
+
+    database = openTeamSessionDatabase({ filename });
+    expect(database.db.pragma("user_version", { simple: true })).toBe(7);
+    expect(
+      database.db
+        .prepare(
+          `SELECT trust_state, source_command_id, source_receipt_id,
+                  source_enforced_fence, safety_fence,
+                  source_effect_ref_commitment,
+                  source_required_effect_enforcer_set_digest,
+                  lifecycle_enforcement_subject_digest,
+                  lifecycle_aggregate_proof_digest
+           FROM runtime_compensation_incidents`
+        )
+        .get()
+    ).toEqual({
+      trust_state: "verified",
+      source_command_id: "runtime-command-1",
+      source_receipt_id: "receipt-1",
+      source_enforced_fence: 2,
+      safety_fence: 3,
+      source_effect_ref_commitment: `effect:v1:${digestFor("runtime-command-1-effect")}`,
+      source_required_effect_enforcer_set_digest: EFFECT_ENFORCER_SET_DIGEST,
+      lifecycle_enforcement_subject_digest: ENFORCEMENT_SUBJECT_DIGEST,
+      lifecycle_aggregate_proof_digest: AGGREGATE_PROOF_DIGEST,
+    });
+    expect(
+      database.db
+        .prepare(
+          `SELECT allocated_fence FROM runtime_binding_safety_fences
+           WHERE runtime_assignment_id = ?`
+        )
+        .get(ASSIGNMENT_ID)
+    ).toEqual({ allocated_fence: 3 });
+    for (const table of [
+      "runtime_compensation_commands",
+      "runtime_compensation_dispatch",
+      "runtime_compensation_receipts",
+      "runtime_compensation_effects",
+      "runtime_compensation_follow_events",
+    ]) {
+      expect(database.db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get()).toEqual({
+        count: 0,
+      });
+    }
+    expect(
+      database.db
+        .prepare(
+          `SELECT status FROM runtime_run_command_dispatch
+           WHERE command_id = 'runtime-command-1'`
+        )
+        .get()
+    ).toEqual({ status: "compensating" });
+    expect(database.db.pragma("foreign_key_check")).toEqual([]);
+    expect(database.db.pragma("quick_check", { simple: true })).toBe("ok");
+  });
+
+  it("backfills a v5 compensating receipt as a non-dispatchable legacy incident", () => {
+    createRuntimeReceiptFollowSchemaV5Fixture(filename);
+    const legacy = new Database(filename);
+    try {
+      legacy.pragma("foreign_keys = ON");
+      seedRuntimeRunCommand(legacy);
+      claimRuntimeRunDispatch(legacy, "runtime-command-1");
+      insertRuntimeRunReceipt(legacy);
+      legacy
+        .prepare(
+          `UPDATE runtime_run_command_dispatch
+           SET status = 'compensating', lease_owner = NULL, lease_expires_at_ms = NULL,
+               updated_at_ms = 110
+           WHERE command_id = 'runtime-command-1'`
+        )
+        .run();
+    } finally {
+      legacy.close();
+    }
+
+    database = openTeamSessionDatabase({ filename });
+    expect(
+      database.db
+        .prepare(
+          `SELECT trust_state, source_enforced_fence, safety_fence,
+                  source_effect_ref_commitment,
+                  source_required_effect_enforcer_set_digest,
+                  lifecycle_enforcement_subject_digest,
+                  lifecycle_aggregate_proof_digest, source_proof_verified_at_ms
+           FROM runtime_compensation_incidents`
+        )
+        .get()
+    ).toEqual({
+      trust_state: "legacy-untrusted",
+      source_enforced_fence: 2,
+      safety_fence: 3,
+      source_effect_ref_commitment: null,
+      source_required_effect_enforcer_set_digest: null,
+      lifecycle_enforcement_subject_digest: null,
+      lifecycle_aggregate_proof_digest: null,
+      source_proof_verified_at_ms: null,
+    });
+    expect(
+      database.db.prepare(`SELECT COUNT(*) AS count FROM runtime_compensation_commands`).get()
+    ).toEqual({ count: 0 });
+    expect(database.db.pragma("foreign_key_check")).toEqual([]);
+  });
+
+  it("rolls back v7 when a compensating v6 dispatch has lost its source receipt", () => {
+    createRuntimeCompensationSchemaV6Fixture(filename);
+    const legacy = new Database(filename);
+    try {
+      legacy.pragma("foreign_keys = ON");
+      seedRuntimeRunCommand(legacy);
+      claimRuntimeRunDispatch(legacy, "runtime-command-1");
+      insertRuntimeRunReceipt(legacy);
+      legacy
+        .prepare(
+          `UPDATE runtime_run_command_dispatch
+           SET status = 'compensating', lease_owner = NULL, lease_expires_at_ms = NULL,
+               updated_at_ms = 110
+           WHERE command_id = 'runtime-command-1'`
+        )
+        .run();
+      legacy.exec(`DROP TRIGGER runtime_run_command_receipts_immutable_delete`);
+      legacy.prepare(`DELETE FROM runtime_run_command_receipts WHERE id = 'receipt-1'`).run();
+    } finally {
+      legacy.close();
+    }
+
+    expect(() => openTeamSessionDatabase({ filename })).toThrow(
+      /compensating dispatch without evidence/
+    );
+    const after = new Database(filename, { readonly: true });
+    try {
+      expect(after.pragma("user_version", { simple: true })).toBe(6);
+      expect(
+        after
+          .prepare(
+            `SELECT COUNT(*) AS count FROM sqlite_schema
+             WHERE type = 'table' AND name LIKE 'runtime_compensation_%'`
+          )
+          .get()
+      ).toEqual({ count: 0 });
+    } finally {
+      after.close();
+    }
+  });
+
+  it("rolls back v7 instead of compensating a legacy lifecycle effect that was already applied", () => {
+    createRuntimeCompensationSchemaV6Fixture(filename);
+    const legacy = new Database(filename);
+    try {
+      legacy.pragma("foreign_keys = ON");
+      seedRuntimeRunCommand(legacy);
+      claimRuntimeRunDispatch(legacy, "runtime-command-1");
+      insertRuntimeRunReceipt(legacy);
+      insertRuntimeRequestEvent(legacy, 2, "event:pause-enforced", { type: "run.paused" });
+      insertRuntimeRunEffect(legacy);
+      legacy
+        .prepare(
+          `UPDATE agent_runs
+           SET lifecycle = 'paused', state_version = 2, updated_at_ms = 115
+           WHERE id = 'run-1'`
+        )
+        .run();
+      legacy
+        .prepare(
+          `UPDATE runtime_run_command_dispatch
+           SET status = 'compensating', lease_owner = NULL, lease_expires_at_ms = NULL,
+               updated_at_ms = 116
+           WHERE command_id = 'runtime-command-1'`
+        )
+        .run();
+    } finally {
+      legacy.close();
+    }
+
+    expect(() => openTeamSessionDatabase({ filename })).toThrow(
+      /compensating dispatch with an applied lifecycle effect/
+    );
+    const after = new Database(filename, { readonly: true });
+    try {
+      expect(after.pragma("user_version", { simple: true })).toBe(6);
+      expect(
+        after
+          .prepare(
+            `SELECT COUNT(*) AS count FROM sqlite_schema
+             WHERE type = 'table' AND name LIKE 'runtime_compensation_%'`
+          )
+          .get()
+      ).toEqual({ count: 0 });
+      expect(
+        after
+          .prepare(
+            `SELECT COUNT(*) AS count FROM runtime_run_command_effects
+             WHERE command_id = 'runtime-command-1'`
+          )
+          .get()
+      ).toEqual({ count: 1 });
+    } finally {
+      after.close();
+    }
   });
 
   it.each([false, true])(
@@ -661,7 +927,7 @@ describe("Team Session Agent Run schema", () => {
 
     database = openTeamSessionDatabase({ filename });
 
-    expect(database.db.pragma("user_version", { simple: true })).toBe(6);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(7);
     expect(
       database.db
         .prepare(`SELECT name FROM sqlite_schema WHERE type = 'table' AND name = ?`)
@@ -690,12 +956,12 @@ describe("Team Session Agent Run schema", () => {
     expect(database.db.pragma("foreign_key_check")).toEqual([]);
   });
 
-  it("migrates a genuinely populated v4 Runtime journal through v5 and v6 without losing truth", () => {
+  it("migrates a populated v4 Runtime journal through v5, v6, and v7 without losing truth", () => {
     const beforeMigration = createPopulatedRuntimeRunSchemaV4Fixture(filename);
 
     database = openTeamSessionDatabase({ filename });
 
-    expect(database.db.pragma("user_version", { simple: true })).toBe(6);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(7);
     expect(
       database.db
         .prepare(`SELECT * FROM runtime_run_commands WHERE id = ?`)
@@ -743,7 +1009,7 @@ describe("Team Session Agent Run schema", () => {
 
       database = openTeamSessionDatabase({ filename });
 
-      expect(database.db.pragma("user_version", { simple: true })).toBe(6);
+      expect(database.db.pragma("user_version", { simple: true })).toBe(7);
       expect(
         database.db
           .prepare(
@@ -1055,6 +1321,7 @@ describe("Team Session Agent Run schema", () => {
       )
       .run();
     insertRuntimeRunReceipt(database.db);
+    insertRuntimeCompensationIncident(database.db);
     expect(() =>
       database!.db
         .prepare(
@@ -1082,6 +1349,260 @@ describe("Team Session Agent Run schema", () => {
         )
         .run()
     ).toThrow(/Invalid Runtime Run command dispatch transition/);
+  });
+
+  it("serializes exact-binding safety allocation above durable high-water", () => {
+    database = openTeamSessionDatabase({ filename });
+    seedSessionAndAssignment(database.db);
+
+    const compareAndAdvance = database.db.prepare(
+      `UPDATE runtime_binding_safety_fences
+       SET allocated_fence = allocated_fence + 1, updated_at_ms = 10
+       WHERE runtime_assignment_id = ? AND allocated_fence = ?
+       RETURNING allocated_fence`
+    );
+    expect(compareAndAdvance.get(ASSIGNMENT_ID, 1)).toEqual({ allocated_fence: 2 });
+    expect(compareAndAdvance.get(ASSIGNMENT_ID, 1)).toBeUndefined();
+    database.db.prepare(`UPDATE sessions SET steering_revision = 7 WHERE id = ?`).run(SESSION_ID);
+    expect(
+      database.db
+        .prepare(
+          `UPDATE runtime_binding_safety_fences
+           SET allocated_fence = MAX(
+                 allocated_fence,
+                 (SELECT steering_revision FROM sessions WHERE id = ?)
+               ) + 1,
+               updated_at_ms = 11
+           WHERE runtime_assignment_id = ?
+           RETURNING allocated_fence`
+        )
+        .get(SESSION_ID, ASSIGNMENT_ID)
+    ).toEqual({ allocated_fence: 8 });
+    expect(() =>
+      database!.db
+        .prepare(
+          `UPDATE runtime_binding_safety_fences
+           SET allocated_fence = 9007199254740992, updated_at_ms = 11
+           WHERE runtime_assignment_id = ?`
+        )
+        .run(ASSIGNMENT_ID)
+    ).toThrow(/beyond durable high-water|CHECK constraint failed/);
+    expect(() =>
+      database!.db
+        .prepare(
+          `INSERT INTO runtime_binding_safety_fences
+             (team_id, project_id, session_id, runtime_assignment_id,
+              runtime_assignment_generation, sandbox_id, sandbox_generation,
+              runtime_principal_id, allocated_fence, updated_at_ms)
+           SELECT team_id, project_id, session_id, id, generation, sandbox_id,
+                  sandbox_generation, runtime_principal_id, 8, 11
+           FROM runtime_assignments WHERE id = ?`
+        )
+        .run(ASSIGNMENT_ID)
+    ).toThrow(/UNIQUE constraint failed/);
+  });
+
+  it("requires an exact proof-backed compensation effect before quarantining the source", () => {
+    database = openTeamSessionDatabase({ filename });
+    seedRuntimeRunCommand(database.db);
+    claimRuntimeRunDispatch(database.db, "runtime-command-1");
+    insertRuntimeRunReceipt(database.db);
+    insertRuntimeCompensationIncident(database.db);
+    database.db
+      .prepare(
+        `UPDATE runtime_run_command_dispatch
+         SET status = 'compensating', lease_owner = NULL, lease_expires_at_ms = NULL,
+             updated_at_ms = 110
+         WHERE command_id = 'runtime-command-1'`
+      )
+      .run();
+    insertRuntimeCompensationCommand(database.db);
+
+    expect(() =>
+      database!.db
+        .prepare(
+          `UPDATE runtime_run_command_dispatch
+           SET status = 'quarantined', last_safe_error_code = 'stale_enforced_effect_compensated',
+               terminal_at_ms = 130, updated_at_ms = 130
+           WHERE command_id = 'runtime-command-1'`
+        )
+        .run()
+    ).toThrow(/Invalid Runtime Run command dispatch transition|lacks durable evidence/);
+
+    database.db
+      .prepare(
+        `UPDATE runtime_compensation_dispatch
+         SET status = 'processing', attempts = 1, lease_owner = 'security-worker-1',
+             lease_expires_at_ms = 220, updated_at_ms = 121
+         WHERE compensation_command_id = 'compensation-command-1'`
+      )
+      .run();
+    database.db
+      .prepare(
+        `UPDATE runtime_compensation_dispatch
+         SET dispatch_interlock_acquired_at_ms = 122, updated_at_ms = 122
+         WHERE compensation_command_id = 'compensation-command-1'`
+      )
+      .run();
+    insertRuntimeCompensationReceiptAndEffect(database.db);
+    database.db
+      .prepare(
+        `UPDATE runtime_compensation_dispatch
+         SET status = 'enforced', lease_owner = NULL, lease_expires_at_ms = NULL,
+             terminal_at_ms = 150, updated_at_ms = 150
+         WHERE compensation_command_id = 'compensation-command-1'`
+      )
+      .run();
+    expect(() =>
+      database!.db
+        .prepare(
+          `UPDATE runtime_run_command_dispatch
+           SET status = 'quarantined', last_safe_error_code = 'stale_enforced_effect_compensated',
+               terminal_at_ms = 151, updated_at_ms = 151
+           WHERE command_id = 'runtime-command-1'`
+        )
+        .run()
+    ).not.toThrow();
+    expect(
+      database.db
+        .prepare(
+          `SELECT status FROM runtime_run_command_dispatch
+           WHERE command_id = 'runtime-command-1'`
+        )
+        .get()
+    ).toEqual({ status: "quarantined" });
+    expect(database.db.pragma("foreign_key_check")).toEqual([]);
+  });
+
+  it("fails closed when compensation dispatch transitions omit their required safe error", () => {
+    database = openTeamSessionDatabase({ filename });
+    seedPendingRuntimeCompensationCommand(database.db);
+
+    expect(() =>
+      database!.db
+        .prepare(
+          `UPDATE runtime_compensation_dispatch
+           SET status = 'expired-before-dispatch', last_safe_error_code = NULL,
+               terminal_at_ms = 121, updated_at_ms = 121
+           WHERE compensation_command_id = 'compensation-command-1'`
+        )
+        .run()
+    ).toThrow(/Invalid Runtime compensation dispatch transition/);
+    expect(runtimeCompensationDispatchState(database.db)).toMatchObject({
+      status: "pending",
+      attempts: 0,
+      last_safe_error_code: null,
+    });
+
+    database.db
+      .prepare(
+        `UPDATE runtime_compensation_dispatch
+         SET status = 'processing', attempts = 1, lease_owner = 'security-worker-1',
+             lease_expires_at_ms = 220, updated_at_ms = 121
+         WHERE compensation_command_id = 'compensation-command-1'`
+      )
+      .run();
+    expect(() =>
+      database!.db
+        .prepare(
+          `UPDATE runtime_compensation_dispatch
+           SET status = 'pending', available_at_ms = 122,
+               lease_owner = NULL, lease_expires_at_ms = NULL,
+               last_safe_error_code = NULL, updated_at_ms = 122
+           WHERE compensation_command_id = 'compensation-command-1'`
+        )
+        .run()
+    ).toThrow(/Invalid Runtime compensation dispatch transition/);
+    expect(runtimeCompensationDispatchState(database.db)).toMatchObject({
+      status: "processing",
+      attempts: 1,
+      lease_owner: "security-worker-1",
+      last_safe_error_code: null,
+    });
+  });
+
+  it("rejects duplicate compensation receipts whose inner identity is not exact-bound", () => {
+    database = openTeamSessionDatabase({ filename });
+    seedPendingRuntimeCompensationCommand(database.db);
+    interlockRuntimeCompensationDispatch(database.db);
+    const validReceiptJson = runtimeCompensationDuplicateReceiptJson(database.db);
+    const mutations: ReadonlyArray<readonly [path: string, value: string | number]> = [
+      ["$.originalReceipt.receiptKind", "runtime.lifecycle"],
+      ["$.originalReceipt.compensationId", "other-compensation"],
+      ["$.originalReceipt.commandId", "other-command"],
+      ["$.originalReceipt.outcome", "accepted"],
+      ["$.originalReceipt.observedRuntimeAuthorizationGeneration", 2],
+      ["$.originalReceipt.binding.teamId", "other-team"],
+      ["$.originalReceipt.binding.projectId", "other-project"],
+      ["$.originalReceipt.binding.sessionId", "other-session"],
+      ["$.originalReceipt.binding.runtimeAssignmentId", "other-assignment"],
+      ["$.originalReceipt.binding.runtimeAssignmentGeneration", 2],
+      ["$.originalReceipt.binding.sandboxId", "other-sandbox"],
+      ["$.originalReceipt.binding.sandboxGeneration", 2],
+      ["$.originalReceipt.binding.runtimePrincipalId", "other-principal"],
+      ["$.originalReceiptDigest", digestFor("other-original-receipt")],
+    ];
+
+    for (const [path, value] of mutations) {
+      const tampered = database.db
+        .prepare(`SELECT json_set(?, ?, ?) AS receipt_json`)
+        .get(validReceiptJson, path, value) as { receipt_json: string };
+      expect(() =>
+        insertRuntimeCompensationDuplicateReceipt(database!.db, tampered.receipt_json)
+      ).toThrow(/CHECK constraint failed/);
+      expect(
+        database.db.prepare(`SELECT COUNT(*) AS count FROM runtime_compensation_receipts`).get()
+      ).toEqual({ count: 0 });
+    }
+
+    expect(() =>
+      insertRuntimeCompensationDuplicateReceipt(database!.db, validReceiptJson)
+    ).not.toThrow();
+  });
+
+  it("rolls back a compensation effect whose enforced fence outruns its allocator", () => {
+    database = openTeamSessionDatabase({ filename });
+    seedPendingRuntimeCompensationCommand(database.db);
+    interlockRuntimeCompensationDispatch(database.db);
+    const command = database.db
+      .prepare(`SELECT safety_fence FROM runtime_compensation_commands WHERE id = ?`)
+      .get("compensation-command-1") as { safety_fence: number };
+
+    expect(() =>
+      insertRuntimeCompensationReceiptAndEffect(database!.db, { advanceSafetyFence: false })
+    ).toThrow(/Runtime compensation effect requires exact verified containment/);
+    expect(
+      database.db.prepare(`SELECT COUNT(*) AS count FROM runtime_compensation_receipts`).get()
+    ).toEqual({ count: 0 });
+    expect(
+      database.db.prepare(`SELECT COUNT(*) AS count FROM runtime_compensation_effects`).get()
+    ).toEqual({ count: 0 });
+    expect(
+      database.db
+        .prepare(
+          `SELECT COUNT(*) AS count FROM session_events
+           WHERE type = 'run.runtime-command.compensated'`
+        )
+        .get()
+    ).toEqual({ count: 0 });
+    expect(
+      database.db
+        .prepare(
+          `SELECT allocated_fence FROM runtime_binding_safety_fences
+           WHERE runtime_assignment_id = ?`
+        )
+        .get(ASSIGNMENT_ID)
+    ).toEqual({ allocated_fence: command.safety_fence });
+
+    expect(() => insertRuntimeCompensationReceiptAndEffect(database!.db)).not.toThrow();
+    expect(
+      database.db
+        .prepare(
+          `SELECT allocated_fence FROM runtime_binding_safety_fences
+           WHERE runtime_assignment_id = ?`
+        )
+        .get(ASSIGNMENT_ID)
+    ).toEqual({ allocated_fence: command.safety_fence + 1 });
   });
 
   it("binds immutable Runtime Run commands to one exact Run snapshot", () => {
@@ -1284,7 +1805,7 @@ describe("Team Session Agent Run schema", () => {
         receiptJson: "{}",
       })
     ).toThrow(
-      /CHECK constraint failed|JSON scope does not match|Runtime enforced receipt lacks an exact verified aggregate proof/
+      /CHECK constraint failed|JSON scope does not match|Runtime enforced receipt lacks an exact verified aggregate proof|Runtime enforced receipt fence is not a safe integer/
     );
     expect(() =>
       database!.db
@@ -1860,17 +2381,23 @@ function insertRuntimeRunReceipt(
     binding,
     runtimeAuthorizationGeneration: 1,
   };
+  const effectRef = hasEnforcementProofColumns
+    ? `effect:v1:${digestFor("runtime-command-1-effect")}`
+    : "effect:runtime-command-1";
+  const originalEffectRef = hasEnforcementProofColumns
+    ? `effect:v1:${digestFor("original-effect")}`
+    : "effect:original";
   const originalOutcomeProof =
     originalOutcome === "accepted"
       ? options.incompleteOriginalProof
         ? {}
-        : { effectRef: "effect:original" }
+        : { effectRef: originalEffectRef }
       : originalOutcome === "enforced"
         ? options.incompleteOriginalProof
           ? { enforcedFence: 2 }
           : {
               enforcedFence: 2,
-              effectRef: "effect:original",
+              effectRef: originalEffectRef,
               ...(hasEnforcementProofColumns
                 ? { aggregateEnforcementProof: schemaAggregateProof() }
                 : {}),
@@ -1882,7 +2409,7 @@ function insertRuntimeRunReceipt(
           : originalOutcome === "quarantined"
             ? options.incompleteOriginalProof
               ? { reason: "isolation_failure" }
-              : { reason: "isolation_failure", effectRef: "effect:original" }
+              : { reason: "isolation_failure", effectRef: originalEffectRef }
             : {};
   const receiptJson =
     options.receiptJson ??
@@ -1903,20 +2430,20 @@ function insertRuntimeRunReceipt(
           ? {
               ...receiptBase,
               enforcedFence: options.enforcedFence ?? 2,
-              effectRef: "effect:runtime-command-1",
+              effectRef,
               ...(hasEnforcementProofColumns
                 ? { aggregateEnforcementProof: schemaAggregateProof() }
                 : {}),
             }
           : outcome === "accepted"
-            ? { ...receiptBase, effectRef: "effect:runtime-command-1" }
+            ? { ...receiptBase, effectRef }
             : outcome === "rejected"
               ? { ...receiptBase, code: "stale_fence", safeDetail: "The fence is stale" }
               : outcome === "quarantined"
                 ? {
                     ...receiptBase,
                     reason: "isolation_failure",
-                    effectRef: "effect:runtime-command-1",
+                    effectRef,
                   }
                 : receiptBase
     );
@@ -1965,6 +2492,479 @@ function effectiveOutcome(
   originalOutcome: "accepted" | "enforced" | "rejected" | "quarantined" | null
 ) {
   return outcome === "duplicate" ? originalOutcome : outcome;
+}
+
+function insertRuntimeCompensationIncident(
+  db: Database.Database,
+  options: {
+    compensationId?: string;
+    incidentDigest?: string;
+    commandId?: string;
+    receiptId?: string;
+  } = {}
+): void {
+  const compensationId = options.compensationId ?? "compensation-1";
+  const incidentDigest = options.incidentDigest ?? digestFor("compensation-incident-1");
+  const commandId = options.commandId ?? "runtime-command-1";
+  const receiptId = options.receiptId ?? "receipt-1";
+  const source = db
+    .prepare(
+      `SELECT json_extract(
+         receipt_json,
+         CASE WHEN outcome = 'duplicate'
+           THEN '$.originalReceipt.enforcedFence' ELSE '$.enforcedFence' END
+       ) AS source_enforced_fence
+       FROM runtime_run_command_receipts WHERE id = ?`
+    )
+    .get(receiptId) as { source_enforced_fence: number };
+  const allocation = db
+    .prepare(
+      `UPDATE runtime_binding_safety_fences
+       SET allocated_fence = MAX(allocated_fence, ?) + 1, updated_at_ms = 110
+       WHERE runtime_assignment_id = ? AND runtime_assignment_generation = 1
+       RETURNING allocated_fence`
+    )
+    .get(source.source_enforced_fence, ASSIGNMENT_ID) as { allocated_fence: number };
+  db.prepare(
+    `INSERT INTO runtime_compensation_incidents (
+       compensation_id, incident_digest, source_command_id, source_receipt_id, trust_state,
+       session_id, team_id, project_id, agent_run_id, run_policy_revision,
+       runtime_assignment_id, runtime_assignment_generation,
+       sandbox_id, sandbox_generation, runtime_principal_id,
+       runtime_authorization_generation, source_command_digest,
+       lifecycle_command_claims_digest, lifecycle_receipt_digest,
+       source_enforced_fence, safety_fence,
+       source_effect_ref_commitment, source_required_effect_enforcer_set_digest,
+       lifecycle_enforcement_subject_digest, lifecycle_aggregate_proof_digest,
+       source_proof_verified_at_ms, created_at_ms
+     )
+     SELECT ?, ?, command.id, receipt.id, 'verified',
+       command.session_id, assignment.team_id, assignment.project_id,
+       command.agent_run_id, command.run_policy_revision,
+       command.runtime_assignment_id, command.runtime_assignment_generation,
+       command.sandbox_id, command.sandbox_generation, command.runtime_principal_id,
+       command.runtime_authorization_generation, command.command_digest,
+       command.authority_digest, receipt.receipt_digest,
+       json_extract(
+         receipt.receipt_json,
+         CASE WHEN receipt.outcome = 'duplicate'
+           THEN '$.originalReceipt.enforcedFence' ELSE '$.enforcedFence' END
+       ),
+       ?,
+       json_extract(
+         receipt.receipt_json,
+         CASE WHEN receipt.outcome = 'duplicate'
+           THEN '$.originalReceipt.effectRef' ELSE '$.effectRef' END
+       ),
+       command.required_effect_enforcer_set_digest,
+       receipt.enforcement_subject_digest, receipt.aggregate_proof_digest,
+       receipt.proof_verified_at_ms, receipt.received_at_ms
+     FROM runtime_run_commands command
+     JOIN runtime_assignments assignment ON assignment.id = command.runtime_assignment_id
+     JOIN runtime_run_command_receipts receipt ON receipt.command_id = command.id
+     WHERE command.id = ? AND receipt.id = ?`
+  ).run(compensationId, incidentDigest, allocation.allocated_fence, commandId, receiptId);
+}
+
+function insertRuntimeCompensationCommand(db: Database.Database): void {
+  const incident = db
+    .prepare(`SELECT * FROM runtime_compensation_incidents WHERE compensation_id = ?`)
+    .get("compensation-1") as Record<string, string | number>;
+  const authorityDigest = digestFor("compensation-authority-1");
+  const commandDigest = digestFor("compensation-command-1");
+  const binding = {
+    teamId: incident.team_id,
+    projectId: incident.project_id,
+    sessionId: incident.session_id,
+    runtimeAssignmentId: incident.runtime_assignment_id,
+    runtimeAssignmentGeneration: incident.runtime_assignment_generation,
+    sandboxId: incident.sandbox_id,
+    sandboxGeneration: incident.sandbox_generation,
+    runtimePrincipalId: incident.runtime_principal_id,
+  };
+  const commandJson = JSON.stringify({
+    kind: "safety.quarantine",
+    commandId: "compensation-command-1",
+    compensationId: incident.compensation_id,
+    binding,
+    observedRuntimeAuthorizationGeneration: incident.runtime_authorization_generation,
+    source: {
+      lifecycleCommandId: incident.source_command_id,
+      lifecycleCommandClaimsDigest: incident.lifecycle_command_claims_digest,
+      lifecycleReceiptDigest: incident.lifecycle_receipt_digest,
+      lifecycleEnforcementSubjectDigest: incident.lifecycle_enforcement_subject_digest,
+      lifecycleAggregateProofDigest: incident.lifecycle_aggregate_proof_digest,
+      sourceRequiredEffectEnforcerSetDigest: incident.source_required_effect_enforcer_set_digest,
+    },
+    platformSecurityPolicyRevision: "platform-security-policy-1",
+    requiredContainmentEnforcerSetDigest: CONTAINMENT_ENFORCER_SET_DIGEST,
+    containment: {
+      revokeTerminalWrites: true,
+      stopProcessExecution: true,
+      quarantineRuntime: true,
+    },
+    safetyFence: incident.safety_fence,
+    exactBindingOnly: true,
+    advanceBeyondCurrentFences: true,
+    reasonRef: incident.incident_digest,
+    causationId: incident.source_command_id,
+    actor: { kind: "system", actorRef: "platform-security" },
+    issuedAtMs: 120,
+    deadlineAtMs: 220,
+    authority: {
+      issuer: "platform-security",
+      issuerKeyId: "platform-security-key-1",
+      audience: "runtime",
+      capability: "safety.quarantine",
+      claimsDigest: authorityDigest,
+      issuedAtMs: 120,
+      expiresAtMs: 220,
+      signature: "platform-security-signature",
+    },
+  });
+  db.transaction(() => {
+    db.prepare(
+      `INSERT INTO runtime_compensation_commands (
+         id, compensation_id, source_command_id, command_sequence, previous_command_sequence,
+         operation, session_id, team_id, project_id, agent_run_id,
+         runtime_assignment_id, runtime_assignment_generation,
+         sandbox_id, sandbox_generation, runtime_principal_id,
+         observed_runtime_authorization_generation,
+         source_required_effect_enforcer_set_digest,
+         lifecycle_command_claims_digest, lifecycle_receipt_digest,
+         lifecycle_enforcement_subject_digest, lifecycle_aggregate_proof_digest,
+         platform_security_policy_revision, required_containment_enforcer_set_digest,
+         safety_fence, reason_ref, causation_id, command_json,
+         command_digest, authority_digest, created_at_ms,
+         authority_verified_at_ms, deadline_at_ms
+       ) VALUES (
+         'compensation-command-1', ?, ?, 1, NULL, 'safety.quarantine',
+         ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+         'platform-security-policy-1', ?, ?, ?, ?, ?, ?, ?, 120, 121, 220
+       )`
+    ).run(
+      incident.compensation_id,
+      incident.source_command_id,
+      incident.session_id,
+      incident.team_id,
+      incident.project_id,
+      incident.agent_run_id,
+      incident.runtime_assignment_id,
+      incident.runtime_assignment_generation,
+      incident.sandbox_id,
+      incident.sandbox_generation,
+      incident.runtime_principal_id,
+      incident.runtime_authorization_generation,
+      incident.source_required_effect_enforcer_set_digest,
+      incident.lifecycle_command_claims_digest,
+      incident.lifecycle_receipt_digest,
+      incident.lifecycle_enforcement_subject_digest,
+      incident.lifecycle_aggregate_proof_digest,
+      CONTAINMENT_ENFORCER_SET_DIGEST,
+      incident.safety_fence,
+      incident.incident_digest,
+      incident.source_command_id,
+      commandJson,
+      commandDigest,
+      authorityDigest
+    );
+    db.prepare(
+      `INSERT INTO runtime_compensation_dispatch (
+         compensation_command_id, compensation_id, source_command_id,
+         status, attempts, available_at_ms, created_at_ms, updated_at_ms
+       ) VALUES (
+         'compensation-command-1', ?, ?, 'pending', 0, 120, 120, 120
+       )`
+    ).run(incident.compensation_id, incident.source_command_id);
+  })();
+}
+
+function seedPendingRuntimeCompensationCommand(db: Database.Database): void {
+  seedRuntimeRunCommand(db);
+  claimRuntimeRunDispatch(db, "runtime-command-1");
+  insertRuntimeRunReceipt(db);
+  insertRuntimeCompensationIncident(db);
+  db.prepare(
+    `UPDATE runtime_run_command_dispatch
+     SET status = 'compensating', lease_owner = NULL, lease_expires_at_ms = NULL,
+         updated_at_ms = 110
+     WHERE command_id = 'runtime-command-1'`
+  ).run();
+  insertRuntimeCompensationCommand(db);
+}
+
+function interlockRuntimeCompensationDispatch(db: Database.Database): void {
+  db.prepare(
+    `UPDATE runtime_compensation_dispatch
+     SET status = 'processing', attempts = 1, lease_owner = 'security-worker-1',
+         lease_expires_at_ms = 220, updated_at_ms = 121
+     WHERE compensation_command_id = 'compensation-command-1'`
+  ).run();
+  db.prepare(
+    `UPDATE runtime_compensation_dispatch
+     SET dispatch_interlock_acquired_at_ms = 122, updated_at_ms = 122
+     WHERE compensation_command_id = 'compensation-command-1'`
+  ).run();
+}
+
+function runtimeCompensationDispatchState(db: Database.Database): Record<string, unknown> {
+  return db
+    .prepare(`SELECT * FROM runtime_compensation_dispatch WHERE compensation_command_id = ?`)
+    .get("compensation-command-1") as Record<string, unknown>;
+}
+
+function runtimeCompensationDuplicateReceiptJson(db: Database.Database): string {
+  const command = db
+    .prepare(`SELECT * FROM runtime_compensation_commands WHERE id = ?`)
+    .get("compensation-command-1") as Record<string, string | number>;
+  const binding = {
+    teamId: command.team_id,
+    projectId: command.project_id,
+    sessionId: command.session_id,
+    runtimeAssignmentId: command.runtime_assignment_id,
+    runtimeAssignmentGeneration: command.runtime_assignment_generation,
+    sandboxId: command.sandbox_id,
+    sandboxGeneration: command.sandbox_generation,
+    runtimePrincipalId: command.runtime_principal_id,
+  };
+  const originalReceipt = {
+    receiptKind: "runtime.compensation",
+    compensationId: command.compensation_id,
+    commandId: command.id,
+    binding,
+    observedRuntimeAuthorizationGeneration: command.observed_runtime_authorization_generation,
+    outcome: "enforced",
+    effectRef: `effect:v1:${digestFor("duplicate-compensation-effect-ref")}`,
+    enforcedSafetyFence: command.safety_fence,
+    containment: {
+      terminalWritesRevoked: true,
+      processExecutionStopped: true,
+      runtimeQuarantined: true,
+    },
+    aggregateEnforcementProof: {
+      generation: command.observed_runtime_authorization_generation,
+      requiredEffectEnforcerSetDigest: CONTAINMENT_ENFORCER_SET_DIGEST,
+      enforcementSubjectDigest: COMPENSATION_ENFORCEMENT_SUBJECT_DIGEST,
+      acknowledgements: [
+        {
+          enforcerRef: "containment-enforcer-1",
+          enforcerKind: "runtime",
+          acknowledgementDigest: digestFor("duplicate-containment-ack-1"),
+        },
+      ],
+      aggregateProofDigest: COMPENSATION_AGGREGATE_PROOF_DIGEST,
+    },
+  };
+  return JSON.stringify({
+    receiptKind: "runtime.compensation",
+    compensationId: command.compensation_id,
+    commandId: command.id,
+    binding,
+    observedRuntimeAuthorizationGeneration: command.observed_runtime_authorization_generation,
+    outcome: "duplicate",
+    originalReceipt,
+    originalReceiptDigest: digestFor("duplicate-original-receipt"),
+  });
+}
+
+function insertRuntimeCompensationDuplicateReceipt(
+  db: Database.Database,
+  receiptJson: string
+): void {
+  const command = db
+    .prepare(`SELECT * FROM runtime_compensation_commands WHERE id = ?`)
+    .get("compensation-command-1") as Record<string, string | number>;
+  db.prepare(
+    `INSERT INTO runtime_compensation_receipts (
+       id, compensation_command_id, compensation_id, source_command_id,
+       version, previous_version, session_id, team_id, project_id, agent_run_id,
+       runtime_assignment_id, runtime_assignment_generation,
+       sandbox_id, sandbox_generation, runtime_principal_id,
+       observed_runtime_authorization_generation, command_digest,
+       enforced_safety_fence, outcome, original_outcome, original_receipt_digest,
+       receipt_json, receipt_digest, required_containment_enforcer_set_digest,
+       effect_ref_commitment, enforcement_subject_digest, aggregate_proof_digest,
+       proof_verified_at_ms, received_at_ms
+     ) VALUES (
+       'compensation-receipt-duplicate', 'compensation-command-1', ?, ?,
+       1, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+       'duplicate', 'enforced', ?, ?, ?, ?, ?, ?, ?, 130, 130
+     )`
+  ).run(
+    command.compensation_id,
+    command.source_command_id,
+    command.session_id,
+    command.team_id,
+    command.project_id,
+    command.agent_run_id,
+    command.runtime_assignment_id,
+    command.runtime_assignment_generation,
+    command.sandbox_id,
+    command.sandbox_generation,
+    command.runtime_principal_id,
+    command.observed_runtime_authorization_generation,
+    command.command_digest,
+    command.safety_fence,
+    digestFor("duplicate-original-receipt"),
+    receiptJson,
+    digestFor("duplicate-compensation-receipt"),
+    CONTAINMENT_ENFORCER_SET_DIGEST,
+    `effect:v1:${digestFor("duplicate-compensation-effect-ref")}`,
+    COMPENSATION_ENFORCEMENT_SUBJECT_DIGEST,
+    COMPENSATION_AGGREGATE_PROOF_DIGEST
+  );
+}
+
+function insertRuntimeCompensationReceiptAndEffect(
+  db: Database.Database,
+  options: { advanceSafetyFence?: boolean } = {}
+): void {
+  const command = db
+    .prepare(`SELECT * FROM runtime_compensation_commands WHERE id = ?`)
+    .get("compensation-command-1") as Record<string, string | number>;
+  const enforcedSafetyFence = Number(command.safety_fence) + 1;
+  const effectRefCommitment = `effect:v1:${digestFor("compensation-effect-ref")}`;
+  const receiptDigest = digestFor("compensation-receipt-1");
+  const effectDigest = digestFor("compensation-effect-1");
+  const binding = {
+    teamId: command.team_id,
+    projectId: command.project_id,
+    sessionId: command.session_id,
+    runtimeAssignmentId: command.runtime_assignment_id,
+    runtimeAssignmentGeneration: command.runtime_assignment_generation,
+    sandboxId: command.sandbox_id,
+    sandboxGeneration: command.sandbox_generation,
+    runtimePrincipalId: command.runtime_principal_id,
+  };
+  const receiptJson = JSON.stringify({
+    receiptKind: "runtime.compensation",
+    compensationId: command.compensation_id,
+    commandId: command.id,
+    binding,
+    observedRuntimeAuthorizationGeneration: command.observed_runtime_authorization_generation,
+    outcome: "enforced",
+    effectRef: effectRefCommitment,
+    enforcedSafetyFence,
+    containment: {
+      terminalWritesRevoked: true,
+      processExecutionStopped: true,
+      runtimeQuarantined: true,
+    },
+    aggregateEnforcementProof: {
+      generation: command.observed_runtime_authorization_generation,
+      requiredEffectEnforcerSetDigest: CONTAINMENT_ENFORCER_SET_DIGEST,
+      enforcementSubjectDigest: COMPENSATION_ENFORCEMENT_SUBJECT_DIGEST,
+      acknowledgements: [
+        {
+          enforcerRef: "containment-enforcer-1",
+          enforcerKind: "runtime",
+          acknowledgementDigest: digestFor("containment-ack-1"),
+        },
+      ],
+      aggregateProofDigest: COMPENSATION_AGGREGATE_PROOF_DIGEST,
+    },
+  });
+  db.transaction(() => {
+    db.prepare(
+      `INSERT INTO runtime_compensation_receipts (
+         id, compensation_command_id, compensation_id, source_command_id,
+         version, previous_version, session_id, team_id, project_id, agent_run_id,
+         runtime_assignment_id, runtime_assignment_generation,
+         sandbox_id, sandbox_generation, runtime_principal_id,
+         observed_runtime_authorization_generation, command_digest,
+         enforced_safety_fence, outcome, original_outcome, original_receipt_digest,
+         receipt_json, receipt_digest, required_containment_enforcer_set_digest,
+         effect_ref_commitment, enforcement_subject_digest, aggregate_proof_digest,
+         proof_verified_at_ms, received_at_ms
+       ) VALUES (
+         'compensation-receipt-1', 'compensation-command-1', ?, ?,
+         1, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+         'enforced', NULL, NULL, ?, ?, ?, ?, ?, ?, 130, 130
+       )`
+    ).run(
+      command.compensation_id,
+      command.source_command_id,
+      command.session_id,
+      command.team_id,
+      command.project_id,
+      command.agent_run_id,
+      command.runtime_assignment_id,
+      command.runtime_assignment_generation,
+      command.sandbox_id,
+      command.sandbox_generation,
+      command.runtime_principal_id,
+      command.observed_runtime_authorization_generation,
+      command.command_digest,
+      enforcedSafetyFence,
+      receiptJson,
+      receiptDigest,
+      CONTAINMENT_ENFORCER_SET_DIGEST,
+      effectRefCommitment,
+      COMPENSATION_ENFORCEMENT_SUBJECT_DIGEST,
+      COMPENSATION_AGGREGATE_PROOF_DIGEST
+    );
+    if (options.advanceSafetyFence !== false) {
+      const advanced = db
+        .prepare(
+          `UPDATE runtime_binding_safety_fences
+           SET allocated_fence = ?, updated_at_ms = 130
+           WHERE team_id = ? AND project_id = ? AND session_id = ?
+             AND runtime_assignment_id = ? AND runtime_assignment_generation = ?
+             AND sandbox_id = ? AND sandbox_generation = ? AND runtime_principal_id = ?
+             AND allocated_fence = ?`
+        )
+        .run(
+          enforcedSafetyFence,
+          command.team_id,
+          command.project_id,
+          command.session_id,
+          command.runtime_assignment_id,
+          command.runtime_assignment_generation,
+          command.sandbox_id,
+          command.sandbox_generation,
+          command.runtime_principal_id,
+          command.safety_fence
+        );
+      expect(advanced.changes).toBe(1);
+    }
+    db.prepare(
+      `INSERT INTO session_events (
+         session_id, sequence, event_id, type, occurred_at_ms,
+         actor_kind, actor_user_id, actor_display_name,
+         source_scope, source_key, payload_json
+       ) VALUES (
+         ?, 2, 'event:compensation-enforced', 'run.runtime-command.compensated', 140,
+         'system', 'platform-security', 'Platform Security',
+         'runtime-compensation', 'compensation-1', ?
+       )`
+    ).run(
+      SESSION_ID,
+      JSON.stringify({
+        compensationId: command.compensation_id,
+        sourceCommandId: command.source_command_id,
+        compensationCommandId: command.id,
+        receiptId: "compensation-receipt-1",
+        effectDigest,
+        agentRunId: command.agent_run_id,
+      })
+    );
+    db.prepare(
+      `INSERT INTO runtime_compensation_effects (
+         compensation_id, source_command_id, compensation_command_id,
+         receipt_id, receipt_outcome, session_id, agent_run_id,
+         applied_session_sequence, effect_digest, applied_at_ms
+       ) VALUES (
+         ?, ?, 'compensation-command-1', 'compensation-receipt-1', 'enforced',
+         ?, ?, 2, ?, 140
+       )`
+    ).run(
+      command.compensation_id,
+      command.source_command_id,
+      command.session_id,
+      command.agent_run_id,
+      effectDigest
+    );
+  })();
 }
 
 function schemaAggregateProof() {
@@ -2588,6 +3588,16 @@ function createRuntimeRunSchemaV3Fixture(filename: string): {
       DROP TRIGGER IF EXISTS sessions_runtime_lifecycle_dispatch_interlock;
       DROP TRIGGER IF EXISTS runtime_assignments_lifecycle_dispatch_interlock;
       DROP TRIGGER IF EXISTS agent_runs_lifecycle_dispatch_interlock;
+      DROP TRIGGER IF EXISTS runtime_assignments_create_binding_safety_fence;
+      DROP TRIGGER IF EXISTS runtime_compensation_referenced_events_immutable_update;
+      DROP TRIGGER IF EXISTS runtime_compensation_referenced_events_immutable_delete;
+      DROP TABLE runtime_compensation_follow_events;
+      DROP TABLE runtime_compensation_effects;
+      DROP TABLE runtime_compensation_receipts;
+      DROP TABLE runtime_compensation_dispatch;
+      DROP TABLE runtime_compensation_commands;
+      DROP TABLE runtime_compensation_incidents;
+      DROP TABLE runtime_binding_safety_fences;
       DROP TABLE runtime_receipt_follow_events;
       DROP TABLE runtime_receipt_follow_streams;
       DROP TABLE runtime_principal_observation_keys;
@@ -2788,6 +3798,35 @@ function createRuntimeReceiptFollowSchemaV5Fixture(filename: string): void {
   }
   if (!committedVersionFive || !stoppedBeforeVersionSix) {
     throw new Error("Expected initializer to stop at committed schema v5");
+  }
+}
+
+function createRuntimeCompensationSchemaV6Fixture(filename: string): void {
+  const pragmaDescriptor = Object.getOwnPropertyDescriptor(Database.prototype, "pragma");
+  if (!pragmaDescriptor?.value) throw new Error("Expected better-sqlite3 pragma method");
+  let committedVersionSix = false;
+  let stoppedBeforeVersionSeven = false;
+  Object.defineProperty(Database.prototype, "pragma", {
+    ...pragmaDescriptor,
+    value(this: Database.Database, source: string, ...args: unknown[]) {
+      if (committedVersionSix && source === "user_version") {
+        stoppedBeforeVersionSeven = true;
+        throw new Error("stop-after-v6-for-migration-fixture");
+      }
+      const result = Reflect.apply(pragmaDescriptor.value, this, [source, ...args]);
+      if (source === "user_version = 6") committedVersionSix = true;
+      return result;
+    },
+  });
+  try {
+    expect(() => openTeamSessionDatabase({ filename })).toThrow(
+      /stop-after-v6-for-migration-fixture/
+    );
+  } finally {
+    Object.defineProperty(Database.prototype, "pragma", pragmaDescriptor);
+  }
+  if (!committedVersionSix || !stoppedBeforeVersionSeven) {
+    throw new Error("Expected initializer to stop at committed schema v6");
   }
 }
 

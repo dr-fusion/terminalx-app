@@ -42,20 +42,50 @@ its “deliberately still closed” list should not be read as current implement
   recovery can still distinguish proven pre-dispatch work from an ambiguous dispatch.
 - A validly signed bad proof is contained without creating receipt/effect truth. Unauthenticated
   malformed packets cannot use that path to quarantine a tenant Runtime.
+- Schema v7 adds immutable stale-effect incidents, separately signed `safety.quarantine` commands,
+  crash-safe compensation dispatch, compensation receipts/effects, and exact-source follow events.
+- Platform-security compensation advances beyond every durable authorization and safety high-water
+  for the exact historical binding. It cannot retire or mutate a replacement Assignment, and the
+  original lifecycle command remains visibly `compensating` until enforced containment exists.
+- Lifecycle and compensation receipt observations use separate signature/digest domains. One
+  binding-pinned receipt-only follower handles both streams without allowing terminal output to
+  starve receipt reconciliation; malformed authenticated containment observations quarantine only
+  their historical stream.
+- A platform-signed effect-enforcer manifest pins the exact purpose-specific Ed25519 enforcer set.
+  Static restart bundles and a bounded synchronous dynamic attestation source both authenticate
+  every acknowledgement digest before SQLite may create effect truth.
+- A separately signed Runtime observation-key registry binds each key to the complete Runtime
+  binding, authorization generation, adapter identity, and adapter configuration. Its production
+  source is independent of Runtime/provider payloads.
+- The process-local terminal write registry has a mandatory production bootstrap mode. The private
+  kernel reconstructs a transactionally consistent SQLite snapshot, preserves authorization
+  high-water across replacement Assignments, and installs it before the server constructs any
+  canonical terminal gateway or Runtime worker.
+- One portable supervisor composition owns lifecycle delivery, receipt follow, compensation
+  materialization/delivery, write-state bootstrap, cancellation, and readiness. Adapter command and
+  handle capabilities are captured from data descriptors before any dispatch interlock.
+- Separate-connection tests prove singular claims and settlement, dispatch-marker crash recovery
+  without redispatch, and rollback without partial leases under deterministic `SQLITE_BUSY`.
 
-## Deliberately closed before Gate 1
+## Phase boundary and remaining release evidence
 
-This slice is not the end of Phase 6 and does not close Gate 1. Production activation remains
-disabled until all of the following are implemented and tested:
+The portable Phase 6 kernel is complete and its full repository gate passes. Production activation
+remains closed: the remaining Gate 1 evidence belongs to the hosted adapter work in Phase 7:
 
-- a separately signed platform-security quarantine command and receipt-backed compensation worker;
-- a production effect-enforcer manifest/attestation verifier and pinned observation-key source;
-- hosted handle/spec reconstruction and restart reconstruction of terminal/process write fences;
-- race, crash/fault-injection, and ambiguous-timeout tests across separate database connections;
-- production composition of lifecycle, follow, compensation, recovery, and readiness supervisors;
+- reconstruct exact opaque hosted handles and immutable Runtime specs after process restart;
+- run the portable command, receipt, follow, compensation, and write-fence semantics against the
+  pinned Daytona fork rather than LocalTmux or a reference Runtime;
+- prove that hosted process execution, terminal input, filesystem, identity, network, and resource
+  fences remain enforced through timeouts, restarts, and replacement Sandbox races; and
+- wire the complete signed trust group into the production server. The live server deliberately
+  continues to expose only the LocalTmux development path until that hosted group exists.
+
+The following evidence remains assigned to later gates and must not be presented as Gate 1 proof:
+
 - restart-reverifiable signed-observation evidence envelopes, including privacy-safe forensic
   commitments for authenticated observations rejected during containment (owned by Gate 8);
-- Daytona-backed evidence for Gate 1, while Gate 2 retains its separate isolation criteria.
+- raw-secret unavailability and connection revocation (Gate 3); and
+- approval, accounting, and YOLO enforcement (Gates 4–6).
 
 Phase 6 can complete the portable signed Runtime-truth kernel with a reference/fake Runtime. Gate 1
 remains open until Phase 7 demonstrates those semantics through the pinned hosted Daytona adapter;

@@ -1,6 +1,6 @@
 import { createHash, createPublicKey } from "node:crypto";
 import type Database from "better-sqlite3";
-import type { RuntimeLifecycleCommand } from "../runtime/contracts";
+import type { RuntimeCompensationCommand, RuntimeLifecycleCommand } from "../runtime/contracts";
 import {
   canonicalRuntimeJson,
   digestRuntimeCommandClaims,
@@ -12,10 +12,20 @@ import {
   type VerifiedRuntimeLifecycleReceiptObservation,
 } from "../runtime/runtime-receipt-observation";
 import {
+  RuntimeCompensationReceiptObservationError,
+  createRuntimeCompensationReceiptObservationVerifier,
+  type VerifiedRuntimeCompensationReceiptObservation,
+} from "../runtime/runtime-compensation-receipt-observation";
+import {
   RUNTIME_RECEIPT_OBSERVATION_MAX_CURSOR_CODE_POINTS,
   runtimeReceiptObservationCursorCodePoints,
 } from "../runtime/runtime-receipt-observation-contract";
 import type { RuntimeBinding } from "./contracts";
+import {
+  RuntimeCompensationReceiptFollowSettlementRejection,
+  type RuntimeCompensationReceiptFollowSettlementInput,
+  type RuntimeCompensationReceiptFollowSettlementResult,
+} from "./sqlite-runtime-compensation-journal";
 
 type SqlValue = string | number | null;
 type SqlRow = Record<string, SqlValue>;
@@ -179,11 +189,17 @@ export type SettleVerifiedRuntimeReceiptInTransaction = (
   input: RuntimeReceiptFollowSettlementInput
 ) => RuntimeReceiptFollowSettlementResult;
 
+/** Optional private seam used only when the compensation trust group is configured. */
+export type SettleVerifiedRuntimeCompensationReceiptInTransaction = (
+  input: RuntimeCompensationReceiptFollowSettlementInput
+) => RuntimeCompensationReceiptFollowSettlementResult;
+
 export interface CreateSqliteRuntimeReceiptFollowJournalOptions {
   readonly db: Database.Database;
   /** Kernel-owned identity source for canonical Session events. */
   readonly idGenerator: () => string;
   readonly settleVerifiedReceiptInTransaction: SettleVerifiedRuntimeReceiptInTransaction;
+  readonly settleVerifiedCompensationReceiptInTransaction?: SettleVerifiedRuntimeCompensationReceiptInTransaction;
   readonly retryDelayMs?: number;
 }
 
@@ -228,6 +244,41 @@ interface CommandRow extends SqlRow {
   operation: RuntimeLifecycleCommand["kind"];
 }
 
+interface CompensationCommandRow extends SqlRow {
+  id: string;
+  compensation_id: string;
+  source_command_id: string;
+  command_sequence: number;
+  previous_command_sequence: number | null;
+  operation: string;
+  session_id: string;
+  team_id: string;
+  project_id: string;
+  agent_run_id: string;
+  runtime_assignment_id: string;
+  runtime_assignment_generation: number;
+  sandbox_id: string;
+  sandbox_generation: number;
+  runtime_principal_id: string;
+  observed_runtime_authorization_generation: number;
+  source_required_effect_enforcer_set_digest: string;
+  lifecycle_command_claims_digest: string;
+  lifecycle_receipt_digest: string;
+  lifecycle_enforcement_subject_digest: string;
+  lifecycle_aggregate_proof_digest: string;
+  platform_security_policy_revision: string;
+  required_containment_enforcer_set_digest: string;
+  safety_fence: number;
+  reason_ref: string;
+  causation_id: string;
+  command_json: string;
+  command_digest: string;
+  authority_digest: string;
+  created_at_ms: number;
+  authority_verified_at_ms: number;
+  deadline_at_ms: number;
+}
+
 /**
  * Durable, private Runtime follow-channel journal.
  *
@@ -239,6 +290,7 @@ export class SqliteRuntimeReceiptFollowJournal {
   private readonly db: Database.Database;
   private readonly idGenerator: () => string;
   private readonly settleVerifiedReceiptInTransaction: SettleVerifiedRuntimeReceiptInTransaction;
+  private readonly settleVerifiedCompensationReceiptInTransaction?: SettleVerifiedRuntimeCompensationReceiptInTransaction;
   private readonly retryDelayMs: number;
 
   constructor(options: CreateSqliteRuntimeReceiptFollowJournalOptions) {
@@ -246,13 +298,17 @@ export class SqliteRuntimeReceiptFollowJournal {
       !options?.db ||
       typeof options.db.prepare !== "function" ||
       typeof options.idGenerator !== "function" ||
-      typeof options.settleVerifiedReceiptInTransaction !== "function"
+      typeof options.settleVerifiedReceiptInTransaction !== "function" ||
+      (options.settleVerifiedCompensationReceiptInTransaction !== undefined &&
+        typeof options.settleVerifiedCompensationReceiptInTransaction !== "function")
     ) {
       fail("invalid_input");
     }
     this.db = options.db;
     this.idGenerator = options.idGenerator;
     this.settleVerifiedReceiptInTransaction = options.settleVerifiedReceiptInTransaction;
+    this.settleVerifiedCompensationReceiptInTransaction =
+      options.settleVerifiedCompensationReceiptInTransaction;
     this.retryDelayMs = boundedInteger(
       options.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS,
       1,
@@ -383,36 +439,7 @@ export class SqliteRuntimeReceiptFollowJournal {
         .prepare(
           `${FOLLOW_STREAM_SELECT}
            WHERE stream.status = 'pending' AND stream.available_at_ms <= ?
-             AND assignment.status = 'ready'
-             AND assignment.runtime_authorization_generation = stream.runtime_authorization_generation
-             AND session.status <> 'ended'
-             AND session.runtime_authorization_generation = stream.runtime_authorization_generation
-             AND session.runtime_authorization_state = 'enforced'
-             AND EXISTS (
-               SELECT 1
-               FROM runtime_run_commands command
-               JOIN runtime_run_command_dispatch dispatch ON dispatch.command_id = command.id
-               WHERE command.session_id = stream.session_id
-                 AND command.runtime_assignment_id = stream.runtime_assignment_id
-                 AND command.runtime_assignment_generation = stream.runtime_assignment_generation
-                 AND command.sandbox_id = stream.sandbox_id
-                 AND command.sandbox_generation = stream.sandbox_generation
-                 AND command.runtime_principal_id = stream.runtime_principal_id
-                 AND command.runtime_authorization_generation = stream.runtime_authorization_generation
-                 AND command.required_effect_enforcer_set_digest IS NOT NULL
-                 AND command.required_effect_enforcer_set_digest = (
-                   SELECT epoch.effect_enforcer_set_digest
-                   FROM runtime_authorization_epochs epoch
-                   WHERE epoch.session_id = command.session_id
-                     AND epoch.generation = command.runtime_authorization_generation
-                     AND epoch.runtime_assignment_id = command.runtime_assignment_id
-                     AND epoch.runtime_assignment_generation = command.runtime_assignment_generation
-                     AND epoch.sandbox_id = command.sandbox_id
-                     AND epoch.sandbox_generation = command.sandbox_generation
-                     AND epoch.runtime_principal_id = command.runtime_principal_id
-                 )
-                 AND dispatch.status = 'awaiting-receipt'
-             )
+             AND (${this.awaitingReceiptPredicate()})
            ORDER BY stream.available_at_ms ASC, stream.created_at_ms ASC,
                     stream.runtime_assignment_id ASC
            LIMIT 1`
@@ -466,17 +493,7 @@ export class SqliteRuntimeReceiptFollowJournal {
            WHERE runtime_assignment_id = ? AND runtime_authorization_generation = ?
              AND status = 'processing' AND lease_owner = ? AND lease_version = ?
              AND lease_expires_at_ms = ? AND lease_expires_at_ms > ?
-             AND EXISTS (
-               SELECT 1 FROM runtime_assignments assignment
-               JOIN sessions session ON session.id = assignment.session_id
-               WHERE assignment.id = stream.runtime_assignment_id
-                 AND assignment.status = 'ready'
-                 AND assignment.runtime_authorization_generation =
-                     stream.runtime_authorization_generation
-                 AND session.runtime_authorization_generation =
-                     stream.runtime_authorization_generation
-                 AND session.runtime_authorization_state = 'enforced'
-             )`
+             AND (${this.awaitingReceiptPredicate()})`
         )
         .run(
           leaseExpiresAtMs,
@@ -540,7 +557,10 @@ export class SqliteRuntimeReceiptFollowJournal {
       const settle = this.db.transaction(() => this.settleInTransaction(options));
       outcome = runImmediate(settle);
     } catch (error) {
-      if (error instanceof RuntimeReceiptObservationError) {
+      if (
+        error instanceof RuntimeReceiptObservationError ||
+        error instanceof RuntimeCompensationReceiptObservationError
+      ) {
         this.containRejectedObservation(options, error.code);
         fail("invalid_observation");
       }
@@ -563,7 +583,17 @@ export class SqliteRuntimeReceiptFollowJournal {
   ): RuntimeReceiptFollowCommitResult | RuntimeReceiptFollowContainmentResult {
     if (!this.db.inTransaction) fail("journal_conflict");
     const stream = this.exactLeasedStream(options);
-    const commandId = observationCommandId(options.observation);
+    const reference = observationReference(options.observation);
+    return reference.kind === "lifecycle"
+      ? this.settleLifecycleObservationInTransaction(stream, reference.commandId, options)
+      : this.settleCompensationObservationInTransaction(stream, reference.commandId, options);
+  }
+
+  private settleLifecycleObservationInTransaction(
+    stream: FollowStreamRow,
+    commandId: string,
+    options: ReturnType<typeof snapshotSettlementOptions>
+  ): RuntimeReceiptFollowCommitResult | RuntimeReceiptFollowContainmentResult {
     const commandRow = this.db
       .prepare(
         `SELECT command.*
@@ -703,6 +733,190 @@ export class SqliteRuntimeReceiptFollowJournal {
         observation.observedAtMs,
         options.receivedAtMs
       );
+    this.advanceFollowStream(observation, receiptSequence, options);
+    return Object.freeze({ kind: "settled", result: settlement });
+  }
+
+  private settleCompensationObservationInTransaction(
+    stream: FollowStreamRow,
+    commandId: string,
+    options: ReturnType<typeof snapshotSettlementOptions>
+  ): RuntimeReceiptFollowCommitResult | RuntimeReceiptFollowContainmentResult {
+    const commandRow = this.db
+      .prepare(
+        `SELECT command.*
+         FROM runtime_compensation_commands command
+         JOIN runtime_compensation_dispatch dispatch
+           ON dispatch.compensation_command_id = command.id
+         JOIN runtime_compensation_incidents incident
+           ON incident.compensation_id = command.compensation_id
+          AND incident.source_command_id = command.source_command_id
+         JOIN runtime_run_command_dispatch source_dispatch
+           ON source_dispatch.command_id = command.source_command_id
+         WHERE command.id = ? AND dispatch.status = 'awaiting-receipt'
+           AND incident.trust_state = 'verified'
+           AND source_dispatch.status = 'compensating'
+           AND command.session_id = ?
+           AND command.team_id = ? AND command.project_id = ?
+           AND command.runtime_assignment_id = ?
+           AND command.runtime_assignment_generation = ?
+           AND command.sandbox_id = ? AND command.sandbox_generation = ?
+           AND command.runtime_principal_id = ?
+           AND command.observed_runtime_authorization_generation = ?`
+      )
+      .get(
+        commandId,
+        stream.session_id,
+        stream.team_id,
+        stream.project_id,
+        stream.runtime_assignment_id,
+        stream.runtime_assignment_generation,
+        stream.sandbox_id,
+        stream.sandbox_generation,
+        stream.runtime_principal_id,
+        stream.runtime_authorization_generation
+      ) as CompensationCommandRow | undefined;
+    if (!commandRow || !this.settleVerifiedCompensationReceiptInTransaction) {
+      fail("invalid_observation");
+    }
+    const command = parsePersistedCompensationCommand(commandRow, bindingFor(stream));
+    const verifier = createRuntimeCompensationReceiptObservationVerifier({
+      pinnedPublicKeys: [
+        {
+          issuerKeyId: stream.issuer_key_id,
+          binding: bindingFor(stream),
+          publicKeyPem: stream.public_key_spki_pem,
+        },
+      ],
+    });
+    let observation: VerifiedRuntimeCompensationReceiptObservation;
+    try {
+      observation = verifier.verify({
+        observation: options.observation,
+        command,
+        expectedPrevious: checkpointFor(stream),
+        nowMs: options.receivedAtMs,
+      });
+    } catch (error) {
+      if (
+        error instanceof RuntimeCompensationReceiptObservationError &&
+        error.code === "invalid_receipt"
+      ) {
+        return this.containCompensationEnforcementProofFailureInTransaction(
+          stream,
+          commandRow,
+          options,
+          "enforcement_proof_verification_failed"
+        );
+      }
+      throw error;
+    }
+    if (
+      runtimeReceiptObservationCursorCodePoints(observation.cursor) >
+      RUNTIME_RECEIPT_OBSERVATION_MAX_CURSOR_CODE_POINTS
+    ) {
+      fail("invalid_observation");
+    }
+
+    let settlement: RuntimeReceiptFollowSettlementResult;
+    try {
+      settlement = snapshotSettlementResult(
+        this.settleVerifiedCompensationReceiptInTransaction(
+          Object.freeze({
+            observation,
+            command,
+            receivedAtMs: options.receivedAtMs,
+            actorRef: options.workerId,
+          })
+        )
+      );
+    } catch (error) {
+      if (error instanceof RuntimeCompensationReceiptFollowSettlementRejection) {
+        return this.containCompensationEnforcementProofFailureInTransaction(
+          stream,
+          commandRow,
+          options,
+          error.code
+        );
+      }
+      if (
+        error instanceof RuntimeCompensationReceiptObservationError ||
+        error instanceof RuntimeReceiptFollowJournalError
+      ) {
+        throw error;
+      }
+      fail("journal_conflict");
+    }
+    if (!this.db.inTransaction) fail("journal_conflict");
+    const durableReceipt = this.db
+      .prepare(
+        `SELECT 1 FROM runtime_compensation_receipts
+         WHERE id = ? AND compensation_command_id = ?
+           AND compensation_id = ? AND source_command_id = ? AND receipt_digest = ?`
+      )
+      .get(
+        settlement.receiptId,
+        command.commandId,
+        command.compensationId,
+        command.source.lifecycleCommandId,
+        settlement.effectiveReceiptDigest
+      );
+    if (!durableReceipt) fail("journal_conflict");
+
+    const receiptSequence = safeAdd(stream.receipt_sequence, 1);
+    this.db
+      .prepare(
+        `INSERT INTO runtime_compensation_follow_events
+           (id, runtime_assignment_id, session_id, runtime_assignment_generation,
+            sandbox_id, sandbox_generation, runtime_principal_id,
+            runtime_authorization_generation, issuer_key_id, public_key_spki_digest,
+            receipt_sequence, cursor, previous_cursor, previous_observation_digest,
+            observation_digest, compensation_command_id, compensation_id,
+            source_command_id, command_digest, receipt_id, wire_receipt_digest,
+            effective_receipt_digest, signature, lease_owner, lease_version,
+            observed_at_ms, received_at_ms)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        observation.observationId,
+        stream.runtime_assignment_id,
+        stream.session_id,
+        stream.runtime_assignment_generation,
+        stream.sandbox_id,
+        stream.sandbox_generation,
+        stream.runtime_principal_id,
+        stream.runtime_authorization_generation,
+        stream.issuer_key_id,
+        stream.public_key_spki_digest,
+        receiptSequence,
+        observation.cursor,
+        observation.previous?.cursor ?? null,
+        observation.previous?.observationDigest ?? null,
+        observation.observationDigest,
+        command.commandId,
+        command.compensationId,
+        command.source.lifecycleCommandId,
+        commandRow.command_digest,
+        settlement.receiptId,
+        observation.receiptDigest,
+        settlement.effectiveReceiptDigest,
+        observation.authority.signature,
+        options.workerId,
+        options.expectedLeaseVersion,
+        observation.observedAtMs,
+        options.receivedAtMs
+      );
+    this.advanceFollowStream(observation, receiptSequence, options);
+    return Object.freeze({ kind: "settled", result: settlement });
+  }
+
+  private advanceFollowStream(
+    observation:
+      | VerifiedRuntimeLifecycleReceiptObservation
+      | VerifiedRuntimeCompensationReceiptObservation,
+    receiptSequence: number,
+    options: ReturnType<typeof snapshotSettlementOptions>
+  ): void {
     const availableAtMs = safeAdd(options.receivedAtMs, this.retryDelayMs);
     const advanced = this.db
       .prepare(
@@ -728,7 +942,6 @@ export class SqliteRuntimeReceiptFollowJournal {
         options.receivedAtMs
       );
     if (advanced.changes !== 1) fail("stale_lease");
-    return Object.freeze({ kind: "settled", result: settlement });
   }
 
   private exactLeasedStream(
@@ -769,6 +982,83 @@ export class SqliteRuntimeReceiptFollowJournal {
     if (!this.db.inTransaction) fail("journal_conflict");
     try {
       return this.applyEnforcementProofContainment(stream, command, options, safeCode);
+    } catch (error) {
+      if (error instanceof RuntimeReceiptFollowJournalError) throw error;
+      fail("journal_conflict");
+    }
+  }
+
+  /**
+   * Historical compensation containment is deliberately stream-local. The
+   * exact compensation work remains awaiting a later trusted receipt, while
+   * replacement assignment and Session authorization state are untouched.
+   */
+  private containCompensationEnforcementProofFailureInTransaction(
+    stream: FollowStreamRow,
+    command: CompensationCommandRow,
+    options: ReturnType<typeof snapshotSettlementOptions>,
+    safeCode: RuntimeReceiptFollowSettlementRejectionCode
+  ): RuntimeReceiptFollowContainmentResult {
+    if (!this.db.inTransaction) fail("journal_conflict");
+    try {
+      const dispatch = this.db
+        .prepare(
+          `UPDATE runtime_compensation_dispatch AS dispatch
+           SET status = 'awaiting-receipt', available_at_ms = MAX(available_at_ms, ?),
+               lease_owner = NULL, lease_expires_at_ms = NULL,
+               last_safe_error_code = ?, updated_at_ms = ?
+           WHERE compensation_command_id = ? AND compensation_id = ?
+             AND source_command_id = ? AND status = 'awaiting-receipt'
+             AND lease_owner IS NULL AND lease_expires_at_ms IS NULL
+             AND EXISTS (
+               SELECT 1
+               FROM runtime_compensation_incidents incident
+               JOIN runtime_run_command_dispatch source_dispatch
+                 ON source_dispatch.command_id = incident.source_command_id
+               WHERE incident.compensation_id = dispatch.compensation_id
+                 AND incident.source_command_id = dispatch.source_command_id
+                 AND incident.trust_state = 'verified'
+                 AND source_dispatch.status = 'compensating'
+             )`
+        )
+        .run(
+          options.receivedAtMs,
+          safeCode,
+          options.receivedAtMs,
+          command.id,
+          command.compensation_id,
+          command.source_command_id
+        );
+      if (dispatch.changes !== 1) fail("journal_conflict");
+
+      const follow = this.db
+        .prepare(
+          `UPDATE runtime_receipt_follow_streams
+           SET status = 'quarantined', lease_owner = NULL, lease_expires_at_ms = NULL,
+               last_safe_error_code = ?, updated_at_ms = ?
+           WHERE runtime_assignment_id = ? AND runtime_authorization_generation = ?
+             AND session_id = ? AND runtime_assignment_generation = ?
+             AND sandbox_id = ? AND sandbox_generation = ? AND runtime_principal_id = ?
+             AND status = 'processing' AND lease_owner = ? AND lease_version = ?
+             AND lease_expires_at_ms = ? AND lease_expires_at_ms > ?`
+        )
+        .run(
+          safeCode,
+          options.receivedAtMs,
+          stream.runtime_assignment_id,
+          stream.runtime_authorization_generation,
+          stream.session_id,
+          stream.runtime_assignment_generation,
+          stream.sandbox_id,
+          stream.sandbox_generation,
+          stream.runtime_principal_id,
+          options.workerId,
+          options.expectedLeaseVersion,
+          options.expectedLeaseExpiresAtMs,
+          options.receivedAtMs
+        );
+      if (follow.changes !== 1) fail("stale_lease");
+      return Object.freeze({ kind: "contained", code: safeCode });
     } catch (error) {
       if (error instanceof RuntimeReceiptFollowJournalError) throw error;
       fail("journal_conflict");
@@ -1072,10 +1362,101 @@ export class SqliteRuntimeReceiptFollowJournal {
     );
   }
 
+  private awaitingReceiptPredicate(): string {
+    return this.settleVerifiedCompensationReceiptInTransaction === undefined
+      ? FOLLOW_STREAM_HAS_CURRENT_LIFECYCLE_RECEIPT
+      : FOLLOW_STREAM_HAS_AWAITING_RECEIPT;
+  }
+
   private nextId(): string {
     return safeIdentifier(this.idGenerator(), MAX_IDENTIFIER_LENGTH, "journal_conflict");
   }
 }
+
+const FOLLOW_STREAM_HAS_CURRENT_LIFECYCLE_RECEIPT = `EXISTS (
+  SELECT 1
+  FROM runtime_assignments current_assignment
+  JOIN sessions current_session ON current_session.id = current_assignment.session_id
+  JOIN runtime_run_commands command
+    ON command.session_id = current_assignment.session_id
+   AND command.runtime_assignment_id = current_assignment.id
+   AND command.runtime_assignment_generation = current_assignment.generation
+   AND command.sandbox_id = current_assignment.sandbox_id
+   AND command.sandbox_generation = current_assignment.sandbox_generation
+   AND command.runtime_principal_id = current_assignment.runtime_principal_id
+  JOIN runtime_run_command_dispatch dispatch ON dispatch.command_id = command.id
+  JOIN runtime_authorization_epochs epoch
+    ON epoch.session_id = command.session_id
+   AND epoch.generation = command.runtime_authorization_generation
+   AND epoch.runtime_assignment_id = command.runtime_assignment_id
+   AND epoch.runtime_assignment_generation = command.runtime_assignment_generation
+   AND epoch.sandbox_id = command.sandbox_id
+   AND epoch.sandbox_generation = command.sandbox_generation
+   AND epoch.runtime_principal_id = command.runtime_principal_id
+  WHERE current_assignment.id = stream.runtime_assignment_id
+    AND current_assignment.session_id = stream.session_id
+    AND current_assignment.generation = stream.runtime_assignment_generation
+    AND current_assignment.sandbox_id = stream.sandbox_id
+    AND current_assignment.sandbox_generation = stream.sandbox_generation
+    AND current_assignment.runtime_principal_id = stream.runtime_principal_id
+    AND current_assignment.runtime_authorization_generation =
+      stream.runtime_authorization_generation
+    AND current_assignment.status = 'ready'
+    AND current_session.status <> 'ended'
+    AND current_session.runtime_authorization_generation =
+      stream.runtime_authorization_generation
+    AND current_session.runtime_authorization_state = 'enforced'
+    AND command.runtime_authorization_generation = stream.runtime_authorization_generation
+    AND command.required_effect_enforcer_set_digest IS NOT NULL
+    AND command.required_effect_enforcer_set_digest = epoch.effect_enforcer_set_digest
+    AND dispatch.status = 'awaiting-receipt'
+)`;
+
+const FOLLOW_STREAM_HAS_HISTORICAL_COMPENSATION_RECEIPT = `EXISTS (
+  SELECT 1
+  FROM runtime_assignments historical_assignment
+  JOIN runtime_compensation_commands command
+    ON command.session_id = historical_assignment.session_id
+   AND command.team_id = historical_assignment.team_id
+   AND command.project_id = historical_assignment.project_id
+   AND command.runtime_assignment_id = historical_assignment.id
+   AND command.runtime_assignment_generation = historical_assignment.generation
+   AND command.sandbox_id = historical_assignment.sandbox_id
+   AND command.sandbox_generation = historical_assignment.sandbox_generation
+   AND command.runtime_principal_id = historical_assignment.runtime_principal_id
+  JOIN runtime_compensation_dispatch dispatch
+    ON dispatch.compensation_command_id = command.id
+  JOIN runtime_compensation_incidents incident
+    ON incident.compensation_id = command.compensation_id
+   AND incident.source_command_id = command.source_command_id
+  JOIN runtime_run_command_dispatch source_dispatch
+    ON source_dispatch.command_id = command.source_command_id
+  WHERE historical_assignment.id = stream.runtime_assignment_id
+    AND historical_assignment.session_id = stream.session_id
+    AND historical_assignment.generation = stream.runtime_assignment_generation
+    AND historical_assignment.sandbox_id = stream.sandbox_id
+    AND historical_assignment.sandbox_generation = stream.sandbox_generation
+    AND historical_assignment.runtime_principal_id = stream.runtime_principal_id
+    AND command.observed_runtime_authorization_generation =
+      stream.runtime_authorization_generation
+    AND incident.trust_state = 'verified'
+    AND incident.session_id = stream.session_id
+    AND incident.team_id = historical_assignment.team_id
+    AND incident.project_id = historical_assignment.project_id
+    AND incident.runtime_assignment_id = stream.runtime_assignment_id
+    AND incident.runtime_assignment_generation = stream.runtime_assignment_generation
+    AND incident.sandbox_id = stream.sandbox_id
+    AND incident.sandbox_generation = stream.sandbox_generation
+    AND incident.runtime_principal_id = stream.runtime_principal_id
+    AND incident.runtime_authorization_generation = stream.runtime_authorization_generation
+    AND dispatch.status = 'awaiting-receipt'
+    AND source_dispatch.status = 'compensating'
+)`;
+
+const FOLLOW_STREAM_HAS_AWAITING_RECEIPT = `
+  (${FOLLOW_STREAM_HAS_CURRENT_LIFECYCLE_RECEIPT}) OR
+  (${FOLLOW_STREAM_HAS_HISTORICAL_COMPENSATION_RECEIPT})
+`;
 
 const FOLLOW_STREAM_SELECT = `
   SELECT stream.*, key.public_key_spki_pem,
@@ -1092,8 +1473,7 @@ const FOLLOW_STREAM_SELECT = `
    AND assignment.generation = stream.runtime_assignment_generation
    AND assignment.sandbox_id = stream.sandbox_id
    AND assignment.sandbox_generation = stream.sandbox_generation
-   AND assignment.runtime_principal_id = stream.runtime_principal_id
-  JOIN sessions session ON session.id = stream.session_id`;
+   AND assignment.runtime_principal_id = stream.runtime_principal_id`;
 
 export function createSqliteRuntimeReceiptFollowJournal(
   options: CreateSqliteRuntimeReceiptFollowJournalOptions
@@ -1312,17 +1692,97 @@ function parsePersistedCommand(row: CommandRow, expectedBinding: RuntimeBinding)
   return deepFreeze(command);
 }
 
-function observationCommandId(value: unknown): string {
+function parsePersistedCompensationCommand(
+  row: CompensationCommandRow,
+  expectedBinding: RuntimeBinding
+): RuntimeCompensationCommand {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(row.command_json);
+  } catch {
+    fail("invalid_observation");
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    fail("invalid_observation");
+  }
+  const command = parsed as RuntimeCompensationCommand;
+  let canonical: string;
+  let claimsDigest: string;
+  try {
+    canonical = canonicalRuntimeJson(command);
+    claimsDigest = digestRuntimeCommandClaims(command);
+  } catch {
+    fail("invalid_observation");
+  }
+  if (
+    canonical !== row.command_json ||
+    sha256(canonical) !== row.command_digest ||
+    command.kind !== "safety.quarantine" ||
+    row.operation !== command.kind ||
+    command.commandId !== row.id ||
+    command.compensationId !== row.compensation_id ||
+    command.source?.lifecycleCommandId !== row.source_command_id ||
+    command.binding === undefined ||
+    !sameBinding(command.binding, expectedBinding) ||
+    command.binding.teamId !== row.team_id ||
+    command.binding.projectId !== row.project_id ||
+    command.binding.sessionId !== row.session_id ||
+    command.binding.runtimeAssignmentId !== row.runtime_assignment_id ||
+    command.binding.runtimeAssignmentGeneration !== row.runtime_assignment_generation ||
+    command.binding.sandboxId !== row.sandbox_id ||
+    command.binding.sandboxGeneration !== row.sandbox_generation ||
+    command.binding.runtimePrincipalId !== row.runtime_principal_id ||
+    command.observedRuntimeAuthorizationGeneration !==
+      row.observed_runtime_authorization_generation ||
+    command.source.sourceRequiredEffectEnforcerSetDigest !==
+      row.source_required_effect_enforcer_set_digest ||
+    command.source.lifecycleCommandClaimsDigest !== row.lifecycle_command_claims_digest ||
+    command.source.lifecycleReceiptDigest !== row.lifecycle_receipt_digest ||
+    command.source.lifecycleEnforcementSubjectDigest !== row.lifecycle_enforcement_subject_digest ||
+    command.source.lifecycleAggregateProofDigest !== row.lifecycle_aggregate_proof_digest ||
+    command.platformSecurityPolicyRevision !== row.platform_security_policy_revision ||
+    command.requiredContainmentEnforcerSetDigest !== row.required_containment_enforcer_set_digest ||
+    command.safetyFence !== row.safety_fence ||
+    command.reasonRef !== row.reason_ref ||
+    command.causationId !== row.causation_id ||
+    command.issuedAtMs !== row.created_at_ms ||
+    command.deadlineAtMs !== row.deadline_at_ms ||
+    command.authority?.claimsDigest !== row.authority_digest ||
+    claimsDigest !== row.authority_digest ||
+    row.authority_verified_at_ms < command.issuedAtMs ||
+    row.authority_verified_at_ms >= command.deadlineAtMs ||
+    row.authority_verified_at_ms < command.authority.issuedAtMs ||
+    row.authority_verified_at_ms >= command.authority.expiresAtMs
+  ) {
+    fail("invalid_observation");
+  }
+  return deepFreeze(command);
+}
+
+function observationReference(value: unknown): {
+  readonly kind: "lifecycle" | "compensation";
+  readonly commandId: string;
+} {
   const observation = plainRecord(value, "invalid_observation");
+  const unsafeKind = dataField(observation, "kind", "invalid_observation");
+  const kind =
+    unsafeKind === "runtime.lifecycle-receipt-observed"
+      ? "lifecycle"
+      : unsafeKind === "runtime.compensation-receipt-observed"
+        ? "compensation"
+        : fail("invalid_observation");
   const command = plainRecord(
     dataField(observation, "command", "invalid_observation"),
     "invalid_observation"
   );
-  return safeIdentifier(
-    dataField(command, "commandId", "invalid_observation"),
-    MAX_IDENTIFIER_LENGTH,
-    "invalid_observation"
-  );
+  return Object.freeze({
+    kind,
+    commandId: safeIdentifier(
+      dataField(command, "commandId", "invalid_observation"),
+      MAX_IDENTIFIER_LENGTH,
+      "invalid_observation"
+    ),
+  });
 }
 
 function canonicalEd25519PublicKey(pem: string): { pem: string; digest: string } {
@@ -1560,7 +2020,8 @@ function runImmediate<T>(transaction: { immediate(): T }): T {
   } catch (error) {
     if (
       error instanceof RuntimeReceiptFollowJournalError ||
-      error instanceof RuntimeReceiptObservationError
+      error instanceof RuntimeReceiptObservationError ||
+      error instanceof RuntimeCompensationReceiptObservationError
     ) {
       throw error;
     }

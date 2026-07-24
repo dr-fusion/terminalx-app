@@ -12,8 +12,13 @@ import {
 import {
   RuntimeCommandExecutionError,
   snapshotRuntimeReceiptForCommand,
+  verifyPersistedRuntimeReceiptEnforcementProofSynchronously,
   verifyRuntimeReceiptEnforcementProofSynchronously,
 } from "../runtime/runtime-command-execution";
+import {
+  digestRuntimeCompensationIncident,
+  snapshotRuntimeCompensationIncident,
+} from "../runtime/runtime-compensation-incident";
 import {
   commitRuntimeEffectRef,
   type SynchronousRuntimeEnforcementProofVerifier,
@@ -43,6 +48,8 @@ const MAX_SAFE_ERROR_CODE_LENGTH = 200;
 const SHA256_DIGEST = /^[0-9a-f]{64}$/;
 const DEFAULT_RETRY_DELAY_MS = 1_000;
 const MAX_RETRY_DELAY_MS = 60_000;
+const MAX_SAFE_FENCE = Number.MAX_SAFE_INTEGER;
+const RUNTIME_COMPENSATION_ID_DOMAIN = "terminalx/runtime-compensation-id/v1\0" as const;
 
 /**
  * Complete persisted trust fence for a lifecycle command immediately before
@@ -245,6 +252,30 @@ interface CompletionRow extends CommandJournalRow {
   run_lifecycle: string;
   run_state_version: number;
   session_run_state_revision: number;
+}
+
+interface StaleIncidentSourceRow extends CommandJournalRow {
+  team_id: string;
+  project_id: string;
+  source_receipt_id: string;
+  receipt_json: string;
+  receipt_digest: string;
+  receipt_received_at_ms: number;
+  receipt_required_effect_enforcer_set_digest: string;
+  receipt_enforcement_subject_digest: string;
+  receipt_aggregate_proof_digest: string;
+  receipt_proof_verified_at_ms: number;
+}
+
+interface SafetyFenceHighWaterRow extends SqlRow {
+  allocated_fence: number;
+  control_epoch: number;
+  steering_revision: number;
+  runtime_authorization_generation: number;
+  maximum_run_state_version: number;
+  maximum_issued_lifecycle_fence: number;
+  maximum_enforced_lifecycle_fence: number;
+  maximum_incident_fence: number;
 }
 
 type ReceiptSettlementFence =
@@ -1046,14 +1077,32 @@ export class SqliteRuntimeLifecycleJournal implements RuntimeLifecycleJournal {
     receiptId: string
   ): void {
     if (!this.commandStillCurrent(row)) {
-      this.invalidateRunGrants(row.agent_run_id, settlement.observedAtMs, "runtime-authorization");
+      const incident = this.recordVerifiedStaleLifecycleIncidentInTransaction({
+        row,
+        sourceReceiptId: receiptId,
+      });
+      const invalidatedGrantCount = this.invalidateRunGrants(
+        row.agent_run_id,
+        settlement.observedAtMs,
+        "runtime-authorization"
+      );
       this.db
         .prepare(
           `UPDATE runtime_assignments SET status = 'quarantined'
-           WHERE id = ? AND session_id = ?
+           WHERE id = ? AND session_id = ? AND generation = ?
+             AND sandbox_id = ? AND sandbox_generation = ? AND runtime_principal_id = ?
+             AND runtime_authorization_generation = ?
              AND status IN ('provisioning', 'ready', 'checkpointing', 'recovering')`
         )
-        .run(row.runtime_assignment_id, row.session_id);
+        .run(
+          row.runtime_assignment_id,
+          row.session_id,
+          row.runtime_assignment_generation,
+          row.sandbox_id,
+          row.sandbox_generation,
+          row.runtime_principal_id,
+          row.runtime_authorization_generation
+        );
       this.db
         .prepare(
           `UPDATE sessions SET runtime_authorization_state = 'quarantined'
@@ -1071,6 +1120,11 @@ export class SqliteRuntimeLifecycleJournal implements RuntimeLifecycleJournal {
           operation: row.operation,
           observedOutcome: "enforced",
           stateVersion: row.run_state_version,
+          compensationId: incident.compensationId,
+          incidentDigest: incident.incidentDigest,
+          safetyFence: incident.safetyFence,
+          sourceReceiptDigest: incident.lifecycleReceiptDigest,
+          invalidatedGrantCount,
         }
       );
       this.markDispatchCompensating(row, settlement);
@@ -1487,6 +1541,275 @@ export class SqliteRuntimeLifecycleJournal implements RuntimeLifecycleJournal {
     return positiveInteger(updated.run_state_revision);
   }
 
+  /**
+   * Persist the one unsigned, proof-backed incident that justifies stale-effect
+   * containment. This method is deliberately synchronous and reads every
+   * security field back from the durable command/receipt rows.
+   */
+  private recordVerifiedStaleLifecycleIncidentInTransaction(input: {
+    readonly row: CompletionRow;
+    readonly sourceReceiptId: string;
+  }): {
+    readonly compensationId: string;
+    readonly incidentDigest: string;
+    readonly safetyFence: number;
+    readonly lifecycleReceiptDigest: string;
+  } {
+    if (!this.db.inTransaction || this.commandStillCurrent(input.row)) fail("journal_conflict");
+    const sourceReceiptId = safeIdentifier(input.sourceReceiptId, MAX_IDENTIFIER_LENGTH);
+    const source = this.db
+      .prepare(
+        `SELECT command.*, assignment.team_id, assignment.project_id,
+                receipt.id AS source_receipt_id,
+                receipt.receipt_json, receipt.receipt_digest,
+                receipt.received_at_ms AS receipt_received_at_ms,
+                receipt.required_effect_enforcer_set_digest AS
+                  receipt_required_effect_enforcer_set_digest,
+                receipt.enforcement_subject_digest AS receipt_enforcement_subject_digest,
+                receipt.aggregate_proof_digest AS receipt_aggregate_proof_digest,
+                receipt.proof_verified_at_ms AS receipt_proof_verified_at_ms
+         FROM runtime_run_commands command
+         JOIN runtime_assignments assignment
+           ON assignment.id = command.runtime_assignment_id
+          AND assignment.session_id = command.session_id
+         JOIN runtime_run_command_receipts receipt
+           ON receipt.command_id = command.id
+         WHERE command.id = ? AND receipt.id = ?
+           AND (receipt.outcome = 'enforced' OR
+             (receipt.outcome = 'duplicate' AND receipt.original_outcome = 'enforced'))
+           AND NOT EXISTS (
+             SELECT 1 FROM runtime_run_command_effects effect
+             WHERE effect.command_id = command.id
+           )`
+      )
+      .get(input.row.id, sourceReceiptId) as StaleIncidentSourceRow | undefined;
+    if (!source) fail("journal_conflict");
+
+    const command = parsePersistedCommand(source);
+    let persistedReceipt: RuntimeReceipt;
+    try {
+      persistedReceipt = JSON.parse(source.receipt_json) as RuntimeReceipt;
+      verifyPersistedRuntimeReceiptEnforcementProofSynchronously(
+        command,
+        persistedReceipt,
+        this.verifyEnforcementProof
+      );
+    } catch {
+      fail("journal_conflict");
+    }
+    const effective =
+      persistedReceipt.outcome === "duplicate"
+        ? persistedReceipt.originalReceipt
+        : persistedReceipt;
+    if (effective.outcome !== "enforced" || !effective.aggregateEnforcementProof) {
+      fail("journal_conflict");
+    }
+    const proof = effective.aggregateEnforcementProof;
+    const sourceRequiredEffectEnforcerSetDigest = sha256Digest(
+      source.required_effect_enforcer_set_digest
+    );
+    const lifecycleReceiptDigest = sha256Digest(source.receipt_digest);
+    const lifecycleEnforcementSubjectDigest = sha256Digest(
+      source.receipt_enforcement_subject_digest
+    );
+    const lifecycleAggregateProofDigest = sha256Digest(source.receipt_aggregate_proof_digest);
+    const sourceProofVerifiedAtMs = nonNegativeInteger(source.receipt_proof_verified_at_ms);
+    const createdAtMs = nonNegativeInteger(source.receipt_received_at_ms);
+    const sourceEnforcedFence = positiveInteger(effective.enforcedFence);
+    if (
+      proof.requiredEffectEnforcerSetDigest !== sourceRequiredEffectEnforcerSetDigest ||
+      proof.enforcementSubjectDigest !== lifecycleEnforcementSubjectDigest ||
+      proof.aggregateProofDigest !== lifecycleAggregateProofDigest ||
+      sourceProofVerifiedAtMs > createdAtMs
+    ) {
+      fail("journal_conflict");
+    }
+
+    const highWater = this.db
+      .prepare(
+        `SELECT safety.allocated_fence, session.control_epoch, session.steering_revision,
+                session.runtime_authorization_generation,
+                COALESCE((
+                  SELECT MAX(run.state_version) FROM agent_runs run
+                  WHERE run.session_id = safety.session_id
+                    AND run.runtime_assignment_id = safety.runtime_assignment_id
+                ), 1) AS maximum_run_state_version,
+                COALESCE((
+                  SELECT MAX(candidate.target_run_state_version)
+                  FROM runtime_run_commands candidate
+                  WHERE candidate.session_id = safety.session_id
+                    AND candidate.runtime_assignment_id = safety.runtime_assignment_id
+                    AND candidate.runtime_assignment_generation =
+                      safety.runtime_assignment_generation
+                    AND candidate.sandbox_id = safety.sandbox_id
+                    AND candidate.sandbox_generation = safety.sandbox_generation
+                    AND candidate.runtime_principal_id = safety.runtime_principal_id
+                ), 1) AS maximum_issued_lifecycle_fence,
+                COALESCE((
+                  SELECT MAX(json_extract(
+                    candidate_receipt.receipt_json,
+                    CASE WHEN candidate_receipt.outcome = 'duplicate'
+                      THEN '$.originalReceipt.enforcedFence' ELSE '$.enforcedFence' END
+                  ))
+                  FROM runtime_run_command_receipts candidate_receipt
+                  JOIN runtime_run_commands candidate_command
+                    ON candidate_command.id = candidate_receipt.command_id
+                  WHERE candidate_command.session_id = safety.session_id
+                    AND candidate_command.runtime_assignment_id = safety.runtime_assignment_id
+                    AND candidate_command.runtime_assignment_generation =
+                      safety.runtime_assignment_generation
+                    AND candidate_command.sandbox_id = safety.sandbox_id
+                    AND candidate_command.sandbox_generation = safety.sandbox_generation
+                    AND candidate_command.runtime_principal_id = safety.runtime_principal_id
+                    AND (candidate_receipt.outcome = 'enforced' OR
+                      (candidate_receipt.outcome = 'duplicate'
+                        AND candidate_receipt.original_outcome = 'enforced'))
+                ), 1) AS maximum_enforced_lifecycle_fence,
+                COALESCE((
+                  SELECT MAX(incident.safety_fence)
+                  FROM runtime_compensation_incidents incident
+                  WHERE incident.team_id = safety.team_id
+                    AND incident.project_id = safety.project_id
+                    AND incident.session_id = safety.session_id
+                    AND incident.runtime_assignment_id = safety.runtime_assignment_id
+                    AND incident.runtime_assignment_generation =
+                      safety.runtime_assignment_generation
+                    AND incident.sandbox_id = safety.sandbox_id
+                    AND incident.sandbox_generation = safety.sandbox_generation
+                    AND incident.runtime_principal_id = safety.runtime_principal_id
+                ), 1) AS maximum_incident_fence
+         FROM runtime_binding_safety_fences safety
+         JOIN sessions session ON session.id = safety.session_id
+         WHERE safety.team_id = ? AND safety.project_id = ? AND safety.session_id = ?
+           AND safety.runtime_assignment_id = ?
+           AND safety.runtime_assignment_generation = ?
+           AND safety.sandbox_id = ? AND safety.sandbox_generation = ?
+           AND safety.runtime_principal_id = ?`
+      )
+      .get(
+        source.team_id,
+        source.project_id,
+        source.session_id,
+        source.runtime_assignment_id,
+        source.runtime_assignment_generation,
+        source.sandbox_id,
+        source.sandbox_generation,
+        source.runtime_principal_id
+      ) as SafetyFenceHighWaterRow | undefined;
+    if (!highWater) fail("journal_conflict");
+    const allocatedFence = positiveInteger(highWater.allocated_fence);
+    const durableHighWater = Math.max(
+      allocatedFence,
+      positiveInteger(highWater.control_epoch),
+      positiveInteger(highWater.steering_revision),
+      positiveInteger(highWater.runtime_authorization_generation),
+      positiveInteger(highWater.maximum_run_state_version),
+      positiveInteger(highWater.maximum_issued_lifecycle_fence),
+      positiveInteger(highWater.maximum_enforced_lifecycle_fence),
+      positiveInteger(highWater.maximum_incident_fence),
+      sourceEnforcedFence
+    );
+    if (durableHighWater >= MAX_SAFE_FENCE) fail("journal_conflict");
+    const safetyFence = durableHighWater + 1;
+    const advanced = this.db
+      .prepare(
+        `UPDATE runtime_binding_safety_fences
+         SET allocated_fence = ?, updated_at_ms = MAX(updated_at_ms, ?)
+         WHERE team_id = ? AND project_id = ? AND session_id = ?
+           AND runtime_assignment_id = ? AND runtime_assignment_generation = ?
+           AND sandbox_id = ? AND sandbox_generation = ? AND runtime_principal_id = ?
+           AND allocated_fence = ?`
+      )
+      .run(
+        safetyFence,
+        createdAtMs,
+        source.team_id,
+        source.project_id,
+        source.session_id,
+        source.runtime_assignment_id,
+        source.runtime_assignment_generation,
+        source.sandbox_id,
+        source.sandbox_generation,
+        source.runtime_principal_id,
+        allocatedFence
+      );
+    if (advanced.changes !== 1) fail("journal_conflict");
+
+    const compensationId = deterministicCompensationId(source.id, sourceReceiptId);
+    const incident = snapshotRuntimeCompensationIncident({
+      version: 1,
+      compensationId,
+      sourceCommandId: source.id,
+      sourceReceiptId,
+      trustState: "verified",
+      binding: command.binding,
+      observedRuntimeAuthorizationGeneration: source.runtime_authorization_generation,
+      lifecycleCommandClaimsDigest: sha256Digest(source.authority_digest),
+      lifecycleReceiptDigest,
+      sourceEnforcedFence,
+      safetyFence,
+      sourceRequiredEffectEnforcerSetDigest,
+      lifecycleEnforcementSubjectDigest,
+      lifecycleAggregateProofDigest,
+      sourceEffectRefCommitment: effective.effectRef,
+      createdAtMs,
+    });
+    const incidentDigest = digestRuntimeCompensationIncident(incident);
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO runtime_compensation_incidents (
+             compensation_id, incident_digest, source_command_id, source_receipt_id, trust_state,
+             session_id, team_id, project_id, agent_run_id, run_policy_revision,
+             runtime_assignment_id, runtime_assignment_generation,
+             sandbox_id, sandbox_generation, runtime_principal_id,
+             runtime_authorization_generation, source_command_digest,
+             lifecycle_command_claims_digest, lifecycle_receipt_digest,
+             source_enforced_fence, safety_fence,
+             source_effect_ref_commitment, source_required_effect_enforcer_set_digest,
+             lifecycle_enforcement_subject_digest, lifecycle_aggregate_proof_digest,
+             source_proof_verified_at_ms, created_at_ms
+           ) VALUES (?, ?, ?, ?, 'verified', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          compensationId,
+          incidentDigest,
+          source.id,
+          sourceReceiptId,
+          source.session_id,
+          source.team_id,
+          source.project_id,
+          source.agent_run_id,
+          source.run_policy_revision,
+          source.runtime_assignment_id,
+          source.runtime_assignment_generation,
+          source.sandbox_id,
+          source.sandbox_generation,
+          source.runtime_principal_id,
+          source.runtime_authorization_generation,
+          sha256Digest(source.command_digest),
+          incident.lifecycleCommandClaimsDigest,
+          lifecycleReceiptDigest,
+          sourceEnforcedFence,
+          safetyFence,
+          incident.sourceEffectRefCommitment,
+          sourceRequiredEffectEnforcerSetDigest,
+          lifecycleEnforcementSubjectDigest,
+          lifecycleAggregateProofDigest,
+          sourceProofVerifiedAtMs,
+          createdAtMs
+        );
+    } catch {
+      fail("journal_conflict");
+    }
+    return Object.freeze({
+      compensationId,
+      incidentDigest,
+      safetyFence,
+      lifecycleReceiptDigest,
+    });
+  }
+
   private commandStillCurrent(row: CompletionRow): boolean {
     return Boolean(
       this.db
@@ -1622,6 +1945,12 @@ export class SqliteRuntimeLifecycleJournal implements RuntimeLifecycleJournal {
 
   private hasSettledReceiptPostcondition(commandId: string, receipt: RuntimeReceipt): boolean {
     const effective = receipt.outcome === "duplicate" ? receipt.originalReceipt : receipt;
+    let exactReceiptDigest: string;
+    try {
+      exactReceiptDigest = digestReceipt(receipt);
+    } catch {
+      return false;
+    }
     const row = this.db
       .prepare(
         `SELECT command.operation, dispatch.status,
@@ -1637,18 +1966,37 @@ export class SqliteRuntimeLifecycleJournal implements RuntimeLifecycleJournal {
                       (successor.outcome = 'duplicate'
                         AND successor.original_outcome IN ('enforced', 'rejected', 'quarantined'))
                     )
-                ) AS has_terminal_receipt
+                ) AS has_terminal_receipt,
+                EXISTS(
+                  SELECT 1 FROM runtime_compensation_incidents incident
+                  JOIN runtime_run_command_receipts source_receipt
+                    ON source_receipt.id = incident.source_receipt_id
+                  WHERE incident.source_command_id = command.id
+                    AND incident.trust_state = 'verified'
+                    AND source_receipt.command_id = command.id
+                    AND source_receipt.receipt_digest = ?
+                    AND incident.lifecycle_receipt_digest = source_receipt.receipt_digest
+                ) AS has_exact_verified_incident,
+                EXISTS(
+                  SELECT 1 FROM runtime_compensation_incidents incident
+                  WHERE incident.source_command_id = command.id
+                    AND incident.trust_state = 'legacy-untrusted'
+                ) AS has_legacy_incident
          FROM runtime_run_commands command
          JOIN runtime_run_command_dispatch dispatch ON dispatch.command_id = command.id
          WHERE command.id = ?`
       )
-      .get(commandId) as SqlRow | undefined;
+      .get(exactReceiptDigest, commandId) as SqlRow | undefined;
     if (!row) return false;
     switch (effective.outcome) {
       case "accepted":
         return row.status === "awaiting-receipt" || row.has_terminal_receipt === 1;
       case "enforced":
-        return row.status === "compensating" || (row.status === "enforced" && row.has_effect === 1);
+        return (
+          (row.status === "compensating" &&
+            (row.has_exact_verified_incident === 1 || row.has_legacy_incident === 1)) ||
+          (row.status === "enforced" && row.has_effect === 1)
+        );
       case "rejected":
         return row.status === "rejected";
       case "quarantined":
@@ -1936,6 +2284,16 @@ function safeAdd(left: number, right: number): number {
 
 function sha256(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function deterministicCompensationId(sourceCommandId: string, sourceReceiptId: string): string {
+  const digest = createHash("sha256")
+    .update(RUNTIME_COMPENSATION_ID_DOMAIN, "utf8")
+    .update(sourceCommandId, "utf8")
+    .update("\0", "utf8")
+    .update(sourceReceiptId, "utf8")
+    .digest("hex");
+  return `compensation:${digest}`;
 }
 
 function sha256Digest(value: unknown): string {

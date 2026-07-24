@@ -39,7 +39,7 @@ import { registerEnsureTopic } from "../src/lib/telegram/bot-bridge";
 import { getTelegramConfig, telegramConfigFingerprint } from "../src/lib/telegram/config";
 import { getConfiguredMaxSessions } from "../src/lib/security-config";
 import { assertValidStartupConfiguration } from "../src/lib/startup-validation";
-import { closeTeamSessions, getTeamSessions } from "../src/lib/team-sessions/service";
+import { closeTeamSessions, getTeamSessionKernel } from "../src/lib/team-sessions/service";
 import {
   isMultiplayerTransportEnabled,
   markMultiplayerTransportAvailable,
@@ -94,7 +94,9 @@ const TERMINUS_MAX_SESSIONS = getConfiguredMaxSessions();
 const TERMINUS_READ_ONLY = process.env.TERMINUS_READ_ONLY === "true";
 const TERMINUS_HOST = process.env.TERMINUS_HOST || "127.0.0.1";
 const MULTIPLAYER_ENABLED = isMultiplayerTransportEnabled();
-markMultiplayerTransportAvailable(MULTIPLAYER_ENABLED);
+// Availability is published only after the durable write fence is installed
+// and the local Runtime worker has started successfully.
+markMultiplayerTransportAvailable(false);
 
 setMaxSessions(TERMINUS_MAX_SESSIONS);
 // Bump tmux's global history-limit so newly-spawned sessions keep deep
@@ -219,57 +221,69 @@ function createCanonicalPtyAdapter(): CanonicalTerminalPtyAdapter {
 }
 
 function createMultiplayerServices(): MultiplayerServices {
-  const teamSessions = getTeamSessions();
-  const writeStates = createRuntimeWriteStateRegistry();
-  const terminalGateway = createTeamSessionTerminalGateway({
-    teamSessions,
-    isRuntimeWriteAllowed: (input) => !TERMINUS_READ_ONLY && writeStates.isWriteAllowed(input),
-  });
-  const runtime = new LocalTmuxRuntime({
-    fenceCallbacks: {
-      updateWriteState: (update) => writeStates.update(update),
-      async terminateCanonicalPtys(input) {
-        destroyCanonicalPtys({
-          teamSessionId: input.sessionId,
-          runtimeAuthorizationGeneration: input.runtimeAuthorizationGeneration,
-          includeCurrentGeneration: input.reason === "retire",
-        });
+  const kernel = getTeamSessionKernel();
+  try {
+    const teamSessions = kernel.teamSessions;
+    const writeStates = createRuntimeWriteStateRegistry({ requireBootstrap: true });
+    // Terminal/process mutations fail closed until this exact SQLite snapshot is
+    // reconstructed. Keep bootstrap synchronous and ahead of every transport and
+    // Runtime worker so restart cannot briefly resurrect a stale authorization.
+    writeStates.bootstrap(kernel.runtimeWriteStateSnapshotSource.read());
+    const terminalGateway = createTeamSessionTerminalGateway({
+      teamSessions,
+      isRuntimeWriteAllowed: (input) => !TERMINUS_READ_ONLY && writeStates.isWriteAllowed(input),
+    });
+    const runtime = new LocalTmuxRuntime({
+      fenceCallbacks: {
+        updateWriteState: (update) => writeStates.update(update),
+        async terminateCanonicalPtys(input) {
+          destroyCanonicalPtys({
+            teamSessionId: input.sessionId,
+            runtimeAuthorizationGeneration: input.runtimeAuthorizationGeneration,
+            includeCurrentGeneration: input.reason === "retire",
+          });
+        },
+        async runtimeEnsureState(input) {
+          return teamSessions.runtimeEnsureState(input);
+        },
+        async isCurrentRuntimeBinding(input) {
+          return teamSessions.isCurrentRuntimeBinding(input);
+        },
       },
-      async runtimeEnsureState(input) {
-        return teamSessions.runtimeEnsureState(input);
-      },
-      async isCurrentRuntimeBinding(input) {
-        return teamSessions.isCurrentRuntimeBinding(input);
-      },
-    },
-  });
-  const worker = createRuntimeOutboxWorker({
-    kernel: teamSessions,
-    runtime,
-    workerId: `local-tmux-runtime-${process.pid}`,
-    onOperationalError: () => console.error("[team-sessions/runtime] InternalError"),
-  });
-  const webSockets = createTeamSessionWebSockets({
-    teamSessions,
-    terminalGateway,
-    pty: createCanonicalPtyAdapter(),
-    resolveTmuxSocketName: (sessionId) => getCanonicalTmuxSocketName(sessionId),
-    shell: TERMINUS_SHELL,
-    reportInternalError: () => console.error("[team-sessions/ws] InternalError"),
-  });
+    });
+    const worker = createRuntimeOutboxWorker({
+      kernel: teamSessions,
+      runtime,
+      workerId: `local-tmux-runtime-${process.pid}`,
+      onOperationalError: () => console.error("[team-sessions/runtime] InternalError"),
+    });
+    const webSockets = createTeamSessionWebSockets({
+      teamSessions,
+      terminalGateway,
+      pty: createCanonicalPtyAdapter(),
+      resolveTmuxSocketName: (sessionId) => getCanonicalTmuxSocketName(sessionId),
+      shell: TERMINUS_SHELL,
+      reportInternalError: () => console.error("[team-sessions/ws] InternalError"),
+    });
 
-  let closePromise: Promise<void> | undefined;
-  return {
-    webSockets,
-    worker,
-    close() {
-      closePromise ??= (async () => {
-        await Promise.allSettled([worker.stop(), webSockets.close()]);
-        closeTeamSessions();
-      })();
-      return closePromise;
-    },
-  };
+    let closePromise: Promise<void> | undefined;
+    return {
+      webSockets,
+      worker,
+      close() {
+        closePromise ??= (async () => {
+          await Promise.allSettled([worker.stop(), webSockets.close()]);
+          closeTeamSessions(kernel);
+        })();
+        return closePromise;
+      },
+    };
+  } catch {
+    // A failed snapshot or adapter construction must not strand the shared DB
+    // singleton for a later request-capable module generation.
+    closeTeamSessions(kernel);
+    throw new TypeError("Multiplayer services could not be initialized");
+  }
 }
 
 // ── WebSocket Servers (noServer mode) ───────────────────────────────────────
@@ -593,6 +607,7 @@ filesWss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
 app.prepare().then(() => {
   const multiplayerServices = MULTIPLAYER_ENABLED ? createMultiplayerServices() : null;
   multiplayerServices?.worker.start();
+  markMultiplayerTransportAvailable(multiplayerServices !== null);
 
   const server = createServer((req, res) => {
     const parsedUrl = parseUrl(req.url || "", true);
@@ -796,6 +811,7 @@ app.prepare().then(() => {
   const shutdown = () => {
     if (shuttingDown) return;
     shuttingDown = true;
+    markMultiplayerTransportAvailable(false);
     console.log("\nShutting down...");
     clearInterval(telegramConfigPoll);
     // Force exit after 5s

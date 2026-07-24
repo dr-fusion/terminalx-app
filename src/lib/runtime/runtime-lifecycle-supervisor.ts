@@ -1,12 +1,19 @@
 import type { Runtime, RuntimeHandle, RuntimeLifecycleCommand, RuntimeReceipt } from "./contracts";
 import {
   RuntimeCommandExecutionError,
-  executeRuntimeCommand,
+  captureRuntimeLifecycleDispatch,
+  executeCapturedRuntimeCommand,
   type RuntimeAuthorityVerifier,
   type RuntimeCommandDispatchCertainty,
   type RuntimeCommandExecutionErrorCode,
+  type RuntimeLifecycleDispatch,
 } from "./runtime-command-execution";
 import type { RuntimeEnforcementProofVerifier } from "./runtime-enforcement-proof";
+import {
+  captureRuntimeHandleResolver,
+  snapshotExactRuntimeHandle,
+  type CapturedRuntimeHandleResolver,
+} from "./runtime-handle-resolution";
 
 const MAX_WORKER_ID_LENGTH = 128;
 
@@ -141,8 +148,8 @@ export interface RuntimeLifecycleRunResult {
  */
 export class RuntimeLifecycleSupervisor {
   private readonly journal: RuntimeLifecycleJournal;
-  private readonly runtime: Runtime;
-  private readonly handles: RuntimeLifecycleHandleResolver;
+  private readonly runtimeDispatch: RuntimeLifecycleDispatch;
+  private readonly resolveHandle: CapturedRuntimeHandleResolver<RuntimeLifecycleCommand>;
   private readonly verifyAuthority: RuntimeAuthorityVerifier;
   private readonly verifyEnforcementProof: RuntimeEnforcementProofVerifier;
   private readonly workerId: string;
@@ -161,6 +168,7 @@ export class RuntimeLifecycleSupervisor {
   private activeRunController: AbortController | null = null;
 
   constructor(options: RuntimeLifecycleSupervisorOptions) {
+    const resolveHandle = captureRuntimeHandleResolver<RuntimeLifecycleCommand>(options?.handles);
     if (!isSafeWorkerId(options.workerId)) throw new TypeError("Invalid Runtime worker ID");
     if (
       typeof options.verifyAuthority !== "function" ||
@@ -168,14 +176,13 @@ export class RuntimeLifecycleSupervisor {
       typeof options.journal?.reconcile !== "function" ||
       typeof options.journal?.claim !== "function" ||
       typeof options.journal?.renew !== "function" ||
-      typeof options.journal?.complete !== "function" ||
-      typeof options.handles?.resolve !== "function"
+      typeof options.journal?.complete !== "function"
     ) {
       throw new TypeError("Invalid Runtime lifecycle supervisor dependency");
     }
+    this.runtimeDispatch = captureRuntimeLifecycleDispatch(options.runtime);
     this.journal = options.journal;
-    this.runtime = options.runtime;
-    this.handles = options.handles;
+    this.resolveHandle = resolveHandle;
     this.verifyAuthority = options.verifyAuthority;
     this.verifyEnforcementProof = options.verifyEnforcementProof;
     this.workerId = options.workerId;
@@ -218,10 +225,10 @@ export class RuntimeLifecycleSupervisor {
 
   async stop(): Promise<void> {
     const loop = this.loopPromise;
-    if (!loop) return;
+    const activeRun = this.activeRun;
     this.controller?.abort();
     this.activeRunController?.abort();
-    await loop;
+    await Promise.allSettled([...(loop ? [loop] : []), ...(activeRun ? [activeRun] : [])]);
   }
 
   /** Concurrent callers share one batch so a worker cannot claim against itself. */
@@ -325,11 +332,15 @@ export class RuntimeLifecycleSupervisor {
     }
     if (signal.aborted) return unavailableBeforeDispatch(delivery);
     const resolved = await boundedOperation(
-      (operationSignal) => this.handles.resolve(delivery.command, operationSignal),
+      (operationSignal) => this.resolveHandle(delivery.command, operationSignal),
       Math.min(this.handleResolveTimeoutMs, resolveRemainingMs - LEASE_COMPLETION_MARGIN_MS),
       signal
     );
-    if (resolved.kind !== "value" || resolved.value === null) {
+    const handle =
+      resolved.kind === "value"
+        ? snapshotExactRuntimeHandle(resolved.value, delivery.command.binding)
+        : null;
+    if (handle === null) {
       return {
         kind: "attempt",
         delivery,
@@ -340,7 +351,6 @@ export class RuntimeLifecycleSupervisor {
         },
       };
     }
-    const handle = resolved.value;
     const renewalAtMs = sampleClock(this.clock);
     if (signal.aborted) return unavailableBeforeDispatch(delivery);
     if (renewalAtMs >= delivery.leaseExpiresAtMs - LEASE_COMPLETION_MARGIN_MS) {
@@ -386,8 +396,8 @@ export class RuntimeLifecycleSupervisor {
 
     const executed = await boundedOperation(
       (operationSignal) =>
-        executeRuntimeCommand(
-          this.runtime,
+        executeCapturedRuntimeCommand(
+          this.runtimeDispatch,
           handle,
           renewedDelivery.command,
           this.verifyAuthority,

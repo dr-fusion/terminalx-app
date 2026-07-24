@@ -6,8 +6,21 @@ import { isValidTmuxSessionName } from "../tmux";
 import { projectPublicSessionRunState } from "./public-run-state";
 import type { RuntimeAuthorizationSnapshot, RuntimeLifecycleCommand } from "../runtime/contracts";
 import type { RuntimeCommandAuthorityIssuer } from "../runtime/runtime-command-authority";
+import {
+  createRuntimeCompensationMaterializer,
+  type RuntimeCompensationAuthorityIssuer,
+  type RuntimeCompensationCommandAuthorityVerifier,
+  type RuntimeCompensationMaterializer,
+  type RuntimeCompensationPolicySource,
+} from "../runtime/runtime-compensation-materializer";
+import type { RuntimeCompensationJournal } from "../runtime/runtime-compensation-supervisor";
+import type { SynchronousRuntimeCompensationEnforcementProofVerifier } from "../runtime/runtime-compensation-enforcement-proof";
 import type { SynchronousRuntimeEnforcementProofVerifier } from "../runtime/runtime-enforcement-proof";
 import type { RuntimeLifecycleJournal } from "../runtime/runtime-lifecycle-supervisor";
+import {
+  createSqliteRuntimeCompensationJournal,
+  type SqliteRuntimeCompensationJournal,
+} from "./sqlite-runtime-compensation-journal";
 import {
   createSqliteRuntimeLifecycleJournal,
   type SqliteRuntimeLifecycleJournal,
@@ -16,6 +29,10 @@ import {
   createSqliteRuntimeReceiptFollowJournal,
   type SqliteRuntimeReceiptFollowJournal,
 } from "./sqlite-runtime-receipt-follow-journal";
+import {
+  createSqliteRuntimeWriteStateSnapshotSource,
+  type RuntimeWriteStateSnapshotSource,
+} from "./sqlite-runtime-write-state-source";
 import {
   assertValidRunPolicyCommit,
   isRunPolicyWidening,
@@ -99,6 +116,14 @@ export interface CreateTeamSessionsOptions {
    */
   runtimeEnforcementProofVerifier?: SynchronousRuntimeEnforcementProofVerifier;
   runtimeLifecycleCommandTtlMs?: number;
+  /** Separately pinned platform-security signer; it may issue only quarantine commands. */
+  runtimeCompensationAuthorityIssuer?: RuntimeCompensationAuthorityIssuer;
+  /** Synchronous pinned-key verifier shared by materialization and durable dispatch. */
+  runtimeCompensationAuthorityVerifier?: RuntimeCompensationCommandAuthorityVerifier;
+  /** Control-plane-owned containment policy; Runtime/provider data cannot implement this seam. */
+  runtimeCompensationPolicySource?: RuntimeCompensationPolicySource;
+  /** Synchronously authenticates every containment-enforcer acknowledgement. */
+  runtimeCompensationEnforcementProofVerifier?: SynchronousRuntimeCompensationEnforcementProofVerifier;
 }
 
 export interface RuntimeAuthorizationSnapshotQuery {
@@ -114,9 +139,15 @@ export interface RuntimeAuthorizationSnapshotSource {
 /** Security-sensitive composition result used only by the Runtime worker root. */
 export interface TeamSessionKernel {
   readonly teamSessions: TeamSessions;
+  /** Private restart seam used before Runtime transports accept mutations. */
+  readonly runtimeWriteStateSnapshotSource: RuntimeWriteStateSnapshotSource;
   readonly runtimeLifecycleJournal: RuntimeLifecycleJournal;
   /** Private worker seam; never project this journal through HTTP or browser state. */
   readonly runtimeReceiptFollowJournal: SqliteRuntimeReceiptFollowJournal;
+  /** Private platform-security worker seam; absent unless its complete trust group is configured. */
+  readonly runtimeCompensationJournal?: RuntimeCompensationJournal;
+  /** Private signer worker seam; absent unless its complete trust group is configured. */
+  readonly runtimeCompensationMaterializer?: RuntimeCompensationMaterializer;
 }
 
 const ROLE_RANK: Record<TeamRole, number> = {
@@ -187,10 +218,15 @@ export function createTeamSessionKernel(
   options: CreateTeamSessionsOptions = {}
 ): TeamSessionKernel {
   const teamSessions = new SqliteTeamSessions(options);
+  const runtimeCompensationJournal = teamSessions.runtimeCompensationJournalForSupervisor();
+  const runtimeCompensationMaterializer = teamSessions.runtimeCompensationMaterializerForWorker();
   return Object.freeze({
     teamSessions,
+    runtimeWriteStateSnapshotSource: teamSessions.runtimeWriteStateSnapshotSourceForKernel(),
     runtimeLifecycleJournal: teamSessions.runtimeJournalForSupervisor(),
     runtimeReceiptFollowJournal: teamSessions.runtimeReceiptFollowJournalForSupervisor(),
+    ...(runtimeCompensationJournal === undefined ? {} : { runtimeCompensationJournal }),
+    ...(runtimeCompensationMaterializer === undefined ? {} : { runtimeCompensationMaterializer }),
   });
 }
 
@@ -204,8 +240,11 @@ class SqliteTeamSessions implements TeamSessions {
   private readonly runtimeAuthorizationSnapshotSource?: RuntimeAuthorizationSnapshotSource;
   private readonly runtimeEnforcementProofVerifier?: SynchronousRuntimeEnforcementProofVerifier;
   private readonly runtimeLifecycleCommandTtlMs: number;
+  private readonly runtimeWriteStateSnapshotSource: RuntimeWriteStateSnapshotSource;
   private readonly runtimeLifecycle: SqliteRuntimeLifecycleJournal;
   private readonly runtimeReceiptFollow: SqliteRuntimeReceiptFollowJournal;
+  private readonly runtimeCompensation?: SqliteRuntimeCompensationJournal;
+  private readonly runtimeCompensationMaterializer?: RuntimeCompensationMaterializer;
   private closed = false;
 
   constructor(options: CreateTeamSessionsOptions) {
@@ -217,6 +256,25 @@ class SqliteTeamSessions implements TeamSessions {
     if (runtimeSecurityComponentCount !== 0 && runtimeSecurityComponentCount !== 3) {
       throw new TypeError(
         "Runtime lifecycle authority, authorization snapshots, and enforcement proof verification must be configured together"
+      );
+    }
+    const runtimeCompensationSecurityComponentCount = [
+      options.runtimeCompensationAuthorityIssuer,
+      options.runtimeCompensationAuthorityVerifier,
+      options.runtimeCompensationPolicySource,
+      options.runtimeCompensationEnforcementProofVerifier,
+    ].filter((component) => component !== undefined).length;
+    if (
+      runtimeCompensationSecurityComponentCount !== 0 &&
+      runtimeCompensationSecurityComponentCount !== 4
+    ) {
+      throw new TypeError(
+        "Runtime compensation authority, policy, and enforcement proof verification must be configured together"
+      );
+    }
+    if (runtimeCompensationSecurityComponentCount === 4 && runtimeSecurityComponentCount !== 3) {
+      throw new TypeError(
+        "Runtime compensation requires the complete Runtime lifecycle security configuration"
       );
     }
     if (
@@ -251,6 +309,9 @@ class SqliteTeamSessions implements TeamSessions {
       MAX_RUNTIME_LIFECYCLE_COMMAND_TTL_MS,
       "Runtime lifecycle command TTL"
     );
+    this.runtimeWriteStateSnapshotSource = createSqliteRuntimeWriteStateSnapshotSource({
+      db: this.db,
+    });
     this.runtimeLifecycle = createSqliteRuntimeLifecycleJournal({
       db: this.db,
       idGenerator: () => this.nextId("runtime-journal"),
@@ -258,11 +319,39 @@ class SqliteTeamSessions implements TeamSessions {
         ? {}
         : { verifyEnforcementProof: this.runtimeEnforcementProofVerifier }),
     });
+    if (
+      options.runtimeCompensationAuthorityIssuer !== undefined &&
+      options.runtimeCompensationAuthorityVerifier !== undefined &&
+      options.runtimeCompensationPolicySource !== undefined &&
+      options.runtimeCompensationEnforcementProofVerifier !== undefined
+    ) {
+      this.runtimeCompensation = createSqliteRuntimeCompensationJournal({
+        db: this.db,
+        idGenerator: () => this.nextId("runtime-compensation-journal"),
+        verifyAuthority: options.runtimeCompensationAuthorityVerifier,
+        verifyEnforcementProof: options.runtimeCompensationEnforcementProofVerifier,
+      });
+      this.runtimeCompensationMaterializer = createRuntimeCompensationMaterializer({
+        journal: this.runtimeCompensation,
+        authorityIssuer: options.runtimeCompensationAuthorityIssuer,
+        verifyAuthority: options.runtimeCompensationAuthorityVerifier,
+        policySource: options.runtimeCompensationPolicySource,
+        idGenerator: () => this.nextId("runtime-compensation-command"),
+        clock: this.clock,
+      });
+    }
+    const runtimeCompensation = this.runtimeCompensation;
     this.runtimeReceiptFollow = createSqliteRuntimeReceiptFollowJournal({
       db: this.db,
       idGenerator: () => this.nextId("runtime-follow-event"),
       settleVerifiedReceiptInTransaction: (input) =>
         this.runtimeLifecycle.settleVerifiedReceiptInTransaction(input),
+      ...(runtimeCompensation === undefined
+        ? {}
+        : {
+            settleVerifiedCompensationReceiptInTransaction: (input) =>
+              runtimeCompensation.settleVerifiedReceiptInTransaction(input),
+          }),
     });
   }
 
@@ -270,8 +359,20 @@ class SqliteTeamSessions implements TeamSessions {
     return this.runtimeLifecycle;
   }
 
+  runtimeWriteStateSnapshotSourceForKernel(): RuntimeWriteStateSnapshotSource {
+    return this.runtimeWriteStateSnapshotSource;
+  }
+
   runtimeReceiptFollowJournalForSupervisor(): SqliteRuntimeReceiptFollowJournal {
     return this.runtimeReceiptFollow;
+  }
+
+  runtimeCompensationJournalForSupervisor(): SqliteRuntimeCompensationJournal | undefined {
+    return this.runtimeCompensation;
+  }
+
+  runtimeCompensationMaterializerForWorker(): RuntimeCompensationMaterializer | undefined {
+    return this.runtimeCompensationMaterializer;
   }
 
   async dispatch(command: SessionCommand): Promise<CommandResult> {

@@ -291,6 +291,65 @@ describe("Team Session Agent Runs", () => {
     ).toThrow(/configured together/);
   });
 
+  it("exposes compensation workers only when the complete platform-security trust group is configured", () => {
+    const lifecycleSecurity = {
+      runtimeCommandAuthorityIssuer: createTestRuntimeCommandAuthorityIssuer(),
+      runtimeAuthorizationSnapshotSource: {
+        resolve: ({
+          runtimeAuthorizationGeneration,
+        }: {
+          runtimeAuthorizationGeneration: number;
+        }) => ({
+          generation: runtimeAuthorizationGeneration,
+          networkPolicyRef: "test-network-policy:v1",
+          networkPolicyDigest: "c".repeat(64),
+          credentialPolicyRef: "test-credential-policy:v1",
+          credentialPolicyDigest: "d".repeat(64),
+          effectEnforcerSetDigest: EFFECT_ENFORCER_SET_DIGEST,
+        }),
+      },
+      runtimeEnforcementProofVerifier: () => true,
+    };
+    const compensationSecurity = {
+      runtimeCompensationAuthorityIssuer: {
+        issue: () => {
+          throw new Error("No incident should be signed during composition");
+        },
+      },
+      runtimeCompensationAuthorityVerifier: () => true,
+      runtimeCompensationPolicySource: { resolve: () => undefined },
+      runtimeCompensationEnforcementProofVerifier: () => true,
+    };
+
+    expect(() =>
+      createTeamSessionKernel({
+        filename: path.join(directory, "partial-compensation.sqlite"),
+        ...lifecycleSecurity,
+        runtimeCompensationAuthorityVerifier:
+          compensationSecurity.runtimeCompensationAuthorityVerifier,
+      })
+    ).toThrow(/compensation.*configured together/i);
+    expect(() =>
+      createTeamSessionKernel({
+        filename: path.join(directory, "compensation-without-lifecycle.sqlite"),
+        ...compensationSecurity,
+      })
+    ).toThrow(/requires the complete Runtime lifecycle/i);
+
+    const composed = createTeamSessionKernel({
+      filename: path.join(directory, "complete-compensation.sqlite"),
+      ...lifecycleSecurity,
+      ...compensationSecurity,
+    });
+    try {
+      expect(composed.runtimeCompensationJournal).toBeDefined();
+      expect(composed.runtimeCompensationMaterializer).toBeDefined();
+      expect(Object.isFrozen(composed)).toBe(true);
+    } finally {
+      composed.teamSessions.close();
+    }
+  });
+
   it("rejects an authorization epoch whose trusted snapshot generation mismatches its binding", async () => {
     runtimeAuthorizationGenerationOffset = 1;
     await enforceNextRuntime("runtime.session.ensure");

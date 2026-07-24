@@ -565,7 +565,17 @@ describe("Team Session kernel", () => {
     try {
       database.exec(`
         PRAGMA foreign_keys = OFF;
+        DROP TRIGGER runtime_receipt_follow_streams_valid_transition;
+        DROP TRIGGER runtime_compensation_referenced_events_immutable_update;
+        DROP TRIGGER runtime_compensation_referenced_events_immutable_delete;
         DROP TABLE runtime_receipt_follow_events;
+        DROP TABLE runtime_compensation_follow_events;
+        DROP TABLE runtime_compensation_effects;
+        DROP TABLE runtime_compensation_receipts;
+        DROP TABLE runtime_compensation_dispatch;
+        DROP TABLE runtime_compensation_commands;
+        DROP TABLE runtime_compensation_incidents;
+        DROP TABLE runtime_binding_safety_fences;
         DROP TABLE runtime_receipt_follow_streams;
         DROP TABLE runtime_principal_observation_keys;
         DROP TRIGGER IF EXISTS run_policy_revisions_enforcer_set_binding;
@@ -2241,7 +2251,7 @@ describe("Team Session kernel", () => {
 
     const database = new Database(filename, { readonly: true });
     try {
-      expect(database.pragma("user_version", { simple: true })).toBe(6);
+      expect(database.pragma("user_version", { simple: true })).toBe(7);
       expect(database.pragma("foreign_key_check")).toEqual([]);
       expect(
         database

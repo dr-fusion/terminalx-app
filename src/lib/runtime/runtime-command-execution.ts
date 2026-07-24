@@ -14,6 +14,10 @@ import {
 } from "./action-policy";
 import { assertRuntimeCommandAuthorityBinding } from "./runtime-authority";
 import {
+  captureRuntimeCommandDataFunction,
+  type RuntimeCommandDataFunction,
+} from "./runtime-command-dispatch";
+import {
   commitRuntimeEffectRef,
   RuntimeEnforcementProofError,
   snapshotAggregateEnforcementProof,
@@ -163,7 +167,7 @@ export type RuntimeAuthorityVerifier = (
 
 export type RuntimeCommandClock = () => number;
 
-type RuntimeDispatch = (
+export type RuntimeLifecycleDispatch = (
   handle: RuntimeHandle,
   command: RuntimeLifecycleCommand,
   signal: AbortSignal
@@ -184,16 +188,42 @@ export async function executeRuntimeCommand(
   verifyEnforcementProof?: RuntimeEnforcementProofVerifier,
   runtimeCommandSignal?: AbortSignal
 ): Promise<RuntimeReceipt> {
+  const dispatch = captureRuntimeLifecycleDispatch(runtime);
+  return executeCapturedRuntimeCommand(
+    dispatch,
+    handle,
+    command,
+    verifyAuthority,
+    clock,
+    verifyEnforcementProof,
+    runtimeCommandSignal
+  );
+}
+
+/**
+ * Execute through a Runtime command data-function captured by the composition
+ * root. Supervisors use this entrypoint so no provider property lookup can
+ * occur after their durable final pre-dispatch interlock.
+ */
+export async function executeCapturedRuntimeCommand(
+  dispatch: RuntimeLifecycleDispatch,
+  handle: RuntimeHandle,
+  command: RuntimeLifecycleCommand,
+  verifyAuthority: RuntimeAuthorityVerifier,
+  clock: RuntimeCommandClock,
+  verifyEnforcementProof?: RuntimeEnforcementProofVerifier,
+  runtimeCommandSignal?: AbortSignal
+): Promise<RuntimeReceipt> {
   if (typeof verifyAuthority !== "function" || typeof clock !== "function") {
     fail("invalid_input");
   }
+  if (typeof dispatch !== "function") fail("invalid_input");
   const dispatchSignal = runtimeCommandSignal ?? new AbortController().signal;
   if (!isNativeAbortSignal(dispatchSignal)) fail("invalid_input");
   if (dispatchSignal.aborted) fail("runtime_command_failed");
 
   const handleSnapshot = snapshotPortable(handle, "invalid_input");
   const commandSnapshot = snapshotPortable(command, "invalid_input");
-  const dispatch = captureRuntimeDispatch(runtime);
   const initialNowMs = sampleClock(clock);
   const preflight = preflightCommand(handleSnapshot, commandSnapshot, initialNowMs);
   const verificationInput = Object.freeze({
@@ -1553,18 +1583,22 @@ function sameBinding(left: RuntimeBinding, right: RuntimeBinding): boolean {
   return BINDING_FIELDS.every((field) => left[field] === right[field]);
 }
 
-function captureRuntimeDispatch(runtime: Runtime): RuntimeDispatch {
+export function captureRuntimeLifecycleDispatch(runtime: Runtime): RuntimeLifecycleDispatch {
   try {
-    if ((typeof runtime !== "object" && typeof runtime !== "function") || runtime === null) {
-      fail("invalid_input");
-    }
-    const method = Reflect.get(runtime as object, "command");
-    if (typeof method !== "function") fail("invalid_input");
-    return (handle, command, signal) =>
-      Reflect.apply(method, runtime, [handle, command, signal]) as Promise<RuntimeReceipt>;
+    const dispatch = captureRuntimeCommandDataFunction(runtime);
+    return (handle, command, signal) => commandResult(dispatch, handle, command, signal);
   } catch {
     fail("invalid_input");
   }
+}
+
+function commandResult(
+  dispatch: RuntimeCommandDataFunction,
+  handle: RuntimeHandle,
+  command: RuntimeLifecycleCommand,
+  signal: AbortSignal
+): Promise<RuntimeReceipt> {
+  return dispatch(handle, command, signal) as Promise<RuntimeReceipt>;
 }
 
 function isNativeAbortSignal(value: unknown): value is AbortSignal {
