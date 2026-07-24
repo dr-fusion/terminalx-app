@@ -16,6 +16,9 @@ YOLO mutations:
 1. **Runtime truth:** deliver exact-bound Run start/pause/resume/stop commands through a durable
    outbox, ingest idempotent Runtime receipts/events, and change lifecycle only after enforcement.
    Terminal authorization and contained process state must agree with pause/stop state.
+   The internal command/receipt and durable-journal foundation is specified in
+   [Phase 5 Runtime truth](./phase-5-runtime-truth.md); Gate 1 remains open until that foundation is
+   wired to the Team Session kernel and a hosted Runtime.
 2. **Hosted isolation:** implement the Daytona adapter and credential proxy using the configured
    public fork pinned to `b5a5d9e78d76c8bcf351f2049620250e0f34eea4`; verify repository
    accessibility and commit ancestry during release, not only URL/SHA shape.

@@ -182,6 +182,10 @@ export type CheckpointReason =
 export type RuntimeCommand =
   | (RuntimeCommandBase<"run.start"> & {
       readonly kind: "run.start";
+      readonly agentRunId: string;
+      readonly runPolicyRevision: number;
+      readonly fromRunStateVersion: number;
+      readonly toRunStateVersion: number;
       readonly policy: AgentRunPolicySnapshot;
       readonly yoloAuthorization?: {
         readonly manifest: ActionManifest;
@@ -210,18 +214,25 @@ export type RuntimeCommand =
   | (RuntimeCommandBase<"run.pause"> & {
       readonly kind: "run.pause";
       readonly agentRunId: string;
+      readonly runPolicyRevision: number;
+      readonly fromRunStateVersion: number;
+      readonly toRunStateVersion: number;
       readonly reason: "human" | "attention_timeout" | "limit" | "safety";
     })
   | (RuntimeCommandBase<"run.resume"> & {
       readonly kind: "run.resume";
       readonly agentRunId: string;
-      readonly revision: number;
+      readonly runPolicyRevision: number;
+      readonly fromRunStateVersion: number;
+      readonly toRunStateVersion: number;
       readonly accountableAssigneePresent: true;
     })
   | (RuntimeCommandBase<"run.stop"> & {
       readonly kind: "run.stop";
       readonly agentRunId: string;
-      readonly revision: number;
+      readonly runPolicyRevision: number;
+      readonly fromRunStateVersion: number;
+      readonly toRunStateVersion: number;
       readonly reason: "human" | "final_review_closed" | "superseded";
     })
   | (EmergencyRuntimeCommandBase<"run.emergency-stop"> & {
@@ -294,6 +305,17 @@ export type RuntimeCommand =
       readonly reasonRef: string;
     });
 
+export type RuntimeLifecycleCommand = Extract<
+  RuntimeCommand,
+  { readonly kind: "run.start" | "run.pause" | "run.resume" | "run.stop" }
+>;
+
+/** Existing-Run transitions currently supported by the fail-closed execution Module. */
+export type RuntimePostStartLifecycleCommand = Extract<
+  RuntimeLifecycleCommand,
+  { readonly kind: "run.pause" | "run.resume" | "run.stop" }
+>;
+
 export interface AggregateEnforcementProof {
   readonly generation: number;
   readonly requiredEffectEnforcerSetDigest: string;
@@ -308,56 +330,69 @@ export interface AggregateEnforcementProof {
       | "other-effect-enforcer";
     readonly acknowledgementDigest: string;
   }>;
+  /**
+   * Internal canonical integrity digest. A consumer must still bind
+   * `requiredEffectEnforcerSetDigest` to its trusted authorization snapshot
+   * before treating the proof as an authoritative cross-enforcer attestation.
+   */
   readonly aggregateProofDigest: string;
 }
 
-export type RuntimeReceipt = {
+interface RuntimeReceiptBase {
   readonly commandId: string;
   readonly binding: RuntimeBinding;
   readonly runtimeAuthorizationGeneration: number;
-} & (
-  | { readonly outcome: "accepted"; readonly effectRef: string }
-  | {
-      readonly outcome: "enforced";
-      readonly effectRef: string;
-      readonly enforcedFence: number;
-      readonly aggregateEnforcementProof?: AggregateEnforcementProof;
-    }
-  | {
+}
+
+/** A complete first-processing result, retained verbatim by duplicate receipts. */
+export type NonDuplicateRuntimeReceipt = RuntimeReceiptBase &
+  (
+    | { readonly outcome: "accepted"; readonly effectRef: string }
+    | {
+        readonly outcome: "enforced";
+        readonly effectRef: string;
+        readonly enforcedFence: number;
+        readonly aggregateEnforcementProof?: AggregateEnforcementProof;
+      }
+    | {
+        readonly outcome: "rejected";
+        readonly code:
+          | "invalid_authority"
+          | "expired"
+          | "stale_binding"
+          | "stale_fence"
+          | "conflicting_duplicate"
+          | "policy_exceeds_ceiling"
+          | "policy_revision_conflict"
+          | "second_active_run"
+          | "awaiting_assignee"
+          | "invalid_manifest"
+          | "invalid_grant"
+          | "grant_consumed"
+          | "action_already_resolved"
+          | "forbidden"
+          | "not_ready";
+        readonly safeDetail: string;
+      }
+    | {
+        readonly outcome: "quarantined";
+        readonly reason:
+          | "authorization_ack_failed"
+          | "effect_enforcer_set_mismatch"
+          | "isolation_failure"
+          | "kill_failure";
+        readonly effectRef: string;
+      }
+  );
+
+export type RuntimeReceipt =
+  | NonDuplicateRuntimeReceipt
+  | (RuntimeReceiptBase & {
       readonly outcome: "duplicate";
-      readonly originalOutcome: "accepted" | "enforced" | "rejected" | "quarantined";
+      readonly originalReceipt: NonDuplicateRuntimeReceipt;
+      /** Lowercase SHA-256 of the strict canonical JSON form of `originalReceipt`. */
       readonly originalReceiptDigest: string;
-    }
-  | {
-      readonly outcome: "rejected";
-      readonly code:
-        | "invalid_authority"
-        | "expired"
-        | "stale_binding"
-        | "stale_fence"
-        | "conflicting_duplicate"
-        | "policy_exceeds_ceiling"
-        | "policy_revision_conflict"
-        | "second_active_run"
-        | "awaiting_assignee"
-        | "invalid_manifest"
-        | "invalid_grant"
-        | "grant_consumed"
-        | "action_already_resolved"
-        | "forbidden"
-        | "not_ready";
-      readonly safeDetail: string;
-    }
-  | {
-      readonly outcome: "quarantined";
-      readonly reason:
-        | "authorization_ack_failed"
-        | "effect_enforcer_set_mismatch"
-        | "isolation_failure"
-        | "kill_failure";
-      readonly effectRef: string;
-    }
-);
+    });
 
 export interface UsageSnapshot {
   readonly usage: ResourceEffect;

@@ -2,7 +2,7 @@ import * as fs from "fs";
 import * as path from "path";
 import Database from "better-sqlite3";
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 const APPLICATION_ID = 0x54585331; // "TXS1"
 
 const CONVERSATION_SCHEMA = `
@@ -1292,6 +1292,795 @@ CREATE UNIQUE INDEX one_open_grant_review_version
   ON grant_reviews(id) WHERE status = 'open';
 `;
 
+const RUNTIME_RUN_COMMAND_SCHEMA = `
+CREATE TABLE runtime_run_commands (
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  agent_run_id TEXT NOT NULL,
+  command_sequence INTEGER NOT NULL CHECK (command_sequence >= 1),
+  previous_command_sequence INTEGER,
+  operation TEXT NOT NULL CHECK (operation IN ('run.pause', 'run.resume', 'run.stop')),
+  target_lifecycle TEXT NOT NULL CHECK (target_lifecycle IN ('active', 'paused', 'stopped')),
+  expected_run_state_version INTEGER NOT NULL CHECK (expected_run_state_version >= 1),
+  target_run_state_version INTEGER NOT NULL CHECK (
+    target_run_state_version = expected_run_state_version + 1
+  ),
+  run_policy_revision INTEGER NOT NULL CHECK (run_policy_revision >= 1),
+  goal_set_id TEXT NOT NULL CHECK (length(goal_set_id) BETWEEN 1 AND 300),
+  goal_set_revision INTEGER NOT NULL CHECK (goal_set_revision >= 1),
+  runtime_assignment_id TEXT NOT NULL,
+  runtime_assignment_generation INTEGER NOT NULL CHECK (runtime_assignment_generation >= 1),
+  sandbox_id TEXT NOT NULL,
+  sandbox_generation INTEGER NOT NULL CHECK (sandbox_generation >= 1),
+  runtime_principal_id TEXT NOT NULL,
+  runtime_authorization_generation INTEGER NOT NULL
+    CHECK (runtime_authorization_generation >= 1),
+  source_session_sequence INTEGER NOT NULL CHECK (source_session_sequence >= 1),
+  command_json TEXT NOT NULL CHECK (
+    json_valid(command_json) AND json_type(command_json) = 'object'
+    AND COALESCE(
+        json_extract(command_json, '$.commandId') = id
+        AND json_extract(command_json, '$.kind') = operation
+        AND json_extract(command_json, '$.agentRunId') = agent_run_id
+        AND json_extract(command_json, '$.runPolicyRevision') = run_policy_revision
+        AND json_type(command_json, '$.projectCeilingRevision') = 'text'
+        AND length(json_extract(command_json, '$.projectCeilingRevision')) BETWEEN 1 AND 300
+        AND json_extract(
+          command_json, '$.fromRunStateVersion'
+        ) = expected_run_state_version
+        AND json_extract(
+          command_json, '$.toRunStateVersion'
+        ) = target_run_state_version
+        AND json_extract(
+          command_json, '$.runtimeAuthorizationGeneration'
+        ) = runtime_authorization_generation
+        AND json_type(command_json, '$.causationId') = 'text'
+        AND length(json_extract(command_json, '$.causationId')) BETWEEN 1 AND 300
+        AND json_type(command_json, '$.actor') = 'object'
+        AND COALESCE(json_extract(command_json, '$.actor.kind'), '') IN ('human', 'system')
+        AND json_type(command_json, '$.actor.actorRef') = 'text'
+        AND length(json_extract(command_json, '$.actor.actorRef')) BETWEEN 1 AND 300
+        AND json_extract(command_json, '$.issuedAtMs') = created_at_ms
+        AND json_extract(command_json, '$.deadlineAtMs') = deadline_at_ms
+        AND json_extract(command_json, '$.authority.issuer') = 'team-session'
+        AND json_type(command_json, '$.authority.issuerKeyId') = 'text'
+        AND length(json_extract(command_json, '$.authority.issuerKeyId')) BETWEEN 1 AND 300
+        AND json_extract(command_json, '$.authority.audience') = 'runtime'
+        AND json_extract(command_json, '$.authority.capability') = operation
+        AND json_extract(command_json, '$.authority.claimsDigest') = authority_digest
+        AND json_type(command_json, '$.authority.issuedAtMs') = 'integer'
+        AND json_extract(command_json, '$.authority.issuedAtMs') >= 0
+        AND json_extract(command_json, '$.authority.issuedAtMs') <= created_at_ms
+        AND json_type(command_json, '$.authority.expiresAtMs') = 'integer'
+        AND json_extract(command_json, '$.authority.expiresAtMs') > created_at_ms
+        AND json_type(command_json, '$.authority.signature') = 'text'
+        AND length(json_extract(command_json, '$.authority.signature')) BETWEEN 1 AND 4000
+        AND json_extract(command_json, '$.binding.sessionId') = session_id
+        AND json_extract(
+          command_json, '$.binding.runtimeAssignmentId'
+        ) = runtime_assignment_id
+        AND json_extract(
+          command_json, '$.binding.runtimeAssignmentGeneration'
+        ) = runtime_assignment_generation
+        AND json_extract(command_json, '$.binding.sandboxId') = sandbox_id
+        AND json_extract(
+          command_json, '$.binding.sandboxGeneration'
+        ) = sandbox_generation
+        AND json_extract(
+          command_json, '$.binding.runtimePrincipalId'
+        ) = runtime_principal_id,
+      0
+    )
+    AND COALESCE((
+      (operation = 'run.pause'
+        AND COALESCE(json_extract(command_json, '$.reason'), '') IN (
+          'human', 'attention_timeout', 'limit', 'safety'
+        )) OR
+      (operation = 'run.resume'
+        AND json_type(command_json, '$.accountableAssigneePresent') = 'true'
+        AND json_extract(command_json, '$.accountableAssigneePresent') = 1) OR
+      (operation = 'run.stop'
+        AND COALESCE(json_extract(command_json, '$.reason'), '') IN (
+          'human', 'final_review_closed', 'superseded'
+        ))
+    ), 0)
+  ),
+  command_digest TEXT NOT NULL CHECK (
+    length(command_digest) = 64 AND command_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  authority_digest TEXT NOT NULL CHECK (
+    length(authority_digest) = 64 AND authority_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  deadline_at_ms INTEGER NOT NULL CHECK (deadline_at_ms > created_at_ms),
+  UNIQUE (agent_run_id, command_sequence),
+  UNIQUE (id, agent_run_id),
+  UNIQUE (
+    id, session_id, agent_run_id, command_sequence,
+    expected_run_state_version, target_run_state_version, source_session_sequence
+  ),
+  UNIQUE (
+    id, session_id, agent_run_id, command_sequence, run_policy_revision,
+    goal_set_id, goal_set_revision, runtime_assignment_id,
+    runtime_assignment_generation, sandbox_id, sandbox_generation,
+    runtime_principal_id, runtime_authorization_generation,
+    expected_run_state_version, target_run_state_version,
+    source_session_sequence, command_digest
+  ),
+  CHECK (
+    (command_sequence = 1 AND previous_command_sequence IS NULL) OR
+    (command_sequence > 1 AND previous_command_sequence = command_sequence - 1)
+  ),
+  CHECK (
+    (operation = 'run.resume' AND target_lifecycle = 'active') OR
+    (operation = 'run.pause' AND target_lifecycle = 'paused') OR
+    (operation = 'run.stop' AND target_lifecycle = 'stopped')
+  ),
+  FOREIGN KEY (session_id, source_session_sequence)
+    REFERENCES session_events(session_id, sequence) ON DELETE RESTRICT,
+  FOREIGN KEY (agent_run_id, session_id)
+    REFERENCES agent_runs(id, session_id) ON DELETE RESTRICT,
+  FOREIGN KEY (agent_run_id, goal_set_id, goal_set_revision)
+    REFERENCES goal_sets(agent_run_id, goal_set_id, revision) ON DELETE RESTRICT,
+  FOREIGN KEY (
+    agent_run_id, session_id, run_policy_revision, runtime_assignment_id,
+    runtime_assignment_generation, sandbox_id, sandbox_generation,
+    runtime_principal_id, runtime_authorization_generation
+  ) REFERENCES run_policy_revisions(
+    agent_run_id, session_id, revision, runtime_assignment_id,
+    runtime_assignment_generation, sandbox_id, sandbox_generation,
+    runtime_principal_id, runtime_authorization_generation
+  ) ON DELETE RESTRICT,
+  FOREIGN KEY (
+    runtime_assignment_id, session_id, runtime_assignment_generation,
+    sandbox_id, sandbox_generation, runtime_principal_id
+  ) REFERENCES runtime_assignments(
+    id, session_id, generation, sandbox_id, sandbox_generation, runtime_principal_id
+  ) ON DELETE RESTRICT,
+  FOREIGN KEY (
+    session_id, runtime_authorization_generation, runtime_assignment_id,
+    runtime_assignment_generation, sandbox_id, sandbox_generation, runtime_principal_id
+  ) REFERENCES runtime_authorization_epochs(
+    session_id, generation, runtime_assignment_id, runtime_assignment_generation,
+    sandbox_id, sandbox_generation, runtime_principal_id
+  ) ON DELETE RESTRICT,
+  FOREIGN KEY (agent_run_id, previous_command_sequence)
+    REFERENCES runtime_run_commands(agent_run_id, command_sequence) ON DELETE RESTRICT
+) STRICT;
+
+CREATE TRIGGER runtime_run_commands_immutable_update
+BEFORE UPDATE ON runtime_run_commands
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime Run commands are immutable');
+END;
+
+CREATE TRIGGER runtime_run_commands_json_scope_binding
+BEFORE INSERT ON runtime_run_commands
+WHEN NOT EXISTS (
+  SELECT 1 FROM runtime_assignments assignment
+  WHERE assignment.id = NEW.runtime_assignment_id
+    AND assignment.session_id = NEW.session_id
+    AND assignment.generation = NEW.runtime_assignment_generation
+    AND assignment.sandbox_id = NEW.sandbox_id
+    AND assignment.sandbox_generation = NEW.sandbox_generation
+    AND assignment.runtime_principal_id = NEW.runtime_principal_id
+    AND json_extract(NEW.command_json, '$.binding.teamId') = assignment.team_id
+    AND json_extract(NEW.command_json, '$.binding.projectId') = assignment.project_id
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime Run command JSON scope does not match its binding');
+END;
+
+CREATE TRIGGER runtime_run_commands_source_event_binding
+BEFORE INSERT ON runtime_run_commands
+WHEN NOT EXISTS (
+  SELECT 1
+  FROM session_events event
+  JOIN run_policy_revisions policy
+    ON policy.agent_run_id = NEW.agent_run_id
+   AND policy.session_id = NEW.session_id
+   AND policy.revision = NEW.run_policy_revision
+  WHERE event.session_id = NEW.session_id
+    AND event.sequence = NEW.source_session_sequence
+    AND event.type = 'run.runtime-command.requested'
+    AND json_extract(event.payload_json, '$.commandId') = NEW.id
+    AND json_extract(event.payload_json, '$.agentRunId') = NEW.agent_run_id
+    AND json_extract(NEW.command_json, '$.causationId') = event.event_id
+    AND json_extract(NEW.command_json, '$.actor.kind') = event.actor_kind
+    AND json_extract(NEW.command_json, '$.actor.actorRef') = event.actor_user_id
+    AND json_extract(
+      NEW.command_json, '$.projectCeilingRevision'
+    ) = policy.project_ceiling_revision
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime Run command source event does not match');
+END;
+
+CREATE TRIGGER runtime_run_commands_immutable_delete
+BEFORE DELETE ON runtime_run_commands
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime Run commands are immutable');
+END;
+
+CREATE TABLE runtime_run_command_dispatch (
+  command_id TEXT PRIMARY KEY,
+  agent_run_id TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN (
+    'pending', 'processing', 'awaiting-receipt',
+    'enforced', 'rejected', 'quarantined', 'superseded', 'failed'
+  )),
+  attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+  lease_owner TEXT,
+  lease_expires_at_ms INTEGER,
+  last_safe_error_code TEXT CHECK (
+    last_safe_error_code IS NULL OR length(last_safe_error_code) BETWEEN 1 AND 200
+  ),
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= created_at_ms),
+  terminal_at_ms INTEGER,
+  CHECK (
+    (status = 'processing' AND lease_owner IS NOT NULL AND lease_expires_at_ms IS NOT NULL) OR
+    (status <> 'processing' AND lease_owner IS NULL AND lease_expires_at_ms IS NULL)
+  ),
+  CHECK (
+    (status IN ('enforced', 'rejected', 'quarantined', 'superseded', 'failed')
+      AND terminal_at_ms IS NOT NULL AND terminal_at_ms >= created_at_ms) OR
+    (status IN ('pending', 'processing', 'awaiting-receipt') AND terminal_at_ms IS NULL)
+  ),
+  FOREIGN KEY (command_id, agent_run_id)
+    REFERENCES runtime_run_commands(id, agent_run_id) ON DELETE RESTRICT
+) STRICT;
+
+CREATE UNIQUE INDEX one_unresolved_runtime_run_command_per_run
+  ON runtime_run_command_dispatch(agent_run_id)
+  WHERE status IN ('pending', 'processing', 'awaiting-receipt');
+
+CREATE TRIGGER runtime_run_command_dispatch_identity_immutable
+BEFORE UPDATE OF command_id, agent_run_id, created_at_ms ON runtime_run_command_dispatch
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime Run command dispatch identity is immutable');
+END;
+
+CREATE TRIGGER runtime_run_command_dispatch_initial_state
+BEFORE INSERT ON runtime_run_command_dispatch
+WHEN NEW.status <> 'pending' OR NEW.attempts <> 0 OR
+  NEW.lease_owner IS NOT NULL OR NEW.lease_expires_at_ms IS NOT NULL OR
+  NEW.last_safe_error_code IS NOT NULL OR NEW.terminal_at_ms IS NOT NULL OR
+  NEW.updated_at_ms <> NEW.created_at_ms
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime Run command dispatch must begin pending');
+END;
+
+CREATE TRIGGER runtime_run_command_dispatch_immutable_delete
+BEFORE DELETE ON runtime_run_command_dispatch
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime Run command dispatch cannot be deleted');
+END;
+
+CREATE TRIGGER runtime_run_command_dispatch_valid_transition
+BEFORE UPDATE ON runtime_run_command_dispatch
+WHEN
+  OLD.status IN ('enforced', 'rejected', 'quarantined', 'superseded', 'failed') OR
+  NEW.updated_at_ms < OLD.updated_at_ms OR
+  NEW.attempts < OLD.attempts OR
+  NEW.attempts > OLD.attempts + 1 OR
+  (NEW.attempts = OLD.attempts + 1 AND NOT (
+    NEW.status = 'processing' AND OLD.status IN ('pending', 'awaiting-receipt')
+  )) OR
+  (NEW.status = 'processing' AND OLD.status <> 'processing'
+    AND NEW.attempts <> OLD.attempts + 1) OR
+  NOT (
+    (OLD.status = 'pending' AND NEW.status IN (
+      'pending', 'processing', 'superseded', 'failed'
+    )) OR
+    (OLD.status = 'processing' AND NEW.status IN (
+      'processing', 'pending', 'awaiting-receipt',
+      'enforced', 'rejected', 'quarantined', 'superseded', 'failed'
+    )) OR
+    (OLD.status = 'awaiting-receipt' AND NEW.status IN (
+      'awaiting-receipt', 'processing',
+      'enforced', 'rejected', 'quarantined', 'superseded', 'failed'
+    ))
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'Invalid Runtime Run command dispatch transition');
+END;
+
+CREATE TABLE runtime_run_command_receipts (
+  id TEXT PRIMARY KEY,
+  command_id TEXT NOT NULL,
+  version INTEGER NOT NULL CHECK (version >= 1),
+  previous_version INTEGER,
+  session_id TEXT NOT NULL,
+  agent_run_id TEXT NOT NULL,
+  command_sequence INTEGER NOT NULL CHECK (command_sequence >= 1),
+  run_policy_revision INTEGER NOT NULL CHECK (run_policy_revision >= 1),
+  goal_set_id TEXT NOT NULL,
+  goal_set_revision INTEGER NOT NULL CHECK (goal_set_revision >= 1),
+  runtime_assignment_id TEXT NOT NULL,
+  runtime_assignment_generation INTEGER NOT NULL CHECK (runtime_assignment_generation >= 1),
+  sandbox_id TEXT NOT NULL,
+  sandbox_generation INTEGER NOT NULL CHECK (sandbox_generation >= 1),
+  runtime_principal_id TEXT NOT NULL,
+  runtime_authorization_generation INTEGER NOT NULL
+    CHECK (runtime_authorization_generation >= 1),
+  expected_run_state_version INTEGER NOT NULL CHECK (expected_run_state_version >= 1),
+  target_run_state_version INTEGER NOT NULL CHECK (
+    target_run_state_version = expected_run_state_version + 1
+  ),
+  source_session_sequence INTEGER NOT NULL CHECK (source_session_sequence >= 1),
+  command_digest TEXT NOT NULL CHECK (length(command_digest) = 64),
+  outcome TEXT NOT NULL CHECK (outcome IN (
+    'accepted', 'enforced', 'duplicate', 'rejected', 'quarantined'
+  )),
+  original_outcome TEXT CHECK (
+    original_outcome IS NULL OR original_outcome IN (
+      'accepted', 'enforced', 'rejected', 'quarantined'
+    )
+  ),
+  original_receipt_digest TEXT CHECK (
+    original_receipt_digest IS NULL OR
+    (length(original_receipt_digest) = 64
+      AND original_receipt_digest NOT GLOB '*[^0-9a-f]*')
+  ),
+  receipt_json TEXT NOT NULL CHECK (
+    json_valid(receipt_json) AND json_type(receipt_json) = 'object'
+    AND COALESCE(
+      json_extract(receipt_json, '$.commandId') = command_id
+        AND json_extract(receipt_json, '$.outcome') = outcome
+        AND json_extract(
+          receipt_json, '$.runtimeAuthorizationGeneration'
+        ) = runtime_authorization_generation
+        AND json_extract(receipt_json, '$.binding.sessionId') = session_id
+        AND json_extract(
+          receipt_json, '$.binding.runtimeAssignmentId'
+        ) = runtime_assignment_id
+        AND json_extract(
+          receipt_json, '$.binding.runtimeAssignmentGeneration'
+        ) = runtime_assignment_generation
+        AND json_extract(receipt_json, '$.binding.sandboxId') = sandbox_id
+        AND json_extract(
+          receipt_json, '$.binding.sandboxGeneration'
+        ) = sandbox_generation
+        AND json_extract(
+          receipt_json, '$.binding.runtimePrincipalId'
+        ) = runtime_principal_id,
+      0
+    )
+    AND (
+      outcome <> 'accepted' OR
+      COALESCE(
+        json_type(receipt_json, '$.effectRef') = 'text'
+          AND length(json_extract(receipt_json, '$.effectRef')) BETWEEN 1 AND 1000,
+        0
+      )
+    )
+    AND (
+      outcome <> 'enforced' OR
+      COALESCE(
+        json_type(receipt_json, '$.enforcedFence') = 'integer'
+          AND json_extract(receipt_json, '$.enforcedFence') = target_run_state_version
+          AND json_type(receipt_json, '$.effectRef') = 'text'
+          AND length(json_extract(receipt_json, '$.effectRef')) BETWEEN 1 AND 1000,
+        0
+      )
+    )
+    AND (
+      outcome <> 'rejected' OR
+      COALESCE(
+        json_type(receipt_json, '$.code') = 'text'
+          AND length(json_extract(receipt_json, '$.code')) BETWEEN 1 AND 200
+          AND json_type(receipt_json, '$.safeDetail') = 'text'
+          AND length(json_extract(receipt_json, '$.safeDetail')) BETWEEN 1 AND 1000,
+        0
+      )
+    )
+    AND (
+      outcome <> 'quarantined' OR
+      COALESCE(
+        json_type(receipt_json, '$.reason') = 'text'
+          AND length(json_extract(receipt_json, '$.reason')) BETWEEN 1 AND 200
+          AND json_type(receipt_json, '$.effectRef') = 'text'
+          AND length(json_extract(receipt_json, '$.effectRef')) BETWEEN 1 AND 1000,
+        0
+      )
+    )
+    AND (
+      outcome <> 'duplicate' OR
+      COALESCE(
+        json_type(receipt_json, '$.originalReceipt') = 'object'
+          AND json_extract(receipt_json, '$.originalReceipt.commandId') = command_id
+          AND json_extract(receipt_json, '$.originalReceipt.outcome') = original_outcome
+          AND json_extract(receipt_json, '$.originalReceiptDigest') = original_receipt_digest
+          AND json_extract(
+            receipt_json, '$.originalReceipt.runtimeAuthorizationGeneration'
+          ) = runtime_authorization_generation
+          AND json_extract(
+            receipt_json, '$.originalReceipt.binding.sessionId'
+          ) = session_id
+          AND json_extract(
+            receipt_json, '$.originalReceipt.binding.teamId'
+          ) = json_extract(receipt_json, '$.binding.teamId')
+          AND json_extract(
+            receipt_json, '$.originalReceipt.binding.projectId'
+          ) = json_extract(receipt_json, '$.binding.projectId')
+          AND json_extract(
+            receipt_json, '$.originalReceipt.binding.runtimeAssignmentId'
+          ) = runtime_assignment_id
+          AND json_extract(
+            receipt_json, '$.originalReceipt.binding.runtimeAssignmentGeneration'
+          ) = runtime_assignment_generation
+          AND json_extract(receipt_json, '$.originalReceipt.binding.sandboxId') = sandbox_id
+          AND json_extract(
+            receipt_json, '$.originalReceipt.binding.sandboxGeneration'
+          ) = sandbox_generation
+          AND json_extract(
+            receipt_json, '$.originalReceipt.binding.runtimePrincipalId'
+          ) = runtime_principal_id
+          AND (
+            original_outcome <> 'accepted' OR
+            (json_type(receipt_json, '$.originalReceipt.effectRef') = 'text'
+              AND length(
+                json_extract(receipt_json, '$.originalReceipt.effectRef')
+              ) BETWEEN 1 AND 1000)
+          )
+          AND (
+            original_outcome <> 'enforced' OR
+            (json_type(receipt_json, '$.originalReceipt.enforcedFence') = 'integer'
+              AND json_extract(
+                receipt_json, '$.originalReceipt.enforcedFence'
+              ) = target_run_state_version
+              AND json_type(receipt_json, '$.originalReceipt.effectRef') = 'text'
+              AND length(json_extract(receipt_json, '$.originalReceipt.effectRef')) BETWEEN 1 AND 1000)
+          )
+          AND (
+            original_outcome <> 'rejected' OR
+            (json_type(receipt_json, '$.originalReceipt.code') = 'text'
+              AND length(json_extract(receipt_json, '$.originalReceipt.code')) BETWEEN 1 AND 200
+              AND json_type(receipt_json, '$.originalReceipt.safeDetail') = 'text'
+              AND length(
+                json_extract(receipt_json, '$.originalReceipt.safeDetail')
+              ) BETWEEN 1 AND 1000)
+          )
+          AND (
+            original_outcome <> 'quarantined' OR
+            (json_type(receipt_json, '$.originalReceipt.reason') = 'text'
+              AND length(
+                json_extract(receipt_json, '$.originalReceipt.reason')
+              ) BETWEEN 1 AND 200
+              AND json_type(receipt_json, '$.originalReceipt.effectRef') = 'text'
+              AND length(
+                json_extract(receipt_json, '$.originalReceipt.effectRef')
+              ) BETWEEN 1 AND 1000)
+          ),
+        0
+      )
+    )
+  ),
+  receipt_digest TEXT NOT NULL CHECK (
+    length(receipt_digest) = 64 AND receipt_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  received_at_ms INTEGER NOT NULL CHECK (received_at_ms >= 0),
+  UNIQUE (command_id, version),
+  UNIQUE (command_id, receipt_digest),
+  UNIQUE (id, command_id, outcome),
+  CHECK (
+    (version = 1 AND previous_version IS NULL) OR
+    (version > 1 AND previous_version = version - 1)
+  ),
+  CHECK (
+    (outcome = 'duplicate' AND original_outcome IS NOT NULL
+      AND original_receipt_digest IS NOT NULL) OR
+    (outcome <> 'duplicate' AND original_outcome IS NULL
+      AND original_receipt_digest IS NULL)
+  ),
+  FOREIGN KEY (
+    command_id, session_id, agent_run_id, command_sequence, run_policy_revision,
+    goal_set_id, goal_set_revision, runtime_assignment_id,
+    runtime_assignment_generation, sandbox_id, sandbox_generation,
+    runtime_principal_id, runtime_authorization_generation,
+    expected_run_state_version, target_run_state_version,
+    source_session_sequence, command_digest
+  ) REFERENCES runtime_run_commands(
+    id, session_id, agent_run_id, command_sequence, run_policy_revision,
+    goal_set_id, goal_set_revision, runtime_assignment_id,
+    runtime_assignment_generation, sandbox_id, sandbox_generation,
+    runtime_principal_id, runtime_authorization_generation,
+    expected_run_state_version, target_run_state_version,
+    source_session_sequence, command_digest
+  ) ON DELETE RESTRICT,
+  FOREIGN KEY (command_id, previous_version)
+    REFERENCES runtime_run_command_receipts(command_id, version) ON DELETE RESTRICT
+) STRICT;
+
+CREATE UNIQUE INDEX one_terminal_runtime_run_receipt_per_command
+  ON runtime_run_command_receipts(command_id)
+  WHERE outcome IN ('enforced', 'rejected', 'quarantined');
+
+CREATE TRIGGER runtime_run_command_receipts_immutable_update
+BEFORE UPDATE ON runtime_run_command_receipts
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime Run command receipts are immutable');
+END;
+
+CREATE TRIGGER runtime_run_command_receipts_json_scope_binding
+BEFORE INSERT ON runtime_run_command_receipts
+WHEN NOT EXISTS (
+  SELECT 1 FROM runtime_assignments assignment
+  WHERE assignment.id = NEW.runtime_assignment_id
+    AND assignment.session_id = NEW.session_id
+    AND assignment.generation = NEW.runtime_assignment_generation
+    AND assignment.sandbox_id = NEW.sandbox_id
+    AND assignment.sandbox_generation = NEW.sandbox_generation
+    AND assignment.runtime_principal_id = NEW.runtime_principal_id
+    AND json_extract(NEW.receipt_json, '$.binding.teamId') = assignment.team_id
+    AND json_extract(NEW.receipt_json, '$.binding.projectId') = assignment.project_id
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime Run receipt JSON scope does not match its binding');
+END;
+
+CREATE TRIGGER runtime_run_command_receipts_immutable_delete
+BEFORE DELETE ON runtime_run_command_receipts
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime Run command receipts are immutable');
+END;
+
+CREATE TRIGGER runtime_run_command_receipts_version_continuity
+BEFORE INSERT ON runtime_run_command_receipts
+WHEN NEW.previous_version IS NOT NULL AND NOT EXISTS (
+  SELECT 1 FROM runtime_run_command_receipts previous
+  WHERE previous.command_id = NEW.command_id
+    AND previous.version = NEW.previous_version
+    AND previous.received_at_ms <= NEW.received_at_ms
+    AND (
+      (previous.outcome = 'accepted' AND (
+        NEW.outcome IN ('enforced', 'rejected', 'quarantined') OR
+        (NEW.outcome = 'duplicate'
+          AND NEW.original_outcome = 'accepted'
+          AND NEW.original_receipt_digest = previous.receipt_digest)
+      )) OR
+      (previous.outcome IN ('enforced', 'rejected', 'quarantined')
+        AND NEW.outcome = 'duplicate'
+        AND NEW.original_outcome = previous.outcome
+        AND NEW.original_receipt_digest = previous.receipt_digest) OR
+      (previous.outcome = 'duplicate' AND previous.original_outcome = 'accepted' AND (
+        NEW.outcome IN ('enforced', 'rejected', 'quarantined') OR
+        (NEW.outcome = 'duplicate'
+          AND NEW.original_outcome = 'accepted'
+          AND NEW.original_receipt_digest = previous.original_receipt_digest)
+      )) OR
+      (previous.outcome = 'duplicate'
+        AND previous.original_outcome IN ('enforced', 'rejected', 'quarantined')
+        AND NEW.outcome = 'duplicate'
+        AND NEW.original_outcome = previous.original_outcome
+        AND NEW.original_receipt_digest = previous.original_receipt_digest)
+    )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Invalid Runtime Run receipt version continuity');
+END;
+
+CREATE TABLE runtime_run_command_effects (
+  command_id TEXT PRIMARY KEY,
+  receipt_id TEXT NOT NULL UNIQUE,
+  receipt_outcome TEXT NOT NULL CHECK (receipt_outcome IN ('enforced', 'duplicate')),
+  session_id TEXT NOT NULL,
+  agent_run_id TEXT NOT NULL,
+  command_sequence INTEGER NOT NULL CHECK (command_sequence >= 1),
+  expected_run_state_version INTEGER NOT NULL CHECK (expected_run_state_version >= 1),
+  target_run_state_version INTEGER NOT NULL CHECK (
+    target_run_state_version = expected_run_state_version + 1
+  ),
+  source_session_sequence INTEGER NOT NULL CHECK (source_session_sequence >= 1),
+  applied_session_sequence INTEGER NOT NULL CHECK (
+    applied_session_sequence > source_session_sequence
+  ),
+  effect_digest TEXT NOT NULL UNIQUE CHECK (
+    length(effect_digest) = 64 AND effect_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  applied_at_ms INTEGER NOT NULL CHECK (applied_at_ms >= 0),
+  FOREIGN KEY (
+    command_id, session_id, agent_run_id, command_sequence,
+    expected_run_state_version, target_run_state_version, source_session_sequence
+  ) REFERENCES runtime_run_commands(
+    id, session_id, agent_run_id, command_sequence,
+    expected_run_state_version, target_run_state_version, source_session_sequence
+  ) ON DELETE RESTRICT,
+  FOREIGN KEY (receipt_id, command_id, receipt_outcome)
+    REFERENCES runtime_run_command_receipts(id, command_id, outcome) ON DELETE RESTRICT,
+  FOREIGN KEY (session_id, applied_session_sequence)
+    REFERENCES session_events(session_id, sequence) ON DELETE RESTRICT
+) STRICT;
+
+CREATE TRIGGER runtime_run_command_effects_enforced_receipt
+BEFORE INSERT ON runtime_run_command_effects
+WHEN NOT EXISTS (
+  SELECT 1 FROM runtime_run_command_receipts receipt
+  WHERE receipt.id = NEW.receipt_id
+    AND receipt.command_id = NEW.command_id
+    AND (
+      receipt.outcome = 'enforced' OR
+      (receipt.outcome = 'duplicate' AND receipt.original_outcome = 'enforced')
+    )
+    AND receipt.received_at_ms <= NEW.applied_at_ms
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime Run effect requires an enforced receipt');
+END;
+
+CREATE TRIGGER runtime_run_command_effects_current_state
+BEFORE INSERT ON runtime_run_command_effects
+WHEN NOT EXISTS (
+  SELECT 1
+  FROM runtime_run_commands command
+  JOIN runtime_run_command_dispatch dispatch
+    ON dispatch.command_id = command.id
+   AND dispatch.agent_run_id = command.agent_run_id
+  JOIN agent_runs run
+    ON run.id = command.agent_run_id
+   AND run.session_id = command.session_id
+  JOIN goal_sets goal_set
+    ON goal_set.agent_run_id = run.id
+   AND goal_set.revision = run.current_goal_set_revision
+  JOIN sessions session ON session.id = run.session_id
+  JOIN runtime_assignments assignment
+    ON assignment.id = run.runtime_assignment_id
+   AND assignment.session_id = run.session_id
+  WHERE command.id = NEW.command_id
+    AND dispatch.status IN ('processing', 'awaiting-receipt')
+    AND dispatch.attempts >= 1
+    AND run.state_version = NEW.expected_run_state_version
+    AND run.current_policy_revision = command.run_policy_revision
+    AND run.current_goal_set_revision = command.goal_set_revision
+    AND goal_set.goal_set_id = command.goal_set_id
+    AND run.runtime_assignment_id = command.runtime_assignment_id
+    AND run.runtime_authorization_generation = command.runtime_authorization_generation
+    AND session.runtime_authorization_generation = command.runtime_authorization_generation
+    AND session.runtime_authorization_state = 'enforced'
+    AND assignment.generation = command.runtime_assignment_generation
+    AND assignment.sandbox_id = command.sandbox_id
+    AND assignment.sandbox_generation = command.sandbox_generation
+    AND assignment.runtime_principal_id = command.runtime_principal_id
+    AND assignment.runtime_authorization_generation = command.runtime_authorization_generation
+    AND assignment.status = 'ready'
+    AND (
+      (command.operation = 'run.pause' AND run.lifecycle = 'active') OR
+      (command.operation = 'run.resume' AND run.lifecycle = 'paused') OR
+      (command.operation = 'run.stop'
+        AND run.lifecycle IN ('active', 'paused', 'agent-work-finished'))
+    )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime Run effect does not match current dispatch and Run state');
+END;
+
+CREATE TRIGGER runtime_run_command_effects_event_binding
+BEFORE INSERT ON runtime_run_command_effects
+WHEN NOT EXISTS (
+  SELECT 1
+  FROM runtime_run_commands command
+  JOIN session_events event
+    ON event.session_id = NEW.session_id
+   AND event.sequence = NEW.applied_session_sequence
+  WHERE command.id = NEW.command_id
+    AND command.agent_run_id = NEW.agent_run_id
+    AND event.type = CASE command.operation
+      WHEN 'run.pause' THEN 'run.paused'
+      WHEN 'run.resume' THEN 'run.resumed'
+      WHEN 'run.stop' THEN 'run.stopped'
+    END
+    AND json_extract(event.payload_json, '$.commandId') = NEW.command_id
+    AND json_extract(event.payload_json, '$.agentRunId') = NEW.agent_run_id
+    AND json_extract(
+      event.payload_json, '$.fromRunStateVersion'
+    ) = NEW.expected_run_state_version
+    AND json_extract(
+      event.payload_json, '$.toRunStateVersion'
+    ) = NEW.target_run_state_version
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime Run effect event does not match its command');
+END;
+
+CREATE TRIGGER runtime_run_command_effects_immutable_update
+BEFORE UPDATE ON runtime_run_command_effects
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime Run command effects are immutable');
+END;
+
+CREATE TRIGGER runtime_run_command_effects_immutable_delete
+BEFORE DELETE ON runtime_run_command_effects
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime Run command effects are immutable');
+END;
+
+CREATE TRIGGER runtime_run_command_dispatch_terminal_evidence
+BEFORE UPDATE OF status ON runtime_run_command_dispatch
+WHEN
+  (NEW.status = 'enforced' AND (
+    NOT EXISTS (
+      SELECT 1 FROM runtime_run_command_effects effect
+      WHERE effect.command_id = NEW.command_id
+    ) OR
+    NOT EXISTS (
+      SELECT 1
+      FROM runtime_run_commands command
+      JOIN agent_runs run
+        ON run.id = command.agent_run_id
+       AND run.session_id = command.session_id
+      JOIN goal_sets goal_set
+        ON goal_set.agent_run_id = run.id
+       AND goal_set.revision = run.current_goal_set_revision
+      JOIN sessions session ON session.id = run.session_id
+      JOIN runtime_assignments assignment
+        ON assignment.id = run.runtime_assignment_id
+       AND assignment.session_id = run.session_id
+      WHERE command.id = NEW.command_id
+        AND run.lifecycle = command.target_lifecycle
+        AND run.state_version = command.target_run_state_version
+        AND run.current_policy_revision = command.run_policy_revision
+        AND run.current_goal_set_revision = command.goal_set_revision
+        AND goal_set.goal_set_id = command.goal_set_id
+        AND run.runtime_assignment_id = command.runtime_assignment_id
+        AND run.runtime_authorization_generation = command.runtime_authorization_generation
+        AND session.runtime_authorization_generation = command.runtime_authorization_generation
+        AND session.runtime_authorization_state = 'enforced'
+        AND assignment.generation = command.runtime_assignment_generation
+        AND assignment.sandbox_id = command.sandbox_id
+        AND assignment.sandbox_generation = command.sandbox_generation
+        AND assignment.runtime_principal_id = command.runtime_principal_id
+        AND assignment.runtime_authorization_generation = command.runtime_authorization_generation
+        AND assignment.status = 'ready'
+    )
+  )) OR
+  (NEW.status IN ('rejected', 'quarantined') AND NOT EXISTS (
+    SELECT 1 FROM runtime_run_command_receipts receipt
+    WHERE receipt.command_id = NEW.command_id
+      AND (
+        receipt.outcome = NEW.status OR
+        (receipt.outcome = 'duplicate' AND receipt.original_outcome = NEW.status)
+      )
+  ))
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime Run dispatch terminal state lacks durable evidence');
+END;
+
+CREATE TRIGGER runtime_run_referenced_session_events_immutable_update
+BEFORE UPDATE ON session_events
+WHEN
+  EXISTS (
+    SELECT 1 FROM runtime_run_commands command
+    WHERE command.session_id = OLD.session_id
+      AND command.source_session_sequence = OLD.sequence
+  ) OR
+  EXISTS (
+    SELECT 1 FROM runtime_run_command_effects effect
+    WHERE effect.session_id = OLD.session_id
+      AND effect.applied_session_sequence = OLD.sequence
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime Run journal events are immutable');
+END;
+
+CREATE TRIGGER runtime_run_referenced_session_events_immutable_delete
+BEFORE DELETE ON session_events
+WHEN
+  EXISTS (
+    SELECT 1 FROM runtime_run_commands command
+    WHERE command.session_id = OLD.session_id
+      AND command.source_session_sequence = OLD.sequence
+  ) OR
+  EXISTS (
+    SELECT 1 FROM runtime_run_command_effects effect
+    WHERE effect.session_id = OLD.session_id
+      AND effect.applied_session_sequence = OLD.sequence
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime Run journal events are immutable');
+END;
+`;
+
 const SCHEMA = `
 CREATE TABLE teams (
   id TEXT PRIMARY KEY,
@@ -1527,6 +2316,8 @@ CREATE TABLE runtime_outbox (
   FOREIGN KEY (session_id, session_sequence)
     REFERENCES session_events(session_id, sequence) ON DELETE RESTRICT
 ) STRICT;
+
+${RUNTIME_RUN_COMMAND_SCHEMA}
 `;
 
 export interface OpenTeamSessionDatabaseOptions {
@@ -1594,6 +2385,10 @@ export function openTeamSessionDatabase(
         migrateAgentRunSchemaV3(db);
         migratedVersion = 3;
       }
+      if (migratedVersion === 3) {
+        migrateRuntimeRunCommandSchemaV4(db);
+        migratedVersion = 4;
+      }
       if (migratedVersion !== SCHEMA_VERSION) {
         throw new Error(
           `Unsupported Team Session database schema ${currentVersion}; expected ${SCHEMA_VERSION}`
@@ -1651,6 +2446,10 @@ function migrateAgentRunSchemaV3(db: Database.Database): void {
       CHECK (run_state_revision >= 1);
     ${AGENT_RUN_SCHEMA}
   `);
+}
+
+function migrateRuntimeRunCommandSchemaV4(db: Database.Database): void {
+  db.exec(RUNTIME_RUN_COMMAND_SCHEMA);
 }
 
 interface ConversationMigrationEvent {
