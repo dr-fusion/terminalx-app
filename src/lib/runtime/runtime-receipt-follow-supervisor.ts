@@ -1,6 +1,14 @@
 import type { RuntimeHandle } from "./contracts";
 import type { RuntimeReceiptObservationCheckpoint } from "./runtime-receipt-observation";
 import type { RuntimeBinding } from "../team-sessions/contracts";
+import {
+  linkRuntimeAbortSignal,
+  runBoundedRuntimeOperation,
+  runtimeHealthClockMinimum,
+  runtimeAbortableDelay,
+  sampleRuntimeHealthClock,
+} from "./runtime-supervisor-operation";
+import type { RuntimeManagedSupervisorHealth } from "./runtime-supervisor-root";
 
 const MAX_PROTOTYPE_DEPTH = 32;
 const MAX_IDENTIFIER_LENGTH = 300;
@@ -130,6 +138,10 @@ export class RuntimeReceiptFollowSupervisor {
   private loopPromise: Promise<void> | null = null;
   private activeRun: Promise<RuntimeReceiptFollowRunResult> | null = null;
   private activeRunController: AbortController | null = null;
+  private lastSuccessAtMs: number | null = null;
+  private lastErrorAtMs: number | null = null;
+  private activeCycleStartedAtMs: number | null = null;
+  private failureSinceSuccess = false;
 
   constructor(options: RuntimeReceiptFollowSupervisorOptions) {
     // Capture provider capability before touching the journal. A getter-backed
@@ -176,6 +188,15 @@ export class RuntimeReceiptFollowSupervisor {
     return this.loopPromise !== null;
   }
 
+  health(): RuntimeManagedSupervisorHealth {
+    return Object.freeze({
+      lastSuccessAtMs: this.lastSuccessAtMs,
+      lastErrorAtMs: this.lastErrorAtMs,
+      activeCycleStartedAtMs: this.activeCycleStartedAtMs,
+      failureSinceSuccess: this.failureSinceSuccess,
+    });
+  }
+
   start(): void {
     if (this.loopPromise) return;
     const controller = new AbortController();
@@ -205,13 +226,43 @@ export class RuntimeReceiptFollowSupervisor {
   runOnce(): Promise<RuntimeReceiptFollowRunResult> {
     if (this.activeRun) return this.activeRun;
     const controller = new AbortController();
-    const unlink = linkAbortSignal(this.controller?.signal, controller);
+    const unlink = linkRuntimeAbortSignal(this.controller?.signal, controller);
     this.activeRunController = controller;
-    const run = this.processOne(controller.signal).finally(() => {
-      unlink();
-      if (this.activeRunController === controller) this.activeRunController = null;
-      if (this.activeRun === run) this.activeRun = null;
-    });
+    const run = this.processOne(controller.signal)
+      .then(
+        (result) => {
+          const minimum = runtimeHealthClockMinimum(
+            this.activeCycleStartedAtMs,
+            this.lastSuccessAtMs,
+            this.lastErrorAtMs
+          );
+          const settledAtMs = sampleRuntimeHealthClock(this.clock, minimum);
+          if (settledAtMs === null) {
+            this.lastErrorAtMs = minimum;
+            this.failureSinceSuccess = true;
+          } else {
+            this.lastSuccessAtMs = settledAtMs;
+            this.failureSinceSuccess = false;
+          }
+          return result;
+        },
+        (error: unknown) => {
+          const minimum = runtimeHealthClockMinimum(
+            this.activeCycleStartedAtMs,
+            this.lastSuccessAtMs,
+            this.lastErrorAtMs
+          );
+          this.lastErrorAtMs = sampleRuntimeHealthClock(this.clock, minimum) ?? minimum;
+          this.failureSinceSuccess = true;
+          throw error;
+        }
+      )
+      .finally(() => {
+        unlink();
+        this.activeCycleStartedAtMs = null;
+        if (this.activeRunController === controller) this.activeRunController = null;
+        if (this.activeRun === run) this.activeRun = null;
+      });
     this.activeRun = run;
     return run;
   }
@@ -226,10 +277,10 @@ export class RuntimeReceiptFollowSupervisor {
             : result.claimed > 0
               ? this.busyDelayMs
               : this.idleDelayMs;
-        await abortableDelay(delay, signal);
+        await runtimeAbortableDelay(delay, signal);
       } catch {
         reportOperationalError(this.onOperationalError);
-        await abortableDelay(this.errorDelayMs, signal);
+        await runtimeAbortableDelay(this.errorDelayMs, signal);
       }
     }
   }
@@ -237,6 +288,7 @@ export class RuntimeReceiptFollowSupervisor {
   private async processOne(signal: AbortSignal): Promise<RuntimeReceiptFollowRunResult> {
     if (signal.aborted) return emptyRunResult();
     const reconcileAtMs = sampleClock(this.clock);
+    this.activeCycleStartedAtMs = reconcileAtMs;
     await this.journal.reconcile(reconcileAtMs);
     if (signal.aborted) return emptyRunResult();
     const claimedAtMs = sampleClock(this.clock, reconcileAtMs);
@@ -254,10 +306,11 @@ export class RuntimeReceiptFollowSupervisor {
       await this.releaseBestEffort(lease, "transport-unavailable", resolveAtMs);
       return transportFailureResult();
     }
-    const resolved = await boundedOperation(
+    const resolved = await runBoundedRuntimeOperation(
       (operationSignal) => this.handles.resolve(lease, operationSignal),
       Math.min(this.handleResolveTimeoutMs, remainingBeforeResolve - LEASE_COMPLETION_MARGIN_MS),
-      signal
+      signal,
+      { abortOnSettlement: true }
     );
     if (resolved.kind !== "value") {
       const failedAtMs = sampleClock(this.clock, resolveAtMs);
@@ -290,16 +343,17 @@ export class RuntimeReceiptFollowSupervisor {
     }
 
     const iteratorHolder: { current?: CapturedAsyncIterator } = {};
-    const next = await boundedOperation(
+    const next = await runBoundedRuntimeOperation<unknown>(
       (operationSignal) => {
         const iterator = captureAsyncIterator(
           this.follow(handle, lease.checkpoint, operationSignal)
         );
         iteratorHolder.current = iterator;
-        return Promise.resolve(iterator.next());
+        return iterator.next();
       },
       Math.min(this.followPollTimeoutMs, remainingBeforePoll - LEASE_COMPLETION_MARGIN_MS),
-      signal
+      signal,
+      { abortOnSettlement: true }
     );
     iteratorHolder.current?.close();
     if (next.kind !== "value") {
@@ -383,7 +437,11 @@ function captureAsyncIterator(iterable: AsyncIterable<unknown>): CapturedAsyncIt
       closed = true;
       try {
         const pending = Reflect.apply(close, iterator, []) as unknown;
-        Promise.resolve(pending).catch(() => undefined);
+        try {
+          Reflect.apply(Promise.prototype.then, pending, [undefined, () => undefined]);
+        } catch {
+          // Custom thenables are not invoked during best-effort cleanup.
+        }
       } catch {
         // Closing is best effort. The AbortSignal is the authoritative transport fence.
       }
@@ -695,80 +753,6 @@ function reportOperationalError(
   } catch {
     // Observability is never allowed to terminate the supervisor loop.
   }
-}
-
-type BoundedOperationResult<T> =
-  | { readonly kind: "value"; readonly value: T }
-  | { readonly kind: "error" }
-  | { readonly kind: "timeout" }
-  | { readonly kind: "aborted" };
-
-function boundedOperation<T>(
-  operation: (signal: AbortSignal) => Promise<T>,
-  timeoutMs: number,
-  parentSignal: AbortSignal
-): Promise<BoundedOperationResult<T>> {
-  return new Promise((resolve) => {
-    let settled = false;
-    const controller = new AbortController();
-    if (parentSignal.aborted) {
-      controller.abort();
-      resolve({ kind: "aborted" });
-      return;
-    }
-    const finish = (result: BoundedOperationResult<T>): void => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      parentSignal.removeEventListener("abort", abortFromParent);
-      controller.abort();
-      resolve(result);
-    };
-    const abortFromParent = () => {
-      controller.abort();
-      finish({ kind: "aborted" });
-    };
-    parentSignal.addEventListener("abort", abortFromParent, { once: true });
-    const timer = setTimeout(() => {
-      controller.abort();
-      finish({ kind: "timeout" });
-    }, timeoutMs);
-    let pending: Promise<T>;
-    try {
-      pending = operation(controller.signal);
-    } catch {
-      finish({ kind: "error" });
-      return;
-    }
-    Promise.resolve(pending).then(
-      (value) => finish({ kind: "value", value }),
-      () => finish({ kind: "error" })
-    );
-  });
-}
-
-function linkAbortSignal(source: AbortSignal | undefined, target: AbortController): () => void {
-  if (!source) return () => undefined;
-  const abort = () => target.abort();
-  if (source.aborted) {
-    abort();
-    return () => undefined;
-  }
-  source.addEventListener("abort", abort, { once: true });
-  return () => source.removeEventListener("abort", abort);
-}
-
-function abortableDelay(milliseconds: number, signal: AbortSignal): Promise<void> {
-  if (signal.aborted) return Promise.resolve();
-  return new Promise((resolve) => {
-    const timer = setTimeout(done, milliseconds);
-    signal.addEventListener("abort", done, { once: true });
-    function done() {
-      clearTimeout(timer);
-      signal.removeEventListener("abort", done);
-      resolve();
-    }
-  });
 }
 
 function deepFreeze<T>(value: T): T {

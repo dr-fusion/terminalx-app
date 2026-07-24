@@ -253,12 +253,14 @@ export type SessionCommand =
       outboxId: string;
       workerId: string;
       expectedAttempt: number;
+      expectedLeaseExpiresAtMs: number;
     })
   | (CommandBase & {
       type: "runtime.outbox.fail";
       outboxId: string;
       workerId: string;
       expectedAttempt: number;
+      expectedLeaseExpiresAtMs: number;
       retryable: boolean;
       /** Closed, safe class only; raw Runtime errors and output never enter the kernel ledger. */
       errorCode: RuntimeOutboxErrorCode;
@@ -475,6 +477,27 @@ export interface RuntimeOutboxClaimOptions {
   leaseDurationMs?: number;
 }
 
+export interface RuntimeOutboxDispatchInterlockOptions {
+  outboxId: string;
+  workerId: string;
+  expectedAttempt: number;
+  expectedLeaseExpiresAtMs: number;
+}
+
+export interface RuntimeOutboxLeaseRenewalOptions {
+  outboxId: string;
+  workerId: string;
+  expectedAttempt: number;
+  expectedLeaseExpiresAtMs: number;
+  leaseDurationMs: number;
+}
+
+export interface RuntimeOutboxLeaseRenewal {
+  leaseExpiresAtMs: number;
+}
+
+export type RuntimeOutboxDispatchMode = "apply" | "reconcile";
+
 interface RuntimeOutboxDeliveryBase {
   outboxId: string;
   sessionId: string;
@@ -482,6 +505,12 @@ interface RuntimeOutboxDeliveryBase {
   attempts: number;
   leaseOwner: string;
   leaseExpiresAtMs: number;
+  /**
+   * Once an attempt has crossed the durable dispatch interlock, every later
+   * owner must reconcile adapter state. A reconciler must never call the
+   * ordinary apply path, even when the original lease has expired.
+   */
+  dispatchMode: RuntimeOutboxDispatchMode;
 }
 
 export type RuntimeOutboxDelivery = RuntimeOutboxDeliveryBase &
@@ -508,24 +537,13 @@ export type RuntimeOutboxDelivery = RuntimeOutboxDeliveryBase &
         payload: {
           sessionId: string;
           runtimeAuthorizationGeneration: number;
-        } & (
-          | {
-              reason?: never;
-              agentRunId?: never;
-              runtimeAssignmentId?: never;
-              runtimeAssignmentGeneration?: never;
-              sandboxId?: never;
-              sandboxGeneration?: never;
-            }
-          | {
-              reason: "emergency-stop";
-              agentRunId: string;
-              runtimeAssignmentId: string;
-              runtimeAssignmentGeneration: number;
-              sandboxId: string;
-              sandboxGeneration: number;
-            }
-        );
+          reason: "emergency-stop";
+          agentRunId: string;
+          runtimeAssignmentId: string;
+          runtimeAssignmentGeneration: number;
+          sandboxId: string;
+          sandboxGeneration: number;
+        };
       }
   );
 
@@ -1028,6 +1046,10 @@ export interface TeamSessions {
   performTerminalMutation(query: SessionTerminalAuthorizationQuery, mutation: () => void): void;
   follow(options: FollowSessionOptions): AsyncIterable<SessionEvent>;
   claimRuntimeOutbox(options: RuntimeOutboxClaimOptions): Promise<RuntimeOutboxDelivery[]>;
+  markRuntimeOutboxDispatch(options: RuntimeOutboxDispatchInterlockOptions): Promise<void>;
+  renewRuntimeOutboxLease(
+    options: RuntimeOutboxLeaseRenewalOptions
+  ): Promise<RuntimeOutboxLeaseRenewal>;
   runtimeEnsureState(input: {
     sessionId: string;
     tmuxName: string;

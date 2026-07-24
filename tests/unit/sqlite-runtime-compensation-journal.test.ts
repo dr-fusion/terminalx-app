@@ -112,6 +112,7 @@ describe("SQLite Runtime compensation journal", () => {
     const observation = createRuntimeCompensationReceiptObservationIssuer({
       issuerKeyId: OBSERVATION_ISSUER_KEY_ID,
       binding: command.binding,
+      trustedConfigurationRoot: directory,
       privateKeyFile: observationPrivateKeyFile,
       clock: () => observedAtMs,
       observationTtlMs: 100,
@@ -228,6 +229,67 @@ describe("SQLite Runtime compensation journal", () => {
       database!.db.prepare(`SELECT COUNT(*) AS count FROM runtime_compensation_dispatch`).get()
     ).toEqual({ count: 0 });
   });
+
+  it("does not read or invoke a custom thenable from pinned authority verification", async () => {
+    const thenBody = vi.fn();
+    const thenGetter = vi.fn(() => thenBody);
+    const hostile = {} as Record<string, unknown>;
+    Object.defineProperty(hostile, "then", { get: thenGetter });
+    const rejected = journal({ authority: (() => hostile) as never });
+    const candidate = await requiredCandidate(rejected);
+    const command = compensationCommand(candidate);
+
+    await expect(
+      rejected.materialize({
+        compensationId: candidate.compensationId,
+        incidentDigest: candidate.incidentDigest,
+        command,
+        authorityVerifiedAtMs: 121,
+        materializedAtMs: 123,
+      })
+    ).rejects.toMatchObject({ code: "invalid_command" });
+    expect(thenGetter).not.toHaveBeenCalled();
+    expect(thenBody).not.toHaveBeenCalled();
+    expect(
+      database!.db.prepare(`SELECT COUNT(*) AS count FROM runtime_compensation_commands`).get()
+    ).toEqual({ count: 0 });
+  });
+
+  it.each([1, 2])(
+    "rolls back all materialization rows when pinned verification aborts reentrantly on call %i",
+    async (abortOnCall) => {
+      const controller = new AbortController();
+      let verificationCalls = 0;
+      const active = journal({
+        authority: () => {
+          verificationCalls += 1;
+          if (verificationCalls === abortOnCall) controller.abort();
+          return true;
+        },
+      });
+      const candidate = await requiredCandidate(active);
+      const command = compensationCommand(candidate);
+
+      await expect(
+        active.materialize(
+          {
+            compensationId: candidate.compensationId,
+            incidentDigest: candidate.incidentDigest,
+            command,
+            authorityVerifiedAtMs: 121,
+            materializedAtMs: 123,
+          },
+          { signal: controller.signal }
+        )
+      ).rejects.toMatchObject({ name: "AbortError" });
+      expect(
+        database!.db.prepare(`SELECT COUNT(*) AS count FROM runtime_compensation_commands`).get()
+      ).toEqual({ count: 0 });
+      expect(
+        database!.db.prepare(`SELECT COUNT(*) AS count FROM runtime_compensation_dispatch`).get()
+      ).toEqual({ count: 0 });
+    }
+  );
 
   it("reclaims only a pre-interlock stale lease and preserves its attempt sequence", async () => {
     const firstJournal = journal({ retryDelayMs: 10 });

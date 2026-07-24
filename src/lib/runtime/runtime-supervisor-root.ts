@@ -1,3 +1,4 @@
+import { types as nodeTypes } from "node:util";
 import type { RuntimeWriteStateUpdate } from "./local-tmux-runtime";
 import type { RuntimeCompensationMaterializerRunResult } from "./runtime-compensation-materializer";
 import type { RuntimeWriteStateRegistry } from "./write-state";
@@ -12,10 +13,22 @@ export type RuntimeSupervisorRootState =
 
 export interface RuntimeManagedSupervisor {
   readonly running: boolean;
+  health(): RuntimeManagedSupervisorHealth;
   start(): void;
   /** One complete reconcile/claim cycle used as the restart barrier. */
   runOnce(): Promise<RuntimeManagedSupervisorRunResult>;
   stop(): Promise<void>;
+}
+
+export interface RuntimeManagedSupervisorHealth {
+  readonly lastSuccessAtMs: number | null;
+  readonly lastErrorAtMs: number | null;
+  readonly activeCycleStartedAtMs: number | null;
+  readonly failureSinceSuccess: boolean;
+}
+
+export interface RuntimeSupervisorComponentHealth extends RuntimeManagedSupervisorHealth {
+  readonly healthy: boolean;
 }
 
 export interface RuntimeManagedSupervisorRunResult {
@@ -32,6 +45,7 @@ export interface RuntimeDurableWriteStateSource {
 }
 
 export interface RuntimeSupervisorRootOptions {
+  readonly assignment: RuntimeManagedSupervisor;
   readonly lifecycle: RuntimeManagedSupervisor;
   readonly receiptFollow: RuntimeManagedSupervisor;
   readonly compensation: RuntimeManagedSupervisor;
@@ -55,13 +69,19 @@ export interface RuntimeSupervisorRootReadiness {
   readonly ready: boolean;
   readonly state: RuntimeSupervisorRootState;
   readonly durableWriteStateLoaded: boolean;
+  readonly assignmentReconciled: boolean;
   readonly lifecycleReconciled: boolean;
   readonly receiptFollowReconciled: boolean;
   readonly compensationReconciled: boolean;
   readonly restartReconciled: boolean;
+  readonly assignmentRunning: boolean;
   readonly lifecycleRunning: boolean;
   readonly receiptFollowRunning: boolean;
   readonly compensationRunning: boolean;
+  readonly assignmentHealth: RuntimeSupervisorComponentHealth;
+  readonly lifecycleHealth: RuntimeSupervisorComponentHealth;
+  readonly receiptFollowHealth: RuntimeSupervisorComponentHealth;
+  readonly compensationHealth: RuntimeSupervisorComponentHealth;
   readonly materializerHealthy: boolean;
   readonly lastMaterializerSuccessAtMs: number | null;
   readonly lastMaterializerErrorAtMs: number | null;
@@ -69,6 +89,7 @@ export interface RuntimeSupervisorRootReadiness {
 
 interface CapturedManagedSupervisor {
   readonly isRunning: () => boolean;
+  readonly health: () => unknown;
   readonly start: () => unknown;
   readonly runOnce: () => unknown;
   readonly stop: () => unknown;
@@ -96,11 +117,12 @@ const MAX_PROTOTYPE_DEPTH = 16;
  * Production lifecycle owner for the portable Runtime-truth workers.
  *
  * Startup is an explicit fail-closed barrier: install the durable write fence,
- * complete one lifecycle reconciliation, complete one signed-receipt follow
- * reconciliation, materialize stale-effect compensation, and complete one
- * compensation reconciliation before any background loop may report ready.
+ * drain assignment recovery, drain lifecycle and signed-receipt reconciliation,
+ * materialize stale-effect compensation, and drain compensation recovery before
+ * any background loop may report ready.
  */
 export class RuntimeSupervisorRoot {
+  private readonly assignment: CapturedManagedSupervisor;
   private readonly lifecycle: CapturedManagedSupervisor;
   private readonly receiptFollow: CapturedManagedSupervisor;
   private readonly compensation: CapturedManagedSupervisor;
@@ -128,6 +150,7 @@ export class RuntimeSupervisorRoot {
   private materializerLoop: Promise<void> | null = null;
   private readonly activeMaterializerSettlements = new Set<Promise<void>>();
   private shutdownWorkersPromise: Promise<boolean> | null = null;
+  private assignmentReconciled = false;
   private lifecycleReconciled = false;
   private receiptFollowReconciled = false;
   private compensationReconciled = false;
@@ -137,6 +160,9 @@ export class RuntimeSupervisorRoot {
 
   constructor(unsafeOptions: RuntimeSupervisorRootOptions) {
     const options = dataRecord(unsafeOptions, "Invalid Runtime supervisor root options");
+    this.assignment = captureManagedSupervisor(
+      requiredDataField(options, "assignment", "Invalid Runtime supervisor root dependency")
+    );
     this.lifecycle = captureManagedSupervisor(
       requiredDataField(options, "lifecycle", "Invalid Runtime supervisor root dependency")
     );
@@ -283,12 +309,36 @@ export class RuntimeSupervisorRoot {
 
   readiness(): RuntimeSupervisorRootReadiness {
     const nowMs = safeClockOrNull(this.clock);
+    const assignmentRunning = this.assignment.isRunning();
     const lifecycleRunning = this.lifecycle.isRunning();
     const receiptFollowRunning = this.receiptFollow.isRunning();
     const compensationRunning = this.compensation.isRunning();
+    const assignmentHealth = snapshotComponentHealth(
+      this.assignment.health,
+      nowMs,
+      this.readinessStaleAfterMs
+    );
+    const lifecycleHealth = snapshotComponentHealth(
+      this.lifecycle.health,
+      nowMs,
+      this.readinessStaleAfterMs
+    );
+    const receiptFollowHealth = snapshotComponentHealth(
+      this.receiptFollow.health,
+      nowMs,
+      this.readinessStaleAfterMs
+    );
+    const compensationHealth = snapshotComponentHealth(
+      this.compensation.health,
+      nowMs,
+      this.readinessStaleAfterMs
+    );
     const durableWriteStateLoaded = this.hasDurableWriteState();
     const restartReconciled =
-      this.lifecycleReconciled && this.receiptFollowReconciled && this.compensationReconciled;
+      this.assignmentReconciled &&
+      this.lifecycleReconciled &&
+      this.receiptFollowReconciled &&
+      this.compensationReconciled;
     const materializerHealthy =
       nowMs !== null &&
       this.lastMaterializerSuccessAtMs !== null &&
@@ -300,19 +350,30 @@ export class RuntimeSupervisorRoot {
         this.currentState === "running" &&
         durableWriteStateLoaded &&
         restartReconciled &&
+        assignmentRunning &&
         lifecycleRunning &&
         receiptFollowRunning &&
         compensationRunning &&
+        assignmentHealth.healthy &&
+        lifecycleHealth.healthy &&
+        receiptFollowHealth.healthy &&
+        compensationHealth.healthy &&
         materializerHealthy,
       state: this.currentState,
       durableWriteStateLoaded,
+      assignmentReconciled: this.assignmentReconciled,
       lifecycleReconciled: this.lifecycleReconciled,
       receiptFollowReconciled: this.receiptFollowReconciled,
       compensationReconciled: this.compensationReconciled,
       restartReconciled,
+      assignmentRunning,
       lifecycleRunning,
       receiptFollowRunning,
       compensationRunning,
+      assignmentHealth,
+      lifecycleHealth,
+      receiptFollowHealth,
+      compensationHealth,
       materializerHealthy,
       lastMaterializerSuccessAtMs: this.lastMaterializerSuccessAtMs,
       lastMaterializerErrorAtMs: this.lastMaterializerErrorAtMs,
@@ -335,6 +396,12 @@ export class RuntimeSupervisorRoot {
         throw new TypeError("Runtime write-state bootstrap did not install a snapshot");
       }
 
+      // Assignment recovery owns sandbox/process existence. Drain it before a
+      // lifecycle command can resolve or dispatch against a stale assignment.
+      await this.primeWorker(this.assignment, signal);
+      this.assignmentReconciled = true;
+      this.assertStarting(signal);
+
       await this.primeWorker(this.lifecycle, signal);
       this.lifecycleReconciled = true;
       this.assertStarting(signal);
@@ -352,9 +419,14 @@ export class RuntimeSupervisorRoot {
       this.compensationReconciled = true;
       this.assertStarting(signal);
 
-      // Start containment first. The explicit priming barrier above means a
-      // synchronous `start()` cannot make readiness outrun reconciliation.
-      for (const worker of [this.compensation, this.receiptFollow, this.lifecycle]) {
+      // Start assignment first and lifecycle last. The explicit priming
+      // barrier above means synchronous starts cannot outrun reconciliation.
+      for (const worker of [
+        this.assignment,
+        this.compensation,
+        this.receiptFollow,
+        this.lifecycle,
+      ]) {
         assertSynchronousVoid(worker.start());
         if (!worker.isRunning()) throw new TypeError("Runtime worker did not start");
         this.assertStarting(signal);
@@ -378,7 +450,15 @@ export class RuntimeSupervisorRoot {
       this.currentState = "running";
     } catch {
       if (this.currentState === "starting") this.currentState = "failed";
-      await this.requestWorkersStop();
+      // A startup timeout is not proof that the materializer stopped. Abort
+      // its linked per-cycle signal and bound settlement before reporting the
+      // failed startup, just as worker shutdown is bounded below.
+      this.startupController?.abort();
+      const activeMaterializers = [...this.activeMaterializerSettlements];
+      await Promise.all([
+        this.requestWorkersStop(),
+        settleAllWithin(activeMaterializers, this.shutdownOperationTimeoutMs),
+      ]);
       throw new TypeError("Runtime supervisor root could not start");
     }
   }
@@ -458,7 +538,7 @@ export class RuntimeSupervisorRoot {
 
   private async stopWorkers(): Promise<boolean> {
     const results = await Promise.all(
-      [this.lifecycle, this.compensation, this.receiptFollow].map((worker) =>
+      [this.assignment, this.lifecycle, this.compensation, this.receiptFollow].map((worker) =>
         boundedNativeOperation(worker.stop, this.shutdownOperationTimeoutMs)
       )
     );
@@ -506,8 +586,8 @@ export class RuntimeSupervisorRoot {
     signal: AbortSignal,
     timeoutMs: number
   ): Promise<RuntimeCompensationMaterializerRunResult> {
-    const outcome = await boundedNativeOperation(
-      () => this.runMaterializer(signal),
+    const outcome = await boundedAbortableNativeOperation(
+      (operationSignal) => this.runMaterializer(operationSignal),
       timeoutMs,
       signal
     );
@@ -539,15 +619,107 @@ export function createRuntimeSupervisorRoot(
 }
 
 function captureManagedSupervisor(value: unknown): CapturedManagedSupervisor {
+  const health = captureDataMethod(value, "health", "Invalid Runtime supervisor root dependency");
   const start = captureDataMethod(value, "start", "Invalid Runtime supervisor root dependency");
   const runOnce = captureDataMethod(value, "runOnce", "Invalid Runtime supervisor root dependency");
   const stop = captureDataMethod(value, "stop", "Invalid Runtime supervisor root dependency");
   return Object.freeze({
     isRunning: captureBooleanReader(value, "running", "Invalid Runtime supervisor root dependency"),
+    health: () => Reflect.apply(health, value, []),
     start: () => Reflect.apply(start, value, []),
     runOnce: () => Reflect.apply(runOnce, value, []),
     stop: () => Reflect.apply(stop, value, []),
   });
+}
+
+function snapshotComponentHealth(
+  read: () => unknown,
+  nowMs: number | null,
+  staleAfterMs: number
+): RuntimeSupervisorComponentHealth {
+  const unhealthy = (): RuntimeSupervisorComponentHealth =>
+    Object.freeze({
+      healthy: false,
+      lastSuccessAtMs: null,
+      lastErrorAtMs: null,
+      activeCycleStartedAtMs: null,
+      failureSinceSuccess: true,
+    });
+  try {
+    const value = read();
+    if (
+      typeof value !== "object" ||
+      value === null ||
+      Array.isArray(value) ||
+      nodeTypes.isProxy(value) ||
+      (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null)
+    ) {
+      return unhealthy();
+    }
+    const fields = [
+      "lastSuccessAtMs",
+      "lastErrorAtMs",
+      "activeCycleStartedAtMs",
+      "failureSinceSuccess",
+    ] as const;
+    const keys = Reflect.ownKeys(value);
+    if (
+      keys.length !== fields.length ||
+      keys.some(
+        (key) => typeof key !== "string" || !fields.includes(key as (typeof fields)[number])
+      )
+    ) {
+      return unhealthy();
+    }
+    const record = value as Record<string, unknown>;
+    const field = (key: (typeof fields)[number]): unknown => {
+      const descriptor = Object.getOwnPropertyDescriptor(record, key);
+      if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) throw new TypeError();
+      return descriptor.value;
+    };
+    const lastSuccessAtMs = nullableHealthTime(field("lastSuccessAtMs"));
+    const lastErrorAtMs = nullableHealthTime(field("lastErrorAtMs"));
+    const activeCycleStartedAtMs = nullableHealthTime(field("activeCycleStartedAtMs"));
+    const failureSinceSuccess = field("failureSinceSuccess");
+    if (failureSinceSuccess !== true && failureSinceSuccess !== false) return unhealthy();
+    const timestamps = [lastSuccessAtMs, lastErrorAtMs, activeCycleStartedAtMs].filter(
+      (timestamp): timestamp is number => timestamp !== null
+    );
+    const timestampsValid = nowMs !== null && timestamps.every((timestamp) => timestamp <= nowMs);
+    const settledOrderingValid =
+      lastSuccessAtMs !== null &&
+      (lastErrorAtMs === null ||
+        (failureSinceSuccess
+          ? lastErrorAtMs >= lastSuccessAtMs
+          : lastSuccessAtMs >= lastErrorAtMs));
+    const activeOrderingValid =
+      activeCycleStartedAtMs === null ||
+      ((lastSuccessAtMs === null || activeCycleStartedAtMs >= lastSuccessAtMs) &&
+        (lastErrorAtMs === null || activeCycleStartedAtMs >= lastErrorAtMs));
+    const freshSuccess =
+      timestampsValid &&
+      settledOrderingValid &&
+      lastSuccessAtMs !== null &&
+      nowMs - lastSuccessAtMs <= staleAfterMs;
+    const activeCycleFresh =
+      activeCycleStartedAtMs === null ||
+      (timestampsValid && activeOrderingValid && nowMs - activeCycleStartedAtMs <= staleAfterMs);
+    return Object.freeze({
+      healthy: freshSuccess && activeCycleFresh && failureSinceSuccess === false,
+      lastSuccessAtMs,
+      lastErrorAtMs,
+      activeCycleStartedAtMs,
+      failureSinceSuccess,
+    });
+  } catch {
+    return unhealthy();
+  }
+}
+
+function nullableHealthTime(value: unknown): number | null {
+  if (value === null) return null;
+  if (!Number.isSafeInteger(value) || (value as number) < 0) throw new TypeError();
+  return value as number;
 }
 
 function captureDataMethod(
@@ -776,6 +948,49 @@ function boundedNativeOperation<T = unknown>(
     let pending: unknown;
     try {
       pending = operation();
+    } catch {
+      finish({ kind: "error" });
+      return;
+    }
+    try {
+      Reflect.apply(Promise.prototype.then, pending, [
+        (value: T) => finish({ kind: "value", value }),
+        () => finish({ kind: "error" }),
+      ]);
+    } catch {
+      finish({ kind: "invalid" });
+    }
+  });
+}
+
+function boundedAbortableNativeOperation<T = unknown>(
+  operation: (signal: AbortSignal) => unknown,
+  timeoutMs: number,
+  parentSignal: AbortSignal
+): Promise<BoundedOperationResult<T>> {
+  return new Promise((resolve) => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const controller = new AbortController();
+    const finish = (result: BoundedOperationResult<T>): void => {
+      if (settled) return;
+      settled = true;
+      if (timer !== null) clearTimeout(timer);
+      parentSignal.removeEventListener("abort", abortFromParent);
+      controller.abort();
+      resolve(result);
+    };
+    const abortFromParent = () => finish({ kind: "aborted" });
+    if (parentSignal.aborted) {
+      finish({ kind: "aborted" });
+      return;
+    }
+    parentSignal.addEventListener("abort", abortFromParent, { once: true });
+    timer = setTimeout(() => finish({ kind: "timeout" }), timeoutMs);
+
+    let pending: unknown;
+    try {
+      pending = operation(controller.signal);
     } catch {
       finish({ kind: "error" });
       return;

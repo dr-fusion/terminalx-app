@@ -44,6 +44,16 @@ its “deliberately still closed” list should not be read as current implement
   malformed packets cannot use that path to quarantine a tenant Runtime.
 - Schema v7 adds immutable stale-effect incidents, separately signed `safety.quarantine` commands,
   crash-safe compensation dispatch, compensation receipts/effects, and exact-source follow events.
+- Schema v8 adds a one-way assignment-outbox dispatch interlock. A crash before the marker may
+  retry ordinary apply; every attempt at or after the marker is reconciliation-only, including
+  databases upgraded from the previously committed v7 schema. Renewable leases retain the
+  original marker across attempts, tolerate a bounded wall-clock correction, self-heal fabricated
+  far-future leases, and fail closed when the clock predates durable work.
+- Runtime outbox completion, retry, failure, and supersession now require immutable per-attempt or
+  per-target evidence bound to the exact accepted command. Direct terminal-state SQL, ambient
+  quarantine, historical retirement, malformed accepted-command JSON, and evidence mutation cannot
+  manufacture Runtime truth. The v7 migration rejects ambiguous JSON tokens, duplicate keys,
+  unsafe numeric state, oversized UTF-8 identifiers, and mismatched source events transactionally.
 - Platform-security compensation advances beyond every durable authorization and safety high-water
   for the exact historical binding. It cannot retire or mutate a replacement Assignment, and the
   original lifecycle command remains visibly `compensating` until enforced containment exists.
@@ -57,13 +67,22 @@ its “deliberately still closed” list should not be read as current implement
 - A separately signed Runtime observation-key registry binds each key to the complete Runtime
   binding, authorization generation, adapter identity, and adapter configuration. Its production
   source is independent of Runtime/provider payloads.
+- Every file-backed command, observation, and enforcer trust source is confined beneath an explicit
+  canonical operator-owned private root. Symlinks, hard links, permissive modes, ownership changes,
+  replacement races, oversized files, and paths outside that root fail closed; loaded private-key
+  bytes are zeroed after key construction.
 - The process-local terminal write registry has a mandatory production bootstrap mode. The private
   kernel reconstructs a transactionally consistent SQLite snapshot, preserves authorization
   high-water across replacement Assignments, and installs it before the server constructs any
   canonical terminal gateway or Runtime worker.
-- One portable supervisor composition owns lifecycle delivery, receipt follow, compensation
-  materialization/delivery, write-state bootstrap, cancellation, and readiness. Adapter command and
-  handle capabilities are captured from data descriptors before any dispatch interlock.
+- LocalTmux assigns every canonical tmux Session a random 256-bit incarnation in addition to tmux's
+  built-in `$id`. Resolver, WebSocket admission, PTY attachment, fencing, detachment, and retirement
+  carry both identities and execute mutations behind a same-connection tmux predicate, so a server
+  restart cannot exploit `$id` reuse to attach to or destroy a replacement Session.
+- One portable supervisor composition owns assignment recovery, lifecycle delivery, receipt follow,
+  compensation materialization/delivery, write-state bootstrap, cancellation, and readiness.
+  Adapter command and handle capabilities are captured from data descriptors before any dispatch
+  interlock, and restart readiness stays closed until assignment ambiguity is drained.
 - Separate-connection tests prove singular claims and settlement, dispatch-marker crash recovery
   without redispatch, and rollback without partial leases under deterministic `SQLITE_BUSY`.
 

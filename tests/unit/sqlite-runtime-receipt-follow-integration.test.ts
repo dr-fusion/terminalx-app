@@ -109,6 +109,7 @@ describe("signed Runtime late-receipt composition", () => {
       runtimeCommandAuthorityIssuer: createRuntimeCommandAuthorityIssuer({
         issuer: "team-session",
         issuerKeyId: "team-session:follow-integration-key",
+        trustedConfigurationRoot: directory,
         privateKeyFile: authorityPrivateKeyFile,
         clock: () => now,
       }),
@@ -169,12 +170,19 @@ describe("signed Runtime late-receipt composition", () => {
       leaseDurationMs: 30_000,
     });
     if (!ensure) throw new Error("Expected Runtime ensure delivery");
+    await sessions.markRuntimeOutboxDispatch({
+      outboxId: ensure.outboxId,
+      workerId: RUNTIME.userId,
+      expectedAttempt: ensure.attempts,
+      expectedLeaseExpiresAtMs: ensure.leaseExpiresAtMs,
+    });
     await dispatch(
       {
         type: "runtime.outbox.acknowledge",
         outboxId: ensure.outboxId,
         workerId: RUNTIME.userId,
         expectedAttempt: ensure.attempts,
+        expectedLeaseExpiresAtMs: ensure.leaseExpiresAtMs,
       },
       RUNTIME
     );
@@ -423,6 +431,7 @@ describe("signed Runtime late-receipt composition", () => {
     const observation = createRuntimeReceiptObservationIssuer({
       issuerKeyId: OBSERVATION_KEY_ID,
       binding: delivery.command.binding,
+      trustedConfigurationRoot: directory,
       privateKeyFile,
       clock: () => now,
     }).issue({
@@ -584,6 +593,7 @@ describe("signed Runtime late-receipt composition", () => {
     const observation = createRuntimeCompensationReceiptObservationIssuer({
       issuerKeyId: OBSERVATION_KEY_ID,
       binding: delivery.command.binding,
+      trustedConfigurationRoot: directory,
       privateKeyFile,
       clock: () => now,
     }).issue({
@@ -1728,6 +1738,7 @@ describe("signed Runtime late-receipt composition", () => {
         : createRuntimeCompensationReceiptObservationIssuer({
             issuerKeyId: OBSERVATION_KEY_ID,
             binding: fixture.delivery.command.binding,
+            trustedConfigurationRoot: directory,
             privateKeyFile,
             clock: () => now,
           }).issue({

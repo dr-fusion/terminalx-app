@@ -5,17 +5,6 @@ import {
   verify as verifyEd25519,
   type KeyObject,
 } from "node:crypto";
-import {
-  constants as fsConstants,
-  closeSync,
-  fstatSync,
-  lstatSync,
-  openSync,
-  readSync,
-  realpathSync,
-  type BigIntStats,
-} from "node:fs";
-import { isAbsolute, resolve } from "node:path";
 import { TextDecoder, types as utilTypes } from "node:util";
 import type { AggregateEnforcementProof } from "./contracts";
 import { canonicalRuntimeJson } from "./runtime-command-canonical";
@@ -29,6 +18,7 @@ import {
   type RuntimeEnforcementProofVerificationInput,
   type SynchronousRuntimeEnforcementProofVerifier,
 } from "./runtime-enforcement-proof";
+import { readTrustedConfigurationFile } from "./runtime-trusted-configuration-file";
 
 export const RUNTIME_EFFECT_ENFORCER_MANIFEST_CLAIMS_DIGEST_DOMAIN =
   "terminalx/runtime-effect-enforcer-manifest-claims/v1\0" as const;
@@ -155,7 +145,11 @@ const SOURCE_CREATE_FIELDS = [
   "pinnedManifestAuthorityPublicKeys",
 ] as const;
 const ATTESTATION_SOURCE_FIELDS = ["get"] as const;
-const FILE_CREATE_FIELDS = ["registryFile", "pinnedManifestAuthorityPublicKeys"] as const;
+const FILE_CREATE_FIELDS = [
+  "trustedConfigurationRoot",
+  "registryFile",
+  "pinnedManifestAuthorityPublicKeys",
+] as const;
 const REGISTRY_BUNDLE_FIELDS = ["manifest", "attestations"] as const;
 const VERIFICATION_INPUT_FIELDS = ["subject", "subjectDigest", "proof"] as const;
 
@@ -248,7 +242,12 @@ export interface CreateRuntimeEffectEnforcerTrustRegistryOptions {
 }
 
 export interface CreateRuntimeEffectEnforcerTrustRegistryFromFileOptions {
-  /** Absolute owner-controlled 0400/0600 canonical-JSON registry bundle. */
+  /**
+   * Absolute canonical private operator configuration root (0500/0700).
+   * This explicit trust boundary must not be an arbitrary browser workspace.
+   */
+  readonly trustedConfigurationRoot: string;
+  /** Absolute canonical 0400/0600 registry path strictly below the trust root. */
   readonly registryFile: string;
   readonly pinnedManifestAuthorityPublicKeys: readonly PinnedRuntimeEffectEnforcerManifestAuthorityPublicKey[];
 }
@@ -496,8 +495,13 @@ export function createRuntimeEffectEnforcerTrustRegistryFromFile(
   unsafeOptions: CreateRuntimeEffectEnforcerTrustRegistryFromFileOptions
 ): RuntimeEffectEnforcerTrustRegistry {
   const options = exactRecord(unsafeOptions, FILE_CREATE_FIELDS, "invalid_configuration");
+  const trustedConfigurationRoot = field(
+    options,
+    "trustedConfigurationRoot",
+    "invalid_configuration"
+  );
   const registryFile = field(options, "registryFile", "invalid_configuration");
-  const bundle = readCanonicalRegistryBundle(registryFile);
+  const bundle = readCanonicalRegistryBundle(trustedConfigurationRoot, registryFile);
   const record = exactRecord(bundle, REGISTRY_BUNDLE_FIELDS, "invalid_registry_file");
   return createRuntimeEffectEnforcerTrustRegistry({
     manifest: field(record, "manifest", "invalid_registry_file"),
@@ -1133,64 +1137,17 @@ function parseCanonicalEd25519PublicKey(pemValue: unknown, digestValue: unknown)
   return Object.freeze({ key, digest, pem: canonicalPem });
 }
 
-function readCanonicalRegistryBundle(value: unknown): unknown {
-  if (
-    typeof value !== "string" ||
-    !isAbsolute(value) ||
-    resolve(value) !== value ||
-    typeof fsConstants.O_NOFOLLOW !== "number" ||
-    typeof process.geteuid !== "function"
-  ) {
-    fail("registry_file_unavailable");
-  }
-  try {
-    if (realpathSync.native(value) !== value) fail("registry_file_unavailable");
-  } catch (error) {
-    if (error instanceof RuntimeEffectEnforcerAttestationError) throw error;
-    fail("registry_file_unavailable");
-  }
-  let descriptor: number;
-  try {
-    descriptor = openSync(value, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
-  } catch {
-    fail("registry_file_unavailable");
-  }
+function readCanonicalRegistryBundle(trustedConfigurationRoot: unknown, value: unknown): unknown {
   let bytes: Buffer;
   try {
-    const before = fstatSync(descriptor, { bigint: true });
-    const pathBefore = lstatSync(value, { bigint: true });
-    const mode = before.mode & BigInt(0o777);
-    if (
-      !before.isFile() ||
-      before.uid !== BigInt(process.geteuid()) ||
-      before.nlink !== BigInt(1) ||
-      (mode !== BigInt(0o400) && mode !== BigInt(0o600)) ||
-      (before.mode & BigInt(0o7000)) !== BigInt(0) ||
-      before.size < BigInt(2) ||
-      before.size > BigInt(MAX_REGISTRY_FILE_BYTES) ||
-      !sameRegistryFileSnapshot(before, pathBefore)
-    ) {
-      fail("registry_file_unavailable");
-    }
-    bytes = readExactRegistryBytes(descriptor, Number(before.size));
-    const after = fstatSync(descriptor, { bigint: true });
-    const pathAfter = lstatSync(value, { bigint: true });
-    if (
-      realpathSync.native(value) !== value ||
-      !sameRegistryFileSnapshot(before, after) ||
-      !sameRegistryFileSnapshot(after, pathAfter)
-    ) {
-      fail("registry_file_unavailable");
-    }
-  } catch (error) {
-    if (error instanceof RuntimeEffectEnforcerAttestationError) throw error;
+    bytes = readTrustedConfigurationFile({
+      trustedConfigurationRoot,
+      filePath: value,
+      minimumBytes: 2,
+      maximumBytes: MAX_REGISTRY_FILE_BYTES,
+    });
+  } catch {
     fail("registry_file_unavailable");
-  } finally {
-    try {
-      closeSync(descriptor);
-    } catch {
-      fail("registry_file_unavailable");
-    }
   }
   let text: string;
   let parsed: unknown;
@@ -1201,34 +1158,10 @@ function readCanonicalRegistryBundle(value: unknown): unknown {
   } catch (error) {
     if (error instanceof RuntimeEffectEnforcerAttestationError) throw error;
     fail("invalid_registry_file");
+  } finally {
+    bytes.fill(0);
   }
   return parsed;
-}
-
-function sameRegistryFileSnapshot(left: BigIntStats, right: BigIntStats): boolean {
-  return (
-    left.dev === right.dev &&
-    left.ino === right.ino &&
-    left.mode === right.mode &&
-    left.uid === right.uid &&
-    left.gid === right.gid &&
-    left.nlink === right.nlink &&
-    left.size === right.size &&
-    left.mtimeNs === right.mtimeNs &&
-    left.ctimeNs === right.ctimeNs
-  );
-}
-
-function readExactRegistryBytes(descriptor: number, expectedBytes: number): Buffer {
-  const bytes = Buffer.allocUnsafe(expectedBytes + 1);
-  let offset = 0;
-  while (offset < bytes.byteLength) {
-    const count = readSync(descriptor, bytes, offset, bytes.byteLength - offset, null);
-    if (count === 0) break;
-    offset += count;
-  }
-  if (offset !== expectedBytes) fail("registry_file_unavailable");
-  return bytes.subarray(0, offset);
 }
 
 /** Reject proxies and accessors before delegated proof snapshotters can touch them. */

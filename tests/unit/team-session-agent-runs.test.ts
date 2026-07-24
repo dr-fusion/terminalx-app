@@ -122,12 +122,19 @@ describe("Team Session Agent Runs", () => {
     });
     expect(delivery?.kind).toBe(kind);
     if (!delivery) throw new Error("Expected Runtime delivery");
+    await sessions.markRuntimeOutboxDispatch({
+      outboxId: delivery.outboxId,
+      workerId: RUNTIME.userId,
+      expectedAttempt: delivery.attempts,
+      expectedLeaseExpiresAtMs: delivery.leaseExpiresAtMs,
+    });
     await dispatch(
       {
         type: "runtime.outbox.acknowledge",
         outboxId: delivery.outboxId,
         workerId: RUNTIME.userId,
         expectedAttempt: delivery.attempts,
+        expectedLeaseExpiresAtMs: delivery.leaseExpiresAtMs,
       },
       RUNTIME
     );
@@ -342,6 +349,7 @@ describe("Team Session Agent Runs", () => {
       ...compensationSecurity,
     });
     try {
+      expect(composed.runtimeAssignmentKernel).toBe(composed.teamSessions);
       expect(composed.runtimeCompensationJournal).toBeDefined();
       expect(composed.runtimeCompensationMaterializer).toBeDefined();
       expect(Object.isFrozen(composed)).toBe(true);
@@ -756,12 +764,19 @@ describe("Team Session Agent Runs", () => {
     });
     expect(failedRetire?.kind).toBe("runtime.session.retire");
     if (!failedRetire) throw new Error("Expected emergency retirement");
+    await sessions.markRuntimeOutboxDispatch({
+      outboxId: failedRetire.outboxId,
+      workerId: RUNTIME.userId,
+      expectedAttempt: failedRetire.attempts,
+      expectedLeaseExpiresAtMs: failedRetire.leaseExpiresAtMs,
+    });
     await dispatch(
       {
         type: "runtime.outbox.fail",
         outboxId: failedRetire.outboxId,
         workerId: RUNTIME.userId,
         expectedAttempt: failedRetire.attempts,
+        expectedLeaseExpiresAtMs: failedRetire.leaseExpiresAtMs,
         retryable: false,
         errorCode: "runtime_invalid_state",
       },

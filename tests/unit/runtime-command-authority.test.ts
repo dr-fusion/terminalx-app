@@ -181,6 +181,7 @@ describe("Ed25519 Runtime command authority", () => {
     return createRuntimeCommandAuthorityIssuer({
       issuer: "team-session",
       issuerKeyId: "team-session:v1",
+      trustedConfigurationRoot: directory,
       privateKeyFile,
       clock: () => 100,
       authorityTtlMs: 300,
@@ -239,6 +240,7 @@ describe("Ed25519 Runtime command authority", () => {
     const platformIssuer = createRuntimeCommandAuthorityIssuer({
       issuer: "platform-security",
       issuerKeyId: "platform-security:v1",
+      trustedConfigurationRoot: directory,
       privateKeyFile: platformPrivateKeyFile,
       clock: () => 100,
       authorityTtlMs: 300,
@@ -344,6 +346,7 @@ describe("Ed25519 Runtime command authority", () => {
       createRuntimeCommandAuthorityIssuer({
         issuer: "team-session",
         issuerKeyId: "team-session:v1",
+        trustedConfigurationRoot: directory,
         privateKeyFile: "relative-key.pem",
       });
     expect(relative).toThrow(expect.objectContaining({ code: "private_key_unavailable" }));
@@ -353,6 +356,7 @@ describe("Ed25519 Runtime command authority", () => {
       createRuntimeCommandAuthorityIssuer({
         issuer: "team-session",
         issuerKeyId: "team-session:v1",
+        trustedConfigurationRoot: directory,
         privateKeyFile,
       })
     ).toThrow(expect.objectContaining({ code: "private_key_unavailable" }));
@@ -364,6 +368,7 @@ describe("Ed25519 Runtime command authority", () => {
       createRuntimeCommandAuthorityIssuer({
         issuer: "team-session",
         issuerKeyId: "team-session:v1",
+        trustedConfigurationRoot: directory,
         privateKeyFile: link,
       })
     ).toThrow(expect.objectContaining({ code: "private_key_unavailable" }));
@@ -381,6 +386,7 @@ describe("Ed25519 Runtime command authority", () => {
       createRuntimeCommandAuthorityIssuer({
         issuer: "team-session",
         issuerKeyId: "team-session:v1",
+        trustedConfigurationRoot: directory,
         privateKeyFile: rsaFile,
       })
     ).toThrow(expect.objectContaining({ code: "invalid_private_key" }));
@@ -406,6 +412,7 @@ describe("Ed25519 Runtime command authority", () => {
       createRuntimeCommandAuthorityIssuer({
         issuer: "team-session",
         issuerKeyId: "team-session:v1",
+        trustedConfigurationRoot: directory,
         privateKeyFile,
       });
     } catch (error) {

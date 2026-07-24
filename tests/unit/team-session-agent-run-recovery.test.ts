@@ -28,6 +28,8 @@ const PROJECT_ID = "22222222-2222-4222-8222-222222222222";
 const SESSION_ID = "33333333-3333-4333-8333-333333333333";
 const ALICE: ActorContext = { kind: "human", userId: "alice", displayName: "Alice" };
 const BOB: ActorContext = { kind: "human", userId: "bob", displayName: "Bob" };
+const CAROL: ActorContext = { kind: "human", userId: "carol", displayName: "Carol" };
+const DAVE: ActorContext = { kind: "human", userId: "dave", displayName: "Dave" };
 const RUNTIME: ActorContext = {
   kind: "system",
   userId: "runtime-worker",
@@ -44,6 +46,16 @@ interface RuntimeBindingRow {
   runtime_principal_id: string;
   runtime_authorization_generation: number;
   status: string;
+}
+
+interface RuntimeOutboxRow {
+  id: string;
+  kind: string;
+  status: string;
+  attempts: number;
+  runtime_authorization_generation: number;
+  lease_owner: string | null;
+  lease_expires_at_ms: number | null;
 }
 
 describe("Team Session active Run recovery", () => {
@@ -190,12 +202,19 @@ describe("Team Session active Run recovery", () => {
     });
     expect(delivery?.kind).toBe(kind);
     if (!delivery) throw new Error("Expected a Runtime delivery");
+    await sessions.markRuntimeOutboxDispatch({
+      outboxId: delivery.outboxId,
+      workerId: RUNTIME.userId,
+      expectedAttempt: delivery.attempts,
+      expectedLeaseExpiresAtMs: delivery.leaseExpiresAtMs,
+    });
     await dispatch(
       {
         type: "runtime.outbox.acknowledge",
         outboxId: delivery.outboxId,
         workerId: RUNTIME.userId,
         expectedAttempt: delivery.attempts,
+        expectedLeaseExpiresAtMs: delivery.leaseExpiresAtMs,
       },
       RUNTIME
     );
@@ -347,6 +366,163 @@ describe("Team Session active Run recovery", () => {
       },
       BOB
     );
+  }
+
+  async function admitOwner(
+    actor: ActorContext,
+    options: { supervisor?: boolean } = {}
+  ): Promise<void> {
+    await dispatch({
+      type: "team.membership.grant",
+      teamId: TEAM_ID,
+      userId: actor.userId,
+      role: "owner",
+      expectedMembershipVersion: 0,
+    });
+    await dispatch({
+      type: "project.access.grant",
+      projectId: PROJECT_ID,
+      userId: actor.userId,
+      role: "contributor",
+      expectedAccessVersion: 0,
+    });
+    const beforeParticipant = await requireSession(ALICE);
+    await dispatch({
+      type: "session.participant.grant",
+      sessionId: SESSION_ID,
+      userId: actor.userId,
+      expectedParticipantVersion: 0,
+      expectedAccessRevision: beforeParticipant.accessRevision,
+    });
+    if (!options.supervisor) return;
+    const beforeSupervision = await requireSession(ALICE);
+    const participant = beforeSupervision.participants.find(
+      (candidate) => candidate.userId === actor.userId
+    );
+    if (!participant) throw new Error("Expected the admitted owner Participant");
+    await dispatch({
+      type: "session.responsibility.grant",
+      sessionId: SESSION_ID,
+      userId: actor.userId,
+      responsibility: "supervisor",
+      expectedSupervisionRevision: beforeSupervision.supervisionRevision,
+      expectedParticipantVersion: participant.version,
+    });
+  }
+
+  async function claimAssignee(actor: ActorContext): Promise<void> {
+    const awaiting = await requireSession(actor);
+    expect(awaiting.status).toBe("awaiting_assignee");
+    await dispatch(
+      {
+        type: "session.assignee.claim",
+        sessionId: SESSION_ID,
+        expectedAssigneeRevision: awaiting.assigneeRevision,
+        expectedAccessRevision: awaiting.accessRevision,
+      },
+      actor
+    );
+  }
+
+  async function revokeMembership(userId: string, actor: ActorContext): Promise<void> {
+    const access = await sessions.inspect({
+      schemaVersion: TEAM_SESSION_SCHEMA_VERSION,
+      actor,
+      type: "team.access",
+      teamId: TEAM_ID,
+    });
+    const membership = access.memberships.find((candidate) => candidate.userId === userId);
+    if (!membership) throw new Error("Expected an active Team Membership to revoke");
+    await dispatch(
+      {
+        type: "team.membership.revoke",
+        teamId: TEAM_ID,
+        userId,
+        expectedMembershipVersion: membership.version,
+      },
+      actor
+    );
+  }
+
+  function readRuntimeOutboxRows(): RuntimeOutboxRow[] {
+    const db = new Database(filename, { readonly: true });
+    try {
+      return db
+        .prepare(
+          `SELECT id, kind, status, attempts, lease_owner, lease_expires_at_ms,
+                  json_extract(payload_json, '$.runtimeAuthorizationGeneration')
+                    AS runtime_authorization_generation
+           FROM runtime_outbox
+           WHERE session_id = ?
+             AND kind IN ('runtime.authorization.fence', 'runtime.session.retire')
+           ORDER BY session_sequence, id`
+        )
+        .all(SESSION_ID) as RuntimeOutboxRow[];
+    } finally {
+      db.close();
+    }
+  }
+
+  async function expectEmergencyRetirementCompleted(
+    agentRunId: string,
+    runtimeAssignmentId: string,
+    expectedFenceGenerations: number[]
+  ): Promise<void> {
+    expect(await requireRunState(CAROL)).toMatchObject({
+      agentRunId,
+      lifecycle: "emergency-stopped",
+      sandboxState: "retired",
+    });
+    const db = new Database(filename, { readonly: true });
+    try {
+      expect(
+        db
+          .prepare(
+            `SELECT run.id AS agent_run_id, assignment.id AS runtime_assignment_id,
+                    assignment.status
+             FROM agent_runs run
+             JOIN runtime_assignments assignment ON assignment.id = run.runtime_assignment_id
+             WHERE run.session_id = ?`
+          )
+          .all(SESSION_ID)
+      ).toEqual([
+        {
+          agent_run_id: agentRunId,
+          runtime_assignment_id: runtimeAssignmentId,
+          status: "retired",
+        },
+      ]);
+      expect(
+        db
+          .prepare(
+            `SELECT COUNT(*) AS count
+             FROM runtime_outbox
+             WHERE session_id = ? AND status IN ('pending', 'processing', 'failed')`
+          )
+          .get(SESSION_ID)
+      ).toEqual({ count: 0 });
+    } finally {
+      db.close();
+    }
+    const fences = readRuntimeOutboxRows().filter(
+      (row) => row.kind === "runtime.authorization.fence"
+    );
+    expect(fences.map((row) => row.runtime_authorization_generation)).toEqual(
+      expectedFenceGenerations
+    );
+    expect(fences.map((row) => row.status)).toEqual(
+      expectedFenceGenerations.map(() => "superseded")
+    );
+    expect(
+      fences.every((row) => row.lease_owner === null && row.lease_expires_at_ms === null)
+    ).toBe(true);
+    await expect(
+      sessions.claimRuntimeOutbox({
+        workerId: "runtime-no-blockage-check",
+        limit: 10,
+        leaseDurationMs: 30_000,
+      })
+    ).resolves.toEqual([]);
   }
 
   function readRuntimeBinding(agentRunId: string): RuntimeBindingRow {
@@ -729,6 +905,208 @@ describe("Team Session active Run recovery", () => {
     });
   });
 
+  it("acknowledges reclaimed Emergency retirement across a later Assignee-loss fence", async () => {
+    const started = await startRun(policy());
+    const agentRunId = started.data.agentRunId as string;
+    const originalBinding = readRuntimeBinding(agentRunId);
+    await admitOwner(CAROL, { supervisor: true });
+
+    await dispatch({
+      type: "run.emergency-stop",
+      sessionId: SESSION_ID,
+      agentRunId,
+      runtimeBinding: {
+        runtimeAssignmentId: originalBinding.id,
+        runtimeAssignmentGeneration: originalBinding.generation,
+        sandboxId: originalBinding.sandbox_id,
+        sandboxGeneration: originalBinding.sandbox_generation,
+      },
+      observedSubordinateFences: {},
+      revokeAllRunGrants: true,
+      reason: "Retire before a later Assignee-loss fence",
+    });
+    const [firstAttempt] = await sessions.claimRuntimeOutbox({
+      workerId: RUNTIME.userId,
+      limit: 1,
+      leaseDurationMs: 1_000,
+    });
+    expect(firstAttempt).toMatchObject({
+      kind: "runtime.session.retire",
+      attempts: 1,
+      dispatchMode: "apply",
+    });
+    if (!firstAttempt) throw new Error("Expected the first Emergency-retire attempt");
+    await sessions.markRuntimeOutboxDispatch({
+      outboxId: firstAttempt.outboxId,
+      workerId: RUNTIME.userId,
+      expectedAttempt: firstAttempt.attempts,
+      expectedLeaseExpiresAtMs: firstAttempt.leaseExpiresAtMs,
+    });
+
+    now = firstAttempt.leaseExpiresAtMs;
+    const [reclaimed] = await sessions.claimRuntimeOutbox({
+      workerId: RUNTIME.userId,
+      limit: 1,
+      leaseDurationMs: 1_000,
+    });
+    expect(reclaimed).toMatchObject({
+      outboxId: firstAttempt.outboxId,
+      kind: "runtime.session.retire",
+      attempts: 2,
+      dispatchMode: "reconcile",
+    });
+    if (!reclaimed) throw new Error("Expected the reclaimed Emergency-retire attempt");
+
+    await revokeAliceSessionAccess();
+    const bindingAfterLoss = readRuntimeBinding(agentRunId);
+    expect(bindingAfterLoss).toMatchObject({
+      id: originalBinding.id,
+      runtime_authorization_generation: 2,
+      status: "quarantined",
+    });
+    const [laterFence] = readRuntimeOutboxRows().filter(
+      (row) => row.kind === "runtime.authorization.fence"
+    );
+    expect(laterFence).toMatchObject({
+      status: "pending",
+      attempts: 0,
+      runtime_authorization_generation: 3,
+    });
+
+    await expect(
+      dispatch(
+        {
+          type: "runtime.outbox.acknowledge",
+          outboxId: reclaimed.outboxId,
+          workerId: RUNTIME.userId,
+          expectedAttempt: reclaimed.attempts,
+          expectedLeaseExpiresAtMs: reclaimed.leaseExpiresAtMs,
+        },
+        RUNTIME
+      )
+    ).resolves.toMatchObject({ data: { superseded: false } });
+
+    const evidence = new Database(filename, { readonly: true });
+    try {
+      expect(
+        evidence
+          .prepare(
+            `SELECT attempt, outcome, dispatch_interlock_attempt
+             FROM runtime_outbox_settlements
+             WHERE outbox_id = ? ORDER BY attempt`
+          )
+          .all(firstAttempt.outboxId)
+      ).toEqual([
+        { attempt: 1, outcome: "lease-expired", dispatch_interlock_attempt: 1 },
+        { attempt: 2, outcome: "acknowledged", dispatch_interlock_attempt: 1 },
+      ]);
+      expect(
+        evidence
+          .prepare(
+            `SELECT target_attempts, target_dispatch_interlock_attempt
+             FROM runtime_outbox_supersession_evidence
+             WHERE source_outbox_id = ? AND target_outbox_id = ?`
+          )
+          .get(firstAttempt.outboxId, laterFence?.id)
+      ).toEqual({ target_attempts: 0, target_dispatch_interlock_attempt: null });
+    } finally {
+      evidence.close();
+    }
+    await expectEmergencyRetirementCompleted(agentRunId, originalBinding.id, [3]);
+  });
+
+  it("acknowledges Emergency retirement after two successive Assignee claim-loss cycles", async () => {
+    const started = await startRun(policy());
+    const agentRunId = started.data.agentRunId as string;
+    const originalBinding = readRuntimeBinding(agentRunId);
+    await admitOwner(CAROL, { supervisor: true });
+    await admitOwner(DAVE);
+
+    await dispatch({
+      type: "run.emergency-stop",
+      sessionId: SESSION_ID,
+      agentRunId,
+      runtimeBinding: {
+        runtimeAssignmentId: originalBinding.id,
+        runtimeAssignmentGeneration: originalBinding.generation,
+        sandboxId: originalBinding.sandbox_id,
+        sandboxGeneration: originalBinding.sandbox_generation,
+      },
+      observedSubordinateFences: {},
+      revokeAllRunGrants: true,
+      reason: "Retire after repeated later Assignee loss",
+    });
+    await revokeAliceSessionAccess();
+    await claimAssignee(BOB);
+    await revokeMembership(BOB.userId, CAROL);
+    await claimAssignee(DAVE);
+    await revokeMembership(DAVE.userId, CAROL);
+
+    const fencesBeforeAcknowledgement = readRuntimeOutboxRows().filter(
+      (row) => row.kind === "runtime.authorization.fence"
+    );
+    expect(fencesBeforeAcknowledgement.map((row) => row.runtime_authorization_generation)).toEqual([
+      3, 4, 5,
+    ]);
+    const binding = readRuntimeBinding(agentRunId);
+    expect(binding).toMatchObject({
+      id: originalBinding.id,
+      runtime_authorization_generation: 2,
+      status: "quarantined",
+    });
+
+    const [retire] = await sessions.claimRuntimeOutbox({
+      workerId: RUNTIME.userId,
+      limit: 1,
+      leaseDurationMs: 30_000,
+    });
+    expect(retire?.kind).toBe("runtime.session.retire");
+    if (!retire) throw new Error("Expected Emergency retirement after repeated Assignee loss");
+    await sessions.markRuntimeOutboxDispatch({
+      outboxId: retire.outboxId,
+      workerId: RUNTIME.userId,
+      expectedAttempt: retire.attempts,
+      expectedLeaseExpiresAtMs: retire.leaseExpiresAtMs,
+    });
+    await expect(
+      dispatch(
+        {
+          type: "runtime.outbox.acknowledge",
+          outboxId: retire.outboxId,
+          workerId: RUNTIME.userId,
+          expectedAttempt: retire.attempts,
+          expectedLeaseExpiresAtMs: retire.leaseExpiresAtMs,
+        },
+        RUNTIME
+      )
+    ).resolves.toMatchObject({ data: { superseded: false } });
+
+    const evidence = new Database(filename, { readonly: true });
+    try {
+      expect(
+        evidence
+          .prepare(
+            `SELECT json_extract(target.payload_json, '$.runtimeAuthorizationGeneration')
+                      AS runtime_authorization_generation,
+                    supersession.reason
+             FROM runtime_outbox_supersession_evidence supersession
+             JOIN runtime_outbox target ON target.id = supersession.target_outbox_id
+             WHERE supersession.source_outbox_id = ?
+             ORDER BY target.session_sequence, target.id`
+          )
+          .all(retire.outboxId)
+      ).toEqual([
+        { runtime_authorization_generation: 3, reason: "retired-binding" },
+        { runtime_authorization_generation: 4, reason: "retired-binding" },
+        { runtime_authorization_generation: 5, reason: "retired-binding" },
+      ]);
+    } finally {
+      evidence.close();
+    }
+
+    await expectEmergencyRetirementCompleted(agentRunId, originalBinding.id, [3, 4, 5]);
+  });
+
   it("does not replace emergency pausing with ordinary recovery after Assignee loss", async () => {
     const started = await startRun(policy());
     const agentRunId = started.data.agentRunId as string;
@@ -776,12 +1154,19 @@ describe("Team Session active Run recovery", () => {
     });
     expect(failedFence?.kind).toBe("runtime.authorization.fence");
     if (!failedFence) throw new Error("Expected Assignee-loss authorization fence");
+    await sessions.markRuntimeOutboxDispatch({
+      outboxId: failedFence.outboxId,
+      workerId: RUNTIME.userId,
+      expectedAttempt: failedFence.attempts,
+      expectedLeaseExpiresAtMs: failedFence.leaseExpiresAtMs,
+    });
     await dispatch(
       {
         type: "runtime.outbox.fail",
         outboxId: failedFence.outboxId,
         workerId: RUNTIME.userId,
         expectedAttempt: failedFence.attempts,
+        expectedLeaseExpiresAtMs: failedFence.leaseExpiresAtMs,
         retryable: false,
         errorCode: "runtime_invalid_state",
       },

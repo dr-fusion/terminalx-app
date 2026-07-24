@@ -71,6 +71,89 @@ const accepted = {
 } as const satisfies RuntimeReceipt;
 
 describe("RuntimeLifecycleSupervisor", () => {
+  it("records a successful health heartbeat when a long cycle settles", async () => {
+    let nowMs = 100;
+    let releaseReconcile: (() => void) | undefined;
+    const journal = journalReturning([]);
+    vi.mocked(journal.reconcile).mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          releaseReconcile = resolve;
+        })
+    );
+    const supervisor = new RuntimeLifecycleSupervisor({
+      journal,
+      runtime: runtimeReturning(accepted),
+      handles: { resolve: async () => handle },
+      verifyAuthority: () => true,
+      verifyEnforcementProof: () => true,
+      workerId: "worker-1",
+      clock: () => nowMs,
+    });
+
+    const running = supervisor.runOnce();
+    expect(supervisor.health()).toMatchObject({ activeCycleStartedAtMs: 100 });
+    nowMs = 40_100;
+    releaseReconcile?.();
+    await expect(running).resolves.toMatchObject({ claimed: 0 });
+    expect(supervisor.health()).toEqual({
+      lastSuccessAtMs: 40_100,
+      lastErrorAtMs: null,
+      activeCycleStartedAtMs: null,
+      failureSinceSuccess: false,
+    });
+  });
+
+  it("fails the settlement heartbeat closed when the health clock rolls back", async () => {
+    let nowMs = 100;
+    let releaseClaim: ((deliveries: ReadonlyArray<RuntimeLifecycleDelivery>) => void) | undefined;
+    const journal = journalReturning([]);
+    vi.mocked(journal.claim).mockImplementation(
+      () =>
+        new Promise<ReadonlyArray<RuntimeLifecycleDelivery>>((resolve) => {
+          releaseClaim = resolve;
+        })
+    );
+    const supervisor = new RuntimeLifecycleSupervisor({
+      journal,
+      runtime: runtimeReturning(accepted),
+      handles: { resolve: async () => handle },
+      verifyAuthority: () => true,
+      verifyEnforcementProof: () => true,
+      workerId: "worker-1",
+      clock: () => nowMs,
+    });
+
+    const running = supervisor.runOnce();
+    await Promise.resolve();
+    nowMs = 99;
+    releaseClaim?.([]);
+
+    await expect(running).resolves.toMatchObject({ claimed: 0 });
+    expect(supervisor.health()).toEqual({
+      lastSuccessAtMs: null,
+      lastErrorAtMs: 100,
+      activeCycleStartedAtMs: null,
+      failureSinceSuccess: true,
+    });
+
+    vi.mocked(journal.claim).mockResolvedValue([]);
+    await expect(supervisor.runOnce()).resolves.toMatchObject({ claimed: 0 });
+    expect(supervisor.health()).toMatchObject({
+      lastSuccessAtMs: null,
+      lastErrorAtMs: 100,
+      failureSinceSuccess: true,
+    });
+
+    nowMs = 100;
+    await expect(supervisor.runOnce()).resolves.toMatchObject({ claimed: 0 });
+    expect(supervisor.health()).toMatchObject({
+      lastSuccessAtMs: 100,
+      lastErrorAtMs: 100,
+      failureSinceSuccess: false,
+    });
+  });
+
   it("rejects an accessor-backed handle resolver without invoking provider code", () => {
     const journal = journalReturning([delivery()]);
     let getterCalls = 0;
@@ -226,6 +309,186 @@ describe("RuntimeLifecycleSupervisor", () => {
       observedAtMs: 100,
       outcome: { kind: "receipt", receipt: accepted },
     });
+    expect(supervisor.health()).toEqual({
+      lastSuccessAtMs: 100,
+      lastErrorAtMs: null,
+      activeCycleStartedAtMs: null,
+      failureSinceSuccess: false,
+    });
+  });
+
+  it("snapshots an expired command structurally and records the executor's safe failure", async () => {
+    const journal = journalReturning([delivery()]);
+    const runtime = runtimeReturning(accepted);
+    const supervisor = new RuntimeLifecycleSupervisor({
+      journal,
+      runtime,
+      handles: { resolve: vi.fn(async () => handle) },
+      verifyAuthority: () => true,
+      verifyEnforcementProof: () => true,
+      workerId: "worker-1",
+      clock: () => command.deadlineAtMs,
+    });
+
+    await expect(supervisor.runOnce()).resolves.toEqual({
+      claimed: 1,
+      receipts: 0,
+      failedBeforeDispatch: 1,
+      dispatchUncertain: 0,
+    });
+    expect(runtime.command).not.toHaveBeenCalled();
+    expect(journal.complete).toHaveBeenCalledWith(
+      expect.objectContaining({
+        commandId: command.commandId,
+        outcome: {
+          kind: "failure",
+          code: "deadline_expired",
+          dispatchCertainty: "not-dispatched",
+        },
+      })
+    );
+  });
+
+  it("uses one frozen delivery snapshot through resolve, renewal, dispatch, and completion", async () => {
+    const expectedBinding = structuredClone(binding);
+    const expectedCommand = structuredClone(command) as RuntimeLifecycleCommand;
+    const mutable = structuredClone(delivery()) as unknown as {
+      command: {
+        commandId: string;
+        causationId: string;
+        binding: {
+          sessionId: string;
+          runtimeAssignmentId: string;
+          sandboxId: string;
+        };
+      };
+      attempt: number;
+      leaseOwner: string;
+      leaseExpiresAtMs: number;
+    };
+    const journal = journalReturning([
+      mutable as unknown as RuntimeLifecycleDelivery,
+    ]) as RuntimeLifecycleJournal & {
+      renew: ReturnType<typeof vi.fn>;
+      complete: ReturnType<typeof vi.fn>;
+    };
+    const exactHandle: RuntimeHandle = { ...handle, binding: expectedBinding };
+    const exactReceipt: RuntimeReceipt = {
+      ...accepted,
+      commandId: expectedCommand.commandId,
+      binding: expectedBinding,
+    };
+    const handles: RuntimeLifecycleHandleResolver = {
+      resolve: vi.fn(async (resolvedCommand) => {
+        expect(resolvedCommand).toEqual(expectedCommand);
+        expect(resolvedCommand).not.toBe(mutable.command);
+        expect(Object.isFrozen(resolvedCommand)).toBe(true);
+        expect(Object.isFrozen(resolvedCommand.binding)).toBe(true);
+        expect(Object.isFrozen(resolvedCommand.authority)).toBe(true);
+
+        mutable.command.commandId = "mutated-during-resolve";
+        mutable.command.causationId = "mutated-cause";
+        mutable.command.binding.sessionId = "mutated-session";
+        mutable.command.binding.runtimeAssignmentId = "mutated-assignment";
+        mutable.attempt = 91;
+        mutable.leaseOwner = "mutated-worker";
+        mutable.leaseExpiresAtMs = 999_999;
+        return exactHandle;
+      }),
+    };
+    journal.renew.mockImplementationOnce(async (options) => {
+      expect(options).toEqual({
+        commandId: expectedCommand.commandId,
+        workerId: "worker-1",
+        expectedAttempt: 1,
+        expectedLeaseExpiresAtMs: 30_100,
+        leaseDurationMs: 30_000,
+        nowMs: 100,
+      });
+      mutable.command.commandId = "mutated-during-renewal";
+      mutable.command.binding.sandboxId = "mutated-sandbox";
+      mutable.attempt = 92;
+      return { kind: "renewed" as const, leaseExpiresAtMs: 60_100 };
+    });
+    const runtime = runtimeReturning(exactReceipt);
+    vi.mocked(runtime.command).mockImplementationOnce(async (_runtimeHandle, dispatchedCommand) => {
+      expect(dispatchedCommand).toEqual(expectedCommand);
+      expect(dispatchedCommand.commandId).toBe(expectedCommand.commandId);
+      expect(dispatchedCommand.binding).toEqual(expectedBinding);
+      expect(Object.isFrozen(dispatchedCommand)).toBe(true);
+      expect(Object.isFrozen(dispatchedCommand.binding)).toBe(true);
+      return exactReceipt;
+    });
+    const supervisor = new RuntimeLifecycleSupervisor({
+      journal,
+      runtime,
+      handles,
+      verifyAuthority: ({ command: verifiedCommand }) => {
+        expect(verifiedCommand.commandId).toBe(expectedCommand.commandId);
+        expect(verifiedCommand.binding).toEqual(expectedBinding);
+        return true;
+      },
+      verifyEnforcementProof: () => true,
+      workerId: "worker-1",
+      clock: () => 100,
+    });
+
+    await expect(supervisor.runOnce()).resolves.toEqual({
+      claimed: 1,
+      receipts: 1,
+      failedBeforeDispatch: 0,
+      dispatchUncertain: 0,
+    });
+    expect(journal.complete).toHaveBeenCalledWith({
+      commandId: expectedCommand.commandId,
+      workerId: "worker-1",
+      expectedAttempt: 1,
+      expectedLeaseExpiresAtMs: 60_100,
+      observedAtMs: 100,
+      outcome: { kind: "receipt", receipt: exactReceipt },
+    });
+  });
+
+  it("rejects delivery proxies, accessors, and inexact records without invoking getters", async () => {
+    let getterCalls = 0;
+    const accessorCommand = Object.defineProperty({ ...command }, "binding", {
+      enumerable: true,
+      get() {
+        getterCalls += 1;
+        throw new Error("journal-secret-binding-getter");
+      },
+    });
+    const missingField = { ...delivery() } as Record<string, unknown>;
+    delete missingField.attempt;
+    const hostileDeliveries: unknown[] = [
+      new Proxy(delivery(), {}),
+      { ...delivery(), command: accessorCommand },
+      { ...delivery(), unexpected: "field" },
+      missingField,
+      { ...delivery(), command: { ...command, unexpected: "field" } },
+    ];
+
+    for (const hostile of hostileDeliveries) {
+      const journal = journalReturning([hostile as RuntimeLifecycleDelivery]);
+      const handles = { resolve: vi.fn(async () => handle) };
+      const runtime = runtimeReturning(accepted);
+      const supervisor = new RuntimeLifecycleSupervisor({
+        journal,
+        runtime,
+        handles,
+        verifyAuthority: () => true,
+        verifyEnforcementProof: () => true,
+        workerId: "worker-1",
+        clock: () => 100,
+      });
+
+      await expect(supervisor.runOnce()).rejects.toThrow("Invalid Runtime lifecycle delivery");
+      expect(handles.resolve).not.toHaveBeenCalled();
+      expect(journal.renew).not.toHaveBeenCalled();
+      expect(runtime.command).not.toHaveBeenCalled();
+      expect(journal.complete).not.toHaveBeenCalled();
+    }
+    expect(getterCalls).toBe(0);
   });
 
   it("records a missing exact handle as provably not dispatched", async () => {

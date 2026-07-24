@@ -1,5 +1,13 @@
-import type { Runtime } from "./contracts";
+import {
+  captureRuntimeCommandDataFunction,
+  type RuntimeCommandCapability,
+} from "./runtime-command-dispatch";
 import type { RuntimeAuthorityVerifier } from "./runtime-command-execution";
+import {
+  RuntimeOutboxWorker,
+  type RuntimeOutboxApplier,
+  type RuntimeOutboxKernel,
+} from "./outbox-worker";
 import type { RuntimeCompensationAuthorityVerifier } from "./runtime-compensation-execution";
 import type { RuntimeCompensationEnforcementProofVerifier } from "./runtime-compensation-enforcement-proof";
 import {
@@ -37,12 +45,14 @@ interface CapturedMethod {
 }
 
 interface CapturedRuntimeSupervisorCompositionOptions {
+  readonly assignmentKernel: RuntimeOutboxKernel;
+  readonly assignmentRuntime: RuntimeOutboxApplier;
   readonly writeStateSource: RuntimeDurableWriteStateSource;
   readonly lifecycleJournal: RuntimeLifecycleJournal;
   readonly receiptFollowJournal: RuntimeReceiptFollowJournal;
   readonly compensationJournal: RuntimeCompensationJournal;
   readonly compensationMaterializer: RuntimeCompensationMaterializerWorker;
-  readonly runtime: Runtime;
+  readonly runtime: RuntimeCommandCapability;
   readonly receiptTransport: RuntimeReceiptFollowTransport;
   readonly lifecycleHandles: RuntimeLifecycleHandleResolver;
   readonly receiptFollowHandles: RuntimeReceiptFollowHandleResolver;
@@ -56,10 +66,16 @@ interface CapturedRuntimeSupervisorCompositionOptions {
   readonly onOperationalError?: (component: RuntimeSupervisorComponent) => void;
 }
 
-export type RuntimeSupervisorComponent = "lifecycle" | "receipt-follow" | "compensation" | "root";
+export type RuntimeSupervisorComponent =
+  | "assignment"
+  | "lifecycle"
+  | "receipt-follow"
+  | "compensation"
+  | "root";
 
 /** Private durable seams supplied by the Team Session kernel. */
 export interface RuntimeSupervisorKernel {
+  readonly runtimeAssignmentKernel: RuntimeOutboxKernel;
   readonly runtimeWriteStateSnapshotSource: RuntimeDurableWriteStateSource;
   readonly runtimeLifecycleJournal: RuntimeLifecycleJournal;
   readonly runtimeReceiptFollowJournal: RuntimeReceiptFollowJournal;
@@ -69,7 +85,8 @@ export interface RuntimeSupervisorKernel {
 
 export interface CreateRuntimeSupervisorCompositionOptions {
   readonly kernel: RuntimeSupervisorKernel;
-  readonly runtime: Runtime;
+  readonly assignmentRuntime: RuntimeOutboxApplier;
+  readonly runtime: RuntimeCommandCapability;
   readonly receiptTransport: RuntimeReceiptFollowTransport;
   readonly lifecycleHandles: RuntimeLifecycleHandleResolver;
   readonly receiptFollowHandles: RuntimeReceiptFollowHandleResolver;
@@ -92,6 +109,7 @@ export interface CreateRuntimeSupervisorCompositionOptions {
 export interface RuntimeSupervisorComposition {
   readonly root: RuntimeSupervisorRoot;
   readonly writeStateRegistry: RuntimeWriteStateRegistry;
+  readonly assignment: RuntimeOutboxWorker;
   readonly lifecycle: RuntimeLifecycleSupervisor;
   readonly receiptFollow: RuntimeReceiptFollowSupervisor;
   readonly compensation: RuntimeCompensationSupervisor;
@@ -119,6 +137,13 @@ export function createRuntimeSupervisorComposition(
   };
   const sharedClock = captured.clock === undefined ? {} : { clock: captured.clock };
   const writeStateRegistry = createRuntimeWriteStateRegistry({ requireBootstrap: true });
+  const assignment = new RuntimeOutboxWorker({
+    kernel: captured.assignmentKernel,
+    runtime: captured.assignmentRuntime,
+    workerId: `${captured.workerIdPrefix}:assignment`,
+    ...sharedClock,
+    onOperationalError: report("assignment"),
+  });
   const lifecycle = new RuntimeLifecycleSupervisor({
     journal: captured.lifecycleJournal,
     runtime: captured.runtime,
@@ -148,6 +173,7 @@ export function createRuntimeSupervisorComposition(
     onOperationalError: report("compensation"),
   });
   const root = new RuntimeSupervisorRoot({
+    assignment,
     lifecycle,
     receiptFollow,
     compensation,
@@ -161,6 +187,7 @@ export function createRuntimeSupervisorComposition(
   return Object.freeze({
     root,
     writeStateRegistry,
+    assignment,
     lifecycle,
     receiptFollow,
     compensation,
@@ -209,6 +236,8 @@ function captureCompositionOptions(
   }
 
   return Object.freeze({
+    assignmentKernel: captureAssignmentKernel(dataField(kernel, "runtimeAssignmentKernel")),
+    assignmentRuntime: captureAssignmentRuntime(dataField(record, "assignmentRuntime")),
     writeStateSource: captureWriteStateSource(dataField(kernel, "runtimeWriteStateSnapshotSource")),
     lifecycleJournal: captureLifecycleJournal(dataField(kernel, "runtimeLifecycleJournal")),
     receiptFollowJournal: captureReceiptFollowJournal(
@@ -238,12 +267,48 @@ function captureCompositionOptions(
   });
 }
 
-function captureRuntime(value: unknown): Runtime {
-  const command = captureMethod(value, "command");
+function captureAssignmentKernel(value: unknown): RuntimeOutboxKernel {
+  const claimRuntimeOutbox = captureMethod(value, "claimRuntimeOutbox");
+  const markRuntimeOutboxDispatch = captureMethod(value, "markRuntimeOutboxDispatch");
+  const renewRuntimeOutboxLease = captureMethod(value, "renewRuntimeOutboxLease");
+  const dispatch = captureMethod(value, "dispatch");
   return Object.freeze({
-    command: (...args: Parameters<Runtime["command"]>) =>
-      invoke(command, args) as ReturnType<Runtime["command"]>,
-  }) as unknown as Runtime;
+    claimRuntimeOutbox: (...args: Parameters<RuntimeOutboxKernel["claimRuntimeOutbox"]>) =>
+      invoke(claimRuntimeOutbox, args) as ReturnType<RuntimeOutboxKernel["claimRuntimeOutbox"]>,
+    markRuntimeOutboxDispatch: (
+      ...args: Parameters<RuntimeOutboxKernel["markRuntimeOutboxDispatch"]>
+    ) =>
+      invoke(markRuntimeOutboxDispatch, args) as ReturnType<
+        RuntimeOutboxKernel["markRuntimeOutboxDispatch"]
+      >,
+    renewRuntimeOutboxLease: (
+      ...args: Parameters<RuntimeOutboxKernel["renewRuntimeOutboxLease"]>
+    ) =>
+      invoke(renewRuntimeOutboxLease, args) as ReturnType<
+        RuntimeOutboxKernel["renewRuntimeOutboxLease"]
+      >,
+    dispatch: (...args: Parameters<RuntimeOutboxKernel["dispatch"]>) =>
+      invoke(dispatch, args) as ReturnType<RuntimeOutboxKernel["dispatch"]>,
+  });
+}
+
+function captureAssignmentRuntime(value: unknown): RuntimeOutboxApplier {
+  const apply = captureMethod(value, "apply");
+  const reconcile = captureMethod(value, "reconcile");
+  return Object.freeze({
+    apply: (...args: Parameters<RuntimeOutboxApplier["apply"]>) =>
+      invoke(apply, args) as ReturnType<RuntimeOutboxApplier["apply"]>,
+    reconcile: (...args: Parameters<RuntimeOutboxApplier["reconcile"]>) =>
+      invoke(reconcile, args) as ReturnType<RuntimeOutboxApplier["reconcile"]>,
+  });
+}
+
+function captureRuntime(value: unknown): RuntimeCommandCapability {
+  const command = captureRuntimeCommandDataFunction(value as RuntimeCommandCapability);
+  return Object.freeze({
+    command: (...args: Parameters<RuntimeCommandCapability["command"]>) =>
+      Reflect.apply(command, undefined, args) as ReturnType<RuntimeCommandCapability["command"]>,
+  });
 }
 
 function captureReceiptTransport(value: unknown): RuntimeReceiptFollowTransport {

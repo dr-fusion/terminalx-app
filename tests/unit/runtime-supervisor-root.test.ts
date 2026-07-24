@@ -7,6 +7,12 @@ import {
 
 class FakeSupervisor implements RuntimeManagedSupervisor {
   running = false;
+  healthState = {
+    lastSuccessAtMs: 100 as number | null,
+    lastErrorAtMs: null as number | null,
+    activeCycleStartedAtMs: null as number | null,
+    failureSinceSuccess: false,
+  };
   readonly runOnce = vi.fn(async () => ({ claimed: 0 }));
   readonly start = vi.fn(() => {
     this.running = true;
@@ -14,6 +20,10 @@ class FakeSupervisor implements RuntimeManagedSupervisor {
   readonly stop = vi.fn(async () => {
     this.running = false;
   });
+
+  health() {
+    return { ...this.healthState };
+  }
 }
 
 const SNAPSHOT = Object.freeze([
@@ -26,6 +36,7 @@ const SNAPSHOT = Object.freeze([
 
 function dependencies() {
   return {
+    assignment: new FakeSupervisor(),
     lifecycle: new FakeSupervisor(),
     receiptFollow: new FakeSupervisor(),
     compensation: new FakeSupervisor(),
@@ -49,6 +60,7 @@ describe("RuntimeSupervisorRoot", () => {
       return { found: 0, created: 0 };
     });
     for (const [name, worker] of [
+      ["assignment-reconcile", input.assignment],
       ["lifecycle-reconcile", input.lifecycle],
       ["follow-reconcile", input.receiptFollow],
       ["compensation-reconcile", input.compensation],
@@ -59,9 +71,10 @@ describe("RuntimeSupervisorRoot", () => {
       });
     }
     for (const [name, worker] of [
+      ["assignment", input.assignment],
+      ["compensation", input.compensation],
       ["follow", input.receiptFollow],
       ["lifecycle", input.lifecycle],
-      ["compensation", input.compensation],
     ] as const) {
       worker.start.mockImplementation(() => {
         order.push(name);
@@ -75,12 +88,14 @@ describe("RuntimeSupervisorRoot", () => {
     });
 
     await root.start();
-    expect(order.slice(0, 8)).toEqual([
+    expect(order.slice(0, 10)).toEqual([
       "snapshot",
+      "assignment-reconcile",
       "lifecycle-reconcile",
       "follow-reconcile",
       "materializer",
       "compensation-reconcile",
+      "assignment",
       "compensation",
       "follow",
       "lifecycle",
@@ -89,13 +104,43 @@ describe("RuntimeSupervisorRoot", () => {
       ready: true,
       state: "running",
       durableWriteStateLoaded: true,
+      assignmentReconciled: true,
       lifecycleReconciled: true,
       receiptFollowReconciled: true,
       compensationReconciled: true,
       restartReconciled: true,
+      assignmentRunning: true,
       lifecycleRunning: true,
       receiptFollowRunning: true,
       compensationRunning: true,
+      assignmentHealth: {
+        healthy: true,
+        lastSuccessAtMs: 100,
+        lastErrorAtMs: null,
+        activeCycleStartedAtMs: null,
+        failureSinceSuccess: false,
+      },
+      lifecycleHealth: {
+        healthy: true,
+        lastSuccessAtMs: 100,
+        lastErrorAtMs: null,
+        activeCycleStartedAtMs: null,
+        failureSinceSuccess: false,
+      },
+      receiptFollowHealth: {
+        healthy: true,
+        lastSuccessAtMs: 100,
+        lastErrorAtMs: null,
+        activeCycleStartedAtMs: null,
+        failureSinceSuccess: false,
+      },
+      compensationHealth: {
+        healthy: true,
+        lastSuccessAtMs: 100,
+        lastErrorAtMs: null,
+        activeCycleStartedAtMs: null,
+        failureSinceSuccess: false,
+      },
       materializerHealthy: true,
       lastMaterializerSuccessAtMs: 100,
       lastMaterializerErrorAtMs: null,
@@ -109,6 +154,7 @@ describe("RuntimeSupervisorRoot", () => {
 
     await root.stop();
     expect(root.state).toBe("stopped");
+    expect(input.assignment.stop).toHaveBeenCalledOnce();
     expect(input.lifecycle.stop).toHaveBeenCalledOnce();
     expect(input.receiptFollow.stop).toHaveBeenCalledOnce();
     expect(input.compensation.stop).toHaveBeenCalledOnce();
@@ -179,14 +225,17 @@ describe("RuntimeSupervisorRoot", () => {
       ready: false,
       state: "starting",
       durableWriteStateLoaded: true,
+      assignmentReconciled: true,
       lifecycleReconciled: true,
       receiptFollowReconciled: true,
       compensationReconciled: false,
       restartReconciled: false,
+      assignmentRunning: false,
       lifecycleRunning: false,
       receiptFollowRunning: false,
       compensationRunning: false,
     });
+    expect(input.assignment.start).not.toHaveBeenCalled();
     expect(input.lifecycle.start).not.toHaveBeenCalled();
     expect(input.receiptFollow.start).not.toHaveBeenCalled();
     expect(input.compensation.start).not.toHaveBeenCalled();
@@ -226,6 +275,7 @@ describe("RuntimeSupervisorRoot", () => {
     });
 
     await root.start();
+    expect(input.assignment.runOnce).toHaveBeenCalledOnce();
     expect(input.lifecycle.runOnce).toHaveBeenCalledTimes(2);
     expect(input.receiptFollow.runOnce).toHaveBeenCalledTimes(2);
     expect(input.compensation.runOnce).toHaveBeenCalledTimes(2);
@@ -233,9 +283,9 @@ describe("RuntimeSupervisorRoot", () => {
     await root.stop();
   });
 
-  it("fails closed when the bounded startup drain never reaches idle", async () => {
+  it("fails closed when assignment reconciliation never reaches idle", async () => {
     const input = dependencies();
-    input.lifecycle.runOnce.mockResolvedValue({ claimed: 1 });
+    input.assignment.runOnce.mockResolvedValue({ claimed: 1 });
     const root = new RuntimeSupervisorRoot({
       ...input,
       clock: () => 100,
@@ -243,14 +293,16 @@ describe("RuntimeSupervisorRoot", () => {
     });
 
     await expect(root.start()).rejects.toThrow("could not start");
-    expect(input.lifecycle.runOnce).toHaveBeenCalledTimes(3);
+    expect(input.assignment.runOnce).toHaveBeenCalledTimes(3);
+    expect(input.lifecycle.runOnce).not.toHaveBeenCalled();
     expect(input.receiptFollow.runOnce).not.toHaveBeenCalled();
     expect(input.materializer.runOnce).not.toHaveBeenCalled();
     expect(input.compensation.runOnce).not.toHaveBeenCalled();
-    expect(input.lifecycle.start).not.toHaveBeenCalled();
+    expect(input.assignment.start).not.toHaveBeenCalled();
     expect(root.readiness()).toMatchObject({
       ready: false,
       state: "failed",
+      assignmentReconciled: false,
       lifecycleReconciled: false,
       restartReconciled: false,
     });
@@ -266,6 +318,7 @@ describe("RuntimeSupervisorRoot", () => {
     });
 
     await expect(root.start()).rejects.toThrow("could not start");
+    expect(input.assignment.runOnce).toHaveBeenCalledOnce();
     expect(input.lifecycle.runOnce).toHaveBeenCalledOnce();
     expect(input.receiptFollow.runOnce).toHaveBeenCalledOnce();
     expect(input.materializer.runOnce).toHaveBeenCalledTimes(2);
@@ -294,6 +347,7 @@ describe("RuntimeSupervisorRoot", () => {
     await expect(root.stop()).rejects.toThrow("could not stop");
     await expect(startup).rejects.toThrow("could not start");
     expect(root.state).toBe("failed");
+    expect(input.assignment.stop).toHaveBeenCalledOnce();
     expect(input.lifecycle.stop).toHaveBeenCalledOnce();
     expect(input.receiptFollow.stop).toHaveBeenCalledOnce();
     expect(input.compensation.stop).toHaveBeenCalledOnce();
@@ -301,7 +355,22 @@ describe("RuntimeSupervisorRoot", () => {
 
   it("bounds a hung startup operation and remains failed closed", async () => {
     const input = dependencies();
-    input.materializer.runOnce.mockImplementationOnce(() => new Promise(() => undefined));
+    let operationSignal: AbortSignal | undefined;
+    let settledAfterAbort = false;
+    input.materializer.runOnce.mockImplementationOnce(
+      (signal?: AbortSignal) =>
+        new Promise<{ found: number; created: number }>((resolve) => {
+          operationSignal = signal;
+          signal?.addEventListener(
+            "abort",
+            () => {
+              settledAfterAbort = true;
+              resolve({ found: 0, created: 0 });
+            },
+            { once: true }
+          );
+        })
+    );
     const root = new RuntimeSupervisorRoot({
       ...input,
       clock: () => 100,
@@ -310,9 +379,13 @@ describe("RuntimeSupervisorRoot", () => {
     });
 
     await expect(root.start()).rejects.toThrow("could not start");
+    expect(operationSignal?.aborted).toBe(true);
+    expect(settledAfterAbort).toBe(true);
     expect(root.state).toBe("failed");
     expect(root.readiness()).toMatchObject({ ready: false, materializerHealthy: false });
+    expect(input.assignment.start).not.toHaveBeenCalled();
     expect(input.lifecycle.start).not.toHaveBeenCalled();
+    expect(input.assignment.stop).toHaveBeenCalledOnce();
     expect(input.lifecycle.stop).toHaveBeenCalledOnce();
     expect(input.receiptFollow.stop).toHaveBeenCalledOnce();
     expect(input.compensation.stop).toHaveBeenCalledOnce();
@@ -337,6 +410,7 @@ describe("RuntimeSupervisorRoot", () => {
     expect(String(error)).not.toContain("pathname");
     expect(String(error)).not.toContain("token");
     expect(root.state).toBe("failed");
+    expect(input.assignment.stop).toHaveBeenCalledOnce();
     expect(input.lifecycle.stop).toHaveBeenCalledOnce();
     expect(input.receiptFollow.stop).toHaveBeenCalledOnce();
     expect(input.compensation.stop).toHaveBeenCalledOnce();
@@ -361,9 +435,67 @@ describe("RuntimeSupervisorRoot", () => {
     await vi.waitFor(() => expect(root.state).toBe("failed"));
     expect(root.readiness()).toMatchObject({ ready: false, materializerHealthy: false });
     expect(onOperationalError).toHaveBeenCalledWith("runtime_supervisor_internal");
+    await vi.waitFor(() => expect(input.assignment.stop).toHaveBeenCalledOnce());
     await vi.waitFor(() => expect(input.lifecycle.stop).toHaveBeenCalledOnce());
     expect(input.receiptFollow.stop).toHaveBeenCalledOnce();
     expect(input.compensation.stop).toHaveBeenCalledOnce();
+  });
+
+  it("pins assignment capabilities against hostile post-construction mutation", async () => {
+    const input = dependencies();
+    const originalRunOnce = input.assignment.runOnce;
+    const originalStart = input.assignment.start;
+    const originalStop = input.assignment.stop;
+    const replacementRunOnce = vi.fn(async () => {
+      throw new Error("replacement assignment claim must not run");
+    });
+    const replacementStart = vi.fn(() => {
+      throw new Error("replacement assignment start must not run");
+    });
+    const replacementStop = vi.fn(async () => {
+      throw new Error("replacement assignment stop must not run");
+    });
+    const root = new RuntimeSupervisorRoot({
+      ...input,
+      clock: () => 100,
+      materializerIdleDelayMs: 60_000,
+    });
+    Object.defineProperties(input.assignment, {
+      runOnce: { configurable: true, value: replacementRunOnce },
+      start: { configurable: true, value: replacementStart },
+      stop: { configurable: true, value: replacementStop },
+    });
+
+    await root.start();
+    expect(originalRunOnce).toHaveBeenCalledOnce();
+    expect(originalStart).toHaveBeenCalledOnce();
+    expect(replacementRunOnce).not.toHaveBeenCalled();
+    expect(replacementStart).not.toHaveBeenCalled();
+    await root.stop();
+    expect(originalStop).toHaveBeenCalledOnce();
+    expect(replacementStop).not.toHaveBeenCalled();
+  });
+
+  it("withdraws readiness when the assignment loop is no longer running", async () => {
+    const input = dependencies();
+    const root = new RuntimeSupervisorRoot({
+      ...input,
+      clock: () => 100,
+      materializerIdleDelayMs: 60_000,
+    });
+
+    await root.start();
+    await input.assignment.stop();
+    expect(root.readiness()).toMatchObject({
+      ready: false,
+      state: "running",
+      assignmentReconciled: true,
+      assignmentRunning: false,
+      lifecycleRunning: true,
+      receiptFollowRunning: true,
+      compensationRunning: true,
+    });
+    await root.stop();
   });
 
   it("rejects accessor capabilities and custom thenables without invoking them", async () => {
@@ -391,6 +523,20 @@ describe("RuntimeSupervisorRoot", () => {
         })
     ).toThrow("Invalid Runtime supervisor root dependency");
     expect(startGetterReads).toBe(0);
+
+    const healthAccessorInput = dependencies();
+    let healthGetterReads = 0;
+    Object.defineProperty(healthAccessorInput.assignment, "health", {
+      configurable: true,
+      get: () => {
+        healthGetterReads += 1;
+        throw new Error("private health accessor detail");
+      },
+    });
+    expect(() => new RuntimeSupervisorRoot({ ...healthAccessorInput, clock: () => 100 })).toThrow(
+      "Invalid Runtime supervisor root dependency"
+    );
+    expect(healthGetterReads).toBe(0);
 
     const thenableInput = dependencies();
     let thenGetterReads = 0;
@@ -427,6 +573,7 @@ describe("RuntimeSupervisorRoot", () => {
     expect(String(error)).toContain("could not start");
     expect(String(error)).not.toContain("process handle");
     expect(root.state).toBe("failed");
+    expect(input.assignment.stop).toHaveBeenCalledOnce();
     expect(input.lifecycle.stop).toHaveBeenCalledOnce();
     expect(input.receiptFollow.stop).toHaveBeenCalledOnce();
     expect(input.compensation.stop).toHaveBeenCalledOnce();
@@ -485,6 +632,107 @@ describe("RuntimeSupervisorRoot", () => {
     await root.start();
     nowMs = 1_101;
     expect(root.readiness()).toMatchObject({ ready: false, materializerHealthy: false });
+    await root.stop();
+  });
+
+  it("withdraws readiness for worker failure or a stale active cycle and recovers on success", async () => {
+    const input = dependencies();
+    let nowMs = 100;
+    const root = new RuntimeSupervisorRoot({
+      ...input,
+      clock: () => nowMs,
+      materializerIdleDelayMs: 60_000,
+      readinessStaleAfterMs: 1_000,
+    });
+    await root.start();
+
+    nowMs = 200;
+    input.assignment.healthState = {
+      lastSuccessAtMs: 100,
+      lastErrorAtMs: 200,
+      activeCycleStartedAtMs: null,
+      failureSinceSuccess: true,
+    };
+    expect(root.readiness()).toMatchObject({
+      ready: false,
+      assignmentHealth: { healthy: false, failureSinceSuccess: true },
+    });
+
+    nowMs = 300;
+    input.assignment.healthState = {
+      lastSuccessAtMs: 300,
+      lastErrorAtMs: 200,
+      activeCycleStartedAtMs: null,
+      failureSinceSuccess: false,
+    };
+    expect(root.readiness()).toMatchObject({
+      ready: true,
+      assignmentHealth: { healthy: true, lastSuccessAtMs: 300 },
+    });
+
+    nowMs = 400;
+    input.assignment.healthState = {
+      lastSuccessAtMs: 300,
+      lastErrorAtMs: 400,
+      activeCycleStartedAtMs: null,
+      failureSinceSuccess: false,
+    };
+    expect(root.readiness()).toMatchObject({
+      ready: false,
+      assignmentHealth: { healthy: false },
+    });
+
+    input.assignment.healthState = {
+      lastSuccessAtMs: 400,
+      lastErrorAtMs: 300,
+      activeCycleStartedAtMs: 200,
+      failureSinceSuccess: false,
+    };
+    expect(root.readiness()).toMatchObject({
+      ready: false,
+      assignmentHealth: { healthy: false },
+    });
+
+    input.assignment.healthState = {
+      lastSuccessAtMs: 300,
+      lastErrorAtMs: 200,
+      activeCycleStartedAtMs: 300,
+      failureSinceSuccess: false,
+    };
+    nowMs = 1_301;
+    expect(root.readiness()).toMatchObject({
+      ready: false,
+      assignmentHealth: { healthy: false, activeCycleStartedAtMs: 300 },
+    });
+    await root.stop();
+  });
+
+  it("fails health closed without assimilating a custom thenable snapshot", async () => {
+    const input = dependencies();
+    let thenGetterReads = 0;
+    const hostile = Object.defineProperty(Object.create(null), "then", {
+      enumerable: true,
+      get: () => {
+        thenGetterReads += 1;
+        throw new Error("private health thenable detail");
+      },
+    });
+    Object.defineProperty(input.assignment, "health", {
+      configurable: true,
+      value: () => hostile,
+    });
+    const root = new RuntimeSupervisorRoot({
+      ...input,
+      clock: () => 100,
+      materializerIdleDelayMs: 60_000,
+    });
+    await root.start();
+
+    expect(root.readiness()).toMatchObject({
+      ready: false,
+      assignmentHealth: { healthy: false },
+    });
+    expect(thenGetterReads).toBe(0);
     await root.stop();
   });
 });

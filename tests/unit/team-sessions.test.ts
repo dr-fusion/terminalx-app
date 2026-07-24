@@ -195,6 +195,22 @@ describe("Team Session kernel", () => {
     });
   }
 
+  function runtimeOutboxState(outboxId: string): {
+    status: string;
+    delivered_at_ms: number | null;
+  } {
+    const verification = new Database(filename, { readonly: true });
+    try {
+      const row = verification
+        .prepare(`SELECT status, delivered_at_ms FROM runtime_outbox WHERE id = ?`)
+        .get(outboxId) as { status: string; delivered_at_ms: number | null } | undefined;
+      if (!row) throw new Error("Expected Runtime outbox state");
+      return row;
+    } finally {
+      verification.close();
+    }
+  }
+
   function requireParticipant(view: SessionView, userId: string): SessionParticipantView {
     const participant = view.participants.find((candidate) => candidate.userId === userId);
     expect(participant).toBeDefined();
@@ -503,6 +519,7 @@ describe("Team Session kernel", () => {
         outboxId: delivery.outboxId,
         workerId: SYSTEM.userId,
         expectedAttempt: delivery.attempts,
+        expectedLeaseExpiresAtMs: delivery.leaseExpiresAtMs,
       },
       SYSTEM
     );
@@ -525,6 +542,14 @@ describe("Team Session kernel", () => {
     ]);
     const delivery = deliveries[0];
     if (!delivery) throw new Error("Expected one Runtime outbox delivery");
+    if (delivery.dispatchMode === "apply") {
+      await kernel().markRuntimeOutboxDispatch({
+        outboxId: delivery.outboxId,
+        workerId: SYSTEM.userId,
+        expectedAttempt: delivery.attempts,
+        expectedLeaseExpiresAtMs: delivery.leaseExpiresAtMs,
+      });
+    }
     return delivery;
   }
 
@@ -566,6 +591,30 @@ describe("Team Session kernel", () => {
       database.exec(`
         PRAGMA foreign_keys = OFF;
         DROP TRIGGER runtime_receipt_follow_streams_valid_transition;
+        DROP TRIGGER IF EXISTS runtime_outbox_dispatch_interlock_valid_insert;
+        DROP TRIGGER IF EXISTS runtime_outbox_dispatch_interlock_valid_update;
+        DROP TRIGGER IF EXISTS runtime_outbox_payload_valid_insert;
+        DROP TRIGGER IF EXISTS runtime_outbox_immutable_update;
+        DROP TRIGGER IF EXISTS runtime_outbox_immutable_delete;
+        DROP TRIGGER IF EXISTS runtime_outbox_source_event_immutable_update;
+        DROP TRIGGER IF EXISTS runtime_outbox_source_event_immutable_delete;
+        DROP TRIGGER IF EXISTS runtime_outbox_source_event_valid_insert;
+        DROP TRIGGER IF EXISTS runtime_outbox_mutation_valid_update;
+        DROP TRIGGER IF EXISTS runtime_outbox_settlements_valid_insert;
+        DROP TRIGGER IF EXISTS runtime_outbox_settlements_immutable_update;
+        DROP TRIGGER IF EXISTS runtime_outbox_settlements_immutable_delete;
+        DROP TRIGGER IF EXISTS runtime_outbox_supersession_evidence_valid_insert;
+        DROP TRIGGER IF EXISTS runtime_outbox_supersession_evidence_immutable_update;
+        DROP TRIGGER IF EXISTS runtime_outbox_supersession_evidence_immutable_delete;
+        DROP TRIGGER IF EXISTS accepted_commands_runtime_outbox_evidence;
+        DROP TRIGGER IF EXISTS accepted_commands_immutable_update;
+        DROP TRIGGER IF EXISTS accepted_commands_immutable_delete;
+        DROP TABLE runtime_outbox_supersession_evidence;
+        DROP TABLE runtime_outbox_settlements;
+        DROP INDEX runtime_outbox_dispatch_interlock_acquired_at_idx;
+        DROP INDEX runtime_outbox_created_at_idx;
+        ALTER TABLE runtime_outbox DROP COLUMN dispatch_interlock_acquired_at_ms;
+        ALTER TABLE runtime_outbox DROP COLUMN dispatch_interlock_attempt;
         DROP TRIGGER runtime_compensation_referenced_events_immutable_update;
         DROP TRIGGER runtime_compensation_referenced_events_immutable_delete;
         DROP TABLE runtime_receipt_follow_events;
@@ -575,6 +624,7 @@ describe("Team Session kernel", () => {
         DROP TABLE runtime_compensation_dispatch;
         DROP TABLE runtime_compensation_commands;
         DROP TABLE runtime_compensation_incidents;
+        DROP TRIGGER IF EXISTS runtime_assignments_create_binding_safety_fence;
         DROP TABLE runtime_binding_safety_fences;
         DROP TABLE runtime_receipt_follow_streams;
         DROP TABLE runtime_principal_observation_keys;
@@ -978,6 +1028,7 @@ describe("Team Session kernel", () => {
         outboxId: delivery.outboxId,
         workerId: SYSTEM.userId,
         expectedAttempt: delivery.attempts,
+        expectedLeaseExpiresAtMs: delivery.leaseExpiresAtMs,
       },
       SYSTEM,
       "system-runtime-replay"
@@ -1546,7 +1597,157 @@ describe("Team Session kernel", () => {
     );
   });
 
-  it("supersedes a failed leased delivery from an older generation and unblocks the newer fence", async () => {
+  it("reopens a marked crash only for reconciliation and gives competing connections one canonical acknowledgement", async () => {
+    await bootstrap();
+    const original = kernel();
+    const [firstAttempt] = await original.claimRuntimeOutbox({
+      workerId: "runtime-before-crash",
+      limit: 1,
+      leaseDurationMs: 1_000,
+    });
+    if (!firstAttempt) throw new Error("Expected Runtime delivery before crash");
+    expect(firstAttempt).toMatchObject({ attempts: 1, dispatchMode: "apply" });
+    await original.markRuntimeOutboxDispatch({
+      outboxId: firstAttempt.outboxId,
+      workerId: "runtime-before-crash",
+      expectedAttempt: firstAttempt.attempts,
+      expectedLeaseExpiresAtMs: firstAttempt.leaseExpiresAtMs,
+    });
+    original.close();
+    teamSessions = undefined;
+
+    nowMs = firstAttempt.leaseExpiresAtMs;
+    const peers = [openKernel(), openKernel()] as const;
+    teamSessions = peers[0];
+    try {
+      const claims = await Promise.all([
+        peers[0].claimRuntimeOutbox({
+          workerId: "runtime-recovery-a",
+          limit: 1,
+          leaseDurationMs: 30_000,
+        }),
+        peers[1].claimRuntimeOutbox({
+          workerId: "runtime-recovery-b",
+          limit: 1,
+          leaseDurationMs: 30_000,
+        }),
+      ]);
+      const claimed = claims.flat();
+      expect(claimed).toHaveLength(1);
+      const recovered = claimed[0];
+      if (!recovered) throw new Error("Expected one reconciler lease");
+      expect(recovered).toMatchObject({
+        outboxId: firstAttempt.outboxId,
+        attempts: 2,
+        dispatchMode: "reconcile",
+      });
+      const owner = recovered.leaseOwner === "runtime-recovery-a" ? peers[0] : peers[1];
+      const command = makeCommand(
+        {
+          type: "runtime.outbox.acknowledge",
+          outboxId: recovered.outboxId,
+          workerId: recovered.leaseOwner,
+          expectedAttempt: recovered.attempts,
+          expectedLeaseExpiresAtMs: recovered.leaseExpiresAtMs,
+        },
+        { ...SYSTEM, userId: recovered.leaseOwner },
+        "crash-reconciliation-ack"
+      );
+
+      const acknowledged = await owner.dispatch(command);
+      await expect(owner.dispatch(command)).resolves.toEqual({
+        ...acknowledged,
+        replayed: true,
+      });
+      expect(acknowledged.events).toEqual([
+        expect.objectContaining({ type: "runtime.session.ensured" }),
+      ]);
+      const events = await owner.inspect({
+        schemaVersion: TEAM_SESSION_SCHEMA_VERSION,
+        actor: ALICE,
+        type: "session.events",
+        sessionId: SESSION_ID,
+        afterSequence: 0,
+        limit: 1_000,
+      });
+      expect(events.filter((event) => event.type === "runtime.session.ensured")).toHaveLength(1);
+      await expect(
+        peers[0].claimRuntimeOutbox({
+          workerId: "runtime-after-ack",
+          limit: 1,
+          leaseDurationMs: 30_000,
+        })
+      ).resolves.toEqual([]);
+    } finally {
+      peers[1].close();
+    }
+  });
+
+  it("canonically supersedes a marked old generation after crash without returning it to apply", async () => {
+    await bootstrap();
+    await admitMember(BOB);
+    await grantMembership(BOB, "owner");
+    const [firstAttempt] = await kernel().claimRuntimeOutbox({
+      workerId: SYSTEM.userId,
+      limit: 1,
+      leaseDurationMs: 1_000,
+    });
+    if (!firstAttempt) throw new Error("Expected original ensure attempt");
+    await kernel().markRuntimeOutboxDispatch({
+      outboxId: firstAttempt.outboxId,
+      workerId: SYSTEM.userId,
+      expectedAttempt: firstAttempt.attempts,
+      expectedLeaseExpiresAtMs: firstAttempt.leaseExpiresAtMs,
+    });
+    await revokeMembership(ALICE, BOB);
+    kernel().close();
+    teamSessions = undefined;
+
+    nowMs = firstAttempt.leaseExpiresAtMs;
+    teamSessions = openKernel();
+    const [recovered] = await kernel().claimRuntimeOutbox({
+      workerId: SYSTEM.userId,
+      limit: 1,
+      leaseDurationMs: 30_000,
+    });
+    if (!recovered) throw new Error("Expected superseded reconciliation lease");
+    expect(recovered).toMatchObject({
+      outboxId: firstAttempt.outboxId,
+      attempts: 2,
+      dispatchMode: "reconcile",
+    });
+
+    await expect(
+      dispatch(
+        {
+          type: "runtime.outbox.acknowledge",
+          outboxId: recovered.outboxId,
+          workerId: SYSTEM.userId,
+          expectedAttempt: recovered.attempts,
+          expectedLeaseExpiresAtMs: recovered.leaseExpiresAtMs,
+        },
+        SYSTEM
+      )
+    ).resolves.toMatchObject({
+      data: { superseded: true, runtimeAuthorizationGeneration: 1 },
+      events: [expect.objectContaining({ type: "runtime.outbox.delivered" })],
+    });
+    expect(runtimeOutboxState(recovered.outboxId)).toEqual({
+      status: "delivered",
+      delivered_at_ms: nowMs,
+    });
+    const [next] = await kernel().claimRuntimeOutbox({
+      workerId: SYSTEM.userId,
+      limit: 1,
+      leaseDurationMs: 30_000,
+    });
+    expect(next).toMatchObject({
+      kind: "runtime.authorization.fence",
+      dispatchMode: "apply",
+    });
+  });
+
+  it("supersedes a reconciled delivery from an older generation and unblocks the newer fence", async () => {
     await bootstrap();
     await admitMember(BOB);
     await grantMembership(BOB, "owner");
@@ -1574,8 +1775,35 @@ describe("Team Session kernel", () => {
           outboxId: olderEnsure.outboxId,
           workerId: SYSTEM.userId,
           expectedAttempt: olderEnsure.attempts,
-          retryable: false,
+          expectedLeaseExpiresAtMs: olderEnsure.leaseExpiresAtMs,
+          retryable: true,
           errorCode: "runtime_conflict",
+        },
+        SYSTEM
+      )
+    ).resolves.toMatchObject({
+      data: { superseded: false, retryable: true },
+      events: [expect.objectContaining({ type: "runtime.outbox.retry-scheduled" })],
+    });
+    const [reconciledEnsure] = await kernel().claimRuntimeOutbox({
+      workerId: SYSTEM.userId,
+      limit: 1,
+      leaseDurationMs: 30_000,
+    });
+    expect(reconciledEnsure).toMatchObject({
+      outboxId: olderEnsure.outboxId,
+      attempts: olderEnsure.attempts + 1,
+      dispatchMode: "reconcile",
+    });
+    if (!reconciledEnsure) throw new Error("Expected old ensure reconciliation");
+    await expect(
+      dispatch(
+        {
+          type: "runtime.outbox.acknowledge",
+          outboxId: reconciledEnsure.outboxId,
+          workerId: SYSTEM.userId,
+          expectedAttempt: reconciledEnsure.attempts,
+          expectedLeaseExpiresAtMs: reconciledEnsure.leaseExpiresAtMs,
         },
         SYSTEM
       )
@@ -1583,9 +1811,12 @@ describe("Team Session kernel", () => {
       data: {
         runtimeAuthorizationGeneration: 1,
         superseded: true,
-        quarantined: false,
       },
-      events: [expect.objectContaining({ type: "runtime.outbox.superseded" })],
+      events: [expect.objectContaining({ type: "runtime.outbox.delivered" })],
+    });
+    expect(runtimeOutboxState(reconciledEnsure.outboxId)).toEqual({
+      status: "delivered",
+      delivered_at_ms: nowMs,
     });
     expect((await requireSession(SESSION_ID, BOB)).runtime.authorizationState).toBe("pending");
 
@@ -1597,6 +1828,7 @@ describe("Team Session kernel", () => {
         outboxId: currentFence.outboxId,
         workerId: SYSTEM.userId,
         expectedAttempt: currentFence.attempts,
+        expectedLeaseExpiresAtMs: currentFence.leaseExpiresAtMs,
       },
       SYSTEM
     );
@@ -1617,6 +1849,7 @@ describe("Team Session kernel", () => {
           outboxId: currentEnsure.outboxId,
           workerId: SYSTEM.userId,
           expectedAttempt: currentEnsure.attempts,
+          expectedLeaseExpiresAtMs: currentEnsure.leaseExpiresAtMs,
           retryable: false,
           errorCode: "runtime_unavailable",
         },
@@ -1681,6 +1914,314 @@ describe("Team Session kernel", () => {
     });
   });
 
+  it("renews only the exact live Runtime lease and carries its new expiry through dispatch", async () => {
+    await bootstrap();
+    const [delivery] = await kernel().claimRuntimeOutbox({
+      workerId: "runtime-renewal-owner",
+      limit: 1,
+      leaseDurationMs: 1_000,
+    });
+    if (!delivery) throw new Error("Expected Runtime delivery for lease renewal");
+    const originalLeaseExpiresAtMs = delivery.leaseExpiresAtMs;
+    nowMs += 500;
+
+    await expect(
+      kernel().renewRuntimeOutboxLease({
+        outboxId: delivery.outboxId,
+        workerId: "wrong-runtime-owner",
+        expectedAttempt: delivery.attempts,
+        expectedLeaseExpiresAtMs: originalLeaseExpiresAtMs,
+        leaseDurationMs: 1_000,
+      })
+    ).rejects.toMatchObject({ code: "stale-revision" });
+    await expect(
+      kernel().renewRuntimeOutboxLease({
+        outboxId: delivery.outboxId,
+        workerId: "runtime-renewal-owner",
+        expectedAttempt: delivery.attempts + 1,
+        expectedLeaseExpiresAtMs: originalLeaseExpiresAtMs,
+        leaseDurationMs: 1_000,
+      })
+    ).rejects.toMatchObject({ code: "stale-revision" });
+    await expect(
+      kernel().renewRuntimeOutboxLease({
+        outboxId: delivery.outboxId,
+        workerId: "runtime-renewal-owner",
+        expectedAttempt: delivery.attempts,
+        expectedLeaseExpiresAtMs: originalLeaseExpiresAtMs + 1,
+        leaseDurationMs: 1_000,
+      })
+    ).rejects.toMatchObject({ code: "stale-revision" });
+    for (const leaseDurationMs of [999, 300_001]) {
+      await expect(
+        kernel().renewRuntimeOutboxLease({
+          outboxId: delivery.outboxId,
+          workerId: "runtime-renewal-owner",
+          expectedAttempt: delivery.attempts,
+          expectedLeaseExpiresAtMs: originalLeaseExpiresAtMs,
+          leaseDurationMs,
+        })
+      ).rejects.toMatchObject({ code: "invalid-command" });
+    }
+
+    const renewed = await kernel().renewRuntimeOutboxLease({
+      outboxId: delivery.outboxId,
+      workerId: "runtime-renewal-owner",
+      expectedAttempt: delivery.attempts,
+      expectedLeaseExpiresAtMs: originalLeaseExpiresAtMs,
+      leaseDurationMs: 1_000,
+    });
+    expect(renewed).toEqual({ leaseExpiresAtMs: nowMs + 1_000 });
+
+    nowMs = originalLeaseExpiresAtMs;
+    const competingKernel = openKernel();
+    try {
+      await expect(
+        competingKernel.claimRuntimeOutbox({
+          workerId: "runtime-competing-worker",
+          limit: 1,
+          leaseDurationMs: 1_000,
+        })
+      ).resolves.toEqual([]);
+    } finally {
+      competingKernel.close();
+    }
+    await expect(
+      kernel().markRuntimeOutboxDispatch({
+        outboxId: delivery.outboxId,
+        workerId: "runtime-renewal-owner",
+        expectedAttempt: delivery.attempts,
+        expectedLeaseExpiresAtMs: originalLeaseExpiresAtMs,
+      })
+    ).rejects.toMatchObject({ code: "stale-revision" });
+    await kernel().markRuntimeOutboxDispatch({
+      outboxId: delivery.outboxId,
+      workerId: "runtime-renewal-owner",
+      expectedAttempt: delivery.attempts,
+      expectedLeaseExpiresAtMs: renewed.leaseExpiresAtMs,
+    });
+    await expect(
+      dispatch(
+        {
+          type: "runtime.outbox.acknowledge",
+          outboxId: delivery.outboxId,
+          workerId: "runtime-renewal-owner",
+          expectedAttempt: delivery.attempts,
+          expectedLeaseExpiresAtMs: originalLeaseExpiresAtMs,
+        },
+        { ...SYSTEM, userId: "runtime-renewal-owner" }
+      )
+    ).rejects.toMatchObject({ code: "stale-revision" });
+    await expect(
+      dispatch(
+        {
+          type: "runtime.outbox.acknowledge",
+          outboxId: delivery.outboxId,
+          workerId: "runtime-renewal-owner",
+          expectedAttempt: delivery.attempts,
+          expectedLeaseExpiresAtMs: renewed.leaseExpiresAtMs,
+        },
+        { ...SYSTEM, userId: "runtime-renewal-owner" }
+      )
+    ).resolves.toMatchObject({ data: { superseded: false } });
+  });
+
+  it("self-heals an invalid far-future Runtime lease instead of blocking the Session", async () => {
+    await bootstrap();
+    const injected = new Database(filename);
+    const outbox = injected
+      .prepare(
+        `SELECT id FROM runtime_outbox
+         WHERE session_id = ? AND status = 'pending'
+         ORDER BY session_sequence, id LIMIT 1`
+      )
+      .get(SESSION_ID) as { id: string } | undefined;
+    if (!outbox) throw new Error("Expected pending Runtime delivery");
+    injected
+      .prepare(
+        `UPDATE runtime_outbox
+         SET status = 'processing', attempts = 1,
+             lease_owner = 'invalid-lease-owner', lease_expires_at_ms = ?
+         WHERE id = ?`
+      )
+      .run(Number.MAX_SAFE_INTEGER, outbox.id);
+    injected.close();
+
+    const [recovered] = await kernel().claimRuntimeOutbox({
+      workerId: "runtime-recovery-owner",
+      limit: 1,
+      leaseDurationMs: 30_000,
+    });
+    expect(recovered).toMatchObject({
+      outboxId: outbox.id,
+      attempts: 2,
+      leaseOwner: "runtime-recovery-owner",
+      dispatchMode: "apply",
+    });
+
+    const verified = new Database(filename, { readonly: true });
+    const settlement = verified
+      .prepare(
+        `SELECT attempt, lease_owner, lease_expires_at_ms, outcome, recorded_at_ms
+         FROM runtime_outbox_settlements
+         WHERE outbox_id = ? AND attempt = 1`
+      )
+      .get(outbox.id);
+    verified.close();
+    expect(settlement).toEqual({
+      attempt: 1,
+      lease_owner: "invalid-lease-owner",
+      lease_expires_at_ms: Number.MAX_SAFE_INTEGER,
+      outcome: "lease-invalid",
+      recorded_at_ms: nowMs,
+    });
+  });
+
+  it("tolerates bounded clock rollback without stealing a valid maximum Runtime lease", async () => {
+    await bootstrap();
+    nowMs += 120_000;
+    const [delivery] = await kernel().claimRuntimeOutbox({
+      workerId: "runtime-before-clock-adjustment",
+      limit: 1,
+      leaseDurationMs: 300_000,
+    });
+    if (!delivery) throw new Error("Expected Runtime delivery before clock adjustment");
+
+    nowMs -= 30_000;
+    await expect(
+      kernel().claimRuntimeOutbox({
+        workerId: "runtime-after-clock-adjustment",
+        limit: 1,
+        leaseDurationMs: 30_000,
+      })
+    ).resolves.toEqual([]);
+    expect(runtimeOutboxState(delivery.outboxId)).toEqual({
+      status: "processing",
+      delivered_at_ms: null,
+    });
+  });
+
+  it("fails closed when the Runtime clock predates durable outbox work", async () => {
+    await bootstrap();
+    nowMs -= 1;
+
+    await expect(
+      kernel().claimRuntimeOutbox({
+        workerId: "runtime-with-regressed-clock",
+        limit: 1,
+        leaseDurationMs: 30_000,
+      })
+    ).rejects.toMatchObject({
+      code: "conflict",
+      message: "Runtime outbox clock moved backwards",
+    });
+  });
+
+  it("fails closed when the Runtime clock predates a durable dispatch marker", async () => {
+    await bootstrap();
+    nowMs += 120_000;
+    const [delivery] = await kernel().claimRuntimeOutbox({
+      workerId: "runtime-before-marker-rollback",
+      limit: 1,
+      leaseDurationMs: 300_000,
+    });
+    if (!delivery) throw new Error("Expected Runtime delivery before marker rollback");
+    await kernel().markRuntimeOutboxDispatch({
+      outboxId: delivery.outboxId,
+      workerId: delivery.leaseOwner,
+      expectedAttempt: delivery.attempts,
+      expectedLeaseExpiresAtMs: delivery.leaseExpiresAtMs,
+    });
+
+    nowMs -= 60_000;
+    await expect(
+      kernel().claimRuntimeOutbox({
+        workerId: "runtime-after-marker-rollback",
+        limit: 1,
+        leaseDurationMs: 30_000,
+      })
+    ).rejects.toMatchObject({
+      code: "conflict",
+      message: "Runtime outbox clock moved backwards",
+    });
+    expect(runtimeOutboxState(delivery.outboxId)).toEqual({
+      status: "processing",
+      delivered_at_ms: null,
+    });
+  });
+
+  it("rejects every outcome until the exact owner and attempt acquire the dispatch interlock", async () => {
+    await bootstrap();
+    const [delivery] = await kernel().claimRuntimeOutbox({
+      workerId: SYSTEM.userId,
+      limit: 1,
+      leaseDurationMs: 30_000,
+    });
+    if (!delivery) throw new Error("Expected unmarked Runtime delivery");
+
+    await expect(
+      dispatch(
+        {
+          type: "runtime.outbox.acknowledge",
+          outboxId: delivery.outboxId,
+          workerId: SYSTEM.userId,
+          expectedAttempt: delivery.attempts,
+          expectedLeaseExpiresAtMs: delivery.leaseExpiresAtMs,
+        },
+        SYSTEM
+      )
+    ).rejects.toMatchObject({ code: "stale-revision" });
+    await expect(
+      dispatch(
+        {
+          type: "runtime.outbox.fail",
+          outboxId: delivery.outboxId,
+          workerId: SYSTEM.userId,
+          expectedAttempt: delivery.attempts,
+          expectedLeaseExpiresAtMs: delivery.leaseExpiresAtMs,
+          retryable: true,
+          errorCode: "runtime_timeout",
+        },
+        SYSTEM
+      )
+    ).rejects.toMatchObject({ code: "stale-revision" });
+    await expect(
+      kernel().markRuntimeOutboxDispatch({
+        outboxId: delivery.outboxId,
+        workerId: "wrong-worker",
+        expectedAttempt: delivery.attempts,
+        expectedLeaseExpiresAtMs: delivery.leaseExpiresAtMs,
+      })
+    ).rejects.toMatchObject({ code: "stale-revision" });
+
+    await kernel().markRuntimeOutboxDispatch({
+      outboxId: delivery.outboxId,
+      workerId: SYSTEM.userId,
+      expectedAttempt: delivery.attempts,
+      expectedLeaseExpiresAtMs: delivery.leaseExpiresAtMs,
+    });
+    await expect(
+      kernel().markRuntimeOutboxDispatch({
+        outboxId: delivery.outboxId,
+        workerId: SYSTEM.userId,
+        expectedAttempt: delivery.attempts,
+        expectedLeaseExpiresAtMs: delivery.leaseExpiresAtMs,
+      })
+    ).rejects.toMatchObject({ code: "stale-revision" });
+    await expect(
+      dispatch(
+        {
+          type: "runtime.outbox.acknowledge",
+          outboxId: delivery.outboxId,
+          workerId: SYSTEM.userId,
+          expectedAttempt: delivery.attempts,
+          expectedLeaseExpiresAtMs: delivery.leaseExpiresAtMs,
+        },
+        SYSTEM
+      )
+    ).resolves.toMatchObject({ data: { superseded: false } });
+  });
+
   it("fences a same-worker lease ABA by attempt and retries without quarantining", async () => {
     await bootstrap();
     const firstClaims = await kernel().claimRuntimeOutbox({
@@ -1707,6 +2248,14 @@ describe("Team Session kernel", () => {
       outboxId: firstAttempt.outboxId,
       kind: "runtime.session.ensure",
       attempts: 2,
+      dispatchMode: "apply",
+    });
+
+    await kernel().markRuntimeOutboxDispatch({
+      outboxId: secondAttempt.outboxId,
+      workerId: SYSTEM.userId,
+      expectedAttempt: secondAttempt.attempts,
+      expectedLeaseExpiresAtMs: secondAttempt.leaseExpiresAtMs,
     });
 
     await expect(
@@ -1716,6 +2265,7 @@ describe("Team Session kernel", () => {
           outboxId: firstAttempt.outboxId,
           workerId: SYSTEM.userId,
           expectedAttempt: firstAttempt.attempts,
+          expectedLeaseExpiresAtMs: firstAttempt.leaseExpiresAtMs,
         },
         SYSTEM
       )
@@ -1727,6 +2277,7 @@ describe("Team Session kernel", () => {
           outboxId: firstAttempt.outboxId,
           workerId: SYSTEM.userId,
           expectedAttempt: firstAttempt.attempts,
+          expectedLeaseExpiresAtMs: firstAttempt.leaseExpiresAtMs,
           retryable: true,
           errorCode: "runtime_conflict",
         },
@@ -1740,6 +2291,7 @@ describe("Team Session kernel", () => {
           outboxId: secondAttempt.outboxId,
           workerId: SYSTEM.userId,
           expectedAttempt: secondAttempt.attempts,
+          expectedLeaseExpiresAtMs: secondAttempt.leaseExpiresAtMs,
         },
         ALICE
       )
@@ -1751,6 +2303,7 @@ describe("Team Session kernel", () => {
           outboxId: secondAttempt.outboxId,
           workerId: SYSTEM.userId,
           expectedAttempt: secondAttempt.attempts,
+          expectedLeaseExpiresAtMs: secondAttempt.leaseExpiresAtMs,
           retryable: true,
           errorCode: "runtime_internal",
         },
@@ -1769,6 +2322,7 @@ describe("Team Session kernel", () => {
           outboxId: secondAttempt.outboxId,
           workerId: SYSTEM.userId,
           expectedAttempt: secondAttempt.attempts,
+          expectedLeaseExpiresAtMs: secondAttempt.leaseExpiresAtMs,
           retryable: true,
           errorCode: "runtime_timeout",
         },
@@ -1789,6 +2343,7 @@ describe("Team Session kernel", () => {
     expect(thirdAttempt).toMatchObject({
       outboxId: firstAttempt.outboxId,
       attempts: 3,
+      dispatchMode: "reconcile",
     });
     await dispatch(
       {
@@ -1796,6 +2351,7 @@ describe("Team Session kernel", () => {
         outboxId: thirdAttempt.outboxId,
         workerId: SYSTEM.userId,
         expectedAttempt: thirdAttempt.attempts,
+        expectedLeaseExpiresAtMs: thirdAttempt.leaseExpiresAtMs,
       },
       SYSTEM
     );
@@ -2251,7 +2807,7 @@ describe("Team Session kernel", () => {
 
     const database = new Database(filename, { readonly: true });
     try {
-      expect(database.pragma("user_version", { simple: true })).toBe(7);
+      expect(database.pragma("user_version", { simple: true })).toBe(8);
       expect(database.pragma("foreign_key_check")).toEqual([]);
       expect(
         database

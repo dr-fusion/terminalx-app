@@ -7,6 +7,7 @@ import {
   snapshotPersistedRuntimeEffectRefCommitment,
   type RuntimeEffectRefCommitment,
 } from "./runtime-enforcement-proof";
+import { suppressNativePromiseRejection } from "./runtime-native-promise";
 
 export const RUNTIME_COMPENSATION_ENFORCEMENT_SUBJECT_DIGEST_DOMAIN =
   "terminalx/runtime-compensation-enforcement-subject/v1\0" as const;
@@ -166,8 +167,8 @@ export function verifyRuntimeCompensationEnforcementProofSynchronously(
     fail("verification_failed");
   }
   if (verified !== true) {
-    // A thenable cannot hold an SQLite transaction open or settle after lease expiry.
-    void Promise.resolve(verified).catch(() => undefined);
+    // A custom thenable cannot execute inside or after the SQLite transaction.
+    suppressNativePromiseRejection(verified);
     fail("verification_failed");
   }
 }

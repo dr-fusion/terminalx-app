@@ -947,6 +947,7 @@ describe("Runtime effect-enforcer attestation trust registry", () => {
     fs.writeFileSync(registryFile, canonicalRuntimeJson(bundle), { mode: 0o600 });
 
     const loaded = createRuntimeEffectEnforcerTrustRegistryFromFile({
+      trustedConfigurationRoot: directory,
       registryFile,
       pinnedManifestAuthorityPublicKeys: [platformPin()],
     });
@@ -958,6 +959,7 @@ describe("Runtime effect-enforcer attestation trust registry", () => {
     fs.writeFileSync(noncanonicalFile, `${canonicalRuntimeJson(bundle)}\n`, { mode: 0o600 });
     expect(() =>
       createRuntimeEffectEnforcerTrustRegistryFromFile({
+        trustedConfigurationRoot: directory,
         registryFile: noncanonicalFile,
         pinnedManifestAuthorityPublicKeys: [platformPin()],
       })
@@ -967,6 +969,7 @@ describe("Runtime effect-enforcer attestation trust registry", () => {
     fs.writeFileSync(permissiveFile, canonicalRuntimeJson(bundle), { mode: 0o644 });
     expect(() =>
       createRuntimeEffectEnforcerTrustRegistryFromFile({
+        trustedConfigurationRoot: directory,
         registryFile: permissiveFile,
         pinnedManifestAuthorityPublicKeys: [platformPin()],
       })
@@ -977,6 +980,7 @@ describe("Runtime effect-enforcer attestation trust registry", () => {
     for (const candidate of [symlinkFile, path.basename(registryFile), directory]) {
       expect(() =>
         createRuntimeEffectEnforcerTrustRegistryFromFile({
+          trustedConfigurationRoot: directory,
           registryFile: candidate,
           pinnedManifestAuthorityPublicKeys: [platformPin()],
         })
@@ -988,6 +992,7 @@ describe("Runtime effect-enforcer attestation trust registry", () => {
     )}`;
     expect(() =>
       createRuntimeEffectEnforcerTrustRegistryFromFile({
+        trustedConfigurationRoot: directory,
         registryFile: nonCanonicalPath,
         pinnedManifestAuthorityPublicKeys: [platformPin()],
       })
@@ -1001,6 +1006,7 @@ describe("Runtime effect-enforcer attestation trust registry", () => {
     fs.symlinkSync(realParent, linkedParent);
     expect(() =>
       createRuntimeEffectEnforcerTrustRegistryFromFile({
+        trustedConfigurationRoot: directory,
         registryFile: path.join(linkedParent, "registry.json"),
         pinnedManifestAuthorityPublicKeys: [platformPin()],
       })
@@ -1010,10 +1016,35 @@ describe("Runtime effect-enforcer attestation trust registry", () => {
     fs.linkSync(registryFile, hardLink);
     expect(() =>
       createRuntimeEffectEnforcerTrustRegistryFromFile({
+        trustedConfigurationRoot: directory,
         registryFile,
         pinnedManifestAuthorityPublicKeys: [platformPin()],
       })
     ).toThrow(expect.objectContaining({ code: "registry_file_unavailable" }));
+    fs.rmSync(hardLink);
+
+    const prefixCollisionRoot = `${directory}-outside`;
+    fs.mkdirSync(prefixCollisionRoot, { mode: 0o700 });
+    const outsideRegistry = path.join(prefixCollisionRoot, "registry.json");
+    fs.writeFileSync(outsideRegistry, canonicalRuntimeJson(bundle), { mode: 0o600 });
+    expect(() =>
+      createRuntimeEffectEnforcerTrustRegistryFromFile({
+        trustedConfigurationRoot: directory,
+        registryFile: outsideRegistry,
+        pinnedManifestAuthorityPublicKeys: [platformPin()],
+      })
+    ).toThrow(expect.objectContaining({ code: "registry_file_unavailable" }));
+    fs.rmSync(prefixCollisionRoot, { recursive: true, force: true });
+
+    fs.chmodSync(directory, 0o770);
+    expect(() =>
+      createRuntimeEffectEnforcerTrustRegistryFromFile({
+        trustedConfigurationRoot: directory,
+        registryFile,
+        pinnedManifestAuthorityPublicKeys: [platformPin()],
+      })
+    ).toThrow(expect.objectContaining({ code: "registry_file_unavailable" }));
+    fs.chmodSync(directory, 0o700);
   });
 
   it("keeps manifest, claims, and signed-attestation digests domain separated", () => {

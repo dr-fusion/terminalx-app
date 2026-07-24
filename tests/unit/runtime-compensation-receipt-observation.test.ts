@@ -1,7 +1,16 @@
 import { generateKeyPairSync, sign as signEd25519 } from "node:crypto";
-import { chmodSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  linkSync,
+  mkdirSync,
+  mkdtempSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { RuntimeBinding } from "@/lib/team-sessions/contracts";
 import type {
@@ -27,6 +36,10 @@ import {
 } from "@/lib/runtime/runtime-compensation-receipt-observation";
 import { digestNonDuplicateRuntimeCompensationReceipt } from "@/lib/runtime/runtime-compensation-execution";
 import { digestAggregateEnforcementProof } from "@/lib/runtime/runtime-enforcement-proof";
+import {
+  TrustedConfigurationFileError,
+  readTrustedConfigurationFileWithRaceHookForTest,
+} from "@/lib/runtime/runtime-trusted-configuration-file";
 import {
   RUNTIME_RECEIPT_OBSERVATION_CLAIMS_DIGEST_DOMAIN,
   RUNTIME_RECEIPT_OBSERVATION_RECEIPT_DIGEST_DOMAIN,
@@ -70,6 +83,7 @@ describe("signed Runtime compensation receipt observations", () => {
     return createRuntimeCompensationReceiptObservationIssuer({
       issuerKeyId: "daytona-compensation-observer:v1",
       binding: issuerBinding,
+      trustedConfigurationRoot: directory,
       privateKeyFile,
       clock,
       observationTtlMs: 500,
@@ -511,9 +525,58 @@ describe("signed Runtime compensation receipt observations", () => {
       createRuntimeCompensationReceiptObservationIssuer({
         issuerKeyId: "daytona-compensation-observer:v1",
         binding,
+        trustedConfigurationRoot: directory,
         privateKeyFile: link,
       })
     ).toThrow(expect.objectContaining({ code: "private_key_unavailable" }));
+
+    const nonCanonicalPath = `${directory}/../${basename(directory)}/${basename(privateKeyFile)}`;
+    expect(() =>
+      createRuntimeCompensationReceiptObservationIssuer({
+        issuerKeyId: "daytona-compensation-observer:v1",
+        binding,
+        trustedConfigurationRoot: directory,
+        privateKeyFile: nonCanonicalPath,
+      })
+    ).toThrow(expect.objectContaining({ code: "private_key_unavailable" }));
+
+    const outsideRoot = `${directory}-outside`;
+    mkdirSync(outsideRoot, { mode: 0o700 });
+    const outsideKey = join(outsideRoot, "private.pem");
+    writeFileSync(outsideKey, privateKeyPem, { mode: 0o600 });
+    expect(() =>
+      createRuntimeCompensationReceiptObservationIssuer({
+        issuerKeyId: "daytona-compensation-observer:v1",
+        binding,
+        trustedConfigurationRoot: directory,
+        privateKeyFile: outsideKey,
+      })
+    ).toThrow(expect.objectContaining({ code: "private_key_unavailable" }));
+    rmSync(outsideRoot, { recursive: true, force: true });
+
+    const realParent = join(directory, "real-parent");
+    mkdirSync(realParent, { mode: 0o700 });
+    const nestedKey = join(realParent, "private.pem");
+    writeFileSync(nestedKey, privateKeyPem, { mode: 0o600 });
+    const linkedParent = join(directory, "linked-parent");
+    symlinkSync(realParent, linkedParent);
+    expect(() =>
+      createRuntimeCompensationReceiptObservationIssuer({
+        issuerKeyId: "daytona-compensation-observer:v1",
+        binding,
+        trustedConfigurationRoot: directory,
+        privateKeyFile: join(linkedParent, "private.pem"),
+      })
+    ).toThrow(expect.objectContaining({ code: "private_key_unavailable" }));
+
+    chmodSync(directory, 0o770);
+    expect(() => issuer()).toThrow(expect.objectContaining({ code: "private_key_unavailable" }));
+    chmodSync(directory, 0o700);
+
+    const hardLink = join(directory, "compensation-observer-hard-link.pem");
+    linkSync(privateKeyFile, hardLink);
+    expect(() => issuer()).toThrow(expect.objectContaining({ code: "private_key_unavailable" }));
+    rmSync(hardLink);
 
     const rsa = generateKeyPairSync("rsa", {
       modulusLength: 2048,
@@ -526,6 +589,7 @@ describe("signed Runtime compensation receipt observations", () => {
       createRuntimeCompensationReceiptObservationIssuer({
         issuerKeyId: "daytona-compensation-observer:v1",
         binding,
+        trustedConfigurationRoot: directory,
         privateKeyFile: rsaFile,
       })
     ).toThrow(expect.objectContaining({ code: "invalid_private_key" }));
@@ -534,6 +598,29 @@ describe("signed Runtime compensation receipt observations", () => {
         expect.objectContaining({ code: "invalid_public_key" })
       );
     }
+  });
+
+  it("fails closed when a trusted file path is replaced after descriptor reading", () => {
+    const replacement = join(directory, "replacement.pem");
+    const original = join(directory, "original.pem");
+    const displaced = join(directory, "displaced.pem");
+    writeFileSync(original, privateKeyPem, { mode: 0o600 });
+    writeFileSync(replacement, privateKeyPem, { mode: 0o600 });
+
+    expect(() =>
+      readTrustedConfigurationFileWithRaceHookForTest(
+        {
+          trustedConfigurationRoot: directory,
+          filePath: original,
+          minimumBytes: 1,
+          maximumBytes: 64 * 1024,
+        },
+        () => {
+          renameSync(original, displaced);
+          renameSync(replacement, original);
+        }
+      )
+    ).toThrow(TrustedConfigurationFileError);
   });
 
   it("cryptographically separates compensation observations from lifecycle domains", () => {

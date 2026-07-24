@@ -81,39 +81,42 @@ describe("Runtime compensation materializer", () => {
 
     await expect(materializer.runOnce()).resolves.toEqual({ found: 1, created: 1 });
     expect(issuer.issue).toHaveBeenCalledOnce();
-    expect(journal.materialize).toHaveBeenCalledWith({
-      compensationId: candidate.compensationId,
-      incidentDigest: candidate.incidentDigest,
-      authorityVerifiedAtMs: 200,
-      materializedAtMs: 200,
-      command: expect.objectContaining({
-        kind: "safety.quarantine",
-        commandId: "quarantine-command-1",
+    expect(journal.materialize).toHaveBeenCalledWith(
+      {
         compensationId: candidate.compensationId,
-        binding: candidate.binding,
-        observedRuntimeAuthorizationGeneration: 4,
-        safetyFence: 8,
-        source: candidate.source,
-        platformSecurityPolicyRevision: "platform-security-policy:v1",
-        requiredContainmentEnforcerSetDigest: "1".repeat(64),
-        containment: {
-          revokeTerminalWrites: true,
-          stopProcessExecution: true,
-          quarantineRuntime: true,
-        },
-        exactBindingOnly: true,
-        advanceBeyondCurrentFences: true,
-        reasonRef: candidate.incidentDigest,
-        causationId: candidate.source.lifecycleCommandId,
-        actor: { kind: "system", actorRef: "platform-security" },
-        issuedAtMs: 200,
-        deadlineAtMs: 30_200,
-        authority: expect.objectContaining({
-          issuer: "platform-security",
-          capability: "safety.quarantine",
+        incidentDigest: candidate.incidentDigest,
+        authorityVerifiedAtMs: 200,
+        materializedAtMs: 200,
+        command: expect.objectContaining({
+          kind: "safety.quarantine",
+          commandId: "quarantine-command-1",
+          compensationId: candidate.compensationId,
+          binding: candidate.binding,
+          observedRuntimeAuthorizationGeneration: 4,
+          safetyFence: 8,
+          source: candidate.source,
+          platformSecurityPolicyRevision: "platform-security-policy:v1",
+          requiredContainmentEnforcerSetDigest: "1".repeat(64),
+          containment: {
+            revokeTerminalWrites: true,
+            stopProcessExecution: true,
+            quarantineRuntime: true,
+          },
+          exactBindingOnly: true,
+          advanceBeyondCurrentFences: true,
+          reasonRef: candidate.incidentDigest,
+          causationId: candidate.source.lifecycleCommandId,
+          actor: { kind: "system", actorRef: "platform-security" },
+          issuedAtMs: 200,
+          deadlineAtMs: 30_200,
+          authority: expect.objectContaining({
+            issuer: "platform-security",
+            capability: "safety.quarantine",
+          }),
         }),
-      }),
-    });
+      },
+      { signal: expect.anything() }
+    );
     const stored = journal.materialize.mock.calls[0]?.[0];
     expect(Object.isFrozen(stored.command)).toBe(true);
     expect(Object.isFrozen(stored.command.source)).toBe(true);
@@ -212,6 +215,70 @@ describe("Runtime compensation materializer", () => {
       );
       expect(journal.materialize).not.toHaveBeenCalled();
     }
+  });
+
+  it("never reads or invokes a custom thenable returned by the synchronous verifier", async () => {
+    const thenBody = vi.fn();
+    const thenGetter = vi.fn(() => thenBody);
+    const hostileVerifierResult = {} as Record<string, unknown>;
+    Object.defineProperty(hostileVerifierResult, "then", {
+      get: thenGetter,
+    });
+    const journal = journalReturning();
+    const materializer = createRuntimeCompensationMaterializer({
+      journal,
+      authorityIssuer: authorityIssuer(),
+      verifyAuthority: (() => hostileVerifierResult) as never,
+      policySource: {
+        resolve: () => ({
+          platformSecurityPolicyRevision: "platform-security-policy:v1",
+          requiredContainmentEnforcerSetDigest: "1".repeat(64),
+        }),
+      },
+      idGenerator: () => "quarantine-command-1",
+      clock: () => 200,
+    });
+
+    await expect(materializer.runOnce()).rejects.toThrow(
+      "Platform-security Runtime authority could not be verified"
+    );
+    expect(thenGetter).not.toHaveBeenCalled();
+    expect(thenBody).not.toHaveBeenCalled();
+    expect(journal.materialize).not.toHaveBeenCalled();
+  });
+
+  it("stops after an aborted materialization read without signing or writing", async () => {
+    let release: ((value: RuntimeCompensationMaterializationCandidate) => void) | undefined;
+    const journal = journalReturning();
+    journal.findMaterializable.mockImplementation(
+      () =>
+        new Promise<RuntimeCompensationMaterializationCandidate>((resolve) => {
+          release = resolve;
+        })
+    );
+    const issuer = authorityIssuer();
+    const materializer = createRuntimeCompensationMaterializer({
+      journal,
+      authorityIssuer: issuer,
+      verifyAuthority: () => true,
+      policySource: {
+        resolve: () => ({
+          platformSecurityPolicyRevision: "platform-security-policy:v1",
+          requiredContainmentEnforcerSetDigest: "1".repeat(64),
+        }),
+      },
+      idGenerator: () => "quarantine-command-1",
+      clock: () => 200,
+    });
+    const controller = new AbortController();
+
+    const running = materializer.runOnce(controller.signal);
+    controller.abort();
+    release?.(candidate);
+
+    await expect(running).rejects.toMatchObject({ name: "AbortError" });
+    expect(issuer.issue).not.toHaveBeenCalled();
+    expect(journal.materialize).not.toHaveBeenCalled();
   });
 
   it("shares one active materialization and handles a concurrent winner idempotently", async () => {

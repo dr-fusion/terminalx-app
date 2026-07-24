@@ -531,11 +531,13 @@ describe("pinned Runtime observation-key source", () => {
     const filePath = writeRegistryFile("registry.json", [signed]);
 
     const first = loadPinnedRuntimeObservationKeySourceFromFile({
+      trustedConfigurationRoot: directory,
       filePath,
       pinnedAuthorityPublicKeys: authorityPins(),
     }).get({ binding, runtimeAuthorizationGeneration: 7 });
     chmodSync(filePath, 0o400);
     const afterRestart = loadPinnedRuntimeObservationKeySourceFromFile({
+      trustedConfigurationRoot: directory,
       filePath,
       pinnedAuthorityPublicKeys: authorityPins(),
     }).get({ binding, runtimeAuthorizationGeneration: 7 });
@@ -552,6 +554,7 @@ describe("pinned Runtime observation-key source", () => {
     const filePath = writeRegistryFile("registry.json", [signed]);
     expect(() =>
       loadPinnedRuntimeObservationKeySourceFromFile({
+        trustedConfigurationRoot: directory,
         filePath: basename(filePath),
         pinnedAuthorityPublicKeys: authorityPins(),
       })
@@ -559,6 +562,7 @@ describe("pinned Runtime observation-key source", () => {
     const nonCanonicalPath = `${directory}/../${basename(directory)}/${basename(filePath)}`;
     expect(() =>
       loadPinnedRuntimeObservationKeySourceFromFile({
+        trustedConfigurationRoot: directory,
         filePath: nonCanonicalPath,
         pinnedAuthorityPublicKeys: authorityPins(),
       })
@@ -568,6 +572,7 @@ describe("pinned Runtime observation-key source", () => {
     symlinkSync(filePath, fileLink);
     expect(() =>
       loadPinnedRuntimeObservationKeySourceFromFile({
+        trustedConfigurationRoot: directory,
         filePath: fileLink,
         pinnedAuthorityPublicKeys: authorityPins(),
       })
@@ -581,6 +586,7 @@ describe("pinned Runtime observation-key source", () => {
     symlinkSync(realParent, linkedParent);
     expect(() =>
       loadPinnedRuntimeObservationKeySourceFromFile({
+        trustedConfigurationRoot: directory,
         filePath: join(linkedParent, "registry.json"),
         pinnedAuthorityPublicKeys: authorityPins(),
       })
@@ -589,6 +595,7 @@ describe("pinned Runtime observation-key source", () => {
     chmodSync(filePath, 0o644);
     expect(() =>
       loadPinnedRuntimeObservationKeySourceFromFile({
+        trustedConfigurationRoot: directory,
         filePath,
         pinnedAuthorityPublicKeys: authorityPins(),
       })
@@ -599,13 +606,39 @@ describe("pinned Runtime observation-key source", () => {
     linkSync(filePath, hardLink);
     expect(() =>
       loadPinnedRuntimeObservationKeySourceFromFile({
+        trustedConfigurationRoot: directory,
         filePath,
         pinnedAuthorityPublicKeys: authorityPins(),
       })
     ).toThrow(expect.objectContaining({ code: "source_unavailable" }));
+    rmSync(hardLink);
+
+    const prefixCollisionRoot = `${directory}-outside`;
+    mkdirSync(prefixCollisionRoot, { mode: 0o700 });
+    const outsideFile = join(prefixCollisionRoot, "registry.json");
+    writeFileSync(outsideFile, registryJson([signed]), { mode: 0o600 });
+    expect(() =>
+      loadPinnedRuntimeObservationKeySourceFromFile({
+        trustedConfigurationRoot: directory,
+        filePath: outsideFile,
+        pinnedAuthorityPublicKeys: authorityPins(),
+      })
+    ).toThrow(expect.objectContaining({ code: "source_unavailable" }));
+    rmSync(prefixCollisionRoot, { recursive: true, force: true });
+
+    chmodSync(directory, 0o770);
+    expect(() =>
+      loadPinnedRuntimeObservationKeySourceFromFile({
+        trustedConfigurationRoot: directory,
+        filePath,
+        pinnedAuthorityPublicKeys: authorityPins(),
+      })
+    ).toThrow(expect.objectContaining({ code: "source_unavailable" }));
+    chmodSync(directory, 0o700);
 
     expect(() =>
       loadPinnedRuntimeObservationKeySourceFromFile({
+        trustedConfigurationRoot: directory,
         filePath: directory,
         pinnedAuthorityPublicKeys: authorityPins(),
       })
@@ -636,6 +669,7 @@ describe("pinned Runtime observation-key source", () => {
       writeFileSync(filePath, contents, { mode: 0o600 });
       expect(() =>
         loadPinnedRuntimeObservationKeySourceFromFile({
+          trustedConfigurationRoot: directory,
           filePath,
           pinnedAuthorityPublicKeys: authorityPins(),
         })
@@ -649,6 +683,7 @@ describe("pinned Runtime observation-key source", () => {
     writeFileSync(filePath, "x".repeat(1024 * 1024 + 1), { mode: 0o600 });
     expect(() =>
       loadPinnedRuntimeObservationKeySourceFromFile({
+        trustedConfigurationRoot: directory,
         filePath,
         pinnedAuthorityPublicKeys: authorityPins(),
       })
@@ -660,6 +695,7 @@ describe("pinned Runtime observation-key source", () => {
     chmodSync(filePath, 0o644);
     try {
       loadPinnedRuntimeObservationKeySourceFromFile({
+        trustedConfigurationRoot: directory,
         filePath,
         pinnedAuthorityPublicKeys: authorityPins(),
       });

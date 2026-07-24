@@ -79,12 +79,19 @@ describe("SQLite Runtime lifecycle journal", () => {
       leaseDurationMs: 30_000,
     });
     if (!ensure) throw new Error("Expected Runtime ensure delivery");
+    await sessions.markRuntimeOutboxDispatch({
+      outboxId: ensure.outboxId,
+      workerId: RUNTIME.userId,
+      expectedAttempt: ensure.attempts,
+      expectedLeaseExpiresAtMs: ensure.leaseExpiresAtMs,
+    });
     await dispatch(
       {
         type: "runtime.outbox.acknowledge",
         outboxId: ensure.outboxId,
         workerId: RUNTIME.userId,
         expectedAttempt: ensure.attempts,
+        expectedLeaseExpiresAtMs: ensure.leaseExpiresAtMs,
       },
       RUNTIME
     );

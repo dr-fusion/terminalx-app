@@ -146,6 +146,23 @@ describe("Runtime compensation enforcement proof", () => {
     ).toThrow(RuntimeCompensationEnforcementProofError);
   });
 
+  it("does not read or invoke a custom thenable from a synchronous proof verifier", () => {
+    const thenBody = vi.fn();
+    const thenGetter = vi.fn(() => thenBody);
+    const hostile = {} as Record<string, unknown>;
+    Object.defineProperty(hostile, "then", { get: thenGetter });
+
+    expect(() =>
+      verifyRuntimeCompensationEnforcementProofSynchronously(
+        subject,
+        proofFor(),
+        (() => hostile) as never
+      )
+    ).toThrow(RuntimeCompensationEnforcementProofError);
+    expect(thenGetter).not.toHaveBeenCalled();
+    expect(thenBody).not.toHaveBeenCalled();
+  });
+
   it("rejects malformed subjects without exposing their values", () => {
     expect(() =>
       digestRuntimeCompensationEnforcementSubject({

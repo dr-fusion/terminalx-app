@@ -21,6 +21,7 @@ import {
 import type { RequestActor, RequestHeaders } from "@/lib/request-actor";
 
 const SESSION_ID = "33333333-3333-4333-8333-333333333333";
+const TMUX_SESSION_INCARNATION = "a".repeat(64);
 const ACTOR: RequestActor = {
   kind: "human",
   userId: "user-alice",
@@ -86,15 +87,27 @@ describe("canonical Team Session WebSockets", () => {
     const resolveTmuxSocketName = vi.fn(
       (sessionId: string) => `terminalx-${sessionId.replaceAll("-", "").slice(0, 16)}`
     );
-    const harness = await createHarness({ resolveTmuxSocketName });
+    const resolveTmuxSessionRef = vi.fn(() => ({
+      tmuxSessionRef: "$7",
+      tmuxSessionIncarnation: TMUX_SESSION_INCARNATION,
+    }));
+    const harness = await createHarness({ resolveTmuxSocketName, resolveTmuxSessionRef });
     const client = await harness.connect("terminal", bearerHeaders());
 
     await expect(client.nextJson()).resolves.toMatchObject({ type: "terminal.ready" });
     expect(resolveTmuxSocketName).toHaveBeenCalledOnce();
     expect(resolveTmuxSocketName).toHaveBeenCalledWith(SESSION_ID);
+    expect(resolveTmuxSessionRef).toHaveBeenCalledWith({
+      sessionId: SESSION_ID,
+      tmuxName: "team-session-runtime",
+      runtimeAuthorizationGeneration: 11,
+      tmuxSocketName: "terminalx-3333333333334333",
+    });
     expect(harness.pty.created[0]?.binding).toMatchObject({
       teamSessionId: SESSION_ID,
       tmuxSocketName: "terminalx-3333333333334333",
+      tmuxSessionRef: "$7",
+      tmuxSessionIncarnation: TMUX_SESSION_INCARNATION,
     });
   });
 
@@ -104,6 +117,37 @@ describe("canonical Team Session WebSockets", () => {
 
     await expect(client.closed).resolves.toMatchObject({ code: 1008 });
     expect(harness.pty.created).toEqual([]);
+  });
+
+  it("fails closed when admission cannot bind the exact immutable tmux Session ref", async () => {
+    const invalid = await createHarness({
+      resolveTmuxSessionRef: () => ({
+        tmuxSessionRef: "=reusable-name:",
+        tmuxSessionIncarnation: TMUX_SESSION_INCARNATION,
+      }),
+    });
+    const invalidClient = await invalid.connect("terminal", bearerHeaders());
+    await expect(invalidClient.closed).resolves.toMatchObject({ code: 1008 });
+    expect(invalid.pty.created).toEqual([]);
+
+    const invalidIncarnation = await createHarness({
+      resolveTmuxSessionRef: () => ({
+        tmuxSessionRef: "$1",
+        tmuxSessionIncarnation: "predictable",
+      }),
+    });
+    const invalidIncarnationClient = await invalidIncarnation.connect("terminal", bearerHeaders());
+    await expect(invalidIncarnationClient.closed).resolves.toMatchObject({ code: 1008 });
+    expect(invalidIncarnation.pty.created).toEqual([]);
+
+    const throws = await createHarness({
+      resolveTmuxSessionRef: () => {
+        throw new Error("tmux binding replaced");
+      },
+    });
+    const throwingClient = await throws.connect("terminal", bearerHeaders());
+    await expect(throwingClient.closed).resolves.toMatchObject({ code: 1008 });
+    expect(throws.pty.created).toEqual([]);
   });
 
   it("rejects URL credentials before invoking authentication", async () => {
@@ -684,6 +728,12 @@ interface HarnessOptions {
   resolveActor?: (headers: RequestHeaders) => Promise<RequestActor | null>;
   credentialCheckIntervalMs?: number;
   resolveTmuxSocketName?: (sessionId: string) => string;
+  resolveTmuxSessionRef?: (input: {
+    sessionId: string;
+    tmuxName: string;
+    runtimeAuthorizationGeneration: number;
+    tmuxSocketName: string;
+  }) => { tmuxSessionRef: string; tmuxSessionIncarnation: string };
 }
 
 interface TestHarness {
@@ -713,6 +763,12 @@ async function createHarness(options: HarnessOptions = {}): Promise<TestHarness>
     shell: "/bin/bash",
     resolveTmuxSocketName:
       options.resolveTmuxSocketName ?? ((sessionId) => `terminalx-${sessionId.slice(0, 8)}`),
+    resolveTmuxSessionRef:
+      options.resolveTmuxSessionRef ??
+      (() => ({
+        tmuxSessionRef: "$1",
+        tmuxSessionIncarnation: TMUX_SESSION_INCARNATION,
+      })),
     resolveActor: options.resolveActor ?? defaultActorResolver,
     credentialCheckIntervalMs: options.credentialCheckIntervalMs ?? 1_000,
     eventPollIntervalMs: 20,

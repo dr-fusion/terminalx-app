@@ -22,6 +22,7 @@ import {
   resizePty,
   destroyPty,
   destroyCanonicalPtys,
+  resolveCanonicalTmuxSessionRef,
   setMaxSessions,
   destroyAllPtys,
   type PtyInstance,
@@ -236,10 +237,13 @@ function createMultiplayerServices(): MultiplayerServices {
     const runtime = new LocalTmuxRuntime({
       fenceCallbacks: {
         updateWriteState: (update) => writeStates.update(update),
-        async terminateCanonicalPtys(input) {
+        async terminateCanonicalPtys(input, signal) {
+          if (signal.aborted) return;
           destroyCanonicalPtys({
             teamSessionId: input.sessionId,
             runtimeAuthorizationGeneration: input.runtimeAuthorizationGeneration,
+            tmuxSessionRef: input.tmuxSessionRef,
+            tmuxSessionIncarnation: input.tmuxSessionIncarnation,
             includeCurrentGeneration: input.reason === "retire",
           });
         },
@@ -262,6 +266,13 @@ function createMultiplayerServices(): MultiplayerServices {
       terminalGateway,
       pty: createCanonicalPtyAdapter(),
       resolveTmuxSocketName: (sessionId) => getCanonicalTmuxSocketName(sessionId),
+      resolveTmuxSessionRef: (input) =>
+        resolveCanonicalTmuxSessionRef({
+          teamSessionId: input.sessionId,
+          tmuxName: input.tmuxName,
+          runtimeAuthorizationGeneration: input.runtimeAuthorizationGeneration,
+          tmuxSocketName: input.tmuxSocketName,
+        }),
       shell: TERMINUS_SHELL,
       reportInternalError: () => console.error("[team-sessions/ws] InternalError"),
     });

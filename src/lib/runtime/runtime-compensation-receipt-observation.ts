@@ -7,8 +7,6 @@ import {
   verify as verifyEd25519,
   type KeyObject,
 } from "node:crypto";
-import { constants as fsConstants, closeSync, fstatSync, openSync, readFileSync } from "node:fs";
-import { isAbsolute } from "node:path";
 import type { RuntimeBinding } from "../team-sessions/contracts";
 import type { RuntimeCompensationCommand, RuntimeCompensationReceipt } from "./contracts";
 import { canonicalRuntimeJson, digestRuntimeCommandClaims } from "./runtime-command-canonical";
@@ -17,6 +15,7 @@ import {
   RUNTIME_RECEIPT_OBSERVATION_MAX_CURSOR_CODE_POINTS,
   runtimeReceiptObservationCursorCodePoints,
 } from "./runtime-receipt-observation-contract";
+import { readTrustedConfigurationFile } from "./runtime-trusted-configuration-file";
 
 export { RUNTIME_RECEIPT_OBSERVATION_MAX_CURSOR_CODE_POINTS } from "./runtime-receipt-observation-contract";
 
@@ -265,6 +264,12 @@ export interface RuntimeCompensationReceiptObservationIssueInput {
 export interface CreateRuntimeCompensationReceiptObservationIssuerOptions {
   readonly issuerKeyId: string;
   readonly binding: RuntimeBinding;
+  /**
+   * Absolute canonical private operator configuration root (0500/0700).
+   * This explicit trust boundary must not be an arbitrary browser workspace.
+   */
+  readonly trustedConfigurationRoot: string;
+  /** Absolute canonical private-key path strictly below `trustedConfigurationRoot`. */
   readonly privateKeyFile: string;
   readonly clock?: () => number;
   readonly observationTtlMs?: number;
@@ -322,7 +327,7 @@ export function createRuntimeCompensationReceiptObservationIssuer(
   const options = dataRecord(unsafeOptions, "invalid_configuration");
   exactFields(
     options,
-    ["issuerKeyId", "binding", "privateKeyFile"],
+    ["issuerKeyId", "binding", "trustedConfigurationRoot", "privateKeyFile"],
     ["clock", "observationTtlMs"],
     "invalid_configuration"
   );
@@ -335,6 +340,7 @@ export function createRuntimeCompensationReceiptObservationIssuer(
     "invalid_configuration"
   );
   const privateKey = loadPrivateKey(
+    dataField(options, "trustedConfigurationRoot", "private_key_unavailable"),
     dataField(options, "privateKeyFile", "private_key_unavailable")
   );
   const clockValue = optionalDataField(options, "clock", "invalid_configuration");
@@ -870,42 +876,17 @@ function snapshotCheckpoint(
   });
 }
 
-function loadPrivateKey(value: unknown): KeyObject {
-  if (typeof value !== "string" || !isAbsolute(value)) fail("private_key_unavailable");
-  if (typeof fsConstants.O_NOFOLLOW !== "number" || typeof process.geteuid !== "function") {
-    fail("private_key_unavailable");
-  }
-  let descriptor: number;
+function loadPrivateKey(trustedConfigurationRoot: unknown, value: unknown): KeyObject {
+  let bytes: Buffer;
   try {
-    descriptor = openSync(value, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    bytes = readTrustedConfigurationFile({
+      trustedConfigurationRoot,
+      filePath: value,
+      minimumBytes: 1,
+      maximumBytes: MAX_KEY_FILE_BYTES,
+    });
   } catch {
     fail("private_key_unavailable");
-  }
-  let bytes: Buffer | undefined;
-  try {
-    const stat = fstatSync(descriptor);
-    const mode = stat.mode & 0o777;
-    if (
-      !stat.isFile() ||
-      stat.uid !== process.geteuid() ||
-      stat.nlink !== 1 ||
-      (mode !== 0o400 && mode !== 0o600) ||
-      (stat.mode & 0o7000) !== 0 ||
-      stat.size < 1 ||
-      stat.size > MAX_KEY_FILE_BYTES
-    ) {
-      fail("private_key_unavailable");
-    }
-    bytes = readFileSync(descriptor);
-  } catch (error) {
-    if (error instanceof RuntimeCompensationReceiptObservationError) throw error;
-    fail("private_key_unavailable");
-  } finally {
-    try {
-      closeSync(descriptor);
-    } catch {
-      fail("private_key_unavailable");
-    }
   }
   try {
     const key = createPrivateKey(bytes);

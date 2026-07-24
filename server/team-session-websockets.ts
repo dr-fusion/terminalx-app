@@ -72,6 +72,8 @@ export interface CanonicalTerminalPtyAdapter {
       teamSessionId: string;
       runtimeAuthorizationGeneration: number;
       tmuxSocketName: string;
+      tmuxSessionRef: string;
+      tmuxSessionIncarnation: string;
       readOnly: boolean;
     };
   }): CanonicalTerminalPty;
@@ -92,6 +94,13 @@ export interface CreateTeamSessionWebSocketsOptions {
   pty: CanonicalTerminalPtyAdapter;
   /** Resolve the isolated tmux server for one canonical Team Session. */
   resolveTmuxSocketName: (sessionId: string) => string;
+  /** Resolve the admitted generation to an immutable session-incarnation/`$id` pair. */
+  resolveTmuxSessionRef: (input: {
+    sessionId: string;
+    tmuxName: string;
+    runtimeAuthorizationGeneration: number;
+    tmuxSocketName: string;
+  }) => { tmuxSessionRef: string; tmuxSessionIncarnation: string };
   shell: string;
   resolveActor?: (headers: RequestHeaders) => Promise<RequestActor | null>;
   credentialCheckIntervalMs?: number;
@@ -407,6 +416,28 @@ async function serveTerminal(
       closeUnavailable();
       return;
     }
+    let tmuxSessionRef: string;
+    let tmuxSessionIncarnation: string;
+    try {
+      const resolvedBinding = options.resolveTmuxSessionRef({
+        sessionId: connection.sessionId,
+        tmuxName: connection.tmuxName,
+        runtimeAuthorizationGeneration: connection.runtimeAuthorizationGeneration,
+        tmuxSocketName,
+      });
+      tmuxSessionRef = resolvedBinding.tmuxSessionRef;
+      tmuxSessionIncarnation = resolvedBinding.tmuxSessionIncarnation;
+    } catch {
+      closeUnavailable();
+      return;
+    }
+    if (
+      !isImmutableTmuxSessionRef(tmuxSessionRef) ||
+      !isTmuxSessionIncarnation(tmuxSessionIncarnation)
+    ) {
+      closeUnavailable();
+      return;
+    }
 
     pty = options.pty.create({
       tmuxName: connection.tmuxName,
@@ -417,6 +448,8 @@ async function serveTerminal(
         teamSessionId: admission.route.sessionId,
         runtimeAuthorizationGeneration: connection.runtimeAuthorizationGeneration,
         tmuxSocketName,
+        tmuxSessionRef,
+        tmuxSessionIncarnation,
         readOnly,
       },
     });
@@ -1012,6 +1045,7 @@ function assertFactoryOptions(options: CreateTeamSessionWebSocketsOptions): void
   const eventInterval = options.eventPollIntervalMs ?? DEFAULT_EVENT_POLL_INTERVAL_MS;
   if (
     typeof options.resolveTmuxSocketName !== "function" ||
+    typeof options.resolveTmuxSessionRef !== "function" ||
     !options.shell ||
     options.shell.length > 4_096 ||
     /[\0\r\n]/.test(options.shell) ||
@@ -1028,4 +1062,12 @@ function assertFactoryOptions(options: CreateTeamSessionWebSocketsOptions): void
 
 function isValidTmuxSocketName(value: unknown): value is string {
   return typeof value === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(value);
+}
+
+function isImmutableTmuxSessionRef(value: unknown): value is string {
+  return typeof value === "string" && /^\$[0-9]{1,20}$/.test(value);
+}
+
+function isTmuxSessionIncarnation(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
 }

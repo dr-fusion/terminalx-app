@@ -457,7 +457,7 @@ export type NonDuplicateRuntimeCompensationReceipt = RuntimeCompensationReceiptB
     | {
         readonly outcome: "enforced";
         readonly effectRef: string;
-        /** Must equal the signed command safety fence; older fences fail closed. */
+        /** Must be at least the signed command safety fence; older fences fail closed. */
         readonly enforcedSafetyFence: number;
         readonly containment: {
           readonly terminalWritesRevoked: true;

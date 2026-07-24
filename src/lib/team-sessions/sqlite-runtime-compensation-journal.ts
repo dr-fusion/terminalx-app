@@ -34,6 +34,7 @@ import type {
   RuntimeCompensationMaterializationJournal,
   RuntimeCompensationMaterializationResult,
 } from "../runtime/runtime-compensation-materializer";
+import { suppressNativePromiseRejection } from "../runtime/runtime-native-promise";
 import type {
   RuntimeCompensationClaimOptions,
   RuntimeCompensationCompletion,
@@ -275,7 +276,9 @@ export class SqliteRuntimeCompensationJournal
 
   async findMaterializable(options: {
     readonly nowMs: number;
+    readonly signal?: AbortSignal;
   }): Promise<RuntimeCompensationMaterializationCandidate | null> {
+    assertMaterializationActive(options?.signal);
     const nowMs = nonNegativeInteger(options?.nowMs);
     const read = this.db.transaction(() => {
       const row = this.db
@@ -324,17 +327,22 @@ export class SqliteRuntimeCompensationJournal
       if (!row) return null;
       return candidateFromIncident(this.verifiedIncident(row));
     });
-    return read.immediate();
+    const candidate = read.immediate();
+    assertMaterializationActive(options.signal);
+    return candidate;
   }
 
   async materialize(
-    unsafeInput: RuntimeCompensationMaterializationInput
+    unsafeInput: RuntimeCompensationMaterializationInput,
+    options: { readonly signal?: AbortSignal } = {}
   ): Promise<RuntimeCompensationMaterializationResult> {
+    assertMaterializationActive(options?.signal);
     const input = snapshotMaterializationInput(unsafeInput);
     const commandJson = canonicalCommandJson(input.command);
     const commandDigest = sha256(commandJson);
 
     const materialize = this.db.transaction((): RuntimeCompensationMaterializationResult => {
+      assertMaterializationActive(options.signal);
       const incidentRow = this.incidentRow(input.compensationId);
       if (!incidentRow) fail("journal_conflict");
       const incident = this.verifiedIncident(incidentRow);
@@ -350,10 +358,12 @@ export class SqliteRuntimeCompensationJournal
         fail("invalid_input");
       }
       requireSynchronousAuthority(this.verifyAuthority, input.command, input.authorityVerifiedAtMs);
+      assertMaterializationActive(options.signal);
       // Signing and the first verification deliberately happen outside this
       // transaction. Verify again at the actual durable materialization time;
       // a signature expiring between those instants must never become work.
       requireSynchronousAuthority(this.verifyAuthority, input.command, input.materializedAtMs);
+      assertMaterializationActive(options.signal);
 
       const existingById = this.commandRow(input.command.commandId);
       if (existingById) {
@@ -399,6 +409,7 @@ export class SqliteRuntimeCompensationJournal
       const previousCommandSequence = commandSequence === 1 ? null : commandSequence - 1;
 
       try {
+        assertMaterializationActive(options.signal);
         this.db
           .prepare(
             `INSERT INTO runtime_compensation_commands (
@@ -453,6 +464,7 @@ export class SqliteRuntimeCompensationJournal
             input.materializedAtMs,
             input.command.deadlineAtMs
           );
+        assertMaterializationActive(options.signal);
         this.db
           .prepare(
             `INSERT INTO runtime_compensation_dispatch (
@@ -470,13 +482,19 @@ export class SqliteRuntimeCompensationJournal
             input.materializedAtMs,
             input.materializedAtMs
           );
+        assertMaterializationActive(options.signal);
       } catch (error) {
+        // Preserve authoritative cancellation while the transaction is still
+        // open; every write above is rolled back by the thrown AbortError.
+        assertMaterializationActive(options.signal);
         if (error instanceof RuntimeCompensationJournalError) throw error;
         fail("journal_conflict");
       }
       return "created";
     });
-    return materialize.immediate();
+    const result = materialize.immediate();
+    assertMaterializationActive(options.signal);
+    return result;
   }
 
   async reconcile(options: RuntimeCompensationReconcileOptions): Promise<void> {
@@ -1933,8 +1951,14 @@ function requireSynchronousAuthority(
     fail("invalid_command");
   }
   if (verified !== true) {
-    void Promise.resolve(verified).catch(() => undefined);
+    suppressNativePromiseRejection(verified);
     fail("invalid_command");
+  }
+}
+
+function assertMaterializationActive(signal: AbortSignal | undefined): void {
+  if (signal?.aborted === true) {
+    throw new DOMException("Runtime compensation materialization aborted", "AbortError");
   }
 }
 

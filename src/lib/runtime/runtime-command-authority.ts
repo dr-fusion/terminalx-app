@@ -1,5 +1,3 @@
-import { constants as fsConstants, closeSync, fstatSync, openSync, readFileSync } from "node:fs";
-import { isAbsolute } from "node:path";
 import {
   createHash,
   createPrivateKey,
@@ -15,6 +13,7 @@ import {
   canonicalRuntimeJson,
   digestRuntimeCommandClaims,
 } from "./runtime-command-canonical";
+import { readTrustedConfigurationFile } from "./runtime-trusted-configuration-file";
 
 const SAFE_KEY_ID = /^[A-Za-z0-9][A-Za-z0-9._~:/-]{0,299}$/;
 const SHA256 = /^[0-9a-f]{64}$/;
@@ -75,7 +74,12 @@ export class RuntimeCommandAuthorityError extends Error {
 export interface CreateRuntimeCommandAuthorityIssuerOptions {
   issuer: RuntimeAuthorityIssuerName;
   issuerKeyId: string;
-  /** Absolute, explicit path to a 0400 or 0600 Ed25519 PKCS#8 private-key file. */
+  /**
+   * Absolute canonical private operator configuration root (0500/0700).
+   * This explicit trust boundary must not be an arbitrary browser workspace.
+   */
+  trustedConfigurationRoot: string;
+  /** Absolute canonical 0400/0600 private-key path strictly below the trust root. */
   privateKeyFile: string;
   clock?: () => number;
   authorityTtlMs?: number;
@@ -126,7 +130,7 @@ export function createRuntimeCommandAuthorityIssuer(
 ): RuntimeCommandAuthorityIssuer {
   const issuer = requiredIssuer(options?.issuer);
   const issuerKeyId = requiredKeyId(options?.issuerKeyId);
-  const privateKey = loadPrivateKey(options?.privateKeyFile);
+  const privateKey = loadPrivateKey(options?.trustedConfigurationRoot, options?.privateKeyFile);
   const clock = options.clock ?? Date.now;
   if (typeof clock !== "function") configurationError();
   const authorityTtlMs = boundedInteger(
@@ -291,45 +295,17 @@ export function createRuntimeCommandAuthorityVerifier(
   });
 }
 
-function loadPrivateKey(filename: string): KeyObject {
-  if (typeof filename !== "string" || !isAbsolute(filename)) {
-    authorityError("private_key_unavailable");
-  }
-  const noFollow = fsConstants.O_NOFOLLOW;
-  if (typeof noFollow !== "number" || typeof process.geteuid !== "function") {
-    authorityError("private_key_unavailable");
-  }
-  let descriptor: number;
+function loadPrivateKey(trustedConfigurationRoot: unknown, filename: unknown): KeyObject {
+  let bytes: Buffer;
   try {
-    descriptor = openSync(filename, fsConstants.O_RDONLY | noFollow);
+    bytes = readTrustedConfigurationFile({
+      trustedConfigurationRoot,
+      filePath: filename,
+      minimumBytes: 1,
+      maximumBytes: MAX_KEY_FILE_BYTES,
+    });
   } catch {
     authorityError("private_key_unavailable");
-  }
-  let bytes: Buffer | undefined;
-  try {
-    const stat = fstatSync(descriptor);
-    const mode = stat.mode & 0o777;
-    if (
-      !stat.isFile() ||
-      stat.uid !== process.geteuid() ||
-      stat.nlink !== 1 ||
-      (mode !== 0o400 && mode !== 0o600) ||
-      (stat.mode & 0o7000) !== 0 ||
-      stat.size < 1 ||
-      stat.size > MAX_KEY_FILE_BYTES
-    ) {
-      authorityError("private_key_unavailable");
-    }
-    bytes = readFileSync(descriptor);
-  } catch (error) {
-    if (error instanceof RuntimeCommandAuthorityError) throw error;
-    authorityError("private_key_unavailable");
-  } finally {
-    try {
-      closeSync(descriptor);
-    } catch {
-      authorityError("private_key_unavailable");
-    }
   }
   try {
     const key = createPrivateKey(bytes);

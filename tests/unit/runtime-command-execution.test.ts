@@ -5,6 +5,7 @@ import {
   digestAggregateEnforcementProof,
   digestNonDuplicateRuntimeReceipt,
   executeRuntimeCommand,
+  verifyRuntimeReceiptEnforcementProofSynchronously,
   type NonDuplicateRuntimeReceipt,
   type Runtime,
   type RuntimeAuthorityVerificationInput,
@@ -792,6 +793,25 @@ describe("Runtime command execution", () => {
         expect(String(error)).not.toContain(secret);
       });
     }
+  });
+
+  it("does not read or invoke a custom thenable from a synchronous proof verifier", () => {
+    const enforced = receipt({
+      outcome: "enforced",
+      effectRef: "effect-1",
+      enforcedFence: command.toRunStateVersion,
+      aggregateEnforcementProof: proof(command.runtimeAuthorizationGeneration),
+    });
+    const thenBody = vi.fn();
+    const thenGetter = vi.fn(() => thenBody);
+    const hostile = {} as Record<string, unknown>;
+    Object.defineProperty(hostile, "then", { get: thenGetter });
+
+    expect(() =>
+      verifyRuntimeReceiptEnforcementProofSynchronously(command, enforced, (() => hostile) as never)
+    ).toThrow(new RuntimeCommandExecutionError("enforcement_proof_verification_failed"));
+    expect(thenGetter).not.toHaveBeenCalled();
+    expect(thenBody).not.toHaveBeenCalled();
   });
 
   it("accepts a duplicate only with its complete original receipt and canonical digest", async () => {

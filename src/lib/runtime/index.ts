@@ -15,6 +15,8 @@ export {
   canonicalTmuxTarget,
   createNodeExactCommandExecutor,
   getCanonicalTmuxSocketName,
+  isCanonicalTmuxSessionIncarnation,
+  parseCanonicalTmuxServerMarker,
   type CanonicalPtyTermination,
   type CreateLocalTmuxRuntimeOptions,
   type ExactCommandExecutor,
@@ -58,6 +60,7 @@ export {
   type RuntimeCommandDispatchCertainty,
   type RuntimeCommandExecutionErrorCode,
 } from "./runtime-command-execution";
+export type { RuntimeCommandCapability } from "./runtime-command-dispatch";
 export {
   RUNTIME_AGGREGATE_ENFORCEMENT_PROOF_DIGEST_DOMAIN,
   RUNTIME_ENFORCEMENT_SUBJECT_DIGEST_DOMAIN,
@@ -135,6 +138,7 @@ export {
   type RuntimeCompensationMaterializationInput,
   type RuntimeCompensationMaterializationJournal,
   type RuntimeCompensationMaterializationResult,
+  type RuntimeCompensationMaterializationWriteOptions,
   type RuntimeCompensationMaterializerOptions,
   type RuntimeCompensationMaterializerRunResult,
   type RuntimeCompensationPolicySnapshot,

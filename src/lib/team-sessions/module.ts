@@ -57,7 +57,11 @@ import {
   type PublicSessionShareView,
   type RuntimeOutboxClaimOptions,
   type RuntimeOutboxDelivery,
+  type RuntimeOutboxDispatchInterlockOptions,
   type RuntimeOutboxKind,
+  type RuntimeOutboxErrorCode,
+  type RuntimeOutboxLeaseRenewal,
+  type RuntimeOutboxLeaseRenewalOptions,
   type SessionCommand,
   type SessionAdmissionQuery,
   type SessionAdmissionView,
@@ -139,6 +143,8 @@ export interface RuntimeAuthorizationSnapshotSource {
 /** Security-sensitive composition result used only by the Runtime worker root. */
 export interface TeamSessionKernel {
   readonly teamSessions: TeamSessions;
+  /** Exact private alias consumed by the portable assignment supervisor graph. */
+  readonly runtimeAssignmentKernel: TeamSessions;
   /** Private restart seam used before Runtime transports accept mutations. */
   readonly runtimeWriteStateSnapshotSource: RuntimeWriteStateSnapshotSource;
   readonly runtimeLifecycleJournal: RuntimeLifecycleJournal;
@@ -170,6 +176,9 @@ const MAX_PENDING_DIRECTIVES_PER_AUTHOR = 64;
 const MAX_PENDING_DIRECTIVES_PER_SESSION = 256;
 const DEFAULT_RUNTIME_LIFECYCLE_COMMAND_TTL_MS = 30_000;
 const MAX_RUNTIME_LIFECYCLE_COMMAND_TTL_MS = 5 * 60_000;
+const MIN_RUNTIME_OUTBOX_LEASE_DURATION_MS = 1_000;
+const MAX_RUNTIME_OUTBOX_LEASE_DURATION_MS = 300_000;
+const RUNTIME_OUTBOX_LEASE_CLOCK_SKEW_MS = 60_000;
 const SHA256_DIGEST = /^[0-9a-f]{64}$/;
 const RUNTIME_AUTHORIZATION_SNAPSHOT_FIELDS = [
   "credentialPolicyDigest",
@@ -222,6 +231,7 @@ export function createTeamSessionKernel(
   const runtimeCompensationMaterializer = teamSessions.runtimeCompensationMaterializerForWorker();
   return Object.freeze({
     teamSessions,
+    runtimeAssignmentKernel: teamSessions,
     runtimeWriteStateSnapshotSource: teamSessions.runtimeWriteStateSnapshotSourceForKernel(),
     runtimeLifecycleJournal: teamSessions.runtimeJournalForSupervisor(),
     runtimeReceiptFollowJournal: teamSessions.runtimeReceiptFollowJournalForSupervisor(),
@@ -616,23 +626,70 @@ class SqliteTeamSessions implements TeamSessions {
     }
     if (
       !Number.isSafeInteger(leaseDurationMs) ||
-      leaseDurationMs < 1_000 ||
-      leaseDurationMs > 300_000
+      leaseDurationMs < MIN_RUNTIME_OUTBOX_LEASE_DURATION_MS ||
+      leaseDurationMs > MAX_RUNTIME_OUTBOX_LEASE_DURATION_MS
     ) {
       throw new TeamSessionError("invalid-command", "Runtime outbox lease duration is invalid");
     }
-    const now = this.clock();
-    if (!Number.isSafeInteger(now) || now < 0 || now + leaseDurationMs > Number.MAX_SAFE_INTEGER) {
-      throw new TeamSessionError("invalid-command", "Invalid Runtime outbox claim time");
-    }
     const claim = this.db.transaction(() => {
+      // The IMMEDIATE transaction acquires the write lock before sampling the
+      // clock. A peer therefore cannot append newer durable work between this
+      // sample, the rollback check, and the claims below.
+      const now = this.clock();
+      if (
+        !Number.isSafeInteger(now) ||
+        now < 0 ||
+        now >
+          Number.MAX_SAFE_INTEGER -
+            MAX_RUNTIME_OUTBOX_LEASE_DURATION_MS -
+            RUNTIME_OUTBOX_LEASE_CLOCK_SKEW_MS
+      ) {
+        throw new TeamSessionError("invalid-command", "Invalid Runtime outbox claim time");
+      }
+      if (
+        this.db.prepare(`SELECT 1 FROM runtime_outbox WHERE created_at_ms > ? LIMIT 1`).get(now) ||
+        this.db
+          .prepare(
+            `SELECT 1 FROM runtime_outbox
+             WHERE dispatch_interlock_acquired_at_ms > ? LIMIT 1`
+          )
+          .get(now)
+      ) {
+        throw new TeamSessionError("conflict", "Runtime outbox clock moved backwards");
+      }
+      this.db
+        .prepare(
+          `INSERT INTO runtime_outbox_settlements (
+             outbox_id, attempt, lease_owner, lease_expires_at_ms,
+             dispatch_interlock_attempt, dispatch_interlock_acquired_at_ms,
+             outcome, error_code, command_source_scope, command_source_key,
+             recorded_at_ms
+           )
+           SELECT id, attempts, lease_owner, lease_expires_at_ms,
+                  dispatch_interlock_attempt, dispatch_interlock_acquired_at_ms,
+                  CASE WHEN lease_expires_at_ms <= ?
+                    THEN 'lease-expired' ELSE 'lease-invalid' END,
+                  NULL, NULL, NULL, ?
+           FROM runtime_outbox
+           WHERE status = 'processing' AND (
+             lease_expires_at_ms <= ? OR lease_expires_at_ms > ?
+           )`
+        )
+        .run(
+          now,
+          now,
+          now,
+          now + MAX_RUNTIME_OUTBOX_LEASE_DURATION_MS + RUNTIME_OUTBOX_LEASE_CLOCK_SKEW_MS
+        );
       this.db
         .prepare(
           `UPDATE runtime_outbox
            SET status = 'pending', lease_owner = NULL, lease_expires_at_ms = NULL
-           WHERE status = 'processing' AND lease_expires_at_ms <= ?`
+           WHERE status = 'processing' AND (
+             lease_expires_at_ms <= ? OR lease_expires_at_ms > ?
+           )`
         )
-        .run(now);
+        .run(now, now + MAX_RUNTIME_OUTBOX_LEASE_DURATION_MS + RUNTIME_OUTBOX_LEASE_CLOCK_SKEW_MS);
       const rows = this.db
         .prepare(
           `SELECT candidate.* FROM runtime_outbox candidate
@@ -671,6 +728,81 @@ class SqliteTeamSessions implements TeamSessions {
       return deliveries;
     });
     return claim.immediate();
+  }
+
+  async markRuntimeOutboxDispatch(options: RuntimeOutboxDispatchInterlockOptions): Promise<void> {
+    this.assertOpen();
+    const outboxId = requiredIdentifier(options?.outboxId, "Runtime outbox id");
+    const workerId = requiredIdentifier(options?.workerId, "Runtime worker id");
+    const expectedAttempt = requiredRevision(options?.expectedAttempt, "Runtime outbox attempt");
+    const expectedLeaseExpiresAtMs = requiredRuntimeOutboxLeaseExpiry(
+      options?.expectedLeaseExpiresAtMs
+    );
+    const now = this.clock();
+    if (!Number.isSafeInteger(now) || now < 0) {
+      throw new TeamSessionError("invalid-command", "Invalid Runtime outbox dispatch time");
+    }
+    const marked = this.db
+      .prepare(
+        `UPDATE runtime_outbox
+         SET dispatch_interlock_attempt = ?, dispatch_interlock_acquired_at_ms = ?
+         WHERE id = ? AND status = 'processing' AND lease_owner = ?
+           AND attempts = ? AND lease_expires_at_ms = ? AND lease_expires_at_ms > ?
+           AND dispatch_interlock_attempt IS NULL
+           AND dispatch_interlock_acquired_at_ms IS NULL`
+      )
+      .run(
+        expectedAttempt,
+        now,
+        outboxId,
+        workerId,
+        expectedAttempt,
+        expectedLeaseExpiresAtMs,
+        now
+      );
+    if (marked.changes !== 1) {
+      throw new TeamSessionError("stale-revision", "Runtime outbox dispatch lease is unavailable");
+    }
+  }
+
+  async renewRuntimeOutboxLease(
+    options: RuntimeOutboxLeaseRenewalOptions
+  ): Promise<RuntimeOutboxLeaseRenewal> {
+    this.assertOpen();
+    const outboxId = requiredIdentifier(options?.outboxId, "Runtime outbox id");
+    const workerId = requiredIdentifier(options?.workerId, "Runtime worker id");
+    const expectedAttempt = requiredRevision(options?.expectedAttempt, "Runtime outbox attempt");
+    const expectedLeaseExpiresAtMs = requiredRuntimeOutboxLeaseExpiry(
+      options?.expectedLeaseExpiresAtMs
+    );
+    const leaseDurationMs = options?.leaseDurationMs;
+    if (
+      !Number.isSafeInteger(leaseDurationMs) ||
+      leaseDurationMs < MIN_RUNTIME_OUTBOX_LEASE_DURATION_MS ||
+      leaseDurationMs > MAX_RUNTIME_OUTBOX_LEASE_DURATION_MS
+    ) {
+      throw new TeamSessionError("invalid-command", "Runtime outbox lease duration is invalid");
+    }
+    const now = this.clock();
+    if (!Number.isSafeInteger(now) || now < 0 || now > Number.MAX_SAFE_INTEGER - leaseDurationMs) {
+      throw new TeamSessionError("invalid-command", "Invalid Runtime outbox renewal time");
+    }
+    const leaseExpiresAtMs = Math.max(expectedLeaseExpiresAtMs, now + leaseDurationMs);
+    const renewed = this.db
+      .prepare(
+        `UPDATE runtime_outbox
+         SET lease_expires_at_ms = ?
+         WHERE id = ? AND status = 'processing' AND lease_owner = ?
+           AND attempts = ? AND lease_expires_at_ms = ? AND lease_expires_at_ms > ?
+         RETURNING lease_expires_at_ms`
+      )
+      .get(leaseExpiresAtMs, outboxId, workerId, expectedAttempt, expectedLeaseExpiresAtMs, now) as
+      | SqlRow
+      | undefined;
+    if (!renewed) {
+      throw new TeamSessionError("stale-revision", "Runtime outbox lease is unavailable");
+    }
+    return Object.freeze({ leaseExpiresAtMs: renewed.lease_expires_at_ms as number });
   }
 
   runtimeEnsureState(input: {
@@ -3205,14 +3337,6 @@ class SqliteTeamSessions implements TeamSessions {
     const invalidatedGrantCount = this.invalidateMutableRunGrants(command.agentRunId, now);
     this.db
       .prepare(
-        `UPDATE runtime_outbox
-         SET status = 'superseded', lease_owner = NULL, lease_expires_at_ms = NULL,
-             delivered_at_ms = ?
-         WHERE session_id = ? AND status IN ('pending', 'processing', 'failed')`
-      )
-      .run(now, command.sessionId);
-    this.db
-      .prepare(
         `UPDATE runtime_run_command_dispatch
          SET status = 'superseded', lease_owner = NULL, lease_expires_at_ms = NULL,
              last_safe_error_code = 'emergency_fenced_before_dispatch',
@@ -3275,6 +3399,48 @@ class SqliteTeamSessions implements TeamSessions {
          VALUES (?, ?, ?, 'runtime.session.retire', ?, 'pending', 0, ?)`
       )
       .run(retireOutboxId, command.sessionId, event.sequence, JSON.stringify(retirePayload), now);
+    this.db
+      .prepare(
+        `INSERT INTO runtime_outbox_supersession_evidence (
+           target_outbox_id, source_outbox_id, reason,
+           target_status, target_attempts, target_lease_owner,
+           target_lease_expires_at_ms, target_dispatch_interlock_attempt,
+           target_dispatch_interlock_acquired_at_ms,
+           source_attempts, source_lease_owner, source_lease_expires_at_ms,
+           source_dispatch_interlock_attempt,
+           source_dispatch_interlock_acquired_at_ms,
+           command_source_scope, command_source_key, recorded_at_ms
+         )
+         SELECT target.id, source.id, 'emergency-cutover',
+                target.status, target.attempts, target.lease_owner,
+                target.lease_expires_at_ms, target.dispatch_interlock_attempt,
+                target.dispatch_interlock_acquired_at_ms,
+                source.attempts, source.lease_owner, source.lease_expires_at_ms,
+                source.dispatch_interlock_attempt,
+                source.dispatch_interlock_acquired_at_ms,
+                ?, ?, ?
+         FROM runtime_outbox source
+         JOIN runtime_outbox target
+           ON target.session_id = source.session_id
+          AND target.session_sequence < source.session_sequence
+         WHERE source.id = ? AND source.status = 'pending' AND source.attempts = 0
+           AND target.status IN ('pending', 'processing', 'failed')
+           AND json_extract(target.payload_json, '$.runtimeAuthorizationGeneration') <
+             json_extract(source.payload_json, '$.runtimeAuthorizationGeneration')`
+      )
+      .run(command.idempotency.scope, command.idempotency.key, now, retireOutboxId);
+    this.db
+      .prepare(
+        `UPDATE runtime_outbox
+         SET status = 'superseded', lease_owner = NULL, lease_expires_at_ms = NULL,
+             delivered_at_ms = ?
+         WHERE id IN (
+           SELECT target_outbox_id
+           FROM runtime_outbox_supersession_evidence
+           WHERE source_outbox_id = ? AND reason = 'emergency-cutover'
+         )`
+      )
+      .run(now, retireOutboxId);
     return result(
       command,
       {
@@ -3742,6 +3908,104 @@ class SqliteTeamSessions implements TeamSessions {
       );
   }
 
+  private recordRuntimeOutboxSettlement(
+    command: Extract<
+      SessionCommand,
+      { type: "runtime.outbox.acknowledge" | "runtime.outbox.fail" }
+    >,
+    outbox: SqlRow,
+    outcome: "acknowledged" | "retryable-failure" | "terminal-failure",
+    errorCode: RuntimeOutboxErrorCode | undefined,
+    now: number
+  ): void {
+    const inserted = this.db
+      .prepare(
+        `INSERT INTO runtime_outbox_settlements (
+           outbox_id, attempt, lease_owner, lease_expires_at_ms,
+           dispatch_interlock_attempt, dispatch_interlock_acquired_at_ms,
+           outcome, error_code, command_source_scope, command_source_key,
+           recorded_at_ms
+         )
+         SELECT id, attempts, lease_owner, lease_expires_at_ms,
+                dispatch_interlock_attempt, dispatch_interlock_acquired_at_ms,
+                ?, ?, ?, ?, ?
+         FROM runtime_outbox
+         WHERE id = ? AND status = 'processing'
+           AND attempts = ? AND lease_owner = ? AND lease_expires_at_ms = ?
+           AND lease_expires_at_ms > ?
+           AND dispatch_interlock_attempt IS NOT NULL
+           AND dispatch_interlock_acquired_at_ms IS NOT NULL`
+      )
+      .run(
+        outcome,
+        errorCode ?? null,
+        command.idempotency.scope,
+        command.idempotency.key,
+        now,
+        outbox.id,
+        command.expectedAttempt,
+        command.workerId,
+        command.expectedLeaseExpiresAtMs,
+        now
+      );
+    if (inserted.changes !== 1) {
+      throw new TeamSessionError("stale-revision", "Runtime outbox settlement lease changed");
+    }
+  }
+
+  private recordRetiredBindingSupersessionEvidence(
+    command: Extract<SessionCommand, { type: "runtime.outbox.acknowledge" }>,
+    source: SqlRow,
+    now: number
+  ): void {
+    this.db
+      .prepare(
+        `INSERT INTO runtime_outbox_supersession_evidence (
+           target_outbox_id, source_outbox_id, reason,
+           target_status, target_attempts, target_lease_owner,
+           target_lease_expires_at_ms, target_dispatch_interlock_attempt,
+           target_dispatch_interlock_acquired_at_ms,
+           source_attempts, source_lease_owner, source_lease_expires_at_ms,
+           source_dispatch_interlock_attempt,
+           source_dispatch_interlock_acquired_at_ms,
+           command_source_scope, command_source_key, recorded_at_ms
+         )
+         SELECT target.id, source.id, 'retired-binding',
+                target.status, target.attempts, target.lease_owner,
+                target.lease_expires_at_ms, target.dispatch_interlock_attempt,
+                target.dispatch_interlock_acquired_at_ms,
+                source.attempts, source.lease_owner, source.lease_expires_at_ms,
+                source.dispatch_interlock_attempt,
+                source.dispatch_interlock_acquired_at_ms,
+                ?, ?, ?
+         FROM runtime_outbox source
+         JOIN runtime_outbox target
+           ON target.session_id = source.session_id
+          AND target.session_sequence > source.session_sequence
+         WHERE source.id = ? AND source.status = 'processing'
+           AND source.attempts = ? AND source.lease_owner = ?
+           AND source.lease_expires_at_ms = ? AND source.lease_expires_at_ms > ?
+           AND source.dispatch_interlock_attempt IS NOT NULL
+           AND source.dispatch_interlock_attempt <= source.attempts
+           AND source.dispatch_interlock_acquired_at_ms IS NOT NULL
+           AND target.status IN ('pending', 'processing', 'failed')
+           AND target.kind = 'runtime.authorization.fence'
+           AND json_extract(target.payload_json, '$.reason') = 'assignee-loss'
+           AND json_extract(target.payload_json, '$.runtimeAuthorizationGeneration') >
+             json_extract(source.payload_json, '$.runtimeAuthorizationGeneration')`
+      )
+      .run(
+        command.idempotency.scope,
+        command.idempotency.key,
+        now,
+        source.id,
+        command.expectedAttempt,
+        command.workerId,
+        command.expectedLeaseExpiresAtMs,
+        now
+      );
+  }
+
   private acknowledgeRuntimeOutbox(
     command: Extract<SessionCommand, { type: "runtime.outbox.acknowledge" }>,
     now: number
@@ -3751,6 +4015,7 @@ class SqliteTeamSessions implements TeamSessions {
       command.outboxId,
       command.workerId,
       command.expectedAttempt,
+      command.expectedLeaseExpiresAtMs,
       now
     );
     const sessionId = outbox.session_id as string;
@@ -3764,21 +4029,28 @@ class SqliteTeamSessions implements TeamSessions {
     }
     const emergencyStopEnforcement = payload.reason === "emergency-stop";
     const superseded = !emergencyStopEnforcement && generation < currentGeneration;
+    this.recordRuntimeOutboxSettlement(command, outbox, "acknowledged", undefined, now);
+    if (emergencyStopEnforcement) {
+      this.recordRetiredBindingSupersessionEvidence(command, outbox, now);
+    }
     const delivered = this.db
       .prepare(
         `UPDATE runtime_outbox
-         SET status = ?, lease_owner = NULL, lease_expires_at_ms = NULL,
+         SET status = 'delivered', lease_owner = NULL, lease_expires_at_ms = NULL,
              delivered_at_ms = ?, last_error = NULL
          WHERE id = ? AND status = 'processing' AND lease_owner = ?
-           AND attempts = ? AND lease_expires_at_ms > ?`
+           AND attempts = ? AND lease_expires_at_ms > ?
+           AND lease_expires_at_ms = ?
+           AND dispatch_interlock_attempt IS NOT NULL
+           AND dispatch_interlock_acquired_at_ms IS NOT NULL`
       )
       .run(
-        superseded ? "superseded" : "delivered",
         now,
         command.outboxId,
         command.workerId,
         command.expectedAttempt,
-        now
+        now,
+        command.expectedLeaseExpiresAtMs
       );
     if (delivered.changes !== 1) {
       throw new TeamSessionError("stale-revision", "Runtime outbox lease changed");
@@ -3789,13 +4061,24 @@ class SqliteTeamSessions implements TeamSessions {
       (kind === "runtime.session.ensure" || kind === "runtime.authorization.fence") &&
       generation === session.runtime_authorization_generation
     ) {
-      const updated = this.db
-        .prepare(
-          `UPDATE sessions SET runtime_authorization_state = 'enforced'
-           WHERE id = ? AND runtime_authorization_generation = ?
-             AND runtime_authorization_state = 'pending'`
-        )
-        .run(sessionId, generation);
+      const updated =
+        kind === "runtime.session.ensure"
+          ? this.db
+              .prepare(
+                `UPDATE sessions SET runtime_authorization_state = 'enforced'
+                 WHERE id = ? AND runtime_authorization_generation = ?
+                   AND runtime_authorization_state = 'pending'
+                   AND status = 'active' AND runtime_kind = 'local-tmux'
+                   AND isolation = 'trusted-shared-host' AND tmux_name = ?`
+              )
+              .run(sessionId, generation, payload.tmuxName)
+          : this.db
+              .prepare(
+                `UPDATE sessions SET runtime_authorization_state = 'enforced'
+                 WHERE id = ? AND runtime_authorization_generation = ?
+                   AND runtime_authorization_state = 'pending'`
+              )
+              .run(sessionId, generation);
       enforced = updated.changes === 1;
     }
     let emergencyStopStateVersion: number | undefined;
@@ -3898,16 +4181,18 @@ class SqliteTeamSessions implements TeamSessions {
           `UPDATE runtime_outbox
            SET status = 'superseded', lease_owner = NULL, lease_expires_at_ms = NULL,
                delivered_at_ms = ?
-           WHERE session_id = ? AND session_sequence > ?
-             AND status IN ('pending', 'processing')`
+           WHERE id IN (
+             SELECT target_outbox_id
+             FROM runtime_outbox_supersession_evidence
+             WHERE source_outbox_id = ? AND reason = 'retired-binding'
+           )`
         )
-        .run(now, sessionId, outbox.session_sequence);
+        .run(now, command.outboxId);
       emergencyStopStateVersion = stopped.state_version as number;
       runStateRevision = this.advanceRunStateRevision(sessionId);
     }
-    const eventType = superseded
-      ? "runtime.outbox.superseded"
-      : emergencyStopStateVersion !== undefined
+    const eventType =
+      emergencyStopStateVersion !== undefined
         ? "run.emergency-stopped"
         : kind === "runtime.session.ensure" && enforced
           ? "runtime.session.ensured"
@@ -3983,6 +4268,7 @@ class SqliteTeamSessions implements TeamSessions {
       command.outboxId,
       command.workerId,
       command.expectedAttempt,
+      command.expectedLeaseExpiresAtMs,
       now
     );
     const sessionId = outbox.session_id as string;
@@ -3994,15 +4280,29 @@ class SqliteTeamSessions implements TeamSessions {
     if (generation > currentGeneration) {
       throw new TeamSessionError("conflict", "Runtime outbox generation is ahead of Session state");
     }
-    const superseded = payload.reason !== "emergency-stop" && generation < currentGeneration;
-    const status = superseded ? "superseded" : command.retryable ? "pending" : "failed";
+    // A failure after the durable dispatch interlock cannot prove that no
+    // external effect occurred. Even when control-plane generation advanced,
+    // only a successful adapter reconciliation (acknowledge) or a stronger
+    // emergency containment transaction may supersede this row.
+    const superseded = false;
+    const status = command.retryable ? "pending" : "failed";
+    this.recordRuntimeOutboxSettlement(
+      command,
+      outbox,
+      command.retryable ? "retryable-failure" : "terminal-failure",
+      command.errorCode,
+      now
+    );
     const failed = this.db
       .prepare(
         `UPDATE runtime_outbox
          SET status = ?, lease_owner = NULL, lease_expires_at_ms = NULL,
              last_error = ?, delivered_at_ms = ?
          WHERE id = ? AND status = 'processing' AND lease_owner = ?
-           AND attempts = ? AND lease_expires_at_ms > ?`
+           AND attempts = ? AND lease_expires_at_ms > ?
+           AND lease_expires_at_ms = ?
+           AND dispatch_interlock_attempt IS NOT NULL
+           AND dispatch_interlock_acquired_at_ms IS NOT NULL`
       )
       .run(
         status,
@@ -4011,7 +4311,8 @@ class SqliteTeamSessions implements TeamSessions {
         command.outboxId,
         command.workerId,
         command.expectedAttempt,
-        now
+        now,
+        command.expectedLeaseExpiresAtMs
       );
     if (failed.changes !== 1) {
       throw new TeamSessionError("stale-revision", "Runtime outbox lease changed");
@@ -4069,15 +4370,18 @@ class SqliteTeamSessions implements TeamSessions {
     outboxId: string,
     workerId: string,
     expectedAttempt: number,
+    expectedLeaseExpiresAtMs: number,
     now: number
   ): SqlRow {
     const outbox = this.db
       .prepare(
         `SELECT * FROM runtime_outbox
          WHERE id = ? AND status = 'processing' AND lease_owner = ?
-           AND attempts = ? AND lease_expires_at_ms > ?`
+           AND attempts = ? AND lease_expires_at_ms = ? AND lease_expires_at_ms > ?`
       )
-      .get(outboxId, workerId, expectedAttempt, now) as SqlRow | undefined;
+      .get(outboxId, workerId, expectedAttempt, expectedLeaseExpiresAtMs, now) as
+      | SqlRow
+      | undefined;
     if (!outbox) {
       throw new TeamSessionError("stale-revision", "Runtime outbox lease is unavailable");
     }
@@ -7399,11 +7703,13 @@ function validateCommandPayload(command: SessionCommand): void {
       requiredIdentifier(command.outboxId, "Runtime outbox id");
       requiredIdentifier(command.workerId, "Runtime worker id");
       requiredRevision(command.expectedAttempt, "Runtime outbox attempt");
+      requiredRuntimeOutboxLeaseExpiry(command.expectedLeaseExpiresAtMs);
       return;
     case "runtime.outbox.fail":
       requiredIdentifier(command.outboxId, "Runtime outbox id");
       requiredIdentifier(command.workerId, "Runtime worker id");
       requiredRevision(command.expectedAttempt, "Runtime outbox attempt");
+      requiredRuntimeOutboxLeaseExpiry(command.expectedLeaseExpiresAtMs);
       if (typeof command.retryable !== "boolean") {
         throw new TeamSessionError("invalid-command", "Runtime retry flag is invalid");
       }
@@ -7633,6 +7939,13 @@ function requiredRevision(value: unknown, label: string): number {
   return value as number;
 }
 
+function requiredRuntimeOutboxLeaseExpiry(value: unknown): number {
+  if (!Number.isSafeInteger(value) || (value as number) < 1) {
+    throw new TeamSessionError("invalid-command", "Runtime outbox lease expiry is invalid");
+  }
+  return value as number;
+}
+
 function requiredVersion(value: unknown, label: string): number {
   if (!Number.isSafeInteger(value) || (value as number) < 0) {
     throw new TeamSessionError("invalid-command", `${label} version is invalid`);
@@ -7661,6 +7974,10 @@ function projectRuntimeOutboxDelivery(
     attempts,
     leaseOwner,
     leaseExpiresAtMs,
+    dispatchMode:
+      row.dispatch_interlock_attempt === null && row.dispatch_interlock_acquired_at_ms === null
+        ? ("apply" as const)
+        : ("reconcile" as const),
   };
   switch (row.kind as RuntimeOutboxKind) {
     case "runtime.session.ensure": {
@@ -7692,44 +8009,29 @@ function projectRuntimeOutboxDelivery(
         },
       };
     case "runtime.session.retire": {
-      const emergency = payload.reason === "emergency-stop";
       if (
-        (payload.reason !== undefined && !emergency) ||
-        (emergency &&
-          (typeof payload.agentRunId !== "string" ||
-            typeof payload.runtimeAssignmentId !== "string" ||
-            !Number.isSafeInteger(payload.runtimeAssignmentGeneration) ||
-            typeof payload.sandboxId !== "string" ||
-            !Number.isSafeInteger(payload.sandboxGeneration))) ||
-        (!emergency &&
-          (payload.agentRunId !== undefined ||
-            payload.runtimeAssignmentId !== undefined ||
-            payload.runtimeAssignmentGeneration !== undefined ||
-            payload.sandboxId !== undefined ||
-            payload.sandboxGeneration !== undefined))
+        payload.reason !== "emergency-stop" ||
+        typeof payload.agentRunId !== "string" ||
+        typeof payload.runtimeAssignmentId !== "string" ||
+        !Number.isSafeInteger(payload.runtimeAssignmentGeneration) ||
+        typeof payload.sandboxId !== "string" ||
+        !Number.isSafeInteger(payload.sandboxGeneration)
       ) {
         throw new TeamSessionError("conflict", "Runtime retire payload is invalid");
-      }
-      if (emergency) {
-        return {
-          ...base,
-          kind: "runtime.session.retire",
-          payload: {
-            sessionId,
-            runtimeAuthorizationGeneration,
-            reason: "emergency-stop",
-            agentRunId: payload.agentRunId as string,
-            runtimeAssignmentId: payload.runtimeAssignmentId as string,
-            runtimeAssignmentGeneration: payload.runtimeAssignmentGeneration as number,
-            sandboxId: payload.sandboxId as string,
-            sandboxGeneration: payload.sandboxGeneration as number,
-          },
-        };
       }
       return {
         ...base,
         kind: "runtime.session.retire",
-        payload: { sessionId, runtimeAuthorizationGeneration },
+        payload: {
+          sessionId,
+          runtimeAuthorizationGeneration,
+          reason: "emergency-stop",
+          agentRunId: payload.agentRunId,
+          runtimeAssignmentId: payload.runtimeAssignmentId,
+          runtimeAssignmentGeneration: payload.runtimeAssignmentGeneration as number,
+          sandboxId: payload.sandboxId,
+          sandboxGeneration: payload.sandboxGeneration as number,
+        },
       };
     }
     default:

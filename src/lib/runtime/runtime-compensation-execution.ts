@@ -3,7 +3,6 @@ import type { RuntimeBinding } from "../team-sessions/contracts";
 import type {
   AggregateEnforcementProof,
   NonDuplicateRuntimeCompensationReceipt,
-  Runtime,
   RuntimeCompensationCommand,
   RuntimeCompensationReceipt,
   RuntimeHandle,
@@ -12,6 +11,7 @@ import { assertRuntimeCommandAuthorityBinding } from "./runtime-authority";
 import { canonicalRuntimeJson } from "./runtime-command-canonical";
 import {
   captureRuntimeCommandDataFunction,
+  type RuntimeCommandCapability,
   type RuntimeCommandDataFunction,
 } from "./runtime-command-dispatch";
 import {
@@ -172,7 +172,7 @@ export type RuntimeCompensationDispatch = (
  * binding. Current Session/Run state is deliberately absent from this module.
  */
 export async function executeRuntimeCompensationCommand(
-  runtime: Runtime,
+  runtime: RuntimeCommandCapability,
   handle: RuntimeHandle,
   command: RuntimeCompensationCommand,
   verifyAuthority: RuntimeCompensationAuthorityVerifier,
@@ -698,7 +698,9 @@ function digestReceipt(value: unknown): string {
   }
 }
 
-export function captureRuntimeCompensationDispatch(runtime: Runtime): RuntimeCompensationDispatch {
+export function captureRuntimeCompensationDispatch(
+  runtime: RuntimeCommandCapability
+): RuntimeCompensationDispatch {
   try {
     const dispatch = captureRuntimeCommandDataFunction(runtime);
     return (handle, command, signal) =>

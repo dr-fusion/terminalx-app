@@ -5,20 +5,10 @@ import {
   verify as verifyEd25519,
   type KeyObject,
 } from "node:crypto";
-import {
-  closeSync,
-  constants as fsConstants,
-  fstatSync,
-  lstatSync,
-  openSync,
-  readSync,
-  realpathSync,
-  type BigIntStats,
-} from "node:fs";
-import { isAbsolute, resolve } from "node:path";
 import { TextDecoder, types as utilTypes } from "node:util";
 import type { RuntimeBinding } from "../team-sessions/contracts";
 import { canonicalRuntimeJson } from "./runtime-command-canonical";
+import { readTrustedConfigurationFile } from "./runtime-trusted-configuration-file";
 
 export const RUNTIME_OBSERVATION_KEY_DESCRIPTOR_DIGEST_DOMAIN =
   "terminalx/runtime-observation-key-descriptor/v1\0" as const;
@@ -206,7 +196,12 @@ export interface CreatePinnedRuntimeObservationKeySourceOptions extends CreateRu
 }
 
 export interface LoadPinnedRuntimeObservationKeySourceFromFileOptions extends CreateRuntimeObservationKeyRegistrationVerifierOptions {
-  /** Absolute canonical path to an owned, regular, non-symlink 0400/0600 JSON file. */
+  /**
+   * Absolute canonical private operator configuration root (0500/0700).
+   * This explicit trust boundary must not be an arbitrary browser workspace.
+   */
+  readonly trustedConfigurationRoot: string;
+  /** Absolute canonical 0400/0600 JSON path strictly below the trust root. */
   readonly filePath: string;
 }
 
@@ -539,9 +534,18 @@ export function loadPinnedRuntimeObservationKeySourceFromFile(
   unsafeOptions: LoadPinnedRuntimeObservationKeySourceFromFileOptions
 ): RuntimeObservationKeySource {
   const options = dataRecord(unsafeOptions, "invalid_configuration");
-  exactFields(options, ["filePath", "pinnedAuthorityPublicKeys"], "invalid_configuration");
+  exactFields(
+    options,
+    ["trustedConfigurationRoot", "filePath", "pinnedAuthorityPublicKeys"],
+    "invalid_configuration"
+  );
+  const trustedConfigurationRoot = dataField(
+    options,
+    "trustedConfigurationRoot",
+    "invalid_configuration"
+  );
   const filePath = dataField(options, "filePath", "invalid_configuration");
-  const parsed = readStrictRegistryFile(filePath);
+  const parsed = readStrictRegistryFile(trustedConfigurationRoot, filePath);
   const registry = dataRecord(parsed, "invalid_source");
   exactFields(registry, ["version", "kind", "registrations"], "invalid_source");
   if (
@@ -735,72 +739,25 @@ function suppressNativePromiseRejection(value: unknown): void {
   }
 }
 
-function readStrictRegistryFile(value: unknown): unknown {
-  if (
-    typeof value !== "string" ||
-    !isAbsolute(value) ||
-    resolve(value) !== value ||
-    typeof fsConstants.O_NOFOLLOW !== "number" ||
-    typeof process.geteuid !== "function"
-  ) {
-    fail("source_unavailable");
-  }
+function readStrictRegistryFile(trustedConfigurationRoot: unknown, value: unknown): unknown {
+  let bytes: Buffer;
   try {
-    if (realpathSync.native(value) !== value) fail("source_unavailable");
-  } catch (error) {
-    if (error instanceof RuntimeObservationKeySourceError) throw error;
-    fail("source_unavailable");
-  }
-
-  let descriptor: number;
-  try {
-    descriptor = openSync(value, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    bytes = readTrustedConfigurationFile({
+      trustedConfigurationRoot,
+      filePath: value,
+      minimumBytes: 1,
+      maximumBytes: MAX_REGISTRY_FILE_BYTES,
+    });
   } catch {
     fail("source_unavailable");
   }
-  let bytes: Buffer;
-  try {
-    const before = fstatSync(descriptor, { bigint: true });
-    const pathBefore = lstatSync(value, { bigint: true });
-    const mode = before.mode & BigInt(0o777);
-    if (
-      !before.isFile() ||
-      before.uid !== BigInt(process.geteuid()) ||
-      before.nlink !== BigInt(1) ||
-      (mode !== BigInt(0o400) && mode !== BigInt(0o600)) ||
-      (before.mode & BigInt(0o7000)) !== BigInt(0) ||
-      before.size < BigInt(1) ||
-      before.size > BigInt(MAX_REGISTRY_FILE_BYTES) ||
-      !sameRegistryFileSnapshot(before, pathBefore)
-    ) {
-      fail("source_unavailable");
-    }
-    bytes = readExactRegistryBytes(descriptor, Number(before.size), "source_unavailable");
-    const after = fstatSync(descriptor, { bigint: true });
-    const pathAfter = lstatSync(value, { bigint: true });
-    if (
-      realpathSync.native(value) !== value ||
-      !sameRegistryFileSnapshot(before, after) ||
-      !sameRegistryFileSnapshot(after, pathAfter)
-    ) {
-      fail("source_unavailable");
-    }
-  } catch (error) {
-    if (error instanceof RuntimeObservationKeySourceError) throw error;
-    fail("source_unavailable");
-  } finally {
-    try {
-      closeSync(descriptor);
-    } catch {
-      fail("source_unavailable");
-    }
-  }
-
   let source: string;
   try {
     source = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
   } catch {
     fail("invalid_source");
+  } finally {
+    bytes.fill(0);
   }
   let parsed: unknown;
   try {
@@ -811,36 +768,6 @@ function readStrictRegistryFile(value: unknown): unknown {
     fail("invalid_source");
   }
   return snapshotJsonData(parsed, "invalid_source");
-}
-
-function sameRegistryFileSnapshot(left: BigIntStats, right: BigIntStats): boolean {
-  return (
-    left.dev === right.dev &&
-    left.ino === right.ino &&
-    left.mode === right.mode &&
-    left.uid === right.uid &&
-    left.gid === right.gid &&
-    left.nlink === right.nlink &&
-    left.size === right.size &&
-    left.mtimeNs === right.mtimeNs &&
-    left.ctimeNs === right.ctimeNs
-  );
-}
-
-function readExactRegistryBytes(
-  descriptor: number,
-  expectedBytes: number,
-  code: RuntimeObservationKeySourceErrorCode
-): Buffer {
-  const bytes = Buffer.allocUnsafe(expectedBytes + 1);
-  let offset = 0;
-  while (offset < bytes.byteLength) {
-    const count = readSync(descriptor, bytes, offset, bytes.byteLength - offset, null);
-    if (count === 0) break;
-    offset += count;
-  }
-  if (offset !== expectedBytes) fail(code);
-  return bytes.subarray(0, offset);
 }
 
 function snapshotJsonData(value: unknown, code: RuntimeObservationKeySourceErrorCode): unknown {

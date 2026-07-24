@@ -3,7 +3,6 @@ import type { RuntimeBinding } from "../team-sessions/contracts";
 import type {
   AggregateEnforcementProof,
   NonDuplicateRuntimeReceipt,
-  Runtime,
   RuntimeHandle,
   RuntimeLifecycleCommand,
   RuntimeReceipt,
@@ -15,6 +14,7 @@ import {
 import { assertRuntimeCommandAuthorityBinding } from "./runtime-authority";
 import {
   captureRuntimeCommandDataFunction,
+  type RuntimeCommandCapability,
   type RuntimeCommandDataFunction,
 } from "./runtime-command-dispatch";
 import {
@@ -28,6 +28,7 @@ import {
   type RuntimeEnforcementSubject,
   type SynchronousRuntimeEnforcementProofVerifier,
 } from "./runtime-enforcement-proof";
+import { suppressNativePromiseRejection } from "./runtime-native-promise";
 
 export { digestAggregateEnforcementProof } from "./runtime-enforcement-proof";
 
@@ -180,7 +181,7 @@ export type RuntimeLifecycleDispatch = (
  * validated snapshot. Persistence remains a separate journal responsibility.
  */
 export async function executeRuntimeCommand(
-  runtime: Runtime,
+  runtime: RuntimeCommandCapability,
   handle: RuntimeHandle,
   command: RuntimeLifecycleCommand,
   verifyAuthority: RuntimeAuthorityVerifier,
@@ -365,9 +366,9 @@ function verifyRuntimeReceiptEnforcementProofSynchronouslyByEffectRefForm(
   }
   if (verified !== true) {
     // The SQLite follow boundary cannot suspend its transaction. Fail closed,
-    // but consume an async/thenable verifier's eventual rejection so this safe
-    // classification cannot also become an unhandled process-level failure.
-    void Promise.resolve(verified).catch(() => undefined);
+    // but observe a genuine Promise rejection without assimilating a custom
+    // thenable or invoking provider-controlled code after rollback.
+    suppressNativePromiseRejection(verified);
     fail("enforcement_proof_verification_failed");
   }
 }
@@ -1583,7 +1584,9 @@ function sameBinding(left: RuntimeBinding, right: RuntimeBinding): boolean {
   return BINDING_FIELDS.every((field) => left[field] === right[field]);
 }
 
-export function captureRuntimeLifecycleDispatch(runtime: Runtime): RuntimeLifecycleDispatch {
+export function captureRuntimeLifecycleDispatch(
+  runtime: RuntimeCommandCapability
+): RuntimeLifecycleDispatch {
   try {
     const dispatch = captureRuntimeCommandDataFunction(runtime);
     return (handle, command, signal) => commandResult(dispatch, handle, command, signal);

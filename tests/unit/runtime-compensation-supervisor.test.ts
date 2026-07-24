@@ -134,6 +134,39 @@ function runtimeWith(
 }
 
 describe("Runtime compensation supervisor", () => {
+  it("records a successful health heartbeat when a long cycle settles", async () => {
+    let nowMs = 200;
+    let releaseReconcile: (() => void) | undefined;
+    const journal = journalReturning(null);
+    journal.reconcile.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          releaseReconcile = resolve;
+        })
+    );
+    const supervisor = createRuntimeCompensationSupervisor({
+      journal,
+      runtime: runtimeWith(),
+      handles: { resolve: async () => handle },
+      verifyAuthority: async () => true,
+      verifyEnforcementProof: async () => true,
+      workerId: "compensation-worker-1",
+      clock: () => nowMs,
+    });
+
+    const running = supervisor.runOnce();
+    expect(supervisor.health()).toMatchObject({ activeCycleStartedAtMs: 200 });
+    nowMs = 40_200;
+    releaseReconcile?.();
+    await expect(running).resolves.toMatchObject({ claimed: 0 });
+    expect(supervisor.health()).toEqual({
+      lastSuccessAtMs: 40_200,
+      lastErrorAtMs: null,
+      activeCycleStartedAtMs: null,
+      failureSinceSuccess: false,
+    });
+  });
+
   it("rejects an accessor-backed handle resolver without invoking provider code", () => {
     const journal = journalReturning(delivery());
     let getterCalls = 0;
@@ -267,6 +300,41 @@ describe("Runtime compensation supervisor", () => {
     expect(journal.claim).toHaveBeenCalledOnce();
   });
 
+  it("snapshots an expired command structurally and records the executor's safe failure", async () => {
+    const expired = compensationCommand();
+    const journal = journalReturning(delivery(expired));
+    const dispatch = vi.fn<Runtime["command"]>(async (_handle, command) =>
+      acceptedReceipt(command as RuntimeCompensationCommand)
+    );
+    const supervisor = createRuntimeCompensationSupervisor({
+      journal,
+      runtime: runtimeWith(dispatch),
+      handles: { resolve: vi.fn(async () => handle) },
+      verifyAuthority: async () => true,
+      verifyEnforcementProof: async () => true,
+      workerId: "compensation-worker-1",
+      clock: () => expired.deadlineAtMs,
+    });
+
+    await expect(supervisor.runOnce()).resolves.toEqual({
+      claimed: 1,
+      receipts: 0,
+      failedBeforeDispatch: 1,
+      dispatchUncertain: 0,
+    });
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(journal.complete).toHaveBeenCalledWith(
+      expect.objectContaining({
+        commandId: expired.commandId,
+        outcome: {
+          kind: "failure",
+          code: "deadline_expired",
+          dispatchCertainty: "not-dispatched",
+        },
+      })
+    );
+  });
+
   it("renews the exact lease before dispatch and completes one receipt", async () => {
     const command = compensationCommand();
     const journal = journalReturning(delivery(command));
@@ -304,6 +372,157 @@ describe("Runtime compensation supervisor", () => {
         outcome: { kind: "receipt", receipt: acceptedReceipt(command) },
       })
     );
+    expect(supervisor.health()).toEqual({
+      lastSuccessAtMs: 200,
+      lastErrorAtMs: null,
+      activeCycleStartedAtMs: null,
+      failureSinceSuccess: false,
+    });
+  });
+
+  it("uses one frozen delivery snapshot through resolve, renewal, dispatch, and completion", async () => {
+    const expectedCommand = compensationCommand();
+    const expectedBinding = structuredClone(binding);
+    const mutable = structuredClone(delivery(expectedCommand)) as unknown as {
+      command: {
+        commandId: string;
+        compensationId: string;
+        causationId: string;
+        binding: {
+          sessionId: string;
+          runtimeAssignmentId: string;
+          sandboxId: string;
+        };
+        source: { lifecycleCommandId: string };
+      };
+      attempt: number;
+      leaseOwner: string;
+      leaseExpiresAtMs: number;
+    };
+    const journal = journalReturning(
+      mutable as unknown as RuntimeCompensationDelivery
+    ) as RuntimeCompensationJournal & {
+      renew: ReturnType<typeof vi.fn>;
+      complete: ReturnType<typeof vi.fn>;
+    };
+    const exactHandle: RuntimeHandle = { ...handle, binding: expectedBinding };
+    const exactReceipt = acceptedReceipt(expectedCommand);
+    const handles = {
+      resolve: vi.fn(async (resolvedCommand: RuntimeCompensationCommand) => {
+        expect(resolvedCommand).toEqual(expectedCommand);
+        expect(resolvedCommand).not.toBe(mutable.command);
+        expect(Object.isFrozen(resolvedCommand)).toBe(true);
+        expect(Object.isFrozen(resolvedCommand.binding)).toBe(true);
+        expect(Object.isFrozen(resolvedCommand.source)).toBe(true);
+        expect(Object.isFrozen(resolvedCommand.authority)).toBe(true);
+
+        mutable.command.commandId = "mutated-during-resolve";
+        mutable.command.compensationId = "mutated-compensation";
+        mutable.command.causationId = "mutated-cause";
+        mutable.command.source.lifecycleCommandId = "mutated-lifecycle-command";
+        mutable.command.binding.sessionId = "mutated-session";
+        mutable.command.binding.runtimeAssignmentId = "mutated-assignment";
+        mutable.attempt = 91;
+        mutable.leaseOwner = "mutated-worker";
+        mutable.leaseExpiresAtMs = 999_999;
+        return exactHandle;
+      }),
+    };
+    journal.renew.mockImplementationOnce(async (options) => {
+      expect(options).toEqual({
+        commandId: expectedCommand.commandId,
+        workerId: "compensation-worker-1",
+        expectedAttempt: 1,
+        expectedLeaseExpiresAtMs: 30_200,
+        leaseDurationMs: 30_000,
+        nowMs: 200,
+      });
+      mutable.command.commandId = "mutated-during-renewal";
+      mutable.command.binding.sandboxId = "mutated-sandbox";
+      mutable.attempt = 92;
+      return { kind: "renewed" as const, leaseExpiresAtMs: 60_200 };
+    });
+    const dispatch = vi.fn<Runtime["command"]>(async (_runtimeHandle, dispatchedCommand) => {
+      expect(dispatchedCommand).toEqual(expectedCommand);
+      expect(dispatchedCommand.commandId).toBe(expectedCommand.commandId);
+      expect(dispatchedCommand.binding).toEqual(expectedBinding);
+      expect(Object.isFrozen(dispatchedCommand)).toBe(true);
+      expect(Object.isFrozen(dispatchedCommand.binding)).toBe(true);
+      return exactReceipt;
+    });
+    const supervisor = createRuntimeCompensationSupervisor({
+      journal,
+      runtime: runtimeWith(dispatch),
+      handles,
+      verifyAuthority: async ({ command: verifiedCommand }) => {
+        expect(verifiedCommand.commandId).toBe(expectedCommand.commandId);
+        expect(verifiedCommand.compensationId).toBe(expectedCommand.compensationId);
+        expect(verifiedCommand.binding).toEqual(expectedBinding);
+        return true;
+      },
+      verifyEnforcementProof: async () => true,
+      workerId: "compensation-worker-1",
+      clock: () => 200,
+    });
+
+    await expect(supervisor.runOnce()).resolves.toEqual({
+      claimed: 1,
+      receipts: 1,
+      failedBeforeDispatch: 0,
+      dispatchUncertain: 0,
+    });
+    expect(journal.complete).toHaveBeenCalledWith({
+      commandId: expectedCommand.commandId,
+      workerId: "compensation-worker-1",
+      expectedAttempt: 1,
+      expectedLeaseExpiresAtMs: 60_200,
+      observedAtMs: 200,
+      outcome: { kind: "receipt", receipt: exactReceipt },
+    });
+  });
+
+  it("rejects delivery proxies, accessors, and inexact records without invoking getters", async () => {
+    let getterCalls = 0;
+    const accessorCommand = Object.defineProperty({ ...compensationCommand() }, "binding", {
+      enumerable: true,
+      get() {
+        getterCalls += 1;
+        throw new Error("journal-secret-binding-getter");
+      },
+    });
+    const missingField = { ...delivery() } as Record<string, unknown>;
+    delete missingField.attempt;
+    const hostileDeliveries: unknown[] = [
+      new Proxy(delivery(), {}),
+      { ...delivery(), command: accessorCommand },
+      { ...delivery(), unexpected: "field" },
+      missingField,
+      { ...delivery(), command: { ...compensationCommand(), unexpected: "field" } },
+    ];
+
+    for (const hostile of hostileDeliveries) {
+      const journal = journalReturning(hostile as RuntimeCompensationDelivery);
+      const handles = { resolve: vi.fn(async () => handle) };
+      const dispatch = vi.fn<Runtime["command"]>(async (_runtimeHandle, dispatchedCommand) =>
+        acceptedReceipt(dispatchedCommand as RuntimeCompensationCommand)
+      );
+      const supervisor = createRuntimeCompensationSupervisor({
+        journal,
+        runtime: runtimeWith(dispatch),
+        handles,
+        verifyAuthority: async () => true,
+        verifyEnforcementProof: async () => true,
+        workerId: "compensation-worker-1",
+        clock: () => 200,
+      });
+
+      await expect(supervisor.runOnce()).rejects.toThrow("Invalid Runtime compensation delivery");
+      expect(handles.resolve).not.toHaveBeenCalled();
+      expect(journal.renew).not.toHaveBeenCalled();
+      expect(dispatch).not.toHaveBeenCalled();
+      expect(journal.complete).not.toHaveBeenCalled();
+    }
+    expect(getterCalls).toBe(0);
   });
 
   it("rejects a replacement handle before acquiring the dispatch interlock", async () => {

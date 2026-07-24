@@ -36,6 +36,7 @@ import {
 const TEAM_ID = "11111111-1111-4111-8111-111111111111";
 const PROJECT_ID = "22222222-2222-4222-8222-222222222222";
 const SESSION_ID = "33333333-3333-4333-8333-333333333333";
+const PEER_SESSION_ID = "44444444-4444-4444-8444-444444444444";
 const ALICE: ActorContext = { kind: "human", userId: "alice", displayName: "Alice" };
 const RUNTIME: ActorContext = {
   kind: "system",
@@ -88,6 +89,7 @@ describe("Phase 6 SQLite concurrency and crash boundaries", () => {
     authorityIssuer = createRuntimeCommandAuthorityIssuer({
       issuer: "team-session",
       issuerKeyId: "team-session:phase6-key",
+      trustedConfigurationRoot: directory,
       privateKeyFile: authorityPrivateKeyFile,
       clock: () => now,
     });
@@ -116,12 +118,19 @@ describe("Phase 6 SQLite concurrency and crash boundaries", () => {
       leaseDurationMs: 30_000,
     });
     if (!ensure) throw new Error("Expected Runtime ensure delivery");
+    await sessions.markRuntimeOutboxDispatch({
+      outboxId: ensure.outboxId,
+      workerId: RUNTIME.userId,
+      expectedAttempt: ensure.attempts,
+      expectedLeaseExpiresAtMs: ensure.leaseExpiresAtMs,
+    });
     await dispatch(
       {
         type: "runtime.outbox.acknowledge",
         outboxId: ensure.outboxId,
         workerId: RUNTIME.userId,
         expectedAttempt: ensure.attempts,
+        expectedLeaseExpiresAtMs: ensure.leaseExpiresAtMs,
       },
       RUNTIME
     );
@@ -514,6 +523,7 @@ describe("Phase 6 SQLite concurrency and crash boundaries", () => {
     const runtimeObservation = createRuntimeReceiptObservationIssuer({
       issuerKeyId: OBSERVATION_KEY_ID,
       binding: lifecycleDelivery.command.binding,
+      trustedConfigurationRoot: directory,
       privateKeyFile: observationPrivateKeyFile,
       clock: () => now,
     }).issue({
@@ -651,6 +661,7 @@ describe("Phase 6 SQLite concurrency and crash boundaries", () => {
     const compensationObservation = createRuntimeCompensationReceiptObservationIssuer({
       issuerKeyId: OBSERVATION_KEY_ID,
       binding: compensationDelivery.command.binding,
+      trustedConfigurationRoot: directory,
       privateKeyFile: observationPrivateKeyFile,
       clock: () => now,
     }).issue({
@@ -710,6 +721,90 @@ describe("Phase 6 SQLite concurrency and crash boundaries", () => {
       events: 1,
       cursor: "runtime-cursor:phase6:2",
       receipt_sequence: 2,
+    });
+  });
+
+  it("samples the Runtime outbox claim clock under the write lock without rejecting a later peer append", async () => {
+    const peerDb = (sessions as unknown as { db: Database.Database }).db;
+    peerDb.pragma("busy_timeout = 0");
+    let probeClaimClock = false;
+    let clockSamples = 0;
+    let peerWriteLockAcquisitions = 0;
+    const peerWriteLockErrors: string[] = [];
+    const claimant = createTeamSessionKernel({
+      ...kernelOptions(),
+      clock: () => {
+        if (!probeClaimClock) return now;
+        clockSamples += 1;
+        let peerTransactionOpen = false;
+        try {
+          peerDb.exec("BEGIN IMMEDIATE");
+          peerTransactionOpen = true;
+          peerWriteLockAcquisitions += 1;
+        } catch (error) {
+          peerWriteLockErrors.push((error as { code?: string }).code ?? "UNKNOWN");
+        } finally {
+          if (peerTransactionOpen) peerDb.exec("ROLLBACK");
+        }
+        return now;
+      },
+    });
+    openSessions.add(claimant.teamSessions);
+    probeClaimClock = true;
+
+    await expect(
+      claimant.teamSessions.claimRuntimeOutbox({
+        workerId: "clock-claimant",
+        limit: 1,
+        leaseDurationMs: 1_000,
+      })
+    ).resolves.toEqual([]);
+    expect({ clockSamples, peerWriteLockAcquisitions, peerWriteLockErrors }).toEqual({
+      clockSamples: 1,
+      peerWriteLockAcquisitions: 0,
+      peerWriteLockErrors: ["SQLITE_BUSY"],
+    });
+
+    now += 1;
+    await dispatch({
+      type: "session.start",
+      teamId: TEAM_ID,
+      projectId: PROJECT_ID,
+      sessionId: PEER_SESSION_ID,
+      name: "Runtime outbox clock peer",
+      tmuxName: "phase6-clock-peer",
+      steeringPolicy: "shared",
+    });
+    expect(
+      peerDb
+        .prepare(
+          `SELECT status, created_at_ms
+           FROM runtime_outbox
+           WHERE session_id = ? AND kind = 'runtime.session.ensure'`
+        )
+        .get(PEER_SESSION_ID)
+    ).toEqual({ status: "pending", created_at_ms: now });
+
+    await expect(
+      claimant.teamSessions.claimRuntimeOutbox({
+        workerId: "clock-claimant",
+        limit: 1,
+        leaseDurationMs: 1_000,
+      })
+    ).resolves.toEqual([
+      expect.objectContaining({
+        sessionId: PEER_SESSION_ID,
+        kind: "runtime.session.ensure",
+        attempts: 1,
+        leaseOwner: "clock-claimant",
+        leaseExpiresAtMs: now + 1_000,
+        dispatchMode: "apply",
+      }),
+    ]);
+    expect({ clockSamples, peerWriteLockAcquisitions, peerWriteLockErrors }).toEqual({
+      clockSamples: 2,
+      peerWriteLockAcquisitions: 0,
+      peerWriteLockErrors: ["SQLITE_BUSY", "SQLITE_BUSY"],
     });
   });
 

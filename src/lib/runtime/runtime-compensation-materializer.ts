@@ -4,6 +4,7 @@ import type {
   RuntimeCompensationCommand,
 } from "./contracts";
 import { digestRuntimeCommandClaims } from "./runtime-command-canonical";
+import { suppressNativePromiseRejection } from "./runtime-native-promise";
 
 const SHA256 = /^[0-9a-f]{64}$/;
 const SAFE_REF = /^[^\u0000-\u001f\u007f]{1,300}$/;
@@ -72,6 +73,13 @@ export interface RuntimeCompensationMaterializationCandidate {
 
 export interface RuntimeCompensationMaterializationClaimOptions {
   readonly nowMs: number;
+  /** Cancellation is authoritative before returning materialization candidates. */
+  readonly signal: AbortSignal;
+}
+
+export interface RuntimeCompensationMaterializationWriteOptions {
+  /** The journal must not begin a durable write after this signal is aborted. */
+  readonly signal: AbortSignal;
 }
 
 export interface RuntimeCompensationMaterializationInput {
@@ -94,7 +102,8 @@ export interface RuntimeCompensationMaterializationJournal {
     options: RuntimeCompensationMaterializationClaimOptions
   ): Promise<RuntimeCompensationMaterializationCandidate | null>;
   materialize(
-    input: RuntimeCompensationMaterializationInput
+    input: RuntimeCompensationMaterializationInput,
+    options: RuntimeCompensationMaterializationWriteOptions
   ): Promise<RuntimeCompensationMaterializationResult>;
 }
 
@@ -168,21 +177,29 @@ export class RuntimeCompensationMaterializer {
   }
 
   /** Concurrent callers share the same signing attempt. */
-  runOnce(): Promise<RuntimeCompensationMaterializerRunResult> {
+  runOnce(
+    signal: AbortSignal = new AbortController().signal
+  ): Promise<RuntimeCompensationMaterializerRunResult> {
     if (this.activeRun) return this.activeRun;
-    const run = this.materializeOne().finally(() => {
+    const run = this.materializeOne(signal).finally(() => {
       if (this.activeRun === run) this.activeRun = null;
     });
     this.activeRun = run;
     return run;
   }
 
-  private async materializeOne(): Promise<RuntimeCompensationMaterializerRunResult> {
+  private async materializeOne(
+    signal: AbortSignal
+  ): Promise<RuntimeCompensationMaterializerRunResult> {
+    assertNotAborted(signal);
     const observedAtMs = sampleClock(this.clock);
-    const unsafeCandidate = await this.journal.findMaterializable({ nowMs: observedAtMs });
+    const unsafeCandidate = await this.journal.findMaterializable({ nowMs: observedAtMs, signal });
+    assertNotAborted(signal);
     if (unsafeCandidate === null) return { found: 0, created: 0 };
     const candidate = snapshotCandidate(unsafeCandidate);
+    assertNotAborted(signal);
     const policy = snapshotPolicy(this.policySource.resolve(candidate));
+    assertNotAborted(signal);
     const issuedAtMs = sampleClock(this.clock, observedAtMs);
     const deadlineAtMs = safeAdd(issuedAtMs, this.commandTtlMs);
     const commandId = safeRef(this.idGenerator());
@@ -210,7 +227,9 @@ export class RuntimeCompensationMaterializer {
       deadlineAtMs,
     }) satisfies RuntimeCompensationCommandClaims;
 
+    assertNotAborted(signal);
     const authority = snapshotAuthority(this.authorityIssuer.issue(claims), claims);
+    assertNotAborted(signal);
     const command = deepFreeze({ ...claims, authority }) satisfies RuntimeCompensationCommand;
     const authorityVerifiedAtMs = sampleClock(this.clock, issuedAtMs);
     if (authorityVerifiedAtMs >= deadlineAtMs) {
@@ -223,21 +242,32 @@ export class RuntimeCompensationMaterializer {
       throw new TypeError("Platform-security Runtime authority could not be verified");
     }
     if (verified !== true) {
-      void Promise.resolve(verified).catch(() => undefined);
+      suppressNativePromiseRejection(verified);
       throw new TypeError("Platform-security Runtime authority could not be verified");
     }
+    assertNotAborted(signal);
     const materializedAtMs = sampleClock(this.clock, authorityVerifiedAtMs);
-    const result = await this.journal.materialize({
-      compensationId: candidate.compensationId,
-      incidentDigest: candidate.incidentDigest,
-      command,
-      authorityVerifiedAtMs,
-      materializedAtMs,
-    });
+    const result = await this.journal.materialize(
+      {
+        compensationId: candidate.compensationId,
+        incidentDigest: candidate.incidentDigest,
+        command,
+        authorityVerifiedAtMs,
+        materializedAtMs,
+      },
+      { signal }
+    );
+    assertNotAborted(signal);
     if (result !== "created" && result !== "already-materialized") {
       throw new TypeError("Invalid Runtime compensation materialization result");
     }
     return { found: 1, created: result === "created" ? 1 : 0 };
+  }
+}
+
+function assertNotAborted(signal: AbortSignal): void {
+  if (signal?.aborted === true) {
+    throw new DOMException("Runtime compensation materialization aborted", "AbortError");
   }
 }
 

@@ -1,9 +1,9 @@
 import type {
-  Runtime,
   RuntimeCompensationCommand,
   RuntimeCompensationReceipt,
   RuntimeHandle,
 } from "./contracts";
+import type { RuntimeCommandCapability } from "./runtime-command-dispatch";
 import {
   RuntimeCompensationExecutionError,
   captureRuntimeCompensationDispatch,
@@ -19,9 +19,30 @@ import {
   snapshotExactRuntimeHandle,
   type CapturedRuntimeHandleResolver,
 } from "./runtime-handle-resolution";
+import {
+  linkRuntimeAbortSignal,
+  runBoundedRuntimeOperation,
+  runtimeHealthClockMinimum,
+  runtimeAbortableDelay,
+  sampleRuntimeHealthClock,
+} from "./runtime-supervisor-operation";
+import {
+  exactRuntimeSupervisorDataRecord as exactDataRecord,
+  runtimeSupervisorCommandValidationInstant as commandStructuralValidationInstant,
+  runtimeSupervisorDataField as dataField,
+  snapshotRuntimeSupervisorPortableData as snapshotPortableData,
+} from "./runtime-supervisor-snapshot";
+import type { RuntimeManagedSupervisorHealth } from "./runtime-supervisor-root";
 
 const MAX_WORKER_ID_LENGTH = 128;
 const LEASE_COMPLETION_MARGIN_MS = 250;
+const DELIVERY_FIELDS = [
+  "command",
+  "attempt",
+  "leaseOwner",
+  "leaseExpiresAtMs",
+  "priorDispatchCertainty",
+] as const;
 
 export interface RuntimeCompensationReconcileOptions {
   readonly nowMs: number;
@@ -92,7 +113,7 @@ export interface RuntimeCompensationHandleResolver {
 
 export interface RuntimeCompensationSupervisorOptions {
   readonly journal: RuntimeCompensationJournal;
-  readonly runtime: Runtime;
+  readonly runtime: RuntimeCommandCapability;
   readonly handles: RuntimeCompensationHandleResolver;
   readonly verifyAuthority: RuntimeCompensationAuthorityVerifier;
   readonly verifyEnforcementProof: RuntimeCompensationEnforcementProofVerifier;
@@ -134,6 +155,10 @@ export class RuntimeCompensationSupervisor {
   private loopPromise: Promise<void> | null = null;
   private activeRun: Promise<RuntimeCompensationRunResult> | null = null;
   private activeRunController: AbortController | null = null;
+  private lastSuccessAtMs: number | null = null;
+  private lastErrorAtMs: number | null = null;
+  private activeCycleStartedAtMs: number | null = null;
+  private failureSinceSuccess = false;
 
   constructor(options: RuntimeCompensationSupervisorOptions) {
     const resolveHandle = captureRuntimeHandleResolver<RuntimeCompensationCommand>(
@@ -182,6 +207,15 @@ export class RuntimeCompensationSupervisor {
     return this.loopPromise !== null;
   }
 
+  health(): RuntimeManagedSupervisorHealth {
+    return Object.freeze({
+      lastSuccessAtMs: this.lastSuccessAtMs,
+      lastErrorAtMs: this.lastErrorAtMs,
+      activeCycleStartedAtMs: this.activeCycleStartedAtMs,
+      failureSinceSuccess: this.failureSinceSuccess,
+    });
+  }
+
   start(): void {
     if (this.loopPromise) return;
     const controller = new AbortController();
@@ -204,13 +238,43 @@ export class RuntimeCompensationSupervisor {
   runOnce(): Promise<RuntimeCompensationRunResult> {
     if (this.activeRun) return this.activeRun;
     const controller = new AbortController();
-    const unlink = linkAbortSignal(this.controller?.signal, controller);
+    const unlink = linkRuntimeAbortSignal(this.controller?.signal, controller);
     this.activeRunController = controller;
-    const run = this.processOne(controller.signal).finally(() => {
-      unlink();
-      if (this.activeRunController === controller) this.activeRunController = null;
-      if (this.activeRun === run) this.activeRun = null;
-    });
+    const run = this.processOne(controller.signal)
+      .then(
+        (result) => {
+          const minimum = runtimeHealthClockMinimum(
+            this.activeCycleStartedAtMs,
+            this.lastSuccessAtMs,
+            this.lastErrorAtMs
+          );
+          const settledAtMs = sampleRuntimeHealthClock(this.clock, minimum);
+          if (settledAtMs === null) {
+            this.lastErrorAtMs = minimum;
+            this.failureSinceSuccess = true;
+          } else {
+            this.lastSuccessAtMs = settledAtMs;
+            this.failureSinceSuccess = false;
+          }
+          return result;
+        },
+        (error: unknown) => {
+          const minimum = runtimeHealthClockMinimum(
+            this.activeCycleStartedAtMs,
+            this.lastSuccessAtMs,
+            this.lastErrorAtMs
+          );
+          this.lastErrorAtMs = sampleRuntimeHealthClock(this.clock, minimum) ?? minimum;
+          this.failureSinceSuccess = true;
+          throw error;
+        }
+      )
+      .finally(() => {
+        unlink();
+        this.activeCycleStartedAtMs = null;
+        if (this.activeRunController === controller) this.activeRunController = null;
+        if (this.activeRun === run) this.activeRun = null;
+      });
     this.activeRun = run;
     return run;
   }
@@ -225,10 +289,10 @@ export class RuntimeCompensationSupervisor {
             : result.claimed > 0
               ? this.busyDelayMs
               : this.idleDelayMs;
-        await abortableDelay(delay, signal);
+        await runtimeAbortableDelay(delay, signal);
       } catch {
         reportOperationalError(this.onOperationalError);
-        await abortableDelay(this.errorDelayMs, signal);
+        await runtimeAbortableDelay(this.errorDelayMs, signal);
       }
     }
   }
@@ -236,16 +300,17 @@ export class RuntimeCompensationSupervisor {
   private async processOne(signal: AbortSignal): Promise<RuntimeCompensationRunResult> {
     if (signal.aborted) return emptyRunResult();
     const reconcileAtMs = sampleClock(this.clock);
+    this.activeCycleStartedAtMs = reconcileAtMs;
     await this.journal.reconcile({ nowMs: reconcileAtMs });
     if (signal.aborted) return emptyRunResult();
     const claimedAtMs = sampleClock(this.clock, reconcileAtMs);
-    const delivery = await this.journal.claim({
+    const claimed = await this.journal.claim({
       workerId: this.workerId,
       leaseDurationMs: this.leaseDurationMs,
       nowMs: claimedAtMs,
     });
-    if (delivery === null) return emptyRunResult();
-    validateDelivery(delivery, this.workerId, claimedAtMs);
+    if (claimed === null) return emptyRunResult();
+    const delivery = snapshotDelivery(claimed, this.workerId, claimedAtMs);
 
     const execution = await this.executeDelivery(delivery, signal);
     if (execution.kind === "expired-before-dispatch") {
@@ -285,7 +350,7 @@ export class RuntimeCompensationSupervisor {
     if (remainingBeforeResolve <= LEASE_COMPLETION_MARGIN_MS || signal.aborted) {
       return failureBeforeDispatch(delivery, "lease_expired_before_dispatch");
     }
-    const resolved = await boundedOperation(
+    const resolved = await runBoundedRuntimeOperation(
       (operationSignal) => this.resolveHandle(delivery.command, operationSignal),
       Math.min(this.handleResolveTimeoutMs, remainingBeforeResolve - LEASE_COMPLETION_MARGIN_MS),
       signal
@@ -309,15 +374,15 @@ export class RuntimeCompensationSupervisor {
       leaseDurationMs: this.leaseDurationMs,
       nowMs: renewalAtMs,
     });
-    if (renewal.kind === "expired-before-dispatch") return { kind: renewal.kind };
     const renewedDelivery = validateRenewal(delivery, renewal, renewalAtMs);
+    if (renewedDelivery === null) return { kind: "expired-before-dispatch" };
 
     const dispatchAtMs = sampleClock(this.clock, renewalAtMs);
     const remainingAfterInterlock = renewedDelivery.leaseExpiresAtMs - dispatchAtMs;
     if (signal.aborted || remainingAfterInterlock <= LEASE_COMPLETION_MARGIN_MS) {
       return failureAfterInterlock(renewedDelivery);
     }
-    const executed = await boundedOperation(
+    const executed = await runBoundedRuntimeOperation(
       (operationSignal) =>
         executeCapturedRuntimeCompensationCommand(
           this.runtimeDispatch,
@@ -392,42 +457,111 @@ function failureAfterInterlock(
   };
 }
 
-function validateDelivery(
-  delivery: RuntimeCompensationDelivery,
+function snapshotDelivery(
+  value: unknown,
   workerId: string,
   claimedAtMs: number
-): void {
-  if (
-    !delivery ||
-    typeof delivery !== "object" ||
-    !Number.isSafeInteger(delivery.attempt) ||
-    delivery.attempt < 1 ||
-    delivery.leaseOwner !== workerId ||
-    !Number.isSafeInteger(delivery.leaseExpiresAtMs) ||
-    delivery.leaseExpiresAtMs <= claimedAtMs ||
-    delivery.priorDispatchCertainty !== "not-dispatched" ||
-    !delivery.command ||
-    typeof delivery.command !== "object" ||
-    delivery.command.kind !== "safety.quarantine" ||
-    !isSafeIdentifier(delivery.command.commandId, 300)
-  ) {
+): RuntimeCompensationDelivery {
+  try {
+    const snapshot = snapshotPortableData(value);
+    const delivery = exactDataRecord(snapshot, DELIVERY_FIELDS);
+    const attempt = dataField(delivery, "attempt");
+    const leaseOwner = dataField(delivery, "leaseOwner");
+    const leaseExpiresAtMs = dataField(delivery, "leaseExpiresAtMs");
+    if (
+      !Number.isSafeInteger(attempt) ||
+      (attempt as number) < 1 ||
+      leaseOwner !== workerId ||
+      !Number.isSafeInteger(leaseExpiresAtMs) ||
+      (leaseExpiresAtMs as number) <= claimedAtMs ||
+      dataField(delivery, "priorDispatchCertainty") !== "not-dispatched"
+    ) {
+      throw new TypeError();
+    }
+    const command = snapshotCompensationCommand(dataField(delivery, "command"), claimedAtMs);
+    return Object.freeze({
+      command,
+      attempt: attempt as number,
+      leaseOwner: leaseOwner as string,
+      leaseExpiresAtMs: leaseExpiresAtMs as number,
+      priorDispatchCertainty: "not-dispatched",
+    });
+  } catch {
     throw new TypeError("Invalid Runtime compensation delivery");
   }
 }
 
+/** Capture the executor's exact, deeply frozen command before any capability call. */
+function snapshotCompensationCommand(value: unknown, nowMs: number): RuntimeCompensationCommand {
+  const command = value as RuntimeCompensationCommand;
+  const commandRecord = exactDataRecord(command, Reflect.ownKeys(command) as string[]);
+  const binding = dataField(commandRecord, "binding") as RuntimeHandle["binding"];
+  const validationAtMs = commandStructuralValidationInstant(commandRecord, nowMs);
+  const validationHandle: RuntimeHandle = Object.freeze({
+    binding,
+    opaqueHandleRef: "supervisor-command-validation",
+    capabilities: Object.freeze({
+      isolatedExecution: true,
+      brokeredCredentials: true,
+      proxyOnlyEgress: true,
+      checkpoints: true,
+      yoloEligible: true,
+    }),
+  });
+  let snapshot: RuntimeCompensationCommand | undefined;
+  const validation = executeCapturedRuntimeCompensationCommand(
+    () => Promise.reject(new TypeError()),
+    validationHandle,
+    command,
+    (input) => {
+      snapshot = input.command;
+      return false;
+    },
+    () => validationAtMs,
+    () => false,
+    new AbortController().signal
+  );
+  void validation.catch(() => undefined);
+  if (!snapshot) throw new TypeError();
+  return snapshot;
+}
+
 function validateRenewal(
   delivery: RuntimeCompensationDelivery,
-  renewal: Extract<RuntimeCompensationRenewal, { kind: "renewed" }>,
+  value: RuntimeCompensationRenewal,
   renewedAtMs: number
-): RuntimeCompensationDelivery {
+): RuntimeCompensationDelivery | null {
+  let renewal: Record<string, unknown>;
+  try {
+    const snapshot = snapshotPortableData(value);
+    if (typeof snapshot !== "object" || snapshot === null || Array.isArray(snapshot)) {
+      throw new TypeError();
+    }
+    const kind = dataField(snapshot as Record<string, unknown>, "kind");
+    renewal = exactDataRecord(
+      snapshot,
+      kind === "expired-before-dispatch" ? ["kind"] : ["kind", "leaseExpiresAtMs"]
+    );
+    if (kind !== "renewed" && kind !== "expired-before-dispatch") throw new TypeError();
+  } catch {
+    throw new TypeError("Invalid Runtime compensation lease renewal");
+  }
+  if (dataField(renewal, "kind") === "expired-before-dispatch") return null;
+  const leaseExpiresAtMs = dataField(renewal, "leaseExpiresAtMs");
   if (
-    !Number.isSafeInteger(renewal.leaseExpiresAtMs) ||
-    renewal.leaseExpiresAtMs < delivery.leaseExpiresAtMs ||
-    renewal.leaseExpiresAtMs <= renewedAtMs
+    !Number.isSafeInteger(leaseExpiresAtMs) ||
+    (leaseExpiresAtMs as number) < delivery.leaseExpiresAtMs ||
+    (leaseExpiresAtMs as number) <= renewedAtMs
   ) {
     throw new TypeError("Invalid Runtime compensation lease renewal");
   }
-  return Object.freeze({ ...delivery, leaseExpiresAtMs: renewal.leaseExpiresAtMs });
+  return Object.freeze({
+    command: delivery.command,
+    attempt: delivery.attempt,
+    leaseOwner: delivery.leaseOwner,
+    leaseExpiresAtMs: leaseExpiresAtMs as number,
+    priorDispatchCertainty: delivery.priorDispatchCertainty,
+  });
 }
 
 function emptyRunResult(): RuntimeCompensationRunResult {
@@ -471,77 +605,4 @@ function reportOperationalError(
   } catch {
     // Observability must not terminate the supervisor loop.
   }
-}
-
-type BoundedOperationResult<T> =
-  | { readonly kind: "value"; readonly value: T }
-  | { readonly kind: "error"; readonly error: unknown }
-  | { readonly kind: "timeout" }
-  | { readonly kind: "aborted" };
-
-function boundedOperation<T>(
-  operation: (signal: AbortSignal) => Promise<T>,
-  timeoutMs: number,
-  parentSignal: AbortSignal
-): Promise<BoundedOperationResult<T>> {
-  return new Promise((resolve) => {
-    let settled = false;
-    const controller = new AbortController();
-    if (parentSignal.aborted) {
-      controller.abort();
-      resolve({ kind: "aborted" });
-      return;
-    }
-    const finish = (result: BoundedOperationResult<T>): void => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      parentSignal.removeEventListener("abort", abortFromParent);
-      resolve(result);
-    };
-    const abortFromParent = () => {
-      controller.abort();
-      finish({ kind: "aborted" });
-    };
-    parentSignal.addEventListener("abort", abortFromParent, { once: true });
-    const timer = setTimeout(() => {
-      controller.abort();
-      finish({ kind: "timeout" });
-    }, timeoutMs);
-    let pending: Promise<T>;
-    try {
-      pending = operation(controller.signal);
-    } catch (error) {
-      finish({ kind: "error", error });
-      return;
-    }
-    Promise.resolve(pending).then(
-      (value) => finish({ kind: "value", value }),
-      (error: unknown) => finish({ kind: "error", error })
-    );
-  });
-}
-
-function linkAbortSignal(source: AbortSignal | undefined, target: AbortController): () => void {
-  if (!source) return () => undefined;
-  const abort = () => target.abort();
-  if (source.aborted) {
-    abort();
-    return () => undefined;
-  }
-  source.addEventListener("abort", abort, { once: true });
-  return () => source.removeEventListener("abort", abort);
-}
-
-function abortableDelay(milliseconds: number, signal: AbortSignal): Promise<void> {
-  if (signal.aborted) return Promise.resolve();
-  return new Promise((resolve) => {
-    const timer = setTimeout(done, milliseconds);
-    signal.addEventListener("abort", done, { once: true });
-    function done() {
-      clearTimeout(timer);
-      signal.removeEventListener("abort", done);
-      resolve();
-    }
-  });
 }

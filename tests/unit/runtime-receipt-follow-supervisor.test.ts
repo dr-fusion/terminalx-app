@@ -100,6 +100,45 @@ function supervisor(
 }
 
 describe("RuntimeReceiptFollowSupervisor", () => {
+  it("records a successful health heartbeat when a long poll cycle settles", async () => {
+    let nowMs = 100;
+    let releaseReconcile: (() => void) | undefined;
+    const journal: RuntimeReceiptFollowJournal = {
+      reconcile: () =>
+        new Promise<number>((resolve) => {
+          releaseReconcile = () => resolve(0);
+        }),
+      claim: () => null,
+      renew: () => ({ leaseExpiresAtMs: 1_200 }),
+      release: () => undefined,
+      settle: () => undefined,
+    };
+    const worker = new RuntimeReceiptFollowSupervisor({
+      journal,
+      transport: {
+        async *follow() {
+          return;
+        },
+      },
+      handles: { resolve: async () => HANDLE },
+      workerId: "worker-1",
+      clock: () => nowMs,
+      leaseDurationMs: 1_000,
+    });
+
+    const running = worker.runOnce();
+    expect(worker.health()).toMatchObject({ activeCycleStartedAtMs: 100 });
+    nowMs = 40_100;
+    releaseReconcile?.();
+    await expect(running).resolves.toMatchObject({ claimed: 0 });
+    expect(worker.health()).toEqual({
+      lastSuccessAtMs: 40_100,
+      lastErrorAtMs: null,
+      activeCycleStartedAtMs: null,
+      failureSinceSuccess: false,
+    });
+  });
+
   it("renews one exact lease, polls the receipt-only checkpoint, settles one item, and closes", async () => {
     const journal = new FakeJournal();
     const observation = Object.freeze({ kind: "runtime.lifecycle-receipt-observed" });
@@ -120,7 +159,8 @@ describe("RuntimeReceiptFollowSupervisor", () => {
       },
     };
 
-    await expect(supervisor(journal, transport).runOnce()).resolves.toEqual({
+    const worker = supervisor(journal, transport);
+    await expect(worker.runOnce()).resolves.toEqual({
       claimed: 1,
       settled: 1,
       empty: 0,
@@ -146,6 +186,12 @@ describe("RuntimeReceiptFollowSupervisor", () => {
       },
     ]);
     expect(journal.released).toEqual([]);
+    expect(worker.health()).toEqual({
+      lastSuccessAtMs: 100,
+      lastErrorAtMs: null,
+      activeCycleStartedAtMs: null,
+      failureSinceSuccess: false,
+    });
   });
 
   it("captures a data-property transport method before later replacement", async () => {
