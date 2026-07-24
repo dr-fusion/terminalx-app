@@ -13,7 +13,13 @@ import {
   type SessionCommand,
   type TeamSessions,
 } from "@/lib/team-sessions";
-import type { RuntimeLifecycleCommand, RuntimeLifecycleJournal } from "@/lib/runtime";
+import {
+  digestAggregateEnforcementProof,
+  commitRuntimeEffectRef,
+  digestRuntimeEnforcementSubject,
+  type RuntimeLifecycleCommand,
+  type RuntimeLifecycleJournal,
+} from "@/lib/runtime";
 import { digestRunPolicyDraft } from "@/lib/team-sessions/run-policy";
 import { createTestRuntimeCommandAuthorityIssuer } from "../helpers/runtime-authority";
 
@@ -27,6 +33,7 @@ const RUNTIME: ActorContext = {
   displayName: "Runtime Worker",
 };
 const unconfigured = { kind: "unconfigured" } as const;
+const EFFECT_ENFORCER_SET_DIGEST = "b".repeat(64);
 
 describe("Team Session Agent Runs", () => {
   let directory: string;
@@ -36,6 +43,7 @@ describe("Team Session Agent Runs", () => {
   let now: number;
   let sequence: number;
   let generated: number;
+  let runtimeAuthorizationGenerationOffset: number;
 
   beforeEach(async () => {
     directory = fs.mkdtempSync(path.join(os.tmpdir(), "terminalx-agent-runs-"));
@@ -43,6 +51,7 @@ describe("Team Session Agent Runs", () => {
     now = 2_000_000_000_000;
     sequence = 0;
     generated = 0;
+    runtimeAuthorizationGenerationOffset = 0;
     const kernel = createTeamSessionKernel({
       filename,
       clock: () => now,
@@ -51,6 +60,17 @@ describe("Team Session Agent Runs", () => {
         return `00000000-0000-4000-8000-${String(generated).padStart(12, "0")}`;
       },
       runtimeCommandAuthorityIssuer: createTestRuntimeCommandAuthorityIssuer(),
+      runtimeAuthorizationSnapshotSource: {
+        resolve: ({ runtimeAuthorizationGeneration }) => ({
+          generation: runtimeAuthorizationGeneration + runtimeAuthorizationGenerationOffset,
+          networkPolicyRef: "test-network-policy:v1",
+          networkPolicyDigest: "c".repeat(64),
+          credentialPolicyRef: "test-credential-policy:v1",
+          credentialPolicyDigest: "d".repeat(64),
+          effectEnforcerSetDigest: EFFECT_ENFORCER_SET_DIGEST,
+        }),
+      },
+      runtimeEnforcementProofVerifier: () => true,
     });
     sessions = kernel.teamSessions;
     runtimeJournal = kernel.runtimeLifecycleJournal;
@@ -180,11 +200,51 @@ describe("Team Session Agent Runs", () => {
     });
     expect(delivery?.command.kind).toBe(expectedKind);
     if (!delivery) throw new Error("Expected a Runtime lifecycle delivery");
-    await runtimeJournal.complete({
+    const requiredEffectEnforcerSetDigest = delivery.command.requiredEffectEnforcerSetDigest;
+    expect(requiredEffectEnforcerSetDigest).toBe(EFFECT_ENFORCER_SET_DIGEST);
+    if (!requiredEffectEnforcerSetDigest) {
+      throw new Error("Expected a trusted effect-enforcer-set digest");
+    }
+    const effectRef = `effect:${delivery.command.commandId}`;
+    const enforcementSubjectDigest = digestRuntimeEnforcementSubject({
+      version: 1,
+      commandId: delivery.command.commandId,
+      commandClaimsDigest: delivery.command.authority.claimsDigest,
+      binding: delivery.command.binding,
+      runtimeAuthorizationGeneration: delivery.command.runtimeAuthorizationGeneration,
+      requiredEffectEnforcerSetDigest,
+      effectRefCommitment: commitRuntimeEffectRef(effectRef),
+      enforcedFence: delivery.command.toRunStateVersion,
+    });
+    const proofPayload = {
+      generation: delivery.command.runtimeAuthorizationGeneration,
+      requiredEffectEnforcerSetDigest,
+      enforcementSubjectDigest,
+      acknowledgements: [
+        {
+          enforcerRef: "test-runtime-enforcer",
+          enforcerKind: "runtime" as const,
+          acknowledgementDigest: "e".repeat(64),
+        },
+      ],
+    };
+    const renewal = await runtimeJournal.renew({
       commandId: delivery.command.commandId,
       workerId: RUNTIME.userId,
       expectedAttempt: delivery.attempt,
       expectedLeaseExpiresAtMs: delivery.leaseExpiresAtMs,
+      leaseDurationMs: 30_000,
+      nowMs: now,
+    });
+    expect(renewal.kind).toBe("renewed");
+    if (renewal.kind !== "renewed") {
+      throw new Error("Expected the Runtime lifecycle dispatch interlock");
+    }
+    await runtimeJournal.complete({
+      commandId: delivery.command.commandId,
+      workerId: RUNTIME.userId,
+      expectedAttempt: delivery.attempt,
+      expectedLeaseExpiresAtMs: renewal.leaseExpiresAtMs,
       observedAtMs: now,
       outcome: {
         kind: "receipt",
@@ -193,8 +253,12 @@ describe("Team Session Agent Runs", () => {
           binding: delivery.command.binding,
           runtimeAuthorizationGeneration: delivery.command.runtimeAuthorizationGeneration,
           outcome: "enforced",
-          effectRef: `effect:${delivery.command.commandId}`,
+          effectRef,
           enforcedFence: delivery.command.toRunStateVersion,
+          aggregateEnforcementProof: {
+            ...proofPayload,
+            aggregateProofDigest: digestAggregateEnforcementProof(proofPayload),
+          },
         },
       },
     });
@@ -219,6 +283,29 @@ describe("Team Session Agent Runs", () => {
     });
   }
 
+  it("keeps lifecycle activation closed unless every trusted security seam is configured", () => {
+    expect(() =>
+      createTeamSessionKernel({
+        runtimeCommandAuthorityIssuer: createTestRuntimeCommandAuthorityIssuer(),
+      })
+    ).toThrow(/configured together/);
+  });
+
+  it("rejects an authorization epoch whose trusted snapshot generation mismatches its binding", async () => {
+    runtimeAuthorizationGenerationOffset = 1;
+    await enforceNextRuntime("runtime.session.ensure");
+    await expect(
+      dispatch(startInput() as unknown as Record<string, unknown>)
+    ).rejects.toMatchObject({ code: "conflict" } satisfies Partial<TeamSessionError>);
+
+    const db = new Database(filename, { readonly: true });
+    const epochCount = db
+      .prepare(`SELECT COUNT(*) AS count FROM runtime_authorization_epochs`)
+      .get() as { count: number };
+    db.close();
+    expect(epochCount.count).toBe(0);
+  });
+
   it("waits for Runtime enforcement, starts one durable Run, and projects its goals", async () => {
     await expect(
       dispatch(startInput() as unknown as Record<string, unknown>)
@@ -236,6 +323,33 @@ describe("Team Session Agent Runs", () => {
     });
     expect(started.events).toHaveLength(1);
     expect(started.events[0]?.type).toBe("run.runtime-command.requested");
+
+    const db = new Database(filename, { readonly: true });
+    const trustedDigests = db
+      .prepare(
+        `SELECT epoch.effect_enforcer_set_digest AS epoch_digest,
+                policy.required_effect_enforcer_set_digest AS policy_digest,
+                command.required_effect_enforcer_set_digest AS command_digest,
+                json_extract(
+                  command.command_json, '$.requiredEffectEnforcerSetDigest'
+                ) AS signed_command_digest,
+                json_extract(
+                  command.command_json, '$.policy.requiredEffectEnforcerSetDigest'
+                ) AS signed_policy_digest
+         FROM agent_runs run
+         JOIN runtime_authorization_epochs epoch
+           ON epoch.session_id = run.session_id
+          AND epoch.generation = run.runtime_authorization_generation
+         JOIN run_policy_revisions policy
+           ON policy.agent_run_id = run.id AND policy.revision = run.current_policy_revision
+         JOIN runtime_run_commands command ON command.id = run.start_command_id
+         WHERE run.id = ?`
+      )
+      .get(started.data.agentRunId) as Record<string, string>;
+    db.close();
+    expect(Object.values(trustedDigests)).toEqual(
+      Array.from({ length: 5 }, () => EFFECT_ENFORCER_SET_DIGEST)
+    );
 
     const state = await runState();
     expect(state).toMatchObject({
@@ -303,13 +417,15 @@ describe("Team Session Agent Runs", () => {
             limits_json, initial_goal_set_id, initial_goal_set_revision,
             project_ceiling_revision, project_ceiling_digest, runtime_assignment_id,
             runtime_assignment_generation, sandbox_id, sandbox_generation, runtime_principal_id,
-            runtime_authorization_generation, yolo_confirmation_ref, created_at_ms)
+            runtime_authorization_generation, required_effect_enforcer_set_digest,
+            yolo_confirmation_ref, created_at_ms)
          SELECT ?, session_id, revision, previous_revision, digest, policy_body_digest,
                 mode, completion_policy, scoped_external_policy_ref, scoped_external_rules_json,
                 limits_json, ?, initial_goal_set_revision,
                 project_ceiling_revision, project_ceiling_digest, runtime_assignment_id,
                 runtime_assignment_generation, sandbox_id, sandbox_generation, runtime_principal_id,
-                runtime_authorization_generation, yolo_confirmation_ref, created_at_ms
+                runtime_authorization_generation, required_effect_enforcer_set_digest,
+                yolo_confirmation_ref, created_at_ms
          FROM run_policy_revisions WHERE agent_run_id = ? AND revision = 1`
       ).run(terminalRunId, terminalGoalSetId, agentRunId);
     })();

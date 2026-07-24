@@ -135,6 +135,8 @@ export interface RunPolicyRevision extends RunPolicyDraft {
   readonly projectCeilingDigest: string;
   readonly binding: RuntimeBinding;
   readonly runtimeAuthorizationGeneration: number;
+  /** Immutable trusted authorization-epoch commitment, never supplied by Runtime. */
+  readonly requiredEffectEnforcerSetDigest: string;
   readonly yoloConfirmationRef?: string;
   readonly createdAtMs: number;
 }

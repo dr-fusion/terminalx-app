@@ -1,6 +1,7 @@
 import { describe, expect, expectTypeOf, it, vi } from "vitest";
 import {
   RuntimeCommandExecutionError,
+  commitRuntimeEffectRef,
   digestAggregateEnforcementProof,
   digestNonDuplicateRuntimeReceipt,
   executeRuntimeCommand,
@@ -14,6 +15,10 @@ import {
   type RuntimeReceipt,
 } from "@/lib/runtime";
 import { digestActionManifest } from "@/lib/runtime/action-policy";
+import {
+  digestRuntimeEnforcementSubject,
+  type RuntimeEnforcementProofVerifier,
+} from "@/lib/runtime/runtime-enforcement-proof";
 
 const binding = {
   teamId: "team-1",
@@ -44,6 +49,7 @@ const command = {
   binding,
   projectCeilingRevision: "ceiling-1",
   runtimeAuthorizationGeneration: 7,
+  requiredEffectEnforcerSetDigest: "b".repeat(64),
   causationId: "cause-1",
   actor: { kind: "human", actorRef: "user-1" },
   issuedAtMs: 50,
@@ -81,8 +87,42 @@ describe("Runtime command execution", () => {
     expect(Object.isFrozen(verification?.command)).toBe(true);
     expect(adapter.command).toHaveBeenCalledWith(
       expect.objectContaining({ binding }),
-      expect.objectContaining({ commandId: command.commandId, binding })
+      expect.objectContaining({ commandId: command.commandId, binding }),
+      expect.any(AbortSignal)
     );
+  });
+
+  it("propagates cancellation to Runtime and never accepts a response after abort", async () => {
+    const accepted = receipt({ outcome: "accepted", effectRef: "effect-1" });
+    const adapter = runtimeReturning(accepted);
+    let receivedSignal: AbortSignal | undefined;
+    let releaseProvider: ((receipt: RuntimeReceipt) => void) | undefined;
+    vi.mocked(adapter.command).mockImplementationOnce(
+      (_handle, _command, signal) =>
+        new Promise<RuntimeReceipt>((resolve) => {
+          receivedSignal = signal;
+          releaseProvider = resolve;
+        })
+    );
+    const controller = new AbortController();
+
+    const execution = executeRuntimeCommand(
+      adapter,
+      handle,
+      command,
+      () => true,
+      () => 100,
+      undefined,
+      controller.signal
+    );
+    await vi.waitFor(() => expect(receivedSignal).toBe(controller.signal));
+    controller.abort();
+    releaseProvider?.(accepted);
+
+    await expect(execution).rejects.toEqual(
+      new RuntimeCommandExecutionError("runtime_command_failed")
+    );
+    expect(receivedSignal?.aborted).toBe(true);
   });
 
   it("rejects handle and receipt binding mismatches", async () => {
@@ -233,7 +273,8 @@ describe("Runtime command execution", () => {
       expect.objectContaining({
         commandId: command.commandId,
         binding: expect.objectContaining({ sandboxId: binding.sandboxId }),
-      })
+      }),
+      expect.any(AbortSignal)
     );
   });
 
@@ -270,6 +311,8 @@ describe("Runtime command execution", () => {
   it("validates exact lifecycle fields, enums, literal true, and positive generations", async () => {
     const missingPolicyRevision = structuredClone(command) as unknown as Record<string, unknown>;
     delete missingPolicyRevision.runPolicyRevision;
+    const missingEnforcerSet = structuredClone(command) as unknown as Record<string, unknown>;
+    delete missingEnforcerSet.requiredEffectEnforcerSetDigest;
     const { reason: _pauseReason, ...lifecycleBase } = command;
     const invalidCommands: RuntimePostStartLifecycleCommand[] = [
       asPostStart({ ...command, reason: "later" }),
@@ -287,6 +330,8 @@ describe("Runtime command execution", () => {
         unexpected: true,
       }),
       asPostStart(missingPolicyRevision),
+      asPostStart(missingEnforcerSet),
+      asPostStart({ ...command, requiredEffectEnforcerSetDigest: "B".repeat(64) }),
       asPostStart({ ...command, runtimeAuthorizationGeneration: 0 }),
       asPostStart({
         ...command,
@@ -575,26 +620,48 @@ describe("Runtime command execution", () => {
   });
 
   it("requires a lifecycle enforced receipt to advance the exact Run-state fence", async () => {
+    const aggregateEnforcementProof = proof(command.runtimeAuthorizationGeneration);
     const enforced = receipt({
       outcome: "enforced",
       effectRef: "effect-1",
       enforcedFence: command.toRunStateVersion,
-      aggregateEnforcementProof: proof(command.runtimeAuthorizationGeneration),
+      aggregateEnforcementProof,
     });
+    const verifyEnforcementProof = vi.fn<RuntimeEnforcementProofVerifier>(() => true);
     await expect(
       executeRuntimeCommand(
         runtimeReturning(enforced),
         handle,
         command,
         () => true,
-        () => 100
+        () => 100,
+        verifyEnforcementProof
       )
     ).resolves.toEqual(enforced);
+    expect(verifyEnforcementProof).toHaveBeenCalledWith({
+      subject: {
+        version: 1,
+        commandId: command.commandId,
+        commandClaimsDigest: command.authority.claimsDigest,
+        binding,
+        runtimeAuthorizationGeneration: command.runtimeAuthorizationGeneration,
+        requiredEffectEnforcerSetDigest: command.requiredEffectEnforcerSetDigest,
+        effectRefCommitment: commitRuntimeEffectRef("effect-1"),
+        enforcedFence: command.toRunStateVersion,
+      },
+      subjectDigest: aggregateEnforcementProof.enforcementSubjectDigest,
+      proof: aggregateEnforcementProof,
+    });
 
     const staleFence = receipt({
       outcome: "enforced",
       effectRef: "effect-1",
       enforcedFence: command.fromRunStateVersion,
+      aggregateEnforcementProof: proof(
+        command.runtimeAuthorizationGeneration,
+        "effect-1",
+        command.fromRunStateVersion
+      ),
     });
     await expect(
       executeRuntimeCommand(
@@ -607,12 +674,83 @@ describe("Runtime command execution", () => {
     ).rejects.toMatchObject({ code: "invalid_receipt" });
   });
 
+  it("always hashes a provider ref even when its text has commitment syntax", async () => {
+    const providerRef = commitRuntimeEffectRef("effect-1");
+    const aggregateEnforcementProof = proof(command.runtimeAuthorizationGeneration, providerRef);
+    const verifyEnforcementProof = vi.fn<RuntimeEnforcementProofVerifier>(() => true);
+
+    await expect(
+      executeRuntimeCommand(
+        runtimeReturning(
+          receipt({
+            outcome: "enforced",
+            effectRef: providerRef,
+            enforcedFence: command.toRunStateVersion,
+            aggregateEnforcementProof,
+          })
+        ),
+        handle,
+        command,
+        () => true,
+        () => 100,
+        verifyEnforcementProof
+      )
+    ).resolves.toMatchObject({ effectRef: providerRef });
+
+    expect(verifyEnforcementProof.mock.calls[0]?.[0].subject.effectRefCommitment).toBe(
+      commitRuntimeEffectRef(providerRef)
+    );
+    expect(commitRuntimeEffectRef(providerRef)).not.toBe(providerRef);
+  });
+
+  it("fails closed when an enforced result has no trusted proof decision", async () => {
+    const enforced = receipt({
+      outcome: "enforced",
+      effectRef: "effect-1",
+      enforcedFence: command.toRunStateVersion,
+      aggregateEnforcementProof: proof(command.runtimeAuthorizationGeneration),
+    });
+    const noVerifierRuntime = runtimeReturning(enforced);
+    await expect(
+      executeRuntimeCommand(
+        noVerifierRuntime,
+        handle,
+        command,
+        () => true,
+        () => 100
+      )
+    ).rejects.toMatchObject({
+      code: "enforcement_proof_verification_failed",
+      dispatchCertainty: "dispatch-uncertain",
+    });
+    expect(noVerifierRuntime.command).toHaveBeenCalledTimes(1);
+
+    const secret = "enforcer-private-key-material";
+    for (const verifier of [() => false, () => Promise.reject(new Error(secret))]) {
+      const failure = executeRuntimeCommand(
+        runtimeReturning(enforced),
+        handle,
+        command,
+        () => true,
+        () => 100,
+        verifier
+      );
+      await expect(failure).rejects.toEqual(
+        new RuntimeCommandExecutionError("enforcement_proof_verification_failed")
+      );
+      await failure.catch((error: unknown) => {
+        expect(JSON.stringify(error)).not.toContain(secret);
+        expect(String(error)).not.toContain(secret);
+      });
+    }
+  });
+
   it("accepts a duplicate only with its complete original receipt and canonical digest", async () => {
     const original = receipt({
       outcome: "enforced",
       effectRef: "effect-original",
       enforcedFence: command.toRunStateVersion,
-      aggregateEnforcementProof: proof(command.runtimeAuthorizationGeneration),
+      aggregateEnforcementProof: proof(command.runtimeAuthorizationGeneration, "effect-original"),
     });
     const duplicate = {
       commandId: command.commandId,
@@ -623,12 +761,14 @@ describe("Runtime command execution", () => {
       originalReceiptDigest: digestNonDuplicateRuntimeReceipt(original),
     } as const satisfies RuntimeReceipt;
 
+    const verifyEnforcementProof = vi.fn<RuntimeEnforcementProofVerifier>(() => true);
     const result = await executeRuntimeCommand(
       runtimeReturning(duplicate),
       handle,
       command,
       () => true,
-      () => 100
+      () => 100,
+      verifyEnforcementProof
     );
     expect(result).not.toBe(duplicate);
     expect(result).toMatchObject({
@@ -636,8 +776,14 @@ describe("Runtime command execution", () => {
       originalReceipt: {
         outcome: "enforced",
         enforcedFence: command.toRunStateVersion,
-        aggregateEnforcementProof: proof(command.runtimeAuthorizationGeneration),
+        aggregateEnforcementProof: proof(command.runtimeAuthorizationGeneration, "effect-original"),
       },
+    });
+    expect(verifyEnforcementProof).toHaveBeenCalledTimes(1);
+    expect(verifyEnforcementProof.mock.calls[0]?.[0].subject).toMatchObject({
+      commandId: command.commandId,
+      effectRefCommitment: commitRuntimeEffectRef("effect-original"),
+      enforcedFence: command.toRunStateVersion,
     });
 
     expectTypeOf(duplicate.originalReceipt).toMatchTypeOf<NonDuplicateRuntimeReceipt>();
@@ -648,7 +794,7 @@ describe("Runtime command execution", () => {
       outcome: "enforced",
       effectRef: "effect-original",
       enforcedFence: command.toRunStateVersion,
-      aggregateEnforcementProof: proof(command.runtimeAuthorizationGeneration),
+      aggregateEnforcementProof: proof(command.runtimeAuthorizationGeneration, "effect-original"),
     });
     const badDigest = {
       commandId: command.commandId,
@@ -684,6 +830,35 @@ describe("Runtime command execution", () => {
       )
     ).rejects.toMatchObject({ code: "invalid_receipt" });
 
+    const verifier = vi.fn<RuntimeEnforcementProofVerifier>(() => true);
+    for (const mismatchedSubjectProof of [
+      proof(command.runtimeAuthorizationGeneration, "effect-other"),
+      proof(
+        command.runtimeAuthorizationGeneration,
+        "effect-1",
+        command.toRunStateVersion,
+        "d".repeat(64)
+      ),
+    ]) {
+      const mismatchedSubject = receipt({
+        outcome: "enforced",
+        effectRef: "effect-1",
+        enforcedFence: command.toRunStateVersion,
+        aggregateEnforcementProof: mismatchedSubjectProof,
+      });
+      await expect(
+        executeRuntimeCommand(
+          runtimeReturning(mismatchedSubject),
+          handle,
+          command,
+          () => true,
+          () => 100,
+          verifier
+        )
+      ).rejects.toMatchObject({ code: "invalid_receipt" });
+    }
+    expect(verifier).not.toHaveBeenCalled();
+
     const internallyConflictingProof = proof(command.runtimeAuthorizationGeneration);
     const changedAcknowledgement = {
       ...internallyConflictingProof,
@@ -717,6 +892,16 @@ describe("Runtime command execution", () => {
       aggregateEnforcementProof: {
         generation: command.runtimeAuthorizationGeneration,
         requiredEffectEnforcerSetDigest: "b".repeat(64),
+        enforcementSubjectDigest: digestRuntimeEnforcementSubject({
+          version: 1,
+          commandId: command.commandId,
+          commandClaimsDigest: command.authority.claimsDigest,
+          binding,
+          runtimeAuthorizationGeneration: command.runtimeAuthorizationGeneration,
+          requiredEffectEnforcerSetDigest: command.requiredEffectEnforcerSetDigest,
+          effectRefCommitment: commitRuntimeEffectRef("effect-1"),
+          enforcedFence: command.toRunStateVersion,
+        }),
         acknowledgements: [],
         aggregateProofDigest: "d".repeat(64),
       },
@@ -917,6 +1102,7 @@ function startCommand(): Extract<RuntimeLifecycleCommand, { kind: "run.start" }>
       projectCeilingDigest: "4".repeat(64),
       binding,
       runtimeAuthorizationGeneration: command.runtimeAuthorizationGeneration,
+      requiredEffectEnforcerSetDigest: command.requiredEffectEnforcerSetDigest,
       createdAtMs: command.issuedAtMs,
     },
   } as const satisfies Extract<RuntimeLifecycleCommand, { kind: "run.start" }>;
@@ -1020,10 +1206,26 @@ function receipt(
   } as NonDuplicateRuntimeReceipt;
 }
 
-function proof(generation: number) {
+function proof(
+  generation: number,
+  effectRef = "effect-1",
+  enforcedFence: number = command.toRunStateVersion,
+  requiredEffectEnforcerSetDigest = command.requiredEffectEnforcerSetDigest
+) {
+  const enforcementSubjectDigest = digestRuntimeEnforcementSubject({
+    version: 1,
+    commandId: command.commandId,
+    commandClaimsDigest: command.authority.claimsDigest,
+    binding,
+    runtimeAuthorizationGeneration: generation,
+    requiredEffectEnforcerSetDigest,
+    effectRefCommitment: commitRuntimeEffectRef(effectRef),
+    enforcedFence,
+  });
   const content = {
     generation,
-    requiredEffectEnforcerSetDigest: "b".repeat(64),
+    requiredEffectEnforcerSetDigest,
+    enforcementSubjectDigest,
     acknowledgements: [
       {
         enforcerRef: "runtime-enforcer-1",

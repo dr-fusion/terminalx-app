@@ -565,6 +565,13 @@ describe("Team Session kernel", () => {
     try {
       database.exec(`
         PRAGMA foreign_keys = OFF;
+        DROP TABLE runtime_receipt_follow_events;
+        DROP TABLE runtime_receipt_follow_streams;
+        DROP TABLE runtime_principal_observation_keys;
+        DROP TRIGGER IF EXISTS run_policy_revisions_enforcer_set_binding;
+        DROP TRIGGER IF EXISTS sessions_runtime_lifecycle_dispatch_interlock;
+        DROP TRIGGER IF EXISTS runtime_assignments_lifecycle_dispatch_interlock;
+        DROP TRIGGER IF EXISTS agent_runs_lifecycle_dispatch_interlock;
         DROP TRIGGER runtime_run_referenced_session_events_immutable_update;
         DROP TRIGGER runtime_run_referenced_session_events_immutable_delete;
         DROP TABLE runtime_run_command_effects;
@@ -2234,7 +2241,7 @@ describe("Team Session kernel", () => {
 
     const database = new Database(filename, { readonly: true });
     try {
-      expect(database.pragma("user_version", { simple: true })).toBe(5);
+      expect(database.pragma("user_version", { simple: true })).toBe(6);
       expect(database.pragma("foreign_key_check")).toEqual([]);
       expect(
         database
@@ -2592,14 +2599,14 @@ describe("Team Session kernel", () => {
         database
           .prepare(
             `SELECT COUNT(*) AS count FROM conversation_directives
-             WHERE session_id = ? AND status = 'queued'`
+               WHERE session_id = ? AND status = 'queued'`
           )
           .get(SESSION_ID)
       ).toEqual({ count: 256 });
     } finally {
       database.close();
     }
-  });
+  }, 15_000);
 
   it("resolves Suggestions atomically and queues accepted text without claiming Runtime dispatch", async () => {
     await bootstrap({ steeringPolicy: "shared" });

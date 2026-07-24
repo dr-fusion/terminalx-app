@@ -132,6 +132,12 @@ interface RuntimeCommandBase<Capability extends RuntimeCapability> {
   readonly binding: RuntimeBinding;
   readonly projectCeilingRevision: string;
   readonly runtimeAuthorizationGeneration: number;
+  /**
+   * Trusted authorization-snapshot commitment signed as part of the command
+   * claims. Optional only for legacy construction compatibility; the production
+   * lifecycle executor rejects a command that omits it.
+   */
+  readonly requiredEffectEnforcerSetDigest?: string;
   readonly causationId: string;
   readonly actor: { readonly kind: "human" | "system"; readonly actorRef: string };
   readonly issuedAtMs: number;
@@ -319,6 +325,8 @@ export type RuntimePostStartLifecycleCommand = Extract<
 export interface AggregateEnforcementProof {
   readonly generation: number;
   readonly requiredEffectEnforcerSetDigest: string;
+  /** Domain-separated digest of the exact signed command and observed effect. */
+  readonly enforcementSubjectDigest: string;
   readonly acknowledgements: ReadonlyArray<{
     readonly enforcerRef: string;
     readonly enforcerKind:
@@ -331,9 +339,8 @@ export interface AggregateEnforcementProof {
     readonly acknowledgementDigest: string;
   }>;
   /**
-   * Internal canonical integrity digest. A consumer must still bind
-   * `requiredEffectEnforcerSetDigest` to its trusted authorization snapshot
-   * before treating the proof as an authoritative cross-enforcer attestation.
+   * Internal canonical integrity digest. Consumers must additionally require a
+   * trusted verifier to authenticate the acknowledgements before enforcement.
    */
   readonly aggregateProofDigest: string;
 }
@@ -352,6 +359,10 @@ export type NonDuplicateRuntimeReceipt = RuntimeReceiptBase &
         readonly outcome: "enforced";
         readonly effectRef: string;
         readonly enforcedFence: number;
+        /**
+         * Optional only for persisted/provider compatibility. The production
+         * lifecycle execution boundary rejects enforcement without this proof.
+         */
         readonly aggregateEnforcementProof?: AggregateEnforcementProof;
       }
     | {
@@ -661,7 +672,16 @@ export interface RuntimeRetireRequest {
 /** Deep Runtime Interface. Provider-native identifiers and credentials stay behind this Seam. */
 export interface Runtime {
   ensure(spec: RuntimeSpec): Promise<RuntimeHandle>;
-  command(handle: RuntimeHandle, command: RuntimeCommand): Promise<RuntimeReceipt>;
+  /**
+   * Adapters must propagate cancellation to the underlying transport and stop
+   * initiating new effects as soon as the signal aborts. An abort never proves
+   * that an already-dispatched effect did not occur.
+   */
+  command(
+    handle: RuntimeHandle,
+    command: RuntimeCommand,
+    signal: AbortSignal
+  ): Promise<RuntimeReceipt>;
   follow(handle: RuntimeHandle, cursor?: RuntimeCursor): AsyncIterable<RuntimeEvent>;
   retire(handle: RuntimeHandle, request: RuntimeRetireRequest): Promise<void>;
 }

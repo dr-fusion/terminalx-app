@@ -13,6 +13,19 @@ import {
   type ActionManifest as DigestibleActionManifest,
 } from "./action-policy";
 import { assertRuntimeCommandAuthorityBinding } from "./runtime-authority";
+import {
+  commitRuntimeEffectRef,
+  RuntimeEnforcementProofError,
+  snapshotAggregateEnforcementProof,
+  snapshotPersistedRuntimeEffectRefCommitment,
+  snapshotRuntimeEnforcementProofVerificationInput,
+  verifyRuntimeEnforcementProof,
+  type RuntimeEnforcementProofVerifier,
+  type RuntimeEnforcementSubject,
+  type SynchronousRuntimeEnforcementProofVerifier,
+} from "./runtime-enforcement-proof";
+
+export { digestAggregateEnforcementProof } from "./runtime-enforcement-proof";
 
 const SHA256 = /^[0-9a-f]{64}$/;
 const SAFE_REF = /^[^\u0000-\u001f\u007f]{1,300}$/;
@@ -20,7 +33,6 @@ const MAX_SNAPSHOT_DEPTH = 32;
 const MAX_SNAPSHOT_NODES = 20_000;
 const MAX_SNAPSHOT_FIELDS = 1_000;
 const MAX_SNAPSHOT_STRING_BYTES = 1_000_000;
-const AGGREGATE_PROOF_DIGEST_DOMAIN = "terminalx/runtime-aggregate-enforcement-proof/v1\0";
 
 const LIFECYCLE_KINDS = new Set<RuntimeLifecycleCommand["kind"]>([
   "run.start",
@@ -35,6 +47,7 @@ const COMMAND_BASE_FIELDS = [
   "binding",
   "projectCeilingRevision",
   "runtimeAuthorizationGeneration",
+  "requiredEffectEnforcerSetDigest",
   "causationId",
   "actor",
   "issuedAtMs",
@@ -85,15 +98,6 @@ const QUARANTINE_REASONS = new Set([
   "kill_failure",
 ]);
 
-const ENFORCER_KINDS = new Set([
-  "runtime",
-  "credential-proxy",
-  "source-control",
-  "deployment",
-  "signer",
-  "other-effect-enforcer",
-]);
-
 export type RuntimeCommandExecutionErrorCode =
   | "invalid_input"
   | "invalid_authority"
@@ -101,7 +105,8 @@ export type RuntimeCommandExecutionErrorCode =
   | "binding_mismatch"
   | "deadline_expired"
   | "runtime_command_failed"
-  | "invalid_receipt";
+  | "invalid_receipt"
+  | "enforcement_proof_verification_failed";
 
 /**
  * Whether the control plane can prove that the portable Runtime command did
@@ -118,6 +123,7 @@ const SAFE_ERROR_MESSAGES: Readonly<Record<RuntimeCommandExecutionErrorCode, str
   deadline_expired: "Runtime command deadline has expired",
   runtime_command_failed: "Runtime command execution failed",
   invalid_receipt: "Runtime returned an invalid receipt",
+  enforcement_proof_verification_failed: "Runtime enforcement proof could not be verified",
 };
 
 const DISPATCH_CERTAINTY: Readonly<
@@ -130,6 +136,7 @@ const DISPATCH_CERTAINTY: Readonly<
   deadline_expired: "not-dispatched",
   runtime_command_failed: "dispatch-uncertain",
   invalid_receipt: "dispatch-uncertain",
+  enforcement_proof_verification_failed: "dispatch-uncertain",
 };
 
 /** Safe error surface: provider and verifier failures are never attached as causes. */
@@ -156,11 +163,10 @@ export type RuntimeAuthorityVerifier = (
 
 export type RuntimeCommandClock = () => number;
 
-type AggregateEnforcementProofDigestInput = Omit<AggregateEnforcementProof, "aggregateProofDigest">;
-
 type RuntimeDispatch = (
   handle: RuntimeHandle,
-  command: RuntimeLifecycleCommand
+  command: RuntimeLifecycleCommand,
+  signal: AbortSignal
 ) => Promise<RuntimeReceipt>;
 
 /**
@@ -174,11 +180,16 @@ export async function executeRuntimeCommand(
   handle: RuntimeHandle,
   command: RuntimeLifecycleCommand,
   verifyAuthority: RuntimeAuthorityVerifier,
-  clock: RuntimeCommandClock
+  clock: RuntimeCommandClock,
+  verifyEnforcementProof?: RuntimeEnforcementProofVerifier,
+  runtimeCommandSignal?: AbortSignal
 ): Promise<RuntimeReceipt> {
   if (typeof verifyAuthority !== "function" || typeof clock !== "function") {
     fail("invalid_input");
   }
+  const dispatchSignal = runtimeCommandSignal ?? new AbortController().signal;
+  if (!isNativeAbortSignal(dispatchSignal)) fail("invalid_input");
+  if (dispatchSignal.aborted) fail("runtime_command_failed");
 
   const handleSnapshot = snapshotPortable(handle, "invalid_input");
   const commandSnapshot = snapshotPortable(command, "invalid_input");
@@ -202,20 +213,133 @@ export async function executeRuntimeCommand(
   const dispatchNowMs = sampleClock(clock);
   if (dispatchNowMs < initialNowMs) fail("invalid_input");
   validateTemporalWindow(preflight.temporal, dispatchNowMs);
+  // A timed-out authority verifier must never resume later and dispatch.
+  if (dispatchSignal.aborted) fail("runtime_command_failed");
 
   let providerReceipt: RuntimeReceipt;
   try {
-    providerReceipt = await dispatch(handleSnapshot, commandSnapshot);
+    providerReceipt = await dispatch(handleSnapshot, commandSnapshot, dispatchSignal);
   } catch {
     fail("runtime_command_failed");
   }
+  // A response racing the deadline cannot restore certainty after cancellation.
+  if (dispatchSignal.aborted) fail("runtime_command_failed");
 
-  return snapshotRuntimeReceiptForCommand(providerReceipt, {
-    commandId: preflight.commandId,
-    binding: preflight.binding,
-    runtimeAuthorizationGeneration: preflight.authorizationGeneration,
-    toRunStateVersion: preflight.lifecycleFence,
-  });
+  const receipt = snapshotRuntimeReceiptForCommand(providerReceipt, commandSnapshot);
+  await verifyRuntimeReceiptEnforcementProof(commandSnapshot, receipt, verifyEnforcementProof);
+  return receipt;
+}
+
+/**
+ * Authenticate any enforced effective receipt against the exact signed command.
+ * Journals and late-receipt reconcilers reuse this boundary so direct settlement
+ * cannot bypass the executor's trust decision.
+ */
+export async function verifyRuntimeReceiptEnforcementProof(
+  command: RuntimeLifecycleCommand,
+  receipt: RuntimeReceipt,
+  verifyEnforcementProof?: RuntimeEnforcementProofVerifier
+): Promise<void> {
+  const enforcedReceipt = unwrapEnforcedReceipt(receipt);
+  if (!enforcedReceipt) return;
+  const aggregateEnforcementProof = enforcedReceipt.aggregateEnforcementProof;
+  if (!aggregateEnforcementProof) fail("invalid_receipt");
+  if (typeof verifyEnforcementProof !== "function") {
+    fail("enforcement_proof_verification_failed");
+  }
+  try {
+    await verifyRuntimeEnforcementProof(
+      runtimeEnforcementSubject(command, enforcedReceipt),
+      aggregateEnforcementProof,
+      verifyEnforcementProof
+    );
+  } catch (error) {
+    if (
+      error instanceof RuntimeEnforcementProofError &&
+      (error.code === "invalid_subject" || error.code === "invalid_proof")
+    ) {
+      fail("invalid_receipt");
+    }
+    fail("enforcement_proof_verification_failed");
+  }
+}
+
+/**
+ * Synchronous variant for an already-open SQLite settlement transaction.
+ * Asynchronous verifiers fail closed; production follow composition must keep
+ * its authenticated enforcer manifest and attestation ledger locally available.
+ */
+export function verifyRuntimeReceiptEnforcementProofSynchronously(
+  command: RuntimeLifecycleCommand,
+  receipt: RuntimeReceipt,
+  verifyEnforcementProof?: SynchronousRuntimeEnforcementProofVerifier
+): void {
+  verifyRuntimeReceiptEnforcementProofSynchronouslyByEffectRefForm(
+    command,
+    receipt,
+    verifyEnforcementProof,
+    "raw-provider"
+  );
+}
+
+/**
+ * Re-authenticate a durable receipt whose effect references were already
+ * committed by this journal. This explicit interface is the only path that
+ * treats an effectRef as a commitment; provider receipts must use the raw path.
+ */
+export function verifyPersistedRuntimeReceiptEnforcementProofSynchronously(
+  command: RuntimeLifecycleCommand,
+  persistedReceipt: RuntimeReceipt,
+  verifyEnforcementProof?: SynchronousRuntimeEnforcementProofVerifier
+): void {
+  const receiptSnapshot = snapshotRuntimeReceiptForCommandByEffectRefForm(
+    persistedReceipt,
+    command,
+    "persisted-commitment"
+  );
+  verifyRuntimeReceiptEnforcementProofSynchronouslyByEffectRefForm(
+    command,
+    receiptSnapshot,
+    verifyEnforcementProof,
+    "persisted-commitment"
+  );
+}
+
+function verifyRuntimeReceiptEnforcementProofSynchronouslyByEffectRefForm(
+  command: RuntimeLifecycleCommand,
+  receipt: RuntimeReceipt,
+  verifyEnforcementProof: SynchronousRuntimeEnforcementProofVerifier | undefined,
+  effectRefForm: RuntimeReceiptEffectRefForm
+): void {
+  const enforcedReceipt = unwrapEnforcedReceipt(receipt);
+  if (!enforcedReceipt) return;
+  const aggregateEnforcementProof = enforcedReceipt.aggregateEnforcementProof;
+  if (!aggregateEnforcementProof) fail("invalid_receipt");
+  if (typeof verifyEnforcementProof !== "function") {
+    fail("enforcement_proof_verification_failed");
+  }
+  let input: ReturnType<typeof snapshotRuntimeEnforcementProofVerificationInput>;
+  try {
+    input = snapshotRuntimeEnforcementProofVerificationInput(
+      runtimeEnforcementSubject(command, enforcedReceipt, effectRefForm),
+      aggregateEnforcementProof
+    );
+  } catch {
+    fail("invalid_receipt");
+  }
+  let verified: unknown;
+  try {
+    verified = verifyEnforcementProof(input);
+  } catch {
+    fail("enforcement_proof_verification_failed");
+  }
+  if (verified !== true) {
+    // The SQLite follow boundary cannot suspend its transaction. Fail closed,
+    // but consume an async/thenable verifier's eventual rejection so this safe
+    // classification cannot also become an unhandled process-level failure.
+    void Promise.resolve(verified).catch(() => undefined);
+    fail("enforcement_proof_verification_failed");
+  }
 }
 
 /**
@@ -228,16 +352,46 @@ export function snapshotRuntimeReceiptForCommand(
   receipt: RuntimeReceipt,
   expected: Pick<
     RuntimeLifecycleCommand,
-    "commandId" | "binding" | "runtimeAuthorizationGeneration" | "toRunStateVersion"
+    | "commandId"
+    | "binding"
+    | "runtimeAuthorizationGeneration"
+    | "requiredEffectEnforcerSetDigest"
+    | "toRunStateVersion"
+    | "authority"
   >
 ): RuntimeReceipt {
+  return snapshotRuntimeReceiptForCommandByEffectRefForm(receipt, expected, "raw-provider");
+}
+
+function snapshotRuntimeReceiptForCommandByEffectRefForm(
+  receipt: RuntimeReceipt,
+  expected: Pick<
+    RuntimeLifecycleCommand,
+    | "commandId"
+    | "binding"
+    | "runtimeAuthorizationGeneration"
+    | "requiredEffectEnforcerSetDigest"
+    | "toRunStateVersion"
+    | "authority"
+  >,
+  effectRefForm: RuntimeReceiptEffectRefForm
+): RuntimeReceipt {
   const receiptSnapshot = snapshotPortable(receipt, "invalid_receipt");
-  validateReceipt(receiptSnapshot, {
-    commandId: expected.commandId,
-    binding: expected.binding,
-    authorizationGeneration: expected.runtimeAuthorizationGeneration,
-    lifecycleFence: expected.toRunStateVersion,
-  });
+  validateReceipt(
+    receiptSnapshot,
+    {
+      commandId: expected.commandId,
+      binding: expected.binding,
+      authorizationGeneration: expected.runtimeAuthorizationGeneration,
+      lifecycleFence: expected.toRunStateVersion,
+      requiredEffectEnforcerSetDigest: sha256(
+        expected.requiredEffectEnforcerSetDigest,
+        "invalid_receipt"
+      ),
+      commandClaimsDigest: sha256(expected.authority.claimsDigest, "invalid_receipt"),
+    },
+    effectRefForm
+  );
   return receiptSnapshot;
 }
 
@@ -248,16 +402,38 @@ export function digestNonDuplicateRuntimeReceipt(receipt: NonDuplicateRuntimeRec
   return sha256Canonical(snapshot);
 }
 
-/** Canonical internal-integrity digest for an aggregate proof's exact contents. */
-export function digestAggregateEnforcementProof(
-  proof: AggregateEnforcementProofDigestInput
-): string {
-  const snapshot = snapshotPortable(proof, "invalid_receipt");
-  validateAggregateProofPayload(snapshot);
-  return createHash("sha256")
-    .update(AGGREGATE_PROOF_DIGEST_DOMAIN, "utf8")
-    .update(canonicalJson(snapshot), "utf8")
-    .digest("hex");
+type EnforcedRuntimeReceipt = Extract<NonDuplicateRuntimeReceipt, { outcome: "enforced" }>;
+type RuntimeReceiptEffectRefForm = "raw-provider" | "persisted-commitment";
+
+function unwrapEnforcedReceipt(receipt: RuntimeReceipt): EnforcedRuntimeReceipt | undefined {
+  if (receipt.outcome === "enforced") return receipt;
+  if (receipt.outcome === "duplicate" && receipt.originalReceipt.outcome === "enforced") {
+    return receipt.originalReceipt;
+  }
+  return undefined;
+}
+
+function runtimeEnforcementSubject(
+  command: RuntimeLifecycleCommand,
+  receipt: EnforcedRuntimeReceipt,
+  effectRefForm: RuntimeReceiptEffectRefForm = "raw-provider"
+): RuntimeEnforcementSubject {
+  return {
+    version: 1,
+    commandId: command.commandId,
+    commandClaimsDigest: sha256(command.authority.claimsDigest, "invalid_receipt"),
+    binding: command.binding,
+    runtimeAuthorizationGeneration: command.runtimeAuthorizationGeneration,
+    requiredEffectEnforcerSetDigest: sha256(
+      command.requiredEffectEnforcerSetDigest,
+      "invalid_receipt"
+    ),
+    effectRefCommitment:
+      effectRefForm === "raw-provider"
+        ? commitRuntimeEffectRef(receipt.effectRef)
+        : snapshotPersistedRuntimeEffectRefCommitment(receipt.effectRef),
+    enforcedFence: receipt.enforcedFence,
+  };
 }
 
 interface TemporalWindow {
@@ -319,6 +495,10 @@ function preflightCommand(
     dataField(commandRecord, "runtimeAuthorizationGeneration", "invalid_input"),
     "invalid_input"
   );
+  const requiredEffectEnforcerSetDigest = sha256(
+    dataField(commandRecord, "requiredEffectEnforcerSetDigest", "invalid_input"),
+    "invalid_input"
+  );
   const agentRunId = safeRef(
     dataField(commandRecord, "agentRunId", "invalid_input"),
     "invalid_input"
@@ -347,6 +527,7 @@ function preflightCommand(
       agentRunId,
       runPolicyRevision,
       projectCeilingRevision,
+      requiredEffectEnforcerSetDigest,
     });
   }
 
@@ -477,6 +658,7 @@ interface StartCommandValidationContext {
   readonly agentRunId: string;
   readonly runPolicyRevision: number;
   readonly projectCeilingRevision: string;
+  readonly requiredEffectEnforcerSetDigest: string;
 }
 
 function validateStartCommandPayload(
@@ -501,6 +683,7 @@ function validateStartCommandPayload(
       "projectCeilingDigest",
       "binding",
       "runtimeAuthorizationGeneration",
+      "requiredEffectEnforcerSetDigest",
       "createdAtMs",
     ],
     ["previousRevision", "yoloConfirmationRef"]
@@ -516,7 +699,11 @@ function validateStartCommandPayload(
     positiveInteger(
       dataField(policy, "runtimeAuthorizationGeneration", "invalid_input"),
       "invalid_input"
-    ) !== context.authorizationGeneration
+    ) !== context.authorizationGeneration ||
+    sha256(
+      dataField(policy, "requiredEffectEnforcerSetDigest", "invalid_input"),
+      "invalid_input"
+    ) !== context.requiredEffectEnforcerSetDigest
   ) {
     fail("invalid_input");
   }
@@ -1170,9 +1357,15 @@ interface ExpectedReceiptBinding {
   readonly binding: RuntimeBinding;
   readonly authorizationGeneration: number;
   readonly lifecycleFence: number;
+  readonly requiredEffectEnforcerSetDigest: string;
+  readonly commandClaimsDigest: string;
 }
 
-function validateReceipt(receipt: RuntimeReceipt, expected: ExpectedReceiptBinding): void {
+function validateReceipt(
+  receipt: RuntimeReceipt,
+  expected: ExpectedReceiptBinding,
+  effectRefForm: RuntimeReceiptEffectRefForm
+): void {
   const record = plainRecord(receipt, "invalid_receipt");
   if (dataField(record, "outcome", "invalid_receipt") === "duplicate") {
     exactFields(record, [
@@ -1189,7 +1382,7 @@ function validateReceipt(receipt: RuntimeReceipt, expected: ExpectedReceiptBindi
       "originalReceipt",
       "invalid_receipt"
     ) as NonDuplicateRuntimeReceipt;
-    validateNonDuplicateReceipt(original, expected);
+    validateNonDuplicateReceipt(original, expected, effectRefForm);
     const claimedDigest = dataField(record, "originalReceiptDigest", "invalid_receipt");
     if (typeof claimedDigest !== "string" || !SHA256.test(claimedDigest)) {
       fail("invalid_receipt");
@@ -1198,12 +1391,13 @@ function validateReceipt(receipt: RuntimeReceipt, expected: ExpectedReceiptBindi
     if (!sameDigest(claimedDigest, actualDigest)) fail("invalid_receipt");
     return;
   }
-  validateNonDuplicateReceipt(receipt as NonDuplicateRuntimeReceipt, expected);
+  validateNonDuplicateReceipt(receipt as NonDuplicateRuntimeReceipt, expected, effectRefForm);
 }
 
 function validateNonDuplicateReceipt(
   receipt: NonDuplicateRuntimeReceipt,
-  expected?: ExpectedReceiptBinding
+  expected?: ExpectedReceiptBinding,
+  effectRefForm: RuntimeReceiptEffectRefForm = "raw-provider"
 ): void {
   const record = plainRecord(receipt, "invalid_receipt");
   const outcome = dataField(record, "outcome", "invalid_receipt");
@@ -1216,35 +1410,57 @@ function validateNonDuplicateReceipt(
       "outcome",
       "effectRef",
     ]);
-    safeRef(dataField(record, "effectRef", "invalid_receipt"), "invalid_receipt");
+    const effectRef = safeRef(dataField(record, "effectRef", "invalid_receipt"), "invalid_receipt");
+    if (effectRefForm === "persisted-commitment") {
+      try {
+        snapshotPersistedRuntimeEffectRefCommitment(effectRef);
+      } catch {
+        fail("invalid_receipt");
+      }
+    }
   } else if (outcome === "enforced") {
-    exactFields(
-      record,
-      [
-        "commandId",
-        "binding",
-        "runtimeAuthorizationGeneration",
-        "outcome",
-        "effectRef",
-        "enforcedFence",
-      ],
-      ["aggregateEnforcementProof"]
-    );
-    safeRef(dataField(record, "effectRef", "invalid_receipt"), "invalid_receipt");
+    exactFields(record, [
+      "commandId",
+      "binding",
+      "runtimeAuthorizationGeneration",
+      "outcome",
+      "effectRef",
+      "enforcedFence",
+      "aggregateEnforcementProof",
+    ]);
+    const effectRef = safeRef(dataField(record, "effectRef", "invalid_receipt"), "invalid_receipt");
     const enforcedFence = positiveInteger(
       dataField(record, "enforcedFence", "invalid_receipt"),
       "invalid_receipt"
     );
     if (expected && enforcedFence !== expected.lifecycleFence) fail("invalid_receipt");
-    const proof = optionalDataField(record, "aggregateEnforcementProof", "invalid_receipt");
-    if (proof !== undefined) {
-      validateAggregateProof(
-        proof,
-        positiveInteger(
-          dataField(record, "runtimeAuthorizationGeneration", "invalid_receipt"),
-          "invalid_receipt"
-        )
-      );
+    const proof = dataField(record, "aggregateEnforcementProof", "invalid_receipt");
+    const generation = positiveInteger(
+      dataField(record, "runtimeAuthorizationGeneration", "invalid_receipt"),
+      "invalid_receipt"
+    );
+    validateAggregateProof(proof, generation);
+    if (expected) {
+      try {
+        snapshotRuntimeEnforcementProofVerificationInput(
+          {
+            version: 1,
+            commandId: expected.commandId,
+            commandClaimsDigest: expected.commandClaimsDigest,
+            binding: expected.binding,
+            runtimeAuthorizationGeneration: expected.authorizationGeneration,
+            requiredEffectEnforcerSetDigest: expected.requiredEffectEnforcerSetDigest,
+            effectRefCommitment:
+              effectRefForm === "raw-provider"
+                ? commitRuntimeEffectRef(effectRef)
+                : snapshotPersistedRuntimeEffectRefCommitment(effectRef),
+            enforcedFence,
+          },
+          proof as AggregateEnforcementProof
+        );
+      } catch {
+        fail("invalid_receipt");
+      }
     }
   } else if (outcome === "rejected") {
     exactFields(record, [
@@ -1271,7 +1487,14 @@ function validateNonDuplicateReceipt(
     if (!QUARANTINE_REASONS.has(dataField(record, "reason", "invalid_receipt") as string)) {
       fail("invalid_receipt");
     }
-    safeRef(dataField(record, "effectRef", "invalid_receipt"), "invalid_receipt");
+    const effectRef = safeRef(dataField(record, "effectRef", "invalid_receipt"), "invalid_receipt");
+    if (effectRefForm === "persisted-commitment") {
+      try {
+        snapshotPersistedRuntimeEffectRefCommitment(effectRef);
+      } catch {
+        fail("invalid_receipt");
+      }
+    }
   } else {
     fail("invalid_receipt");
   }
@@ -1304,69 +1527,11 @@ function validateReceiptBase(
 }
 
 function validateAggregateProof(value: unknown, expectedGeneration: number): void {
-  const proof = plainRecord(value, "invalid_receipt");
-  exactFields(proof, [
-    "generation",
-    "requiredEffectEnforcerSetDigest",
-    "acknowledgements",
-    "aggregateProofDigest",
-  ]);
-  if (
-    positiveInteger(dataField(proof, "generation", "invalid_receipt"), "invalid_receipt") !==
-    expectedGeneration
-  ) {
+  try {
+    const proof = snapshotAggregateEnforcementProof(value as AggregateEnforcementProof);
+    if (proof.generation !== expectedGeneration) fail("invalid_receipt");
+  } catch {
     fail("invalid_receipt");
-  }
-  const claimedDigest = sha256(
-    dataField(proof, "aggregateProofDigest", "invalid_receipt"),
-    "invalid_receipt"
-  );
-  const payload = Object.freeze({
-    generation: dataField(proof, "generation", "invalid_receipt"),
-    requiredEffectEnforcerSetDigest: dataField(
-      proof,
-      "requiredEffectEnforcerSetDigest",
-      "invalid_receipt"
-    ),
-    acknowledgements: dataField(proof, "acknowledgements", "invalid_receipt"),
-  }) as AggregateEnforcementProofDigestInput;
-  validateAggregateProofPayload(payload);
-  const actualDigest = createHash("sha256")
-    .update(AGGREGATE_PROOF_DIGEST_DOMAIN, "utf8")
-    .update(canonicalJson(payload), "utf8")
-    .digest("hex");
-  if (!sameDigest(claimedDigest, actualDigest)) fail("invalid_receipt");
-}
-
-function validateAggregateProofPayload(value: unknown): void {
-  const proof = plainRecord(value, "invalid_receipt");
-  exactFields(proof, ["generation", "requiredEffectEnforcerSetDigest", "acknowledgements"]);
-  positiveInteger(dataField(proof, "generation", "invalid_receipt"), "invalid_receipt");
-  sha256(dataField(proof, "requiredEffectEnforcerSetDigest", "invalid_receipt"), "invalid_receipt");
-  const acknowledgements = dataField(proof, "acknowledgements", "invalid_receipt");
-  if (
-    !Array.isArray(acknowledgements) ||
-    acknowledgements.length < 1 ||
-    acknowledgements.length > 64
-  ) {
-    fail("invalid_receipt");
-  }
-  const enforcerRefs = new Set<string>();
-  for (const acknowledgement of acknowledgements) {
-    const record = plainRecord(acknowledgement, "invalid_receipt");
-    exactFields(record, ["enforcerRef", "enforcerKind", "acknowledgementDigest"]);
-    const enforcerRef = safeRef(
-      dataField(record, "enforcerRef", "invalid_receipt"),
-      "invalid_receipt"
-    );
-    if (
-      enforcerRefs.has(enforcerRef) ||
-      !ENFORCER_KINDS.has(dataField(record, "enforcerKind", "invalid_receipt") as string)
-    ) {
-      fail("invalid_receipt");
-    }
-    enforcerRefs.add(enforcerRef);
-    sha256(dataField(record, "acknowledgementDigest", "invalid_receipt"), "invalid_receipt");
   }
 }
 
@@ -1395,10 +1560,24 @@ function captureRuntimeDispatch(runtime: Runtime): RuntimeDispatch {
     }
     const method = Reflect.get(runtime as object, "command");
     if (typeof method !== "function") fail("invalid_input");
-    return (handle, command) =>
-      Reflect.apply(method, runtime, [handle, command]) as Promise<RuntimeReceipt>;
+    return (handle, command, signal) =>
+      Reflect.apply(method, runtime, [handle, command, signal]) as Promise<RuntimeReceipt>;
   } catch {
     fail("invalid_input");
+  }
+}
+
+function isNativeAbortSignal(value: unknown): value is AbortSignal {
+  try {
+    const abortedGetter = Object.getOwnPropertyDescriptor(AbortSignal.prototype, "aborted")?.get;
+    return (
+      typeof abortedGetter === "function" &&
+      typeof Reflect.apply(abortedGetter, value, []) === "boolean" &&
+      typeof (value as AbortSignal).addEventListener === "function" &&
+      typeof (value as AbortSignal).removeEventListener === "function"
+    );
+  } catch {
+    return false;
   }
 }
 

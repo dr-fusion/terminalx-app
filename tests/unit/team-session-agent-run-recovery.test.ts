@@ -13,7 +13,13 @@ import {
   type SessionView,
   type TeamSessions,
 } from "@/lib/team-sessions";
-import type { RuntimeLifecycleCommand, RuntimeLifecycleJournal } from "@/lib/runtime";
+import {
+  digestAggregateEnforcementProof,
+  commitRuntimeEffectRef,
+  digestRuntimeEnforcementSubject,
+  type RuntimeLifecycleCommand,
+  type RuntimeLifecycleJournal,
+} from "@/lib/runtime";
 import { digestRunPolicyDraft } from "@/lib/team-sessions/run-policy";
 import { createTestRuntimeCommandAuthorityIssuer } from "../helpers/runtime-authority";
 
@@ -28,6 +34,7 @@ const RUNTIME: ActorContext = {
   displayName: "Runtime Worker",
 };
 const unconfigured = { kind: "unconfigured" } as const;
+const EFFECT_ENFORCER_SET_DIGEST = "b".repeat(64);
 
 interface RuntimeBindingRow {
   id: string;
@@ -62,6 +69,17 @@ describe("Team Session active Run recovery", () => {
         return `00000000-0000-4000-8000-${String(generated).padStart(12, "0")}`;
       },
       runtimeCommandAuthorityIssuer: createTestRuntimeCommandAuthorityIssuer(),
+      runtimeAuthorizationSnapshotSource: {
+        resolve: ({ runtimeAuthorizationGeneration }) => ({
+          generation: runtimeAuthorizationGeneration,
+          networkPolicyRef: "test-network-policy:v1",
+          networkPolicyDigest: "c".repeat(64),
+          credentialPolicyRef: "test-credential-policy:v1",
+          credentialPolicyDigest: "d".repeat(64),
+          effectEnforcerSetDigest: EFFECT_ENFORCER_SET_DIGEST,
+        }),
+      },
+      runtimeEnforcementProofVerifier: () => true,
     });
     sessions = kernel.teamSessions;
     runtimeJournal = kernel.runtimeLifecycleJournal;
@@ -245,11 +263,51 @@ describe("Team Session active Run recovery", () => {
     });
     expect(delivery?.command.kind).toBe(expectedKind);
     if (!delivery) throw new Error("Expected a Runtime lifecycle delivery");
-    await runtimeJournal.complete({
+    const requiredEffectEnforcerSetDigest = delivery.command.requiredEffectEnforcerSetDigest;
+    expect(requiredEffectEnforcerSetDigest).toBe(EFFECT_ENFORCER_SET_DIGEST);
+    if (!requiredEffectEnforcerSetDigest) {
+      throw new Error("Expected a trusted effect-enforcer-set digest");
+    }
+    const effectRef = `effect:${delivery.command.commandId}`;
+    const enforcementSubjectDigest = digestRuntimeEnforcementSubject({
+      version: 1,
+      commandId: delivery.command.commandId,
+      commandClaimsDigest: delivery.command.authority.claimsDigest,
+      binding: delivery.command.binding,
+      runtimeAuthorizationGeneration: delivery.command.runtimeAuthorizationGeneration,
+      requiredEffectEnforcerSetDigest,
+      effectRefCommitment: commitRuntimeEffectRef(effectRef),
+      enforcedFence: delivery.command.toRunStateVersion,
+    });
+    const proofPayload = {
+      generation: delivery.command.runtimeAuthorizationGeneration,
+      requiredEffectEnforcerSetDigest,
+      enforcementSubjectDigest,
+      acknowledgements: [
+        {
+          enforcerRef: "test-runtime-enforcer",
+          enforcerKind: "runtime" as const,
+          acknowledgementDigest: "e".repeat(64),
+        },
+      ],
+    };
+    const renewal = await runtimeJournal.renew({
       commandId: delivery.command.commandId,
       workerId: RUNTIME.userId,
       expectedAttempt: delivery.attempt,
       expectedLeaseExpiresAtMs: delivery.leaseExpiresAtMs,
+      leaseDurationMs: 30_000,
+      nowMs: now,
+    });
+    expect(renewal.kind).toBe("renewed");
+    if (renewal.kind !== "renewed") {
+      throw new Error("Expected the Runtime lifecycle dispatch interlock");
+    }
+    await runtimeJournal.complete({
+      commandId: delivery.command.commandId,
+      workerId: RUNTIME.userId,
+      expectedAttempt: delivery.attempt,
+      expectedLeaseExpiresAtMs: renewal.leaseExpiresAtMs,
       observedAtMs: now,
       outcome: {
         kind: "receipt",
@@ -258,8 +316,12 @@ describe("Team Session active Run recovery", () => {
           binding: delivery.command.binding,
           runtimeAuthorizationGeneration: delivery.command.runtimeAuthorizationGeneration,
           outcome: "enforced",
-          effectRef: `effect:${delivery.command.commandId}`,
+          effectRef,
           enforcedFence: delivery.command.toRunStateVersion,
+          aggregateEnforcementProof: {
+            ...proofPayload,
+            aggregateProofDigest: digestAggregateEnforcementProof(proofPayload),
+          },
         },
       },
     });

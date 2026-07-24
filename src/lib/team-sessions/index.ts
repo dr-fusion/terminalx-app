@@ -72,7 +72,12 @@ export type {
 } from "./types";
 export { RUNTIME_OUTBOX_ERROR_CODES, TEAM_SESSION_SCHEMA_VERSION, TeamSessionError } from "./types";
 export { createTeamSessionKernel, createTeamSessions } from "./module";
-export type { CreateTeamSessionsOptions, TeamSessionKernel } from "./module";
+export type {
+  CreateTeamSessionsOptions,
+  RuntimeAuthorizationSnapshotQuery,
+  RuntimeAuthorizationSnapshotSource,
+  TeamSessionKernel,
+} from "./module";
 export { projectPublicSessionRunState } from "./public-run-state";
 export type {
   ActionClass,
