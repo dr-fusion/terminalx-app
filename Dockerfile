@@ -1,60 +1,59 @@
-# TerminalX — Self-hosted terminal IDE for the browser
-# Single-stage build: node-pty native addon requires build-essential at both
-# compile and runtime (glibc must match). Single stage avoids version mismatches.
-#
-# Pinned to minor version. Dependabot updates patch releases and digest.
-FROM node:25.9-bookworm-slim
+# TerminalX production image.
+# Keep both stages on the same immutable Debian/Node image so node-pty is
+# compiled against the exact glibc shipped at runtime.
+ARG NODE_IMAGE=node:24-bookworm-slim@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d
 
-# Install system dependencies: tmux (terminal multiplexer), build tools (node-pty),
-# tini (PID 1 signal handling), curl (HEALTHCHECK).
+FROM ${NODE_IMAGE} AS build
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    tmux \
     build-essential \
     python3 \
-    ca-certificates \
-    tini \
-    openssl \
-    curl \
   && rm -rf /var/lib/apt/lists/*
-
-# Create non-root user owning /app and /home/terminus (the file-browser root).
-RUN useradd --create-home --shell /bin/bash --uid 1001 terminus
 
 WORKDIR /app
 
-# Install dependencies (cached layer). Chown so the app user owns node_modules.
-# vendor/ must be present before `npm ci` because package.json references
-# vendored wterm tarballs (e.g. @wterm/react → file:vendor/wterm/*.tgz).
-COPY --chown=terminus:terminus package.json package-lock.json .npmrc ./
-COPY --chown=terminus:terminus vendor/ ./vendor/
+COPY package.json package-lock.json .npmrc ./
+COPY vendor/ ./vendor/
 RUN npm ci --include=dev
 
-# Copy source, owned by the app user.
-COPY --chown=terminus:terminus . .
+COPY . .
+RUN npm run build \
+  && npm prune --omit=dev \
+  && npm cache clean --force
 
-# Build Next.js
-RUN npm run build
+FROM ${NODE_IMAGE} AS runtime
 
-# Create data directory for recordings / secrets / user store.
-RUN mkdir -p /app/data && chown terminus:terminus /app/data && chmod 700 /app/data
-RUN chmod +x /app/docker-entrypoint.sh
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    git \
+    openssh-client \
+    openssl \
+    tini \
+    tmux \
+  && rm -rf /var/lib/apt/lists/* \
+  && useradd --create-home --shell /bin/bash --uid 1001 terminus \
+  && mkdir -p /app/data /workspace \
+  && chown -R terminus:terminus /app /workspace \
+  && chmod 700 /app/data /workspace
 
-# Runtime configuration
-ENV NODE_ENV=production
-ENV PORT=3000
-ENV TERMINUS_HOST=0.0.0.0
-ENV TERMINUS_ROOT=/home/terminus
-ENV TERMINALX_AUTH_MODE=local
+WORKDIR /app
+COPY --from=build --chown=terminus:terminus /app /app
 
-# Drop privileges.
+RUN chmod 755 /app/docker-entrypoint.sh
+
+ENV NODE_ENV=production \
+    NEXT_TELEMETRY_DISABLED=1 \
+    PORT=3000 \
+    TERMINUS_HOST=0.0.0.0 \
+    TERMINUS_ROOT=/workspace
+
 USER terminus
 
 EXPOSE 3000
 
-# Liveness probe — hits the unauthenticated server-level /health handler.
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
   CMD curl -fsS http://localhost:${PORT}/health || exit 1
 
-# tini reaps zombies and forwards signals to node (important for tmux children).
 ENTRYPOINT ["/usr/bin/tini", "--", "/app/docker-entrypoint.sh"]
-CMD ["npx", "tsx", "server/index.ts"]
+CMD ["./node_modules/.bin/tsx", "server/index.ts"]

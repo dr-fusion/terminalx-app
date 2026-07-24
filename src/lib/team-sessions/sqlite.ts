@@ -2333,15 +2333,17 @@ export function openTeamSessionDatabase(
   options: OpenTeamSessionDatabaseOptions
 ): TeamSessionDatabase {
   const resolved =
-    options.filename === ":memory:" ? options.filename : path.resolve(options.filename);
+    options.filename === ":memory:"
+      ? options.filename
+      : path.resolve(/* turbopackIgnore: true */ options.filename);
   let filename: string | undefined;
   if (resolved !== ":memory:") {
-    const parent = path.dirname(resolved);
-    fs.mkdirSync(parent, { recursive: true, mode: 0o700 });
+    const parent = path.dirname(/* turbopackIgnore: true */ resolved);
+    fs.mkdirSync(/* turbopackIgnore: true */ parent, { recursive: true, mode: 0o700 });
     filename = resolved;
-    const descriptor = fs.openSync(resolved, "a", 0o600);
+    const descriptor = fs.openSync(/* turbopackIgnore: true */ resolved, "a", 0o600);
     fs.closeSync(descriptor);
-    fs.chmodSync(resolved, 0o600);
+    fs.chmodSync(/* turbopackIgnore: true */ resolved, 0o600);
   }
 
   const db = new Database(resolved);
@@ -2637,6 +2639,8 @@ function migrationError(event: ConversationMigrationEvent, detail: string): Erro
 function secureDatabaseFiles(filename: string | undefined): void {
   if (!filename || process.platform === "win32") return;
   for (const candidate of [filename, `${filename}-wal`, `${filename}-shm`, `${filename}-journal`]) {
-    if (fs.existsSync(candidate)) fs.chmodSync(candidate, 0o600);
+    if (fs.existsSync(/* turbopackIgnore: true */ candidate)) {
+      fs.chmodSync(/* turbopackIgnore: true */ candidate, 0o600);
+    }
   }
 }

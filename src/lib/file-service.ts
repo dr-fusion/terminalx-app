@@ -29,7 +29,9 @@ export interface FileInfo {
 }
 
 export function getTerminusRoot(): string {
-  return path.resolve(process.env.TERMINUS_ROOT || process.env.HOME || "/");
+  return path.resolve(
+    /* turbopackIgnore: true */ process.env.TERMINUS_ROOT || process.env.HOME || "/"
+  );
 }
 
 function sensitiveFileAccessAllowed(): boolean {
@@ -49,13 +51,13 @@ export function isSensitivePath(filePath: string): boolean {
   if (sensitiveFileAccessAllowed()) return false;
 
   const root = getTerminusRoot();
-  const resolved = path.resolve(filePath);
+  const resolved = path.resolve(/* turbopackIgnore: true */ filePath);
   const telegramAuditDb = path.resolve(
-    process.env.TERMINALX_TELEGRAM_MESSAGE_DB_PATH ??
+    /* turbopackIgnore: true */ process.env.TERMINALX_TELEGRAM_MESSAGE_DB_PATH ??
       path.join(process.cwd(), "data", "telegram-messages.sqlite")
   );
   const teamSessionDb = path.resolve(
-    process.env.TERMINALX_TEAM_SESSION_DB_PATH ??
+    /* turbopackIgnore: true */ process.env.TERMINALX_TEAM_SESSION_DB_PATH ??
       path.join(process.cwd(), "data", "team-sessions.sqlite")
   );
   if (
@@ -107,8 +109,8 @@ export function resolveSafePath(requestedPath: string): string {
 
   // Expand ~ to root
   const expanded = requestedPath.startsWith("~/")
-    ? path.join(root, requestedPath.slice(2))
-    : path.resolve(root, requestedPath);
+    ? path.join(/* turbopackIgnore: true */ root, requestedPath.slice(2))
+    : path.resolve(/* turbopackIgnore: true */ root, requestedPath);
 
   // Ensure the resolved path is within or equal to root
   if (!expanded.startsWith(root + path.sep) && expanded !== root) {
@@ -117,7 +119,7 @@ export function resolveSafePath(requestedPath: string): string {
 
   // Follow symlinks and re-check to prevent symlink traversal
   try {
-    const realPath = fs.realpathSync(expanded);
+    const realPath = fs.realpathSync(/* turbopackIgnore: true */ expanded);
     if (!realPath.startsWith(root + path.sep) && realPath !== root) {
       throw new Error("Path is outside the allowed root directory");
     }
@@ -150,19 +152,21 @@ export function listDirectory(requestedPath: string): FileEntry[] {
   const safePath = resolveSafePath(requestedPath);
   assertNotSensitivePath(safePath);
 
-  const stats = fs.statSync(safePath);
+  const stats = fs.statSync(/* turbopackIgnore: true */ safePath);
   if (!stats.isDirectory()) {
     throw new Error("Path is not a directory");
   }
 
-  const entries = fs.readdirSync(safePath, { withFileTypes: true });
+  const entries = fs.readdirSync(/* turbopackIgnore: true */ safePath, {
+    withFileTypes: true,
+  });
 
   return entries
     .map((entry) => {
       try {
-        const entryPath = path.join(safePath, entry.name);
+        const entryPath = path.join(/* turbopackIgnore: true */ safePath, entry.name);
         if (isSensitivePath(entryPath)) return null;
-        const stat = fs.statSync(entryPath);
+        const stat = fs.statSync(/* turbopackIgnore: true */ entryPath);
         return {
           name: entry.name,
           path: entryPath,
@@ -188,7 +192,7 @@ export function readFile(requestedPath: string): string {
   const safePath = resolveSafePath(requestedPath);
   assertNotSensitivePath(safePath);
 
-  const stats = fs.statSync(safePath);
+  const stats = fs.statSync(/* turbopackIgnore: true */ safePath);
   if (!stats.isFile()) {
     throw new Error("Path is not a file");
   }
@@ -199,14 +203,14 @@ export function readFile(requestedPath: string): string {
     );
   }
 
-  return fs.readFileSync(safePath, "utf-8");
+  return fs.readFileSync(/* turbopackIgnore: true */ safePath, "utf-8");
 }
 
 export function getFileInfo(requestedPath: string): FileInfo {
   const safePath = resolveSafePath(requestedPath);
   assertNotSensitivePath(safePath);
 
-  const stats = fs.lstatSync(safePath);
+  const stats = fs.lstatSync(/* turbopackIgnore: true */ safePath);
 
   return {
     name: path.basename(safePath),
