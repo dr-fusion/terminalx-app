@@ -44,30 +44,26 @@ describe("snippets", () => {
 
   it("rejects missing name", async () => {
     const mod = await load();
-    await expect(
-      mod.createSnippet({ name: "", command: "ls" })
-    ).rejects.toThrow(/Name required/);
+    await expect(mod.createSnippet({ name: "", command: "ls" })).rejects.toThrow(/Name required/);
   });
 
   it("rejects missing command", async () => {
     const mod = await load();
-    await expect(
-      mod.createSnippet({ name: "x", command: "" })
-    ).rejects.toThrow(/Command required/);
+    await expect(mod.createSnippet({ name: "x", command: "" })).rejects.toThrow(/Command required/);
   });
 
   it("rejects overlong name", async () => {
     const mod = await load();
-    await expect(
-      mod.createSnippet({ name: "x".repeat(100), command: "ls" })
-    ).rejects.toThrow(/Name too long/);
+    await expect(mod.createSnippet({ name: "x".repeat(100), command: "ls" })).rejects.toThrow(
+      /Name too long/
+    );
   });
 
   it("rejects overlong command", async () => {
     const mod = await load();
-    await expect(
-      mod.createSnippet({ name: "x", command: "y".repeat(5000) })
-    ).rejects.toThrow(/Command too long/);
+    await expect(mod.createSnippet({ name: "x", command: "y".repeat(5000) })).rejects.toThrow(
+      /Command too long/
+    );
   });
 
   it("deletes a snippet by id", async () => {

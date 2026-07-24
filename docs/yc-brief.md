@@ -92,13 +92,15 @@ TerminalX treats autonomy as scoped authority, not a blanket bypass.
 
 TerminalX is an actively hardened pre-production application, not yet an external-pilot release.
 The collaborative kernel, durable conversation, multiplayer workspace, Agent Run model, and Runtime
-command/receipt foundation are complete. End-to-end Runtime truth is in progress. Hosted Daytona
-isolation, brokered secrets, authoritative approvals/limits/YOLO, recovery/evidence, production
-operations, and adversarial release verification remain gated.
+command/receipt foundation are complete. The portable end-to-end Runtime-truth kernel is complete;
+its production activation remains closed until the pinned hosted Daytona adapter supplies the
+isolation and real-provider evidence assigned to the next phase. Brokered secrets, authoritative
+approvals/limits/YOLO, recovery/evidence, production operations, and adversarial release
+verification remain gated.
 
-The authoritative plan contains **13 implementation phases, numbered 0 through 12**. Phases 0–5
-are complete, Phase 6 is in progress, and production is enabled only after all eight security gates
-and final operational/release evidence are closed. See
+The authoritative plan contains **13 implementation phases, numbered 0 through 12**. Phases 0–6
+are complete, Phase 7 is next, and production is enabled only after all eight security gates and
+final operational/release evidence are closed. See
 [the production roadmap](./production-readiness/roadmap.md).
 
 ## What we are looking for

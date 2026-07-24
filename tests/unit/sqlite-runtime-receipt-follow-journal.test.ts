@@ -343,6 +343,7 @@ describe("SQLite Runtime signed receipt follow journal", () => {
     return createRuntimeReceiptObservationIssuer({
       issuerKeyId: ISSUER_KEY_ID,
       binding: BINDING,
+      trustedConfigurationRoot: directory,
       privateKeyFile,
       clock,
       observationTtlMs: 30_000,

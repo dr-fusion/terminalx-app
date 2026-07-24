@@ -767,6 +767,7 @@ describe("Team Session HTTP adapter", () => {
         outboxId: "outbox-1",
         workerId: "attacker-worker",
         expectedAttempt: 1,
+        expectedLeaseExpiresAtMs: 1,
       },
       "runtime-command"
     );

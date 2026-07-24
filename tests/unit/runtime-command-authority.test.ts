@@ -48,6 +48,37 @@ const pauseClaims = {
   reason: "human",
 } as const satisfies RuntimeCommandClaims<"run.pause">;
 
+const quarantineClaims = {
+  kind: "safety.quarantine",
+  commandId: "quarantine-command-1",
+  compensationId: "compensation-1",
+  binding,
+  observedRuntimeAuthorizationGeneration: 4,
+  causationId: "lifecycle-command-1",
+  actor: { kind: "system", actorRef: "platform-security" },
+  issuedAtMs: 100,
+  deadlineAtMs: 1_000,
+  source: {
+    lifecycleCommandId: "lifecycle-command-1",
+    lifecycleCommandClaimsDigest: "b".repeat(64),
+    lifecycleReceiptDigest: "c".repeat(64),
+    lifecycleEnforcementSubjectDigest: "d".repeat(64),
+    lifecycleAggregateProofDigest: "e".repeat(64),
+    sourceRequiredEffectEnforcerSetDigest: "f".repeat(64),
+  },
+  platformSecurityPolicyRevision: "platform-security-policy:v1",
+  requiredContainmentEnforcerSetDigest: "1".repeat(64),
+  containment: {
+    revokeTerminalWrites: true,
+    stopProcessExecution: true,
+    quarantineRuntime: true,
+  },
+  safetyFence: 8,
+  advanceBeyondCurrentFences: true,
+  exactBindingOnly: true,
+  reasonRef: "compensation-incident:1",
+} as const satisfies RuntimeCommandClaims<"safety.quarantine">;
+
 describe("Runtime command canonical claims", () => {
   it("sorts every record, omits only top-level authority, and uses a digest domain", () => {
     const reordered = {
@@ -150,6 +181,7 @@ describe("Ed25519 Runtime command authority", () => {
     return createRuntimeCommandAuthorityIssuer({
       issuer: "team-session",
       issuerKeyId: "team-session:v1",
+      trustedConfigurationRoot: directory,
       privateKeyFile,
       clock: () => 100,
       authorityTtlMs: 300,
@@ -192,6 +224,74 @@ describe("Ed25519 Runtime command authority", () => {
     expect(verifier()({ command, nowMs: 399 })).toBe(true);
     expect(verifier()({ command, nowMs: 400 })).toBe(false);
     expectTypeOf(verifier()).toMatchTypeOf<ExecutionVerifier>();
+  });
+
+  it("reserves safety quarantine authority for the platform-security issuer", () => {
+    expect(() => issuer().issue(quarantineClaims)).toThrow(
+      expect.objectContaining({ code: "invalid_command" })
+    );
+
+    const platformPair = generateKeyPairSync("ed25519", {
+      privateKeyEncoding: { type: "pkcs8", format: "pem" },
+      publicKeyEncoding: { type: "spki", format: "pem" },
+    });
+    const platformPrivateKeyFile = join(directory, "platform-security-authority.pem");
+    writeFileSync(platformPrivateKeyFile, platformPair.privateKey, { mode: 0o600 });
+    const platformIssuer = createRuntimeCommandAuthorityIssuer({
+      issuer: "platform-security",
+      issuerKeyId: "platform-security:v1",
+      trustedConfigurationRoot: directory,
+      privateKeyFile: platformPrivateKeyFile,
+      clock: () => 100,
+      authorityTtlMs: 300,
+    });
+    const command = {
+      ...quarantineClaims,
+      authority: platformIssuer.issue(quarantineClaims),
+    };
+    const platformVerifier = createRuntimeCommandAuthorityVerifier({
+      pinnedPublicKeys: [
+        {
+          issuer: "platform-security",
+          issuerKeyId: "platform-security:v1",
+          publicKeyPem: platformPair.publicKey,
+        },
+      ],
+    });
+
+    expect(command.authority.issuer).toBe("platform-security");
+    expect(platformVerifier({ command, nowMs: 200 })).toBe(true);
+    expect(
+      platformVerifier({
+        command: {
+          ...command,
+          source: {
+            ...command.source,
+            lifecycleReceiptDigest: "0".repeat(64),
+          },
+        },
+        nowMs: 200,
+      })
+    ).toBe(false);
+  });
+
+  it("rejects Ed25519 key reuse across Team Session and platform-security trust domains", () => {
+    expect(() =>
+      createRuntimeCommandAuthorityVerifier({
+        pinnedPublicKeys: [
+          {
+            issuer: "team-session",
+            issuerKeyId: "team-session:v1",
+            publicKeyPem,
+          },
+          {
+            issuer: "platform-security",
+            issuerKeyId: "platform-security:v1",
+            publicKeyPem,
+          },
+        ],
+      })
+    ).toThrow(expect.objectContaining({ code: "invalid_public_key" }));
   });
 
   it("rejects claim, capability, audience, issuer, key-id, time, digest, and signature tampering", () => {
@@ -246,6 +346,7 @@ describe("Ed25519 Runtime command authority", () => {
       createRuntimeCommandAuthorityIssuer({
         issuer: "team-session",
         issuerKeyId: "team-session:v1",
+        trustedConfigurationRoot: directory,
         privateKeyFile: "relative-key.pem",
       });
     expect(relative).toThrow(expect.objectContaining({ code: "private_key_unavailable" }));
@@ -255,6 +356,7 @@ describe("Ed25519 Runtime command authority", () => {
       createRuntimeCommandAuthorityIssuer({
         issuer: "team-session",
         issuerKeyId: "team-session:v1",
+        trustedConfigurationRoot: directory,
         privateKeyFile,
       })
     ).toThrow(expect.objectContaining({ code: "private_key_unavailable" }));
@@ -266,6 +368,7 @@ describe("Ed25519 Runtime command authority", () => {
       createRuntimeCommandAuthorityIssuer({
         issuer: "team-session",
         issuerKeyId: "team-session:v1",
+        trustedConfigurationRoot: directory,
         privateKeyFile: link,
       })
     ).toThrow(expect.objectContaining({ code: "private_key_unavailable" }));
@@ -283,6 +386,7 @@ describe("Ed25519 Runtime command authority", () => {
       createRuntimeCommandAuthorityIssuer({
         issuer: "team-session",
         issuerKeyId: "team-session:v1",
+        trustedConfigurationRoot: directory,
         privateKeyFile: rsaFile,
       })
     ).toThrow(expect.objectContaining({ code: "invalid_private_key" }));
@@ -308,6 +412,7 @@ describe("Ed25519 Runtime command authority", () => {
       createRuntimeCommandAuthorityIssuer({
         issuer: "team-session",
         issuerKeyId: "team-session:v1",
+        trustedConfigurationRoot: directory,
         privateKeyFile,
       });
     } catch (error) {

@@ -59,6 +59,7 @@ describe("signed Runtime lifecycle receipt observations", () => {
     return createRuntimeReceiptObservationIssuer({
       issuerKeyId: "daytona-observer:v1",
       binding,
+      trustedConfigurationRoot: directory,
       privateKeyFile,
       clock,
       observationTtlMs: 500,
@@ -475,6 +476,7 @@ describe("signed Runtime lifecycle receipt observations", () => {
       createRuntimeReceiptObservationIssuer({
         issuerKeyId: "daytona-observer:v1",
         binding,
+        trustedConfigurationRoot: directory,
         privateKeyFile: link,
       })
     ).toThrow(expect.objectContaining({ code: "private_key_unavailable" }));
@@ -490,6 +492,7 @@ describe("signed Runtime lifecycle receipt observations", () => {
       createRuntimeReceiptObservationIssuer({
         issuerKeyId: "daytona-observer:v1",
         binding,
+        trustedConfigurationRoot: directory,
         privateKeyFile: rsaFile,
       })
     ).toThrow(expect.objectContaining({ code: "invalid_private_key" }));

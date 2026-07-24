@@ -1,14 +1,44 @@
-import type { Runtime, RuntimeHandle, RuntimeLifecycleCommand, RuntimeReceipt } from "./contracts";
+import { types as nodeTypes } from "node:util";
+import type { RuntimeHandle, RuntimeLifecycleCommand, RuntimeReceipt } from "./contracts";
+import type { RuntimeCommandCapability } from "./runtime-command-dispatch";
 import {
   RuntimeCommandExecutionError,
-  executeRuntimeCommand,
+  captureRuntimeLifecycleDispatch,
+  executeCapturedRuntimeCommand,
   type RuntimeAuthorityVerifier,
   type RuntimeCommandDispatchCertainty,
   type RuntimeCommandExecutionErrorCode,
+  type RuntimeLifecycleDispatch,
 } from "./runtime-command-execution";
 import type { RuntimeEnforcementProofVerifier } from "./runtime-enforcement-proof";
+import {
+  captureRuntimeHandleResolver,
+  snapshotExactRuntimeHandle,
+  type CapturedRuntimeHandleResolver,
+} from "./runtime-handle-resolution";
+import {
+  linkRuntimeAbortSignal,
+  runBoundedRuntimeOperation,
+  runtimeHealthClockMinimum,
+  runtimeAbortableDelay,
+  sampleRuntimeHealthClock,
+} from "./runtime-supervisor-operation";
+import {
+  exactRuntimeSupervisorDataRecord as exactDataRecord,
+  runtimeSupervisorCommandValidationInstant as commandStructuralValidationInstant,
+  runtimeSupervisorDataField as dataField,
+  snapshotRuntimeSupervisorPortableData as snapshotPortableData,
+} from "./runtime-supervisor-snapshot";
+import type { RuntimeManagedSupervisorHealth } from "./runtime-supervisor-root";
 
 const MAX_WORKER_ID_LENGTH = 128;
+const DELIVERY_FIELDS = [
+  "command",
+  "attempt",
+  "leaseOwner",
+  "leaseExpiresAtMs",
+  "priorDispatchCertainty",
+] as const;
 
 export interface RuntimeLifecycleReconcileOptions {
   /** Stale processing leases at or before this instant must be reconciled conservatively. */
@@ -111,7 +141,7 @@ export interface RuntimeLifecycleHandleResolver {
 
 export interface RuntimeLifecycleSupervisorOptions {
   readonly journal: RuntimeLifecycleJournal;
-  readonly runtime: Runtime;
+  readonly runtime: RuntimeCommandCapability;
   readonly handles: RuntimeLifecycleHandleResolver;
   readonly verifyAuthority: RuntimeAuthorityVerifier;
   readonly verifyEnforcementProof: RuntimeEnforcementProofVerifier;
@@ -141,8 +171,8 @@ export interface RuntimeLifecycleRunResult {
  */
 export class RuntimeLifecycleSupervisor {
   private readonly journal: RuntimeLifecycleJournal;
-  private readonly runtime: Runtime;
-  private readonly handles: RuntimeLifecycleHandleResolver;
+  private readonly runtimeDispatch: RuntimeLifecycleDispatch;
+  private readonly resolveHandle: CapturedRuntimeHandleResolver<RuntimeLifecycleCommand>;
   private readonly verifyAuthority: RuntimeAuthorityVerifier;
   private readonly verifyEnforcementProof: RuntimeEnforcementProofVerifier;
   private readonly workerId: string;
@@ -159,8 +189,13 @@ export class RuntimeLifecycleSupervisor {
   private loopPromise: Promise<void> | null = null;
   private activeRun: Promise<RuntimeLifecycleRunResult> | null = null;
   private activeRunController: AbortController | null = null;
+  private lastSuccessAtMs: number | null = null;
+  private lastErrorAtMs: number | null = null;
+  private activeCycleStartedAtMs: number | null = null;
+  private failureSinceSuccess = false;
 
   constructor(options: RuntimeLifecycleSupervisorOptions) {
+    const resolveHandle = captureRuntimeHandleResolver<RuntimeLifecycleCommand>(options?.handles);
     if (!isSafeWorkerId(options.workerId)) throw new TypeError("Invalid Runtime worker ID");
     if (
       typeof options.verifyAuthority !== "function" ||
@@ -168,14 +203,13 @@ export class RuntimeLifecycleSupervisor {
       typeof options.journal?.reconcile !== "function" ||
       typeof options.journal?.claim !== "function" ||
       typeof options.journal?.renew !== "function" ||
-      typeof options.journal?.complete !== "function" ||
-      typeof options.handles?.resolve !== "function"
+      typeof options.journal?.complete !== "function"
     ) {
       throw new TypeError("Invalid Runtime lifecycle supervisor dependency");
     }
+    this.runtimeDispatch = captureRuntimeLifecycleDispatch(options.runtime);
     this.journal = options.journal;
-    this.runtime = options.runtime;
-    this.handles = options.handles;
+    this.resolveHandle = resolveHandle;
     this.verifyAuthority = options.verifyAuthority;
     this.verifyEnforcementProof = options.verifyEnforcementProof;
     this.workerId = options.workerId;
@@ -206,6 +240,15 @@ export class RuntimeLifecycleSupervisor {
     return this.loopPromise !== null;
   }
 
+  health(): RuntimeManagedSupervisorHealth {
+    return Object.freeze({
+      lastSuccessAtMs: this.lastSuccessAtMs,
+      lastErrorAtMs: this.lastErrorAtMs,
+      activeCycleStartedAtMs: this.activeCycleStartedAtMs,
+      failureSinceSuccess: this.failureSinceSuccess,
+    });
+  }
+
   start(): void {
     if (this.loopPromise) return;
     const controller = new AbortController();
@@ -218,23 +261,53 @@ export class RuntimeLifecycleSupervisor {
 
   async stop(): Promise<void> {
     const loop = this.loopPromise;
-    if (!loop) return;
+    const activeRun = this.activeRun;
     this.controller?.abort();
     this.activeRunController?.abort();
-    await loop;
+    await Promise.allSettled([...(loop ? [loop] : []), ...(activeRun ? [activeRun] : [])]);
   }
 
   /** Concurrent callers share one batch so a worker cannot claim against itself. */
   runOnce(): Promise<RuntimeLifecycleRunResult> {
     if (this.activeRun) return this.activeRun;
     const controller = new AbortController();
-    const unlink = linkAbortSignal(this.controller?.signal, controller);
+    const unlink = linkRuntimeAbortSignal(this.controller?.signal, controller);
     this.activeRunController = controller;
-    const run = this.processOneBatch(controller.signal).finally(() => {
-      unlink();
-      if (this.activeRunController === controller) this.activeRunController = null;
-      if (this.activeRun === run) this.activeRun = null;
-    });
+    const run = this.processOneBatch(controller.signal)
+      .then(
+        (result) => {
+          const minimum = runtimeHealthClockMinimum(
+            this.activeCycleStartedAtMs,
+            this.lastSuccessAtMs,
+            this.lastErrorAtMs
+          );
+          const settledAtMs = sampleRuntimeHealthClock(this.clock, minimum);
+          if (settledAtMs === null) {
+            this.lastErrorAtMs = minimum;
+            this.failureSinceSuccess = true;
+          } else {
+            this.lastSuccessAtMs = settledAtMs;
+            this.failureSinceSuccess = false;
+          }
+          return result;
+        },
+        (error: unknown) => {
+          const minimum = runtimeHealthClockMinimum(
+            this.activeCycleStartedAtMs,
+            this.lastSuccessAtMs,
+            this.lastErrorAtMs
+          );
+          this.lastErrorAtMs = sampleRuntimeHealthClock(this.clock, minimum) ?? minimum;
+          this.failureSinceSuccess = true;
+          throw error;
+        }
+      )
+      .finally(() => {
+        unlink();
+        this.activeCycleStartedAtMs = null;
+        if (this.activeRunController === controller) this.activeRunController = null;
+        if (this.activeRun === run) this.activeRun = null;
+      });
     this.activeRun = run;
     return run;
   }
@@ -250,10 +323,10 @@ export class RuntimeLifecycleSupervisor {
             : result.claimed > 0
               ? this.busyDelayMs
               : this.idleDelayMs;
-        await abortableDelay(delay, signal);
+        await runtimeAbortableDelay(delay, signal);
       } catch {
         reportOperationalError(this.onOperationalError);
-        await abortableDelay(this.errorDelayMs, signal);
+        await runtimeAbortableDelay(this.errorDelayMs, signal);
       }
     }
   }
@@ -261,18 +334,22 @@ export class RuntimeLifecycleSupervisor {
   private async processOneBatch(signal: AbortSignal): Promise<RuntimeLifecycleRunResult> {
     if (signal.aborted) return emptyRunResult();
     const reconcileAtMs = sampleClock(this.clock);
+    this.activeCycleStartedAtMs = reconcileAtMs;
     await this.journal.reconcile({ nowMs: reconcileAtMs });
     if (signal.aborted) return emptyRunResult();
     const claimAtMs = sampleClock(this.clock, reconcileAtMs);
-    const deliveries = await this.journal.claim({
+    const claimed = await this.journal.claim({
       workerId: this.workerId,
       limit: this.claimLimit,
       leaseDurationMs: this.leaseDurationMs,
       nowMs: claimAtMs,
     });
-    if (!Array.isArray(deliveries) || deliveries.length > this.claimLimit) {
-      throw new TypeError("Invalid Runtime lifecycle claim result");
-    }
+    const deliveries = snapshotClaimedDeliveries(
+      claimed,
+      this.workerId,
+      claimAtMs,
+      this.claimLimit
+    );
 
     const result = {
       claimed: deliveries.length,
@@ -281,7 +358,6 @@ export class RuntimeLifecycleSupervisor {
       dispatchUncertain: 0,
     };
     for (const delivery of deliveries) {
-      validateDelivery(delivery, this.workerId, claimAtMs);
       const execution = await this.executeDelivery(delivery, signal);
       if (execution.kind === "superseded") {
         result.failedBeforeDispatch += 1;
@@ -324,12 +400,16 @@ export class RuntimeLifecycleSupervisor {
       };
     }
     if (signal.aborted) return unavailableBeforeDispatch(delivery);
-    const resolved = await boundedOperation(
-      (operationSignal) => this.handles.resolve(delivery.command, operationSignal),
+    const resolved = await runBoundedRuntimeOperation(
+      (operationSignal) => this.resolveHandle(delivery.command, operationSignal),
       Math.min(this.handleResolveTimeoutMs, resolveRemainingMs - LEASE_COMPLETION_MARGIN_MS),
       signal
     );
-    if (resolved.kind !== "value" || resolved.value === null) {
+    const handle =
+      resolved.kind === "value"
+        ? snapshotExactRuntimeHandle(resolved.value, delivery.command.binding)
+        : null;
+    if (handle === null) {
       return {
         kind: "attempt",
         delivery,
@@ -340,7 +420,6 @@ export class RuntimeLifecycleSupervisor {
         },
       };
     }
-    const handle = resolved.value;
     const renewalAtMs = sampleClock(this.clock);
     if (signal.aborted) return unavailableBeforeDispatch(delivery);
     if (renewalAtMs >= delivery.leaseExpiresAtMs - LEASE_COMPLETION_MARGIN_MS) {
@@ -384,10 +463,10 @@ export class RuntimeLifecycleSupervisor {
       remainingMs - LEASE_COMPLETION_MARGIN_MS
     );
 
-    const executed = await boundedOperation(
+    const executed = await runBoundedRuntimeOperation(
       (operationSignal) =>
-        executeRuntimeCommand(
-          this.runtime,
+        executeCapturedRuntimeCommand(
+          this.runtimeDispatch,
           handle,
           renewedDelivery.command,
           this.verifyAuthority,
@@ -459,49 +538,162 @@ function unavailableBeforeDispatch(delivery: RuntimeLifecycleDelivery): {
   };
 }
 
-function validateDelivery(
-  delivery: RuntimeLifecycleDelivery,
+function snapshotClaimedDeliveries(
+  value: unknown,
+  workerId: string,
+  claimedAtMs: number,
+  limit: number
+): ReadonlyArray<RuntimeLifecycleDelivery> {
+  try {
+    if (typeof value !== "object" || value === null || nodeTypes.isProxy(value)) {
+      throw new TypeError();
+    }
+    if (!Array.isArray(value)) throw new TypeError();
+    const keys = Reflect.ownKeys(value);
+    const lengthDescriptor = Object.getOwnPropertyDescriptor(value, "length");
+    if (!lengthDescriptor || !("value" in lengthDescriptor)) throw new TypeError();
+    const length = lengthDescriptor.value;
+    if (
+      !Number.isSafeInteger(length) ||
+      length < 0 ||
+      length > limit ||
+      keys.length !== length + 1 ||
+      !keys.includes("length")
+    ) {
+      throw new TypeError();
+    }
+    const deliveries: RuntimeLifecycleDelivery[] = [];
+    for (let index = 0; index < length; index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+      if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) {
+        throw new TypeError();
+      }
+      deliveries.push(snapshotDelivery(descriptor.value, workerId, claimedAtMs));
+    }
+    return Object.freeze(deliveries);
+  } catch (error) {
+    if (error instanceof InvalidRuntimeLifecycleDeliveryError) throw error;
+    throw new TypeError("Invalid Runtime lifecycle claim result");
+  }
+}
+
+class InvalidRuntimeLifecycleDeliveryError extends TypeError {
+  constructor() {
+    super("Invalid Runtime lifecycle delivery");
+    this.name = "InvalidRuntimeLifecycleDeliveryError";
+  }
+}
+
+function snapshotDelivery(
+  value: unknown,
   workerId: string,
   claimedAtMs: number
-): void {
-  if (
-    delivery === null ||
-    typeof delivery !== "object" ||
-    !Number.isSafeInteger(delivery.attempt) ||
-    delivery.attempt < 1 ||
-    delivery.leaseOwner !== workerId ||
-    !Number.isSafeInteger(delivery.leaseExpiresAtMs) ||
-    delivery.leaseExpiresAtMs <= claimedAtMs ||
-    delivery.priorDispatchCertainty !== "not-dispatched" ||
-    delivery.command === null ||
-    typeof delivery.command !== "object" ||
-    !isSafeIdentifier(delivery.command.commandId, 300)
-  ) {
-    throw new TypeError("Invalid Runtime lifecycle delivery");
+): RuntimeLifecycleDelivery {
+  try {
+    const snapshot = snapshotPortableData(value);
+    const delivery = exactDataRecord(snapshot, DELIVERY_FIELDS);
+    const attempt = dataField(delivery, "attempt");
+    const leaseOwner = dataField(delivery, "leaseOwner");
+    const leaseExpiresAtMs = dataField(delivery, "leaseExpiresAtMs");
+    if (
+      !Number.isSafeInteger(attempt) ||
+      (attempt as number) < 1 ||
+      leaseOwner !== workerId ||
+      !Number.isSafeInteger(leaseExpiresAtMs) ||
+      (leaseExpiresAtMs as number) <= claimedAtMs ||
+      dataField(delivery, "priorDispatchCertainty") !== "not-dispatched"
+    ) {
+      throw new TypeError();
+    }
+    const command = snapshotLifecycleCommand(dataField(delivery, "command"), claimedAtMs);
+    return Object.freeze({
+      command,
+      attempt: attempt as number,
+      leaseOwner: leaseOwner as string,
+      leaseExpiresAtMs: leaseExpiresAtMs as number,
+      priorDispatchCertainty: "not-dispatched",
+    });
+  } catch {
+    throw new InvalidRuntimeLifecycleDeliveryError();
   }
+}
+
+/**
+ * Reuse the executor's exact command snapshot and schema preflight without
+ * crossing an authority or Runtime seam. Async functions run synchronously to
+ * their first await, so the inert verifier captures the validated snapshot
+ * before this helper returns; its deliberate rejection is consumed locally.
+ */
+function snapshotLifecycleCommand(value: unknown, nowMs: number): RuntimeLifecycleCommand {
+  const command = value as RuntimeLifecycleCommand;
+  const commandRecord = exactDataRecord(command, Reflect.ownKeys(command) as string[]);
+  const binding = dataField(commandRecord, "binding") as RuntimeHandle["binding"];
+  const validationAtMs = commandStructuralValidationInstant(commandRecord, nowMs);
+  const validationHandle: RuntimeHandle = Object.freeze({
+    binding,
+    opaqueHandleRef: "supervisor-command-validation",
+    capabilities: Object.freeze({
+      isolatedExecution: true,
+      brokeredCredentials: true,
+      proxyOnlyEgress: true,
+      checkpoints: true,
+      yoloEligible: true,
+    }),
+  });
+  let snapshot: RuntimeLifecycleCommand | undefined;
+  const validation = executeCapturedRuntimeCommand(
+    () => Promise.reject(new TypeError()),
+    validationHandle,
+    command,
+    (input) => {
+      snapshot = input.command;
+      return false;
+    },
+    () => validationAtMs,
+    () => false,
+    new AbortController().signal
+  );
+  void validation.catch(() => undefined);
+  if (!snapshot) throw new TypeError();
+  return snapshot;
 }
 
 function validateRenewal(
   delivery: RuntimeLifecycleDelivery,
-  renewal: RuntimeLifecycleRenewal,
+  value: RuntimeLifecycleRenewal,
   renewedAtMs: number
 ): RuntimeLifecycleDelivery | null {
+  let renewal: Record<string, unknown>;
+  try {
+    const snapshot = snapshotPortableData(value);
+    if (typeof snapshot !== "object" || snapshot === null || Array.isArray(snapshot)) {
+      throw new TypeError();
+    }
+    const kind = dataField(snapshot as Record<string, unknown>, "kind");
+    renewal = exactDataRecord(
+      snapshot,
+      kind === "superseded" ? ["kind"] : ["kind", "leaseExpiresAtMs"]
+    );
+    if (kind !== "renewed" && kind !== "superseded") throw new TypeError();
+  } catch {
+    throw new TypeError("Invalid Runtime lifecycle lease renewal");
+  }
+  if (dataField(renewal, "kind") === "superseded") return null;
+  const leaseExpiresAtMs = dataField(renewal, "leaseExpiresAtMs");
   if (
-    renewal === null ||
-    typeof renewal !== "object" ||
-    (renewal.kind !== "renewed" && renewal.kind !== "superseded")
+    !Number.isSafeInteger(leaseExpiresAtMs) ||
+    (leaseExpiresAtMs as number) < delivery.leaseExpiresAtMs ||
+    (leaseExpiresAtMs as number) <= renewedAtMs
   ) {
     throw new TypeError("Invalid Runtime lifecycle lease renewal");
   }
-  if (renewal.kind === "superseded") return null;
-  if (
-    !Number.isSafeInteger(renewal.leaseExpiresAtMs) ||
-    renewal.leaseExpiresAtMs < delivery.leaseExpiresAtMs ||
-    renewal.leaseExpiresAtMs <= renewedAtMs
-  ) {
-    throw new TypeError("Invalid Runtime lifecycle lease renewal");
-  }
-  return Object.freeze({ ...delivery, leaseExpiresAtMs: renewal.leaseExpiresAtMs });
+  return Object.freeze({
+    command: delivery.command,
+    attempt: delivery.attempt,
+    leaseOwner: delivery.leaseOwner,
+    leaseExpiresAtMs: leaseExpiresAtMs as number,
+    priorDispatchCertainty: delivery.priorDispatchCertainty,
+  });
 }
 
 type RuntimeLifecycleExecution =
@@ -556,77 +748,3 @@ function reportOperationalError(
 }
 
 const LEASE_COMPLETION_MARGIN_MS = 250;
-
-type BoundedOperationResult<T> =
-  | { readonly kind: "value"; readonly value: T }
-  | { readonly kind: "error"; readonly error: unknown }
-  | { readonly kind: "timeout" }
-  | { readonly kind: "aborted" };
-
-function boundedOperation<T>(
-  operation: (signal: AbortSignal) => Promise<T>,
-  timeoutMs: number,
-  parentSignal: AbortSignal
-): Promise<BoundedOperationResult<T>> {
-  return new Promise((resolve) => {
-    let settled = false;
-    const controller = new AbortController();
-    if (parentSignal.aborted) {
-      controller.abort();
-      resolve({ kind: "aborted" });
-      return;
-    }
-    const abortFromParent = () => {
-      controller.abort();
-      finish({ kind: "aborted" });
-    };
-    parentSignal.addEventListener("abort", abortFromParent, { once: true });
-    const timer = setTimeout(() => {
-      controller.abort();
-      finish({ kind: "timeout" });
-    }, timeoutMs);
-    let pending: Promise<T>;
-    try {
-      pending = operation(controller.signal);
-    } catch (error) {
-      finish({ kind: "error", error });
-      return;
-    }
-    Promise.resolve(pending).then(
-      (value) => finish({ kind: "value", value }),
-      (error: unknown) => finish({ kind: "error", error })
-    );
-
-    function finish(result: BoundedOperationResult<T>): void {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      parentSignal.removeEventListener("abort", abortFromParent);
-      resolve(result);
-    }
-  });
-}
-
-function linkAbortSignal(source: AbortSignal | undefined, target: AbortController): () => void {
-  if (!source) return () => undefined;
-  const abort = () => target.abort();
-  if (source.aborted) {
-    abort();
-    return () => undefined;
-  }
-  source.addEventListener("abort", abort, { once: true });
-  return () => source.removeEventListener("abort", abort);
-}
-
-function abortableDelay(milliseconds: number, signal: AbortSignal): Promise<void> {
-  if (signal.aborted) return Promise.resolve();
-  return new Promise((resolve) => {
-    const timer = setTimeout(done, milliseconds);
-    signal.addEventListener("abort", done, { once: true });
-    function done() {
-      clearTimeout(timer);
-      signal.removeEventListener("abort", done);
-      resolve();
-    }
-  });
-}

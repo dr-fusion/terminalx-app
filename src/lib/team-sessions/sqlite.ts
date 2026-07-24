@@ -1,11 +1,17 @@
 import * as fs from "fs";
 import * as path from "path";
+import { createHash } from "node:crypto";
 import Database from "better-sqlite3";
+import { digestRuntimeCompensationIncident } from "../runtime/runtime-compensation-incident";
 import { RUNTIME_RECEIPT_OBSERVATION_MAX_CURSOR_CODE_POINTS } from "../runtime/runtime-receipt-observation-contract";
+import { isValidTmuxSessionName } from "../tmux";
 
-const SCHEMA_VERSION = 6;
+const SCHEMA_VERSION = 8;
 const PRE_RUNTIME_START_SCHEMA_VERSION = 4;
 const RUNTIME_START_SCHEMA_VERSION = 5;
+const RUNTIME_RECEIPT_FOLLOW_SCHEMA_VERSION = 6;
+const RUNTIME_COMPENSATION_SCHEMA_VERSION = 7;
+const RUNTIME_ASSIGNMENT_OUTBOX_INTERLOCK_SCHEMA_VERSION = 8;
 const APPLICATION_ID = 0x54585331; // "TXS1"
 
 const CONVERSATION_SCHEMA = `
@@ -3707,6 +3713,2710 @@ BEGIN
 END;
 `;
 
+const RUNTIME_COMPENSATION_TABLES_SCHEMA_V7 = `
+CREATE TABLE runtime_binding_safety_fences (
+  team_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  runtime_assignment_id TEXT NOT NULL,
+  runtime_assignment_generation INTEGER NOT NULL CHECK (runtime_assignment_generation >= 1),
+  sandbox_id TEXT NOT NULL,
+  sandbox_generation INTEGER NOT NULL CHECK (sandbox_generation >= 1),
+  runtime_principal_id TEXT NOT NULL,
+  allocated_fence INTEGER NOT NULL CHECK (
+    allocated_fence >= 1 AND allocated_fence <= 9007199254740991
+  ),
+  updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= 0),
+  PRIMARY KEY (
+    team_id, project_id, session_id, runtime_assignment_id,
+    runtime_assignment_generation, sandbox_id, sandbox_generation, runtime_principal_id
+  ),
+  FOREIGN KEY (session_id, team_id, project_id)
+    REFERENCES sessions(id, team_id, project_id) ON DELETE RESTRICT,
+  FOREIGN KEY (
+    runtime_assignment_id, session_id, runtime_assignment_generation,
+    sandbox_id, sandbox_generation, runtime_principal_id
+  ) REFERENCES runtime_assignments(
+    id, session_id, generation, sandbox_id, sandbox_generation, runtime_principal_id
+  ) ON DELETE RESTRICT
+) STRICT;
+
+CREATE TABLE runtime_compensation_incidents (
+  compensation_id TEXT PRIMARY KEY CHECK (length(compensation_id) BETWEEN 1 AND 300),
+  incident_digest TEXT NOT NULL UNIQUE CHECK (
+    length(incident_digest) = 64 AND incident_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  source_command_id TEXT NOT NULL UNIQUE,
+  source_receipt_id TEXT NOT NULL UNIQUE,
+  trust_state TEXT NOT NULL CHECK (trust_state IN ('verified', 'legacy-untrusted')),
+  session_id TEXT NOT NULL,
+  team_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  agent_run_id TEXT NOT NULL,
+  run_policy_revision INTEGER NOT NULL CHECK (run_policy_revision >= 1),
+  runtime_assignment_id TEXT NOT NULL,
+  runtime_assignment_generation INTEGER NOT NULL CHECK (runtime_assignment_generation >= 1),
+  sandbox_id TEXT NOT NULL,
+  sandbox_generation INTEGER NOT NULL CHECK (sandbox_generation >= 1),
+  runtime_principal_id TEXT NOT NULL,
+  runtime_authorization_generation INTEGER NOT NULL
+    CHECK (runtime_authorization_generation >= 1),
+  source_command_digest TEXT NOT NULL CHECK (
+    length(source_command_digest) = 64 AND source_command_digest = lower(source_command_digest)
+  ),
+  lifecycle_command_claims_digest TEXT NOT NULL CHECK (
+    length(lifecycle_command_claims_digest) = 64 AND
+    lifecycle_command_claims_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  lifecycle_receipt_digest TEXT NOT NULL CHECK (
+    length(lifecycle_receipt_digest) = 64 AND
+    lifecycle_receipt_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  source_enforced_fence INTEGER NOT NULL CHECK (
+    source_enforced_fence >= 1 AND source_enforced_fence <= 9007199254740991
+  ),
+  safety_fence INTEGER NOT NULL CHECK (
+    safety_fence > source_enforced_fence AND safety_fence <= 9007199254740991
+  ),
+  source_effect_ref_commitment TEXT,
+  source_required_effect_enforcer_set_digest TEXT,
+  lifecycle_enforcement_subject_digest TEXT,
+  lifecycle_aggregate_proof_digest TEXT,
+  source_proof_verified_at_ms INTEGER,
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  UNIQUE (
+    compensation_id, source_command_id, source_receipt_id,
+    session_id, team_id, project_id, agent_run_id,
+    runtime_assignment_id, runtime_assignment_generation, sandbox_id,
+    sandbox_generation, runtime_principal_id, runtime_authorization_generation
+  ),
+  UNIQUE (compensation_id, source_command_id),
+  UNIQUE (
+    team_id, project_id, session_id, runtime_assignment_id,
+    runtime_assignment_generation, sandbox_id, sandbox_generation,
+    runtime_principal_id, safety_fence
+  ),
+  CHECK (
+    (trust_state = 'verified'
+      AND source_effect_ref_commitment IS NOT NULL
+      AND length(source_effect_ref_commitment) = 74
+      AND substr(source_effect_ref_commitment, 1, 10) = 'effect:v1:'
+      AND substr(source_effect_ref_commitment, 11) NOT GLOB '*[^0-9a-f]*'
+      AND source_required_effect_enforcer_set_digest IS NOT NULL
+      AND length(source_required_effect_enforcer_set_digest) = 64
+      AND source_required_effect_enforcer_set_digest NOT GLOB '*[^0-9a-f]*'
+      AND lifecycle_enforcement_subject_digest IS NOT NULL
+      AND length(lifecycle_enforcement_subject_digest) = 64
+      AND lifecycle_enforcement_subject_digest NOT GLOB '*[^0-9a-f]*'
+      AND lifecycle_aggregate_proof_digest IS NOT NULL
+      AND length(lifecycle_aggregate_proof_digest) = 64
+      AND lifecycle_aggregate_proof_digest NOT GLOB '*[^0-9a-f]*'
+      AND source_proof_verified_at_ms IS NOT NULL
+      AND source_proof_verified_at_ms >= 0) OR
+    (trust_state = 'legacy-untrusted'
+      AND source_effect_ref_commitment IS NULL
+      AND source_required_effect_enforcer_set_digest IS NULL
+      AND lifecycle_enforcement_subject_digest IS NULL
+      AND lifecycle_aggregate_proof_digest IS NULL
+      AND source_proof_verified_at_ms IS NULL)
+  ),
+  FOREIGN KEY (source_command_id) REFERENCES runtime_run_commands(id) ON DELETE RESTRICT,
+  FOREIGN KEY (source_receipt_id) REFERENCES runtime_run_command_receipts(id) ON DELETE RESTRICT,
+  FOREIGN KEY (session_id, team_id, project_id)
+    REFERENCES sessions(id, team_id, project_id) ON DELETE RESTRICT,
+  FOREIGN KEY (
+    runtime_assignment_id, session_id, runtime_assignment_generation,
+    sandbox_id, sandbox_generation, runtime_principal_id
+  ) REFERENCES runtime_assignments(
+    id, session_id, generation, sandbox_id, sandbox_generation, runtime_principal_id
+  ) ON DELETE RESTRICT,
+  FOREIGN KEY (
+    session_id, runtime_authorization_generation, runtime_assignment_id,
+    runtime_assignment_generation, sandbox_id, sandbox_generation, runtime_principal_id
+  ) REFERENCES runtime_authorization_epochs(
+    session_id, generation, runtime_assignment_id, runtime_assignment_generation,
+    sandbox_id, sandbox_generation, runtime_principal_id
+  ) ON DELETE RESTRICT
+) STRICT;
+
+CREATE TABLE runtime_compensation_commands (
+  id TEXT PRIMARY KEY,
+  compensation_id TEXT NOT NULL,
+  source_command_id TEXT NOT NULL,
+  command_sequence INTEGER NOT NULL CHECK (command_sequence >= 1),
+  previous_command_sequence INTEGER,
+  operation TEXT NOT NULL CHECK (operation = 'safety.quarantine'),
+  session_id TEXT NOT NULL,
+  team_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  agent_run_id TEXT NOT NULL,
+  runtime_assignment_id TEXT NOT NULL,
+  runtime_assignment_generation INTEGER NOT NULL CHECK (runtime_assignment_generation >= 1),
+  sandbox_id TEXT NOT NULL,
+  sandbox_generation INTEGER NOT NULL CHECK (sandbox_generation >= 1),
+  runtime_principal_id TEXT NOT NULL,
+  observed_runtime_authorization_generation INTEGER NOT NULL
+    CHECK (observed_runtime_authorization_generation >= 1),
+  source_required_effect_enforcer_set_digest TEXT NOT NULL CHECK (
+    length(source_required_effect_enforcer_set_digest) = 64 AND
+    source_required_effect_enforcer_set_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  lifecycle_command_claims_digest TEXT NOT NULL CHECK (
+    length(lifecycle_command_claims_digest) = 64 AND
+    lifecycle_command_claims_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  lifecycle_receipt_digest TEXT NOT NULL CHECK (
+    length(lifecycle_receipt_digest) = 64 AND
+    lifecycle_receipt_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  lifecycle_enforcement_subject_digest TEXT NOT NULL CHECK (
+    length(lifecycle_enforcement_subject_digest) = 64 AND
+    lifecycle_enforcement_subject_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  lifecycle_aggregate_proof_digest TEXT NOT NULL CHECK (
+    length(lifecycle_aggregate_proof_digest) = 64 AND
+    lifecycle_aggregate_proof_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  platform_security_policy_revision TEXT NOT NULL
+    CHECK (length(platform_security_policy_revision) BETWEEN 1 AND 300),
+  required_containment_enforcer_set_digest TEXT NOT NULL CHECK (
+    length(required_containment_enforcer_set_digest) = 64 AND
+    required_containment_enforcer_set_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  safety_fence INTEGER NOT NULL CHECK (
+    safety_fence >= 1 AND safety_fence <= 9007199254740991
+  ),
+  reason_ref TEXT NOT NULL CHECK (length(reason_ref) BETWEEN 1 AND 300),
+  causation_id TEXT NOT NULL CHECK (length(causation_id) BETWEEN 1 AND 300),
+  command_json TEXT NOT NULL CHECK (
+    json_valid(command_json) AND json_type(command_json) = 'object'
+  ),
+  command_digest TEXT NOT NULL CHECK (
+    length(command_digest) = 64 AND command_digest = lower(command_digest)
+  ),
+  authority_digest TEXT NOT NULL CHECK (
+    length(authority_digest) = 64 AND authority_digest = lower(authority_digest)
+  ),
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  authority_verified_at_ms INTEGER NOT NULL CHECK (
+    authority_verified_at_ms >= created_at_ms
+  ),
+  deadline_at_ms INTEGER NOT NULL CHECK (deadline_at_ms > created_at_ms),
+  CHECK (authority_verified_at_ms < deadline_at_ms),
+  UNIQUE (compensation_id, command_sequence),
+  UNIQUE (id, compensation_id, source_command_id),
+  CHECK (
+    (command_sequence = 1 AND previous_command_sequence IS NULL) OR
+    (command_sequence > 1 AND previous_command_sequence = command_sequence - 1)
+  ),
+  FOREIGN KEY (compensation_id, source_command_id)
+    REFERENCES runtime_compensation_incidents(compensation_id, source_command_id)
+    ON DELETE RESTRICT,
+  FOREIGN KEY (compensation_id, previous_command_sequence)
+    REFERENCES runtime_compensation_commands(compensation_id, command_sequence)
+    ON DELETE RESTRICT,
+  FOREIGN KEY (
+    runtime_assignment_id, session_id, runtime_assignment_generation,
+    sandbox_id, sandbox_generation, runtime_principal_id
+  ) REFERENCES runtime_assignments(
+    id, session_id, generation, sandbox_id, sandbox_generation, runtime_principal_id
+  ) ON DELETE RESTRICT,
+  FOREIGN KEY (
+    session_id, observed_runtime_authorization_generation, runtime_assignment_id,
+    runtime_assignment_generation, sandbox_id, sandbox_generation, runtime_principal_id
+  ) REFERENCES runtime_authorization_epochs(
+    session_id, generation, runtime_assignment_id, runtime_assignment_generation,
+    sandbox_id, sandbox_generation, runtime_principal_id
+  ) ON DELETE RESTRICT
+) STRICT;
+
+CREATE TABLE runtime_compensation_dispatch (
+  compensation_command_id TEXT PRIMARY KEY,
+  compensation_id TEXT NOT NULL,
+  source_command_id TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN (
+    'pending', 'processing', 'awaiting-receipt',
+    'enforced', 'blocked', 'expired-before-dispatch'
+  )),
+  attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+  available_at_ms INTEGER NOT NULL CHECK (available_at_ms >= created_at_ms),
+  lease_owner TEXT,
+  lease_expires_at_ms INTEGER,
+  dispatch_interlock_acquired_at_ms INTEGER CHECK (
+    dispatch_interlock_acquired_at_ms IS NULL OR
+    dispatch_interlock_acquired_at_ms >= created_at_ms
+  ),
+  last_safe_error_code TEXT CHECK (
+    last_safe_error_code IS NULL OR length(last_safe_error_code) BETWEEN 1 AND 200
+  ),
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= created_at_ms),
+  terminal_at_ms INTEGER,
+  CHECK (
+    (status = 'processing'
+      AND lease_owner IS NOT NULL AND length(lease_owner) BETWEEN 1 AND 300
+      AND lease_expires_at_ms IS NOT NULL AND lease_expires_at_ms > updated_at_ms) OR
+    (status <> 'processing' AND lease_owner IS NULL AND lease_expires_at_ms IS NULL)
+  ),
+  CHECK (
+    (status IN ('enforced', 'blocked', 'expired-before-dispatch')
+      AND terminal_at_ms IS NOT NULL AND terminal_at_ms >= created_at_ms) OR
+    (status IN ('pending', 'processing', 'awaiting-receipt') AND terminal_at_ms IS NULL)
+  ),
+  UNIQUE (compensation_command_id, compensation_id, source_command_id),
+  FOREIGN KEY (compensation_command_id, compensation_id, source_command_id)
+    REFERENCES runtime_compensation_commands(id, compensation_id, source_command_id)
+    ON DELETE RESTRICT
+) STRICT;
+
+CREATE UNIQUE INDEX one_unresolved_runtime_compensation_per_case
+  ON runtime_compensation_dispatch(compensation_id)
+  WHERE status IN ('pending', 'processing', 'awaiting-receipt');
+
+CREATE INDEX runtime_compensation_dispatch_claimable
+  ON runtime_compensation_dispatch(status, available_at_ms, created_at_ms, compensation_command_id);
+
+CREATE TABLE runtime_compensation_receipts (
+  id TEXT PRIMARY KEY,
+  compensation_command_id TEXT NOT NULL,
+  compensation_id TEXT NOT NULL,
+  source_command_id TEXT NOT NULL,
+  version INTEGER NOT NULL CHECK (version >= 1),
+  previous_version INTEGER,
+  session_id TEXT NOT NULL,
+  team_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  agent_run_id TEXT NOT NULL,
+  runtime_assignment_id TEXT NOT NULL,
+  runtime_assignment_generation INTEGER NOT NULL CHECK (runtime_assignment_generation >= 1),
+  sandbox_id TEXT NOT NULL,
+  sandbox_generation INTEGER NOT NULL CHECK (sandbox_generation >= 1),
+  runtime_principal_id TEXT NOT NULL,
+  observed_runtime_authorization_generation INTEGER NOT NULL
+    CHECK (observed_runtime_authorization_generation >= 1),
+  command_digest TEXT NOT NULL CHECK (
+    length(command_digest) = 64 AND command_digest = lower(command_digest)
+  ),
+  enforced_safety_fence INTEGER CHECK (
+    enforced_safety_fence IS NULL OR (
+      enforced_safety_fence >= 1 AND enforced_safety_fence <= 9007199254740991
+    )
+  ),
+  outcome TEXT NOT NULL CHECK (outcome IN (
+    'accepted', 'enforced', 'duplicate', 'rejected', 'quarantined'
+  )),
+  original_outcome TEXT CHECK (
+    original_outcome IS NULL OR original_outcome IN (
+      'accepted', 'enforced', 'rejected', 'quarantined'
+    )
+  ),
+  original_receipt_digest TEXT CHECK (
+    original_receipt_digest IS NULL OR (
+      length(original_receipt_digest) = 64 AND
+      original_receipt_digest = lower(original_receipt_digest)
+    )
+  ),
+  receipt_json TEXT NOT NULL CHECK (
+    json_valid(receipt_json) AND json_type(receipt_json) = 'object'
+    AND COALESCE(json_extract(receipt_json, '$.receiptKind') = 'runtime.compensation', 0)
+    AND COALESCE(json_extract(receipt_json, '$.compensationId') = compensation_id, 0)
+    AND COALESCE(json_extract(receipt_json, '$.commandId') = compensation_command_id, 0)
+    AND COALESCE(json_extract(receipt_json, '$.outcome') = outcome, 0)
+    AND COALESCE(
+      json_extract(receipt_json, '$.observedRuntimeAuthorizationGeneration') =
+        observed_runtime_authorization_generation,
+      0
+    )
+    AND COALESCE(json_extract(receipt_json, '$.binding.teamId') = team_id, 0)
+    AND COALESCE(json_extract(receipt_json, '$.binding.projectId') = project_id, 0)
+    AND COALESCE(json_extract(receipt_json, '$.binding.sessionId') = session_id, 0)
+    AND COALESCE(
+      json_extract(receipt_json, '$.binding.runtimeAssignmentId') = runtime_assignment_id,
+      0
+    )
+    AND COALESCE(
+      json_extract(receipt_json, '$.binding.runtimeAssignmentGeneration') =
+        runtime_assignment_generation,
+      0
+    )
+    AND COALESCE(json_extract(receipt_json, '$.binding.sandboxId') = sandbox_id, 0)
+    AND COALESCE(
+      json_extract(receipt_json, '$.binding.sandboxGeneration') = sandbox_generation,
+      0
+    )
+    AND COALESCE(
+      json_extract(receipt_json, '$.binding.runtimePrincipalId') = runtime_principal_id,
+      0
+    )
+    AND (
+      outcome <> 'duplicate' OR COALESCE(
+        json_type(receipt_json, '$.originalReceipt') = 'object'
+          AND json_extract(
+            receipt_json, '$.originalReceipt.receiptKind'
+          ) = 'runtime.compensation'
+          AND json_extract(
+            receipt_json, '$.originalReceipt.compensationId'
+          ) = compensation_id
+          AND json_extract(
+            receipt_json, '$.originalReceipt.commandId'
+          ) = compensation_command_id
+          AND json_extract(
+            receipt_json, '$.originalReceipt.outcome'
+          ) = original_outcome
+          AND json_extract(
+            receipt_json, '$.originalReceiptDigest'
+          ) = original_receipt_digest
+          AND json_extract(
+            receipt_json, '$.originalReceipt.observedRuntimeAuthorizationGeneration'
+          ) = observed_runtime_authorization_generation
+          AND json_extract(
+            receipt_json, '$.originalReceipt.binding.teamId'
+          ) = team_id
+          AND json_extract(
+            receipt_json, '$.originalReceipt.binding.projectId'
+          ) = project_id
+          AND json_extract(
+            receipt_json, '$.originalReceipt.binding.sessionId'
+          ) = session_id
+          AND json_extract(
+            receipt_json, '$.originalReceipt.binding.runtimeAssignmentId'
+          ) = runtime_assignment_id
+          AND json_extract(
+            receipt_json, '$.originalReceipt.binding.runtimeAssignmentGeneration'
+          ) = runtime_assignment_generation
+          AND json_extract(
+            receipt_json, '$.originalReceipt.binding.sandboxId'
+          ) = sandbox_id
+          AND json_extract(
+            receipt_json, '$.originalReceipt.binding.sandboxGeneration'
+          ) = sandbox_generation
+          AND json_extract(
+            receipt_json, '$.originalReceipt.binding.runtimePrincipalId'
+          ) = runtime_principal_id,
+        0
+      )
+    )
+  ),
+  receipt_digest TEXT NOT NULL CHECK (
+    length(receipt_digest) = 64 AND receipt_digest = lower(receipt_digest)
+  ),
+  required_containment_enforcer_set_digest TEXT,
+  effect_ref_commitment TEXT,
+  enforcement_subject_digest TEXT,
+  aggregate_proof_digest TEXT,
+  proof_verified_at_ms INTEGER CHECK (proof_verified_at_ms IS NULL OR proof_verified_at_ms >= 0),
+  received_at_ms INTEGER NOT NULL CHECK (received_at_ms >= 0),
+  UNIQUE (compensation_command_id, version),
+  UNIQUE (compensation_command_id, receipt_digest),
+  UNIQUE (id, compensation_command_id),
+  UNIQUE (id, compensation_command_id, outcome),
+  CHECK (
+    (version = 1 AND previous_version IS NULL) OR
+    (version > 1 AND previous_version = version - 1)
+  ),
+  CHECK (
+    (outcome = 'duplicate' AND original_outcome IS NOT NULL
+      AND original_receipt_digest IS NOT NULL) OR
+    (outcome <> 'duplicate' AND original_outcome IS NULL
+      AND original_receipt_digest IS NULL)
+  ),
+  FOREIGN KEY (compensation_command_id, compensation_id, source_command_id)
+    REFERENCES runtime_compensation_commands(id, compensation_id, source_command_id)
+    ON DELETE RESTRICT,
+  FOREIGN KEY (compensation_command_id, previous_version)
+    REFERENCES runtime_compensation_receipts(compensation_command_id, version)
+    ON DELETE RESTRICT
+) STRICT;
+
+CREATE UNIQUE INDEX one_terminal_runtime_compensation_receipt_per_command
+  ON runtime_compensation_receipts(compensation_command_id)
+  WHERE outcome IN ('enforced', 'rejected', 'quarantined');
+
+CREATE TABLE runtime_compensation_effects (
+  compensation_id TEXT PRIMARY KEY,
+  source_command_id TEXT NOT NULL UNIQUE,
+  compensation_command_id TEXT NOT NULL UNIQUE,
+  receipt_id TEXT NOT NULL UNIQUE,
+  receipt_outcome TEXT NOT NULL CHECK (receipt_outcome IN ('enforced', 'duplicate')),
+  session_id TEXT NOT NULL,
+  agent_run_id TEXT NOT NULL,
+  applied_session_sequence INTEGER NOT NULL CHECK (applied_session_sequence >= 1),
+  effect_digest TEXT NOT NULL UNIQUE CHECK (
+    length(effect_digest) = 64 AND effect_digest = lower(effect_digest)
+  ),
+  applied_at_ms INTEGER NOT NULL CHECK (applied_at_ms >= 0),
+  FOREIGN KEY (compensation_id, source_command_id)
+    REFERENCES runtime_compensation_incidents(compensation_id, source_command_id)
+    ON DELETE RESTRICT,
+  FOREIGN KEY (compensation_command_id, compensation_id, source_command_id)
+    REFERENCES runtime_compensation_commands(id, compensation_id, source_command_id)
+    ON DELETE RESTRICT,
+  FOREIGN KEY (receipt_id, compensation_command_id, receipt_outcome)
+    REFERENCES runtime_compensation_receipts(id, compensation_command_id, outcome)
+    ON DELETE RESTRICT,
+  FOREIGN KEY (session_id, applied_session_sequence)
+    REFERENCES session_events(session_id, sequence) ON DELETE RESTRICT
+) STRICT;
+
+CREATE TABLE runtime_compensation_follow_events (
+  id TEXT PRIMARY KEY,
+  runtime_assignment_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  runtime_assignment_generation INTEGER NOT NULL CHECK (runtime_assignment_generation >= 1),
+  sandbox_id TEXT NOT NULL,
+  sandbox_generation INTEGER NOT NULL CHECK (sandbox_generation >= 1),
+  runtime_principal_id TEXT NOT NULL,
+  runtime_authorization_generation INTEGER NOT NULL
+    CHECK (runtime_authorization_generation >= 1),
+  issuer_key_id TEXT NOT NULL CHECK (length(issuer_key_id) BETWEEN 1 AND 300),
+  public_key_spki_digest TEXT NOT NULL CHECK (
+    length(public_key_spki_digest) = 64 AND public_key_spki_digest = lower(public_key_spki_digest)
+  ),
+  receipt_sequence INTEGER NOT NULL CHECK (receipt_sequence >= 1),
+  cursor TEXT NOT NULL CHECK (
+    length(cursor) BETWEEN 1 AND ${RUNTIME_RECEIPT_OBSERVATION_MAX_CURSOR_CODE_POINTS}
+  ),
+  previous_cursor TEXT CHECK (
+    previous_cursor IS NULL OR
+    length(previous_cursor) BETWEEN 1 AND ${RUNTIME_RECEIPT_OBSERVATION_MAX_CURSOR_CODE_POINTS}
+  ),
+  previous_observation_digest TEXT CHECK (
+    previous_observation_digest IS NULL OR (
+      length(previous_observation_digest) = 64 AND
+      previous_observation_digest = lower(previous_observation_digest)
+    )
+  ),
+  observation_digest TEXT NOT NULL CHECK (
+    length(observation_digest) = 64 AND observation_digest = lower(observation_digest)
+  ),
+  compensation_command_id TEXT NOT NULL,
+  compensation_id TEXT NOT NULL,
+  source_command_id TEXT NOT NULL,
+  command_digest TEXT NOT NULL CHECK (
+    length(command_digest) = 64 AND command_digest = lower(command_digest)
+  ),
+  receipt_id TEXT NOT NULL,
+  wire_receipt_digest TEXT NOT NULL CHECK (
+    length(wire_receipt_digest) = 64 AND wire_receipt_digest = lower(wire_receipt_digest)
+  ),
+  effective_receipt_digest TEXT NOT NULL CHECK (
+    length(effective_receipt_digest) = 64 AND
+    effective_receipt_digest = lower(effective_receipt_digest)
+  ),
+  signature TEXT NOT NULL CHECK (length(signature) BETWEEN 1 AND 2000),
+  lease_owner TEXT NOT NULL CHECK (length(lease_owner) BETWEEN 1 AND 300),
+  lease_version INTEGER NOT NULL CHECK (lease_version >= 1),
+  observed_at_ms INTEGER NOT NULL CHECK (observed_at_ms >= 0),
+  received_at_ms INTEGER NOT NULL CHECK (received_at_ms >= observed_at_ms),
+  UNIQUE (runtime_assignment_id, runtime_authorization_generation, receipt_sequence),
+  UNIQUE (runtime_assignment_id, runtime_authorization_generation, cursor),
+  UNIQUE (runtime_assignment_id, runtime_authorization_generation, observation_digest),
+  FOREIGN KEY (
+    runtime_assignment_id, runtime_authorization_generation, session_id,
+    runtime_assignment_generation, sandbox_id, sandbox_generation, runtime_principal_id,
+    issuer_key_id, public_key_spki_digest
+  ) REFERENCES runtime_receipt_follow_streams(
+    runtime_assignment_id, runtime_authorization_generation, session_id,
+    runtime_assignment_generation, sandbox_id, sandbox_generation, runtime_principal_id,
+    issuer_key_id, public_key_spki_digest
+  ) ON DELETE RESTRICT,
+  FOREIGN KEY (compensation_command_id, compensation_id, source_command_id)
+    REFERENCES runtime_compensation_commands(id, compensation_id, source_command_id)
+    ON DELETE RESTRICT,
+  FOREIGN KEY (receipt_id, compensation_command_id)
+    REFERENCES runtime_compensation_receipts(id, compensation_command_id) ON DELETE RESTRICT,
+  CHECK (
+    (receipt_sequence = 1 AND previous_cursor IS NULL AND previous_observation_digest IS NULL) OR
+    (receipt_sequence > 1 AND previous_cursor IS NOT NULL AND previous_observation_digest IS NOT NULL)
+  )
+) STRICT;
+`;
+
+const RUNTIME_COMPENSATION_TRIGGERS_SCHEMA_V7 = `
+CREATE TRIGGER runtime_assignments_create_binding_safety_fence
+AFTER INSERT ON runtime_assignments
+BEGIN
+  INSERT INTO runtime_binding_safety_fences (
+    team_id, project_id, session_id, runtime_assignment_id,
+    runtime_assignment_generation, sandbox_id, sandbox_generation,
+    runtime_principal_id, allocated_fence, updated_at_ms
+  )
+  SELECT
+    NEW.team_id, NEW.project_id, NEW.session_id, NEW.id,
+    NEW.generation, NEW.sandbox_id, NEW.sandbox_generation,
+    NEW.runtime_principal_id,
+    MAX(1, session.control_epoch, session.steering_revision,
+      session.runtime_authorization_generation),
+    NEW.created_at_ms
+  FROM sessions session
+  WHERE session.id = NEW.session_id;
+END;
+
+CREATE TRIGGER runtime_binding_safety_fences_valid_insert
+BEFORE INSERT ON runtime_binding_safety_fences
+WHEN NOT EXISTS (
+  SELECT 1
+  FROM runtime_assignments assignment
+  JOIN sessions session ON session.id = assignment.session_id
+  WHERE assignment.id = NEW.runtime_assignment_id
+    AND assignment.session_id = NEW.session_id
+    AND assignment.team_id = NEW.team_id
+    AND assignment.project_id = NEW.project_id
+    AND assignment.generation = NEW.runtime_assignment_generation
+    AND assignment.sandbox_id = NEW.sandbox_id
+    AND assignment.sandbox_generation = NEW.sandbox_generation
+    AND assignment.runtime_principal_id = NEW.runtime_principal_id
+    AND NEW.allocated_fence >= session.control_epoch
+    AND NEW.allocated_fence >= session.steering_revision
+    AND NEW.allocated_fence >= session.runtime_authorization_generation
+    AND NEW.allocated_fence >= COALESCE((
+      SELECT MAX(run.state_version)
+      FROM agent_runs run
+      WHERE run.session_id = NEW.session_id
+        AND run.runtime_assignment_id = NEW.runtime_assignment_id
+    ), 1)
+    AND NEW.allocated_fence >= COALESCE((
+      SELECT MAX(command.target_run_state_version)
+      FROM runtime_run_commands command
+      WHERE command.session_id = NEW.session_id
+        AND command.runtime_assignment_id = NEW.runtime_assignment_id
+        AND command.runtime_assignment_generation = NEW.runtime_assignment_generation
+        AND command.sandbox_id = NEW.sandbox_id
+        AND command.sandbox_generation = NEW.sandbox_generation
+        AND command.runtime_principal_id = NEW.runtime_principal_id
+    ), 1)
+    AND NEW.allocated_fence >= COALESCE((
+      SELECT MAX(json_extract(
+        receipt.receipt_json,
+        CASE WHEN receipt.outcome = 'duplicate'
+          THEN '$.originalReceipt.enforcedFence' ELSE '$.enforcedFence' END
+      ))
+      FROM runtime_run_command_receipts receipt
+      JOIN runtime_run_commands command ON command.id = receipt.command_id
+      WHERE command.session_id = NEW.session_id
+        AND command.runtime_assignment_id = NEW.runtime_assignment_id
+        AND command.runtime_assignment_generation = NEW.runtime_assignment_generation
+        AND command.sandbox_id = NEW.sandbox_id
+        AND command.sandbox_generation = NEW.sandbox_generation
+        AND command.runtime_principal_id = NEW.runtime_principal_id
+        AND (receipt.outcome = 'enforced' OR
+          (receipt.outcome = 'duplicate' AND receipt.original_outcome = 'enforced'))
+    ), 1)
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime binding safety fence starts below durable high-water');
+END;
+
+CREATE TRIGGER runtime_binding_safety_fences_identity_immutable
+BEFORE UPDATE OF team_id, project_id, session_id, runtime_assignment_id,
+  runtime_assignment_generation, sandbox_id, sandbox_generation, runtime_principal_id
+ON runtime_binding_safety_fences
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime binding safety fence identity is immutable');
+END;
+
+CREATE TRIGGER runtime_binding_safety_fences_valid_advance
+BEFORE UPDATE OF allocated_fence, updated_at_ms ON runtime_binding_safety_fences
+WHEN NOT (
+  NEW.allocated_fence > OLD.allocated_fence
+  AND NEW.updated_at_ms >= OLD.updated_at_ms
+  AND EXISTS (
+    SELECT 1
+    FROM runtime_assignments assignment
+    JOIN sessions session ON session.id = assignment.session_id
+    WHERE assignment.id = NEW.runtime_assignment_id
+      AND assignment.session_id = NEW.session_id
+      AND assignment.team_id = NEW.team_id
+      AND assignment.project_id = NEW.project_id
+      AND assignment.generation = NEW.runtime_assignment_generation
+      AND assignment.sandbox_id = NEW.sandbox_id
+      AND assignment.sandbox_generation = NEW.sandbox_generation
+      AND assignment.runtime_principal_id = NEW.runtime_principal_id
+      AND NEW.allocated_fence > session.control_epoch
+      AND NEW.allocated_fence > session.steering_revision
+      AND NEW.allocated_fence > session.runtime_authorization_generation
+      AND NEW.allocated_fence > COALESCE((
+        SELECT MAX(run.state_version)
+        FROM agent_runs run
+        WHERE run.session_id = NEW.session_id
+          AND run.runtime_assignment_id = NEW.runtime_assignment_id
+      ), 0)
+      AND NEW.allocated_fence > COALESCE((
+        SELECT MAX(command.target_run_state_version)
+        FROM runtime_run_commands command
+        WHERE command.session_id = NEW.session_id
+          AND command.runtime_assignment_id = NEW.runtime_assignment_id
+          AND command.runtime_assignment_generation = NEW.runtime_assignment_generation
+          AND command.sandbox_id = NEW.sandbox_id
+          AND command.sandbox_generation = NEW.sandbox_generation
+          AND command.runtime_principal_id = NEW.runtime_principal_id
+      ), 0)
+      AND NEW.allocated_fence > COALESCE((
+        SELECT MAX(json_extract(
+          receipt.receipt_json,
+          CASE WHEN receipt.outcome = 'duplicate'
+            THEN '$.originalReceipt.enforcedFence' ELSE '$.enforcedFence' END
+        ))
+        FROM runtime_run_command_receipts receipt
+        JOIN runtime_run_commands command ON command.id = receipt.command_id
+        WHERE command.session_id = NEW.session_id
+          AND command.runtime_assignment_id = NEW.runtime_assignment_id
+          AND command.runtime_assignment_generation = NEW.runtime_assignment_generation
+          AND command.sandbox_id = NEW.sandbox_id
+          AND command.sandbox_generation = NEW.sandbox_generation
+          AND command.runtime_principal_id = NEW.runtime_principal_id
+          AND (receipt.outcome = 'enforced' OR
+            (receipt.outcome = 'duplicate' AND receipt.original_outcome = 'enforced'))
+          AND json_type(
+            receipt.receipt_json,
+            CASE WHEN receipt.outcome = 'duplicate'
+              THEN '$.originalReceipt.enforcedFence' ELSE '$.enforcedFence' END
+          ) = 'integer'
+      ), 0)
+  )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime binding safety fence must advance beyond durable high-water');
+END;
+
+CREATE TRIGGER runtime_binding_safety_fences_immutable_delete
+BEFORE DELETE ON runtime_binding_safety_fences
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime binding safety fences cannot be deleted');
+END;
+
+CREATE TRIGGER runtime_compensation_incidents_valid_insert
+BEFORE INSERT ON runtime_compensation_incidents
+WHEN NEW.trust_state <> 'verified' OR NOT EXISTS (
+  SELECT 1
+  FROM runtime_run_commands command
+  JOIN runtime_run_command_dispatch dispatch ON dispatch.command_id = command.id
+  JOIN runtime_run_command_receipts receipt ON receipt.id = NEW.source_receipt_id
+  JOIN runtime_assignments assignment ON assignment.id = command.runtime_assignment_id
+  WHERE command.id = NEW.source_command_id
+    AND dispatch.status IN ('processing', 'awaiting-receipt', 'compensating')
+    AND receipt.command_id = command.id
+    AND (
+      receipt.outcome = 'enforced' OR
+      (receipt.outcome = 'duplicate' AND receipt.original_outcome = 'enforced')
+    )
+    AND NOT EXISTS (
+      SELECT 1 FROM runtime_run_command_effects effect
+      WHERE effect.command_id = command.id
+    )
+    AND command.session_id = NEW.session_id
+    AND assignment.team_id = NEW.team_id
+    AND assignment.project_id = NEW.project_id
+    AND command.agent_run_id = NEW.agent_run_id
+    AND command.run_policy_revision = NEW.run_policy_revision
+    AND command.runtime_assignment_id = NEW.runtime_assignment_id
+    AND command.runtime_assignment_generation = NEW.runtime_assignment_generation
+    AND command.sandbox_id = NEW.sandbox_id
+    AND command.sandbox_generation = NEW.sandbox_generation
+    AND command.runtime_principal_id = NEW.runtime_principal_id
+    AND command.runtime_authorization_generation = NEW.runtime_authorization_generation
+    AND command.command_digest = NEW.source_command_digest
+    AND command.authority_digest = NEW.lifecycle_command_claims_digest
+    AND receipt.receipt_digest = NEW.lifecycle_receipt_digest
+    AND json_extract(
+      receipt.receipt_json,
+      CASE WHEN receipt.outcome = 'duplicate'
+        THEN '$.originalReceipt.enforcedFence' ELSE '$.enforcedFence' END
+    ) = NEW.source_enforced_fence
+    AND command.required_effect_enforcer_set_digest =
+      NEW.source_required_effect_enforcer_set_digest
+    AND receipt.required_effect_enforcer_set_digest =
+      NEW.source_required_effect_enforcer_set_digest
+    AND receipt.enforcement_subject_digest = NEW.lifecycle_enforcement_subject_digest
+    AND receipt.aggregate_proof_digest = NEW.lifecycle_aggregate_proof_digest
+    AND receipt.proof_verified_at_ms = NEW.source_proof_verified_at_ms
+    AND NEW.source_proof_verified_at_ms <= receipt.received_at_ms
+    AND json_extract(
+      receipt.receipt_json,
+      CASE WHEN receipt.outcome = 'duplicate'
+        THEN '$.originalReceipt.effectRef' ELSE '$.effectRef' END
+    ) = NEW.source_effect_ref_commitment
+    AND NEW.created_at_ms = receipt.received_at_ms
+    AND EXISTS (
+      SELECT 1 FROM runtime_binding_safety_fences safety
+      WHERE safety.team_id = NEW.team_id
+        AND safety.project_id = NEW.project_id
+        AND safety.session_id = NEW.session_id
+        AND safety.runtime_assignment_id = NEW.runtime_assignment_id
+        AND safety.runtime_assignment_generation = NEW.runtime_assignment_generation
+        AND safety.sandbox_id = NEW.sandbox_id
+        AND safety.sandbox_generation = NEW.sandbox_generation
+        AND safety.runtime_principal_id = NEW.runtime_principal_id
+        AND safety.allocated_fence = NEW.safety_fence
+    )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime compensation incident lacks exact verified source evidence');
+END;
+
+CREATE TRIGGER runtime_compensation_incidents_immutable_update
+BEFORE UPDATE ON runtime_compensation_incidents
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime compensation incidents are immutable');
+END;
+
+CREATE TRIGGER runtime_compensation_incidents_immutable_delete
+BEFORE DELETE ON runtime_compensation_incidents
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime compensation incidents are immutable');
+END;
+
+CREATE TRIGGER runtime_compensation_commands_valid_insert
+BEFORE INSERT ON runtime_compensation_commands
+WHEN NOT EXISTS (
+  SELECT 1
+  FROM runtime_compensation_incidents incident
+  JOIN runtime_run_command_dispatch source_dispatch
+    ON source_dispatch.command_id = incident.source_command_id
+  WHERE incident.compensation_id = NEW.compensation_id
+    AND incident.source_command_id = NEW.source_command_id
+    AND incident.trust_state = 'verified'
+    AND source_dispatch.status = 'compensating'
+    AND NOT EXISTS (
+      SELECT 1 FROM runtime_compensation_effects effect
+      WHERE effect.compensation_id = NEW.compensation_id
+    )
+    AND incident.session_id = NEW.session_id
+    AND incident.team_id = NEW.team_id
+    AND incident.project_id = NEW.project_id
+    AND incident.agent_run_id = NEW.agent_run_id
+    AND incident.runtime_assignment_id = NEW.runtime_assignment_id
+    AND incident.runtime_assignment_generation = NEW.runtime_assignment_generation
+    AND incident.sandbox_id = NEW.sandbox_id
+    AND incident.sandbox_generation = NEW.sandbox_generation
+    AND incident.runtime_principal_id = NEW.runtime_principal_id
+    AND incident.runtime_authorization_generation =
+      NEW.observed_runtime_authorization_generation
+    AND incident.source_required_effect_enforcer_set_digest =
+      NEW.source_required_effect_enforcer_set_digest
+    AND incident.lifecycle_command_claims_digest = NEW.lifecycle_command_claims_digest
+    AND incident.lifecycle_receipt_digest = NEW.lifecycle_receipt_digest
+    AND incident.lifecycle_enforcement_subject_digest =
+      NEW.lifecycle_enforcement_subject_digest
+    AND incident.lifecycle_aggregate_proof_digest = NEW.lifecycle_aggregate_proof_digest
+    AND incident.safety_fence = NEW.safety_fence
+    AND NEW.reason_ref = incident.incident_digest
+    AND COALESCE(json_extract(NEW.command_json, '$.kind') = 'safety.quarantine', 0)
+    AND COALESCE(json_extract(NEW.command_json, '$.commandId') = NEW.id, 0)
+    AND COALESCE(
+      json_extract(NEW.command_json, '$.compensationId') = NEW.compensation_id,
+      0
+    )
+    AND COALESCE(
+      json_extract(NEW.command_json, '$.observedRuntimeAuthorizationGeneration') =
+        NEW.observed_runtime_authorization_generation,
+      0
+    )
+    AND COALESCE(json_extract(NEW.command_json, '$.binding.teamId') = NEW.team_id, 0)
+    AND COALESCE(json_extract(NEW.command_json, '$.binding.projectId') = NEW.project_id, 0)
+    AND COALESCE(json_extract(NEW.command_json, '$.binding.sessionId') = NEW.session_id, 0)
+    AND COALESCE(
+      json_extract(NEW.command_json, '$.binding.runtimeAssignmentId') =
+        NEW.runtime_assignment_id,
+      0
+    )
+    AND COALESCE(
+      json_extract(NEW.command_json, '$.binding.runtimeAssignmentGeneration') =
+        NEW.runtime_assignment_generation,
+      0
+    )
+    AND COALESCE(json_extract(NEW.command_json, '$.binding.sandboxId') = NEW.sandbox_id, 0)
+    AND COALESCE(
+      json_extract(NEW.command_json, '$.binding.sandboxGeneration') = NEW.sandbox_generation,
+      0
+    )
+    AND COALESCE(
+      json_extract(NEW.command_json, '$.binding.runtimePrincipalId') =
+        NEW.runtime_principal_id,
+      0
+    )
+    AND COALESCE(
+      json_extract(NEW.command_json, '$.source.lifecycleCommandId') = NEW.source_command_id,
+      0
+    )
+    AND COALESCE(
+      json_extract(NEW.command_json, '$.source.lifecycleCommandClaimsDigest') =
+        NEW.lifecycle_command_claims_digest,
+      0
+    )
+    AND COALESCE(
+      json_extract(NEW.command_json, '$.source.lifecycleReceiptDigest') =
+        NEW.lifecycle_receipt_digest,
+      0
+    )
+    AND COALESCE(
+      json_extract(NEW.command_json, '$.source.lifecycleEnforcementSubjectDigest') =
+        NEW.lifecycle_enforcement_subject_digest,
+      0
+    )
+    AND COALESCE(
+      json_extract(NEW.command_json, '$.source.lifecycleAggregateProofDigest') =
+        NEW.lifecycle_aggregate_proof_digest,
+      0
+    )
+    AND COALESCE(
+      json_extract(NEW.command_json, '$.source.sourceRequiredEffectEnforcerSetDigest') =
+        NEW.source_required_effect_enforcer_set_digest,
+      0
+    )
+    AND COALESCE(
+      json_extract(NEW.command_json, '$.platformSecurityPolicyRevision') =
+        NEW.platform_security_policy_revision,
+      0
+    )
+    AND COALESCE(
+      json_extract(NEW.command_json, '$.requiredContainmentEnforcerSetDigest') =
+        NEW.required_containment_enforcer_set_digest,
+      0
+    )
+    AND COALESCE(json_extract(NEW.command_json, '$.safetyFence') = NEW.safety_fence, 0)
+    AND COALESCE(json_extract(NEW.command_json, '$.containment.revokeTerminalWrites') = 1, 0)
+    AND COALESCE(json_extract(NEW.command_json, '$.containment.stopProcessExecution') = 1, 0)
+    AND COALESCE(json_extract(NEW.command_json, '$.containment.quarantineRuntime') = 1, 0)
+    AND COALESCE(json_extract(NEW.command_json, '$.exactBindingOnly') = 1, 0)
+    AND COALESCE(json_extract(NEW.command_json, '$.advanceBeyondCurrentFences') = 1, 0)
+    AND COALESCE(json_extract(NEW.command_json, '$.reasonRef') = NEW.reason_ref, 0)
+    AND COALESCE(json_extract(NEW.command_json, '$.causationId') = NEW.causation_id, 0)
+    AND COALESCE(json_extract(NEW.command_json, '$.actor.kind') = 'system', 0)
+    AND COALESCE(
+      json_extract(NEW.command_json, '$.actor.actorRef') = 'platform-security',
+      0
+    )
+    AND COALESCE(
+      json_extract(NEW.command_json, '$.authority.issuer') = 'platform-security',
+      0
+    )
+    AND COALESCE(json_extract(NEW.command_json, '$.authority.audience') = 'runtime', 0)
+    AND COALESCE(
+      json_extract(NEW.command_json, '$.authority.capability') = 'safety.quarantine',
+      0
+    )
+    AND COALESCE(
+      json_extract(NEW.command_json, '$.authority.claimsDigest') = NEW.authority_digest,
+      0
+    )
+    AND COALESCE(
+      json_extract(NEW.command_json, '$.authority.issuedAtMs') <=
+        NEW.authority_verified_at_ms,
+      0
+    )
+    AND COALESCE(
+      json_extract(NEW.command_json, '$.authority.expiresAtMs') >
+        NEW.authority_verified_at_ms,
+      0
+    )
+    AND COALESCE(json_extract(NEW.command_json, '$.issuedAtMs') = NEW.created_at_ms, 0)
+    AND COALESCE(json_extract(NEW.command_json, '$.deadlineAtMs') = NEW.deadline_at_ms, 0)
+    AND (
+      (NEW.command_sequence = 1 AND NOT EXISTS (
+        SELECT 1 FROM runtime_compensation_commands previous
+        WHERE previous.compensation_id = NEW.compensation_id
+      )) OR
+      (NEW.command_sequence > 1 AND EXISTS (
+        SELECT 1
+        FROM runtime_compensation_commands previous
+        JOIN runtime_compensation_dispatch previous_dispatch
+          ON previous_dispatch.compensation_command_id = previous.id
+        WHERE previous.compensation_id = NEW.compensation_id
+          AND previous.command_sequence = NEW.previous_command_sequence
+          AND previous_dispatch.status = 'expired-before-dispatch'
+      ))
+    )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime compensation command is not exact platform-security work');
+END;
+
+CREATE TRIGGER runtime_compensation_commands_immutable_update
+BEFORE UPDATE ON runtime_compensation_commands
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime compensation commands are immutable');
+END;
+
+CREATE TRIGGER runtime_compensation_commands_immutable_delete
+BEFORE DELETE ON runtime_compensation_commands
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime compensation commands are immutable');
+END;
+
+CREATE TRIGGER runtime_compensation_dispatch_initial_state
+BEFORE INSERT ON runtime_compensation_dispatch
+WHEN NEW.status <> 'pending' OR NEW.attempts <> 0 OR
+  NEW.available_at_ms <> NEW.created_at_ms OR NEW.lease_owner IS NOT NULL OR
+  NEW.lease_expires_at_ms IS NOT NULL OR
+  NEW.dispatch_interlock_acquired_at_ms IS NOT NULL OR
+  NEW.last_safe_error_code IS NOT NULL OR NEW.terminal_at_ms IS NOT NULL OR
+  NEW.updated_at_ms <> NEW.created_at_ms
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime compensation dispatch must begin pending');
+END;
+
+CREATE TRIGGER runtime_compensation_dispatch_identity_immutable
+BEFORE UPDATE OF compensation_command_id, compensation_id, source_command_id, created_at_ms
+ON runtime_compensation_dispatch
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime compensation dispatch identity is immutable');
+END;
+
+CREATE TRIGGER runtime_compensation_dispatch_immutable_delete
+BEFORE DELETE ON runtime_compensation_dispatch
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime compensation dispatch cannot be deleted');
+END;
+
+CREATE TRIGGER runtime_compensation_dispatch_valid_transition
+BEFORE UPDATE ON runtime_compensation_dispatch
+WHEN
+  OLD.status IN ('enforced', 'blocked', 'expired-before-dispatch') OR
+  NEW.updated_at_ms < OLD.updated_at_ms OR
+  NOT COALESCE((
+    (OLD.status = 'pending' AND NEW.status = 'processing'
+      AND NEW.attempts = OLD.attempts + 1
+      AND NEW.available_at_ms = OLD.available_at_ms
+      AND NEW.updated_at_ms >= OLD.available_at_ms
+      AND NEW.dispatch_interlock_acquired_at_ms IS NULL) OR
+    (OLD.status = 'pending' AND NEW.status = 'expired-before-dispatch'
+      AND NEW.attempts = OLD.attempts
+      AND NEW.available_at_ms = OLD.available_at_ms
+      AND NEW.dispatch_interlock_acquired_at_ms IS NULL
+      AND NEW.last_safe_error_code = 'deadline_expired') OR
+    (OLD.status = 'processing' AND NEW.status = 'processing'
+      AND NEW.attempts = OLD.attempts
+      AND NEW.available_at_ms = OLD.available_at_ms
+      AND NEW.lease_owner = OLD.lease_owner
+      AND NEW.updated_at_ms < OLD.lease_expires_at_ms
+      AND NEW.lease_expires_at_ms >= OLD.lease_expires_at_ms
+      AND OLD.dispatch_interlock_acquired_at_ms IS NULL
+      AND NEW.dispatch_interlock_acquired_at_ms = NEW.updated_at_ms
+      AND NEW.dispatch_interlock_acquired_at_ms < NEW.lease_expires_at_ms) OR
+    (OLD.status = 'processing' AND NEW.status = 'pending'
+      AND NEW.attempts = OLD.attempts
+      AND NEW.available_at_ms >= OLD.available_at_ms
+      AND NEW.available_at_ms >= NEW.updated_at_ms
+      AND OLD.dispatch_interlock_acquired_at_ms IS NULL
+      AND NEW.dispatch_interlock_acquired_at_ms IS NULL
+      AND NEW.last_safe_error_code IN (
+        'invalid_input', 'invalid_authority', 'authority_verification_failed',
+        'binding_mismatch', 'runtime_handle_unavailable', 'lease_expired_before_dispatch'
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM runtime_compensation_receipts receipt
+        WHERE receipt.compensation_command_id = OLD.compensation_command_id
+      )) OR
+    (OLD.status = 'processing' AND NEW.status = 'expired-before-dispatch'
+      AND NEW.attempts = OLD.attempts
+      AND NEW.available_at_ms = OLD.available_at_ms
+      AND OLD.dispatch_interlock_acquired_at_ms IS NULL
+      AND NEW.dispatch_interlock_acquired_at_ms IS NULL
+      AND NEW.last_safe_error_code IN ('deadline_expired', 'lease_expired_before_dispatch')
+      AND NOT EXISTS (
+        SELECT 1 FROM runtime_compensation_receipts receipt
+        WHERE receipt.compensation_command_id = OLD.compensation_command_id
+      )) OR
+    (OLD.status = 'processing' AND NEW.status = 'awaiting-receipt'
+      AND NEW.attempts = OLD.attempts
+      AND NEW.available_at_ms >= OLD.available_at_ms
+      AND NEW.available_at_ms >= NEW.updated_at_ms
+      AND OLD.dispatch_interlock_acquired_at_ms IS NOT NULL
+      AND NEW.dispatch_interlock_acquired_at_ms IS OLD.dispatch_interlock_acquired_at_ms) OR
+    (OLD.status = 'processing' AND NEW.status IN ('enforced', 'blocked')
+      AND NEW.attempts = OLD.attempts
+      AND NEW.available_at_ms = OLD.available_at_ms
+      AND OLD.dispatch_interlock_acquired_at_ms IS NOT NULL
+      AND NEW.dispatch_interlock_acquired_at_ms IS OLD.dispatch_interlock_acquired_at_ms) OR
+    (OLD.status = 'awaiting-receipt' AND NEW.status = 'awaiting-receipt'
+      AND NEW.attempts = OLD.attempts
+      AND NEW.available_at_ms >= OLD.available_at_ms
+      AND NEW.available_at_ms >= NEW.updated_at_ms
+      AND NEW.dispatch_interlock_acquired_at_ms IS OLD.dispatch_interlock_acquired_at_ms) OR
+    (OLD.status = 'awaiting-receipt' AND NEW.status IN ('enforced', 'blocked')
+      AND NEW.attempts = OLD.attempts
+      AND NEW.available_at_ms = OLD.available_at_ms
+      AND NEW.dispatch_interlock_acquired_at_ms IS OLD.dispatch_interlock_acquired_at_ms)
+  ), 0)
+BEGIN
+  SELECT RAISE(ABORT, 'Invalid Runtime compensation dispatch transition');
+END;
+
+CREATE TRIGGER runtime_compensation_receipts_dispatch_state
+BEFORE INSERT ON runtime_compensation_receipts
+WHEN NOT EXISTS (
+  SELECT 1 FROM runtime_compensation_dispatch dispatch
+  WHERE dispatch.compensation_command_id = NEW.compensation_command_id
+    AND dispatch.compensation_id = NEW.compensation_id
+    AND dispatch.source_command_id = NEW.source_command_id
+    AND (
+      (dispatch.status = 'processing'
+        AND dispatch.dispatch_interlock_acquired_at_ms IS NOT NULL) OR
+      dispatch.status = 'awaiting-receipt'
+    )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime compensation dispatch is not accepting receipts');
+END;
+
+CREATE TRIGGER runtime_compensation_receipts_exact_command
+BEFORE INSERT ON runtime_compensation_receipts
+WHEN NOT EXISTS (
+  SELECT 1 FROM runtime_compensation_commands command
+  WHERE command.id = NEW.compensation_command_id
+    AND command.compensation_id = NEW.compensation_id
+    AND command.source_command_id = NEW.source_command_id
+    AND command.session_id = NEW.session_id
+    AND command.team_id = NEW.team_id
+    AND command.project_id = NEW.project_id
+    AND command.agent_run_id = NEW.agent_run_id
+    AND command.runtime_assignment_id = NEW.runtime_assignment_id
+    AND command.runtime_assignment_generation = NEW.runtime_assignment_generation
+    AND command.sandbox_id = NEW.sandbox_id
+    AND command.sandbox_generation = NEW.sandbox_generation
+    AND command.runtime_principal_id = NEW.runtime_principal_id
+    AND command.observed_runtime_authorization_generation =
+      NEW.observed_runtime_authorization_generation
+    AND command.command_digest = NEW.command_digest
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime compensation receipt does not match its command');
+END;
+
+CREATE TRIGGER runtime_compensation_receipts_enforcement_proof
+BEFORE INSERT ON runtime_compensation_receipts
+WHEN NOT EXISTS (
+  SELECT 1 FROM runtime_compensation_commands command
+  WHERE command.id = NEW.compensation_command_id
+    AND (
+      ((NEW.outcome = 'enforced' OR
+        (NEW.outcome = 'duplicate' AND NEW.original_outcome = 'enforced'))
+        AND NEW.required_containment_enforcer_set_digest =
+          command.required_containment_enforcer_set_digest
+        AND NEW.effect_ref_commitment IS NOT NULL
+        AND length(NEW.effect_ref_commitment) = 74
+        AND substr(NEW.effect_ref_commitment, 1, 10) = 'effect:v1:'
+        AND substr(NEW.effect_ref_commitment, 11) NOT GLOB '*[^0-9a-f]*'
+        AND NEW.enforcement_subject_digest IS NOT NULL
+        AND NEW.aggregate_proof_digest IS NOT NULL
+        AND NEW.proof_verified_at_ms IS NOT NULL
+        AND NEW.proof_verified_at_ms <= NEW.received_at_ms
+        AND NEW.enforced_safety_fence >= command.safety_fence
+        AND COALESCE(json_extract(
+          NEW.receipt_json,
+          CASE WHEN NEW.outcome = 'duplicate'
+            THEN '$.originalReceipt.enforcedSafetyFence'
+            ELSE '$.enforcedSafetyFence' END
+        ) = NEW.enforced_safety_fence, 0)
+        AND COALESCE(json_extract(
+          NEW.receipt_json,
+          CASE WHEN NEW.outcome = 'duplicate'
+            THEN '$.originalReceipt.effectRef' ELSE '$.effectRef' END
+        ) = NEW.effect_ref_commitment, 0)
+        AND COALESCE(json_extract(
+          NEW.receipt_json,
+          CASE WHEN NEW.outcome = 'duplicate'
+            THEN '$.originalReceipt.containment.terminalWritesRevoked'
+            ELSE '$.containment.terminalWritesRevoked' END
+        ) = 1, 0)
+        AND COALESCE(json_extract(
+          NEW.receipt_json,
+          CASE WHEN NEW.outcome = 'duplicate'
+            THEN '$.originalReceipt.containment.processExecutionStopped'
+            ELSE '$.containment.processExecutionStopped' END
+        ) = 1, 0)
+        AND COALESCE(json_extract(
+          NEW.receipt_json,
+          CASE WHEN NEW.outcome = 'duplicate'
+            THEN '$.originalReceipt.containment.runtimeQuarantined'
+            ELSE '$.containment.runtimeQuarantined' END
+        ) = 1, 0)
+        AND COALESCE(json_extract(
+          NEW.receipt_json,
+          CASE WHEN NEW.outcome = 'duplicate'
+            THEN '$.originalReceipt.aggregateEnforcementProof.generation'
+            ELSE '$.aggregateEnforcementProof.generation' END
+        ) = command.observed_runtime_authorization_generation, 0)
+        AND COALESCE(json_extract(
+          NEW.receipt_json,
+          CASE WHEN NEW.outcome = 'duplicate'
+            THEN '$.originalReceipt.aggregateEnforcementProof.requiredEffectEnforcerSetDigest'
+            ELSE '$.aggregateEnforcementProof.requiredEffectEnforcerSetDigest' END
+        ) = NEW.required_containment_enforcer_set_digest, 0)
+        AND COALESCE(json_extract(
+          NEW.receipt_json,
+          CASE WHEN NEW.outcome = 'duplicate'
+            THEN '$.originalReceipt.aggregateEnforcementProof.enforcementSubjectDigest'
+            ELSE '$.aggregateEnforcementProof.enforcementSubjectDigest' END
+        ) = NEW.enforcement_subject_digest, 0)
+        AND COALESCE(json_extract(
+          NEW.receipt_json,
+          CASE WHEN NEW.outcome = 'duplicate'
+            THEN '$.originalReceipt.aggregateEnforcementProof.aggregateProofDigest'
+            ELSE '$.aggregateEnforcementProof.aggregateProofDigest' END
+        ) = NEW.aggregate_proof_digest, 0)) OR
+      (NOT (NEW.outcome = 'enforced' OR
+        (NEW.outcome = 'duplicate' AND NEW.original_outcome = 'enforced'))
+        AND NEW.required_containment_enforcer_set_digest IS NULL
+        AND NEW.enforcement_subject_digest IS NULL
+        AND NEW.aggregate_proof_digest IS NULL
+        AND NEW.proof_verified_at_ms IS NULL
+        AND NEW.enforced_safety_fence IS NULL
+        AND (
+          ((NEW.outcome IN ('accepted', 'quarantined') OR
+            (NEW.outcome = 'duplicate' AND NEW.original_outcome IN (
+              'accepted', 'quarantined'
+            )))
+            AND NEW.effect_ref_commitment IS NOT NULL
+            AND COALESCE(json_extract(
+              NEW.receipt_json,
+              CASE WHEN NEW.outcome = 'duplicate'
+                THEN '$.originalReceipt.effectRef' ELSE '$.effectRef' END
+            ) = NEW.effect_ref_commitment, 0)) OR
+          ((NEW.outcome = 'rejected' OR
+            (NEW.outcome = 'duplicate' AND NEW.original_outcome = 'rejected'))
+            AND NEW.effect_ref_commitment IS NULL)
+        ))
+    )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime compensation receipt lacks exact containment evidence');
+END;
+
+CREATE TRIGGER runtime_compensation_receipts_version_continuity
+BEFORE INSERT ON runtime_compensation_receipts
+WHEN NEW.previous_version IS NOT NULL AND NOT EXISTS (
+  SELECT 1 FROM runtime_compensation_receipts previous
+  WHERE previous.compensation_command_id = NEW.compensation_command_id
+    AND previous.version = NEW.previous_version
+    AND previous.received_at_ms <= NEW.received_at_ms
+    AND (
+      (previous.outcome = 'accepted' AND (
+        NEW.outcome IN ('enforced', 'rejected', 'quarantined') OR
+        (NEW.outcome = 'duplicate'
+          AND NEW.original_outcome = 'accepted'
+          AND NEW.original_receipt_digest = previous.receipt_digest)
+      )) OR
+      (previous.outcome IN ('enforced', 'rejected', 'quarantined')
+        AND NEW.outcome = 'duplicate'
+        AND NEW.original_outcome = previous.outcome
+        AND NEW.original_receipt_digest = previous.receipt_digest) OR
+      (previous.outcome = 'duplicate' AND previous.original_outcome = 'accepted' AND (
+        NEW.outcome IN ('enforced', 'rejected', 'quarantined') OR
+        (NEW.outcome = 'duplicate'
+          AND NEW.original_outcome = 'accepted'
+          AND NEW.original_receipt_digest = previous.original_receipt_digest)
+      )) OR
+      (previous.outcome = 'duplicate'
+        AND previous.original_outcome IN ('enforced', 'rejected', 'quarantined')
+        AND NEW.outcome = 'duplicate'
+        AND NEW.original_outcome = previous.original_outcome
+        AND NEW.original_receipt_digest = previous.original_receipt_digest)
+    )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Invalid Runtime compensation receipt version continuity');
+END;
+
+CREATE TRIGGER runtime_compensation_receipts_immutable_update
+BEFORE UPDATE ON runtime_compensation_receipts
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime compensation receipts are immutable');
+END;
+
+CREATE TRIGGER runtime_compensation_receipts_immutable_delete
+BEFORE DELETE ON runtime_compensation_receipts
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime compensation receipts are immutable');
+END;
+
+CREATE TRIGGER runtime_compensation_effects_verified_receipt
+BEFORE INSERT ON runtime_compensation_effects
+WHEN NOT EXISTS (
+  SELECT 1
+  FROM runtime_compensation_receipts receipt
+  JOIN runtime_compensation_commands command
+    ON command.id = receipt.compensation_command_id
+  JOIN runtime_compensation_incidents incident
+    ON incident.compensation_id = command.compensation_id
+  JOIN runtime_run_command_dispatch source_dispatch
+    ON source_dispatch.command_id = incident.source_command_id
+  JOIN runtime_compensation_dispatch compensation_dispatch
+    ON compensation_dispatch.compensation_command_id = command.id
+  JOIN runtime_binding_safety_fences safety
+    ON safety.team_id = command.team_id
+   AND safety.project_id = command.project_id
+   AND safety.session_id = command.session_id
+   AND safety.runtime_assignment_id = command.runtime_assignment_id
+   AND safety.runtime_assignment_generation = command.runtime_assignment_generation
+   AND safety.sandbox_id = command.sandbox_id
+   AND safety.sandbox_generation = command.sandbox_generation
+   AND safety.runtime_principal_id = command.runtime_principal_id
+  WHERE receipt.id = NEW.receipt_id
+    AND receipt.compensation_command_id = NEW.compensation_command_id
+    AND receipt.compensation_id = NEW.compensation_id
+    AND receipt.source_command_id = NEW.source_command_id
+    AND (
+      receipt.outcome = 'enforced' OR
+      (receipt.outcome = 'duplicate' AND receipt.original_outcome = 'enforced')
+    )
+    AND receipt.required_containment_enforcer_set_digest =
+      command.required_containment_enforcer_set_digest
+    AND receipt.effect_ref_commitment IS NOT NULL
+    AND receipt.enforcement_subject_digest IS NOT NULL
+    AND receipt.aggregate_proof_digest IS NOT NULL
+    AND receipt.proof_verified_at_ms IS NOT NULL
+    AND receipt.proof_verified_at_ms <= receipt.received_at_ms
+    AND receipt.received_at_ms <= NEW.applied_at_ms
+    AND safety.allocated_fence >= receipt.enforced_safety_fence
+    AND incident.trust_state = 'verified'
+    AND incident.session_id = NEW.session_id
+    AND incident.agent_run_id = NEW.agent_run_id
+    AND source_dispatch.status = 'compensating'
+    AND (
+      (compensation_dispatch.status = 'processing'
+        AND compensation_dispatch.dispatch_interlock_acquired_at_ms IS NOT NULL) OR
+      compensation_dispatch.status = 'awaiting-receipt'
+    )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime compensation effect requires exact verified containment');
+END;
+
+CREATE TRIGGER runtime_compensation_effects_event_binding
+BEFORE INSERT ON runtime_compensation_effects
+WHEN NOT EXISTS (
+  SELECT 1 FROM session_events event
+  WHERE event.session_id = NEW.session_id
+    AND event.sequence = NEW.applied_session_sequence
+    AND event.type = 'run.runtime-command.compensated'
+    AND json_extract(event.payload_json, '$.compensationId') = NEW.compensation_id
+    AND json_extract(event.payload_json, '$.sourceCommandId') = NEW.source_command_id
+    AND json_extract(event.payload_json, '$.compensationCommandId') =
+      NEW.compensation_command_id
+    AND json_extract(event.payload_json, '$.receiptId') = NEW.receipt_id
+    AND json_extract(event.payload_json, '$.effectDigest') = NEW.effect_digest
+    AND json_extract(event.payload_json, '$.agentRunId') = NEW.agent_run_id
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime compensation effect event does not match');
+END;
+
+CREATE TRIGGER runtime_compensation_effects_immutable_update
+BEFORE UPDATE ON runtime_compensation_effects
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime compensation effects are immutable');
+END;
+
+CREATE TRIGGER runtime_compensation_effects_immutable_delete
+BEFORE DELETE ON runtime_compensation_effects
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime compensation effects are immutable');
+END;
+
+CREATE TRIGGER runtime_compensation_referenced_events_immutable_update
+BEFORE UPDATE ON session_events
+WHEN EXISTS (
+  SELECT 1 FROM runtime_compensation_effects effect
+  WHERE effect.session_id = OLD.session_id
+    AND effect.applied_session_sequence = OLD.sequence
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime compensation journal events are immutable');
+END;
+
+CREATE TRIGGER runtime_compensation_referenced_events_immutable_delete
+BEFORE DELETE ON session_events
+WHEN EXISTS (
+  SELECT 1 FROM runtime_compensation_effects effect
+  WHERE effect.session_id = OLD.session_id
+    AND effect.applied_session_sequence = OLD.sequence
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime compensation journal events are immutable');
+END;
+
+CREATE TRIGGER runtime_compensation_dispatch_terminal_evidence
+BEFORE UPDATE OF status ON runtime_compensation_dispatch
+WHEN
+  (NEW.status = 'enforced' AND NOT EXISTS (
+    SELECT 1 FROM runtime_compensation_effects effect
+    WHERE effect.compensation_command_id = NEW.compensation_command_id
+      AND effect.compensation_id = NEW.compensation_id
+      AND effect.source_command_id = NEW.source_command_id
+  )) OR
+  (NEW.status = 'blocked' AND NOT EXISTS (
+    SELECT 1 FROM runtime_compensation_receipts receipt
+    WHERE receipt.compensation_command_id = NEW.compensation_command_id
+      AND (
+        receipt.outcome IN ('rejected', 'quarantined') OR
+        (receipt.outcome = 'duplicate'
+          AND receipt.original_outcome IN ('rejected', 'quarantined'))
+      )
+  )) OR
+  (NEW.status = 'expired-before-dispatch' AND (
+    NEW.dispatch_interlock_acquired_at_ms IS NOT NULL OR
+    EXISTS (
+      SELECT 1 FROM runtime_compensation_receipts receipt
+      WHERE receipt.compensation_command_id = NEW.compensation_command_id
+    ) OR EXISTS (
+      SELECT 1 FROM runtime_compensation_effects effect
+      WHERE effect.compensation_command_id = NEW.compensation_command_id
+    )
+  ))
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime compensation terminal state lacks durable evidence');
+END;
+`;
+
+const RUNTIME_COMPENSATION_INTEGRATION_TRIGGERS_SCHEMA_V7 = `
+CREATE TRIGGER runtime_run_command_receipts_safe_enforced_fence_v7
+BEFORE INSERT ON runtime_run_command_receipts
+WHEN (NEW.outcome = 'enforced' OR
+    (NEW.outcome = 'duplicate' AND NEW.original_outcome = 'enforced'))
+  AND (
+    COALESCE(json_type(
+      NEW.receipt_json,
+      CASE WHEN NEW.outcome = 'duplicate'
+        THEN '$.originalReceipt.enforcedFence' ELSE '$.enforcedFence' END
+    ) = 'integer', 0) = 0 OR
+    json_extract(
+      NEW.receipt_json,
+      CASE WHEN NEW.outcome = 'duplicate'
+        THEN '$.originalReceipt.enforcedFence' ELSE '$.enforcedFence' END
+    ) < 1 OR
+    json_extract(
+      NEW.receipt_json,
+      CASE WHEN NEW.outcome = 'duplicate'
+        THEN '$.originalReceipt.enforcedFence' ELSE '$.enforcedFence' END
+    ) > 9007199254740991
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime enforced receipt fence is not a safe integer');
+END;
+
+CREATE TRIGGER runtime_compensation_follow_events_valid_insert
+BEFORE INSERT ON runtime_compensation_follow_events
+WHEN NOT EXISTS (
+  SELECT 1
+  FROM runtime_receipt_follow_streams stream
+  JOIN runtime_compensation_commands command
+    ON command.id = NEW.compensation_command_id
+  JOIN runtime_compensation_receipts receipt ON receipt.id = NEW.receipt_id
+  WHERE stream.runtime_assignment_id = NEW.runtime_assignment_id
+    AND stream.runtime_authorization_generation = NEW.runtime_authorization_generation
+    AND stream.status = 'processing'
+    AND stream.lease_owner = NEW.lease_owner
+    AND stream.lease_version = NEW.lease_version
+    AND stream.lease_expires_at_ms > NEW.received_at_ms
+    AND NEW.receipt_sequence = stream.receipt_sequence + 1
+    AND NEW.previous_cursor IS stream.cursor
+    AND NEW.previous_observation_digest IS stream.last_observation_digest
+    AND command.compensation_id = NEW.compensation_id
+    AND command.source_command_id = NEW.source_command_id
+    AND command.session_id = NEW.session_id
+    AND command.runtime_assignment_id = NEW.runtime_assignment_id
+    AND command.runtime_assignment_generation = NEW.runtime_assignment_generation
+    AND command.sandbox_id = NEW.sandbox_id
+    AND command.sandbox_generation = NEW.sandbox_generation
+    AND command.runtime_principal_id = NEW.runtime_principal_id
+    AND command.observed_runtime_authorization_generation =
+      NEW.runtime_authorization_generation
+    AND command.command_digest = NEW.command_digest
+    AND receipt.compensation_command_id = command.id
+    AND receipt.compensation_id = command.compensation_id
+    AND receipt.observed_runtime_authorization_generation =
+      NEW.runtime_authorization_generation
+    AND receipt.receipt_digest = NEW.effective_receipt_digest
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime compensation follow event is not exact-bound');
+END;
+
+CREATE TRIGGER runtime_compensation_follow_events_cross_lifecycle
+BEFORE INSERT ON runtime_compensation_follow_events
+WHEN EXISTS (
+  SELECT 1 FROM runtime_receipt_follow_events event
+  WHERE event.id = NEW.id OR
+    (event.runtime_assignment_id = NEW.runtime_assignment_id
+      AND event.runtime_authorization_generation = NEW.runtime_authorization_generation
+      AND (event.receipt_sequence = NEW.receipt_sequence OR
+        event.cursor = NEW.cursor OR event.observation_digest = NEW.observation_digest))
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime follow observation conflicts across ledgers');
+END;
+
+CREATE TRIGGER runtime_receipt_follow_events_cross_compensation
+BEFORE INSERT ON runtime_receipt_follow_events
+WHEN EXISTS (
+  SELECT 1 FROM runtime_compensation_follow_events event
+  WHERE event.id = NEW.id OR
+    (event.runtime_assignment_id = NEW.runtime_assignment_id
+      AND event.runtime_authorization_generation = NEW.runtime_authorization_generation
+      AND (event.receipt_sequence = NEW.receipt_sequence OR
+        event.cursor = NEW.cursor OR event.observation_digest = NEW.observation_digest))
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime follow observation conflicts across ledgers');
+END;
+
+CREATE TRIGGER runtime_compensation_follow_events_immutable_update
+BEFORE UPDATE ON runtime_compensation_follow_events
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime compensation follow events are immutable');
+END;
+
+CREATE TRIGGER runtime_compensation_follow_events_immutable_delete
+BEFORE DELETE ON runtime_compensation_follow_events
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime compensation follow events cannot be deleted');
+END;
+
+DROP TRIGGER runtime_receipt_follow_streams_valid_transition;
+
+CREATE TRIGGER runtime_receipt_follow_streams_valid_transition
+BEFORE UPDATE ON runtime_receipt_follow_streams
+WHEN NEW.updated_at_ms < OLD.updated_at_ms OR NOT (
+  (OLD.status = 'pending' AND NEW.status = 'processing'
+    AND NEW.attempts = OLD.attempts + 1
+    AND NEW.lease_version = OLD.lease_version + 1
+    AND NEW.available_at_ms = OLD.available_at_ms
+    AND NEW.cursor IS OLD.cursor
+    AND NEW.last_observation_digest IS OLD.last_observation_digest
+    AND NEW.receipt_sequence = OLD.receipt_sequence
+    AND NEW.updated_at_ms >= OLD.available_at_ms) OR
+  (OLD.status = 'pending' AND NEW.status = 'pending'
+    AND NEW.attempts = OLD.attempts
+    AND NEW.lease_version = OLD.lease_version
+    AND NEW.available_at_ms >= OLD.available_at_ms
+    AND NEW.available_at_ms >= NEW.updated_at_ms
+    AND NEW.cursor IS OLD.cursor
+    AND NEW.last_observation_digest IS OLD.last_observation_digest
+    AND NEW.receipt_sequence = OLD.receipt_sequence) OR
+  (OLD.status = 'processing' AND NEW.status = 'processing'
+    AND NEW.attempts = OLD.attempts
+    AND NEW.lease_version = OLD.lease_version
+    AND NEW.available_at_ms = OLD.available_at_ms
+    AND NEW.lease_owner = OLD.lease_owner
+    AND NEW.cursor IS OLD.cursor
+    AND NEW.last_observation_digest IS OLD.last_observation_digest
+    AND NEW.receipt_sequence = OLD.receipt_sequence
+    AND NEW.updated_at_ms < OLD.lease_expires_at_ms
+    AND NEW.lease_expires_at_ms >= OLD.lease_expires_at_ms) OR
+  (OLD.status = 'processing' AND NEW.status = 'pending'
+    AND NEW.attempts = OLD.attempts
+    AND NEW.lease_version = OLD.lease_version
+    AND NEW.available_at_ms >= OLD.available_at_ms
+    AND NEW.available_at_ms >= NEW.updated_at_ms
+    AND (
+      (NEW.cursor IS OLD.cursor
+        AND NEW.last_observation_digest IS OLD.last_observation_digest
+        AND NEW.receipt_sequence = OLD.receipt_sequence) OR
+      (NEW.cursor IS NOT NULL
+        AND NEW.last_observation_digest IS NOT NULL
+        AND NEW.receipt_sequence = OLD.receipt_sequence + 1
+        AND 1 = (
+          SELECT COUNT(*) FROM (
+            SELECT event.id FROM runtime_receipt_follow_events event
+            WHERE event.runtime_assignment_id = OLD.runtime_assignment_id
+              AND event.runtime_authorization_generation = OLD.runtime_authorization_generation
+              AND event.receipt_sequence = NEW.receipt_sequence
+              AND event.cursor = NEW.cursor
+              AND event.observation_digest = NEW.last_observation_digest
+              AND event.lease_owner = OLD.lease_owner
+              AND event.lease_version = OLD.lease_version
+            UNION ALL
+            SELECT event.id FROM runtime_compensation_follow_events event
+            WHERE event.runtime_assignment_id = OLD.runtime_assignment_id
+              AND event.runtime_authorization_generation = OLD.runtime_authorization_generation
+              AND event.receipt_sequence = NEW.receipt_sequence
+              AND event.cursor = NEW.cursor
+              AND event.observation_digest = NEW.last_observation_digest
+              AND event.lease_owner = OLD.lease_owner
+              AND event.lease_version = OLD.lease_version
+          )
+        ))
+    )) OR
+  (OLD.status IN ('pending', 'processing') AND NEW.status = 'quarantined'
+    AND NEW.attempts = OLD.attempts
+    AND NEW.lease_version = OLD.lease_version
+    AND NEW.available_at_ms = OLD.available_at_ms
+    AND NEW.cursor IS OLD.cursor
+    AND NEW.last_observation_digest IS OLD.last_observation_digest
+    AND NEW.receipt_sequence = OLD.receipt_sequence
+    AND NEW.last_safe_error_code IS NOT NULL) OR
+  (OLD.status = 'quarantined' AND NEW.status = 'quarantined'
+    AND NEW.attempts = OLD.attempts
+    AND NEW.lease_version = OLD.lease_version
+    AND NEW.available_at_ms = OLD.available_at_ms
+    AND NEW.cursor IS OLD.cursor
+    AND NEW.last_observation_digest IS OLD.last_observation_digest
+    AND NEW.receipt_sequence = OLD.receipt_sequence
+    AND NEW.last_safe_error_code = OLD.last_safe_error_code)
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Invalid Runtime receipt follow stream transition');
+END;
+
+DROP TRIGGER runtime_run_command_dispatch_valid_transition;
+
+CREATE TRIGGER runtime_run_command_dispatch_valid_transition
+BEFORE UPDATE ON runtime_run_command_dispatch
+WHEN
+  OLD.status IN ('enforced', 'rejected', 'quarantined', 'superseded', 'failed') OR
+  NEW.updated_at_ms < OLD.updated_at_ms OR
+  NOT (
+    (OLD.status = 'pending' AND NEW.status = 'processing'
+      AND NEW.attempts = OLD.attempts + 1
+      AND NEW.available_at_ms = OLD.available_at_ms
+      AND NEW.updated_at_ms >= OLD.available_at_ms
+      AND NEW.dispatch_interlock_acquired_at_ms IS NULL
+      AND (
+        OLD.attempts = 0 OR COALESCE(OLD.last_safe_error_code IN (
+            'invalid_input', 'invalid_authority', 'authority_verification_failed',
+            'binding_mismatch', 'deadline_expired', 'runtime_handle_unavailable',
+            'lease_expired_before_dispatch'
+          ), 0)
+      )) OR
+    (OLD.status = 'pending' AND NEW.status = 'pending'
+      AND NEW.attempts = OLD.attempts
+      AND NEW.available_at_ms >= OLD.available_at_ms
+      AND NEW.available_at_ms >= NEW.updated_at_ms
+      AND NEW.dispatch_interlock_acquired_at_ms IS OLD.dispatch_interlock_acquired_at_ms
+      AND (
+        OLD.attempts = 0 OR COALESCE(
+          NEW.last_safe_error_code = OLD.last_safe_error_code,
+          0
+        )
+      )) OR
+    (OLD.status = 'pending' AND NEW.status = 'failed'
+      AND NEW.attempts = OLD.attempts
+      AND NEW.available_at_ms = OLD.available_at_ms
+      AND NEW.dispatch_interlock_acquired_at_ms IS OLD.dispatch_interlock_acquired_at_ms
+      AND COALESCE(NEW.last_safe_error_code IN (
+          'invalid_input', 'invalid_authority', 'authority_verification_failed',
+          'binding_mismatch', 'deadline_expired', 'runtime_handle_unavailable',
+          'lease_expired_before_dispatch'
+        ), 0)
+      AND (
+        OLD.attempts = 0 OR COALESCE(
+          NEW.last_safe_error_code = OLD.last_safe_error_code,
+          0
+        )
+      )) OR
+    (OLD.status = 'pending' AND NEW.status = 'superseded'
+      AND NEW.attempts = OLD.attempts
+      AND NEW.available_at_ms = OLD.available_at_ms
+      AND NEW.dispatch_interlock_acquired_at_ms IS OLD.dispatch_interlock_acquired_at_ms
+      AND NEW.last_safe_error_code = 'state_fence_superseded'
+      AND (
+        OLD.attempts = 0 OR COALESCE(OLD.last_safe_error_code IN (
+            'invalid_input', 'invalid_authority', 'authority_verification_failed',
+            'binding_mismatch', 'deadline_expired', 'runtime_handle_unavailable',
+            'lease_expired_before_dispatch'
+          ), 0)
+      )) OR
+    (OLD.status = 'processing' AND NEW.status = 'processing'
+      AND NEW.attempts = OLD.attempts
+      AND NEW.available_at_ms = OLD.available_at_ms
+      AND NEW.lease_owner = OLD.lease_owner
+      AND NEW.updated_at_ms < OLD.lease_expires_at_ms
+      AND NEW.lease_expires_at_ms >= OLD.lease_expires_at_ms
+      AND OLD.dispatch_interlock_acquired_at_ms IS NULL
+      AND NEW.dispatch_interlock_acquired_at_ms = NEW.updated_at_ms
+      AND NEW.dispatch_interlock_acquired_at_ms < NEW.lease_expires_at_ms) OR
+    (OLD.status = 'processing' AND NEW.status = 'pending'
+      AND NEW.attempts = OLD.attempts
+      AND NEW.available_at_ms >= OLD.available_at_ms
+      AND NEW.available_at_ms >= NEW.updated_at_ms
+      AND NEW.dispatch_interlock_acquired_at_ms IS OLD.dispatch_interlock_acquired_at_ms
+      AND COALESCE(NEW.last_safe_error_code IN (
+          'invalid_input', 'invalid_authority', 'authority_verification_failed',
+          'binding_mismatch', 'deadline_expired', 'runtime_handle_unavailable',
+          'lease_expired_before_dispatch'
+        ), 0)
+      AND (
+        NEW.updated_at_ms < OLD.lease_expires_at_ms OR (
+          OLD.dispatch_interlock_acquired_at_ms IS NULL
+          AND NEW.last_safe_error_code IN (
+            'lease_expired_before_dispatch', 'deadline_expired'
+          )
+          AND NEW.updated_at_ms >= OLD.lease_expires_at_ms
+        )
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM runtime_run_command_receipts receipt
+        WHERE receipt.command_id = OLD.command_id
+      )) OR
+    (OLD.status = 'processing' AND NEW.status = 'superseded'
+      AND NEW.attempts = OLD.attempts
+      AND NEW.available_at_ms = OLD.available_at_ms
+      AND OLD.dispatch_interlock_acquired_at_ms IS NULL
+      AND NEW.dispatch_interlock_acquired_at_ms IS NULL
+      AND NEW.updated_at_ms < OLD.lease_expires_at_ms
+      AND NEW.last_safe_error_code = 'state_fence_superseded'
+      AND NOT EXISTS (
+        SELECT 1 FROM runtime_run_command_receipts receipt
+        WHERE receipt.command_id = OLD.command_id
+      )) OR
+    (OLD.status = 'processing' AND NEW.status = 'awaiting-receipt'
+      AND NEW.attempts = OLD.attempts
+      AND NEW.available_at_ms >= OLD.available_at_ms
+      AND NEW.available_at_ms >= NEW.updated_at_ms
+      AND OLD.dispatch_interlock_acquired_at_ms IS NOT NULL
+      AND NEW.dispatch_interlock_acquired_at_ms IS OLD.dispatch_interlock_acquired_at_ms) OR
+    (OLD.status = 'processing' AND NEW.status = 'compensating'
+      AND NEW.attempts = OLD.attempts
+      AND NEW.available_at_ms = OLD.available_at_ms
+      AND NEW.dispatch_interlock_acquired_at_ms IS OLD.dispatch_interlock_acquired_at_ms
+      AND EXISTS (
+        SELECT 1 FROM runtime_run_command_receipts receipt
+        WHERE receipt.command_id = OLD.command_id
+          AND (
+            receipt.outcome = 'enforced' OR
+            (receipt.outcome = 'duplicate' AND receipt.original_outcome = 'enforced')
+          )
+      )
+      AND EXISTS (
+        SELECT 1 FROM runtime_compensation_incidents incident
+        WHERE incident.source_command_id = OLD.command_id
+          AND incident.trust_state = 'verified'
+      )) OR
+    (OLD.status = 'processing' AND NEW.status IN (
+        'enforced', 'rejected', 'quarantined'
+      )
+      AND NEW.attempts = OLD.attempts
+      AND NEW.available_at_ms = OLD.available_at_ms
+      AND NEW.dispatch_interlock_acquired_at_ms IS OLD.dispatch_interlock_acquired_at_ms) OR
+    (OLD.status = 'awaiting-receipt' AND NEW.status = 'awaiting-receipt'
+      AND NEW.attempts = OLD.attempts
+      AND NEW.available_at_ms >= OLD.available_at_ms
+      AND NEW.available_at_ms >= NEW.updated_at_ms
+      AND NEW.dispatch_interlock_acquired_at_ms IS OLD.dispatch_interlock_acquired_at_ms) OR
+    (OLD.status = 'awaiting-receipt' AND NEW.status = 'compensating'
+      AND NEW.attempts = OLD.attempts
+      AND NEW.available_at_ms = OLD.available_at_ms
+      AND NEW.dispatch_interlock_acquired_at_ms IS OLD.dispatch_interlock_acquired_at_ms
+      AND EXISTS (
+        SELECT 1 FROM runtime_run_command_receipts receipt
+        WHERE receipt.command_id = OLD.command_id
+          AND (
+            receipt.outcome = 'enforced' OR
+            (receipt.outcome = 'duplicate' AND receipt.original_outcome = 'enforced')
+          )
+      )
+      AND EXISTS (
+        SELECT 1 FROM runtime_compensation_incidents incident
+        WHERE incident.source_command_id = OLD.command_id
+          AND incident.trust_state = 'verified'
+      )) OR
+    (OLD.status = 'awaiting-receipt' AND NEW.status IN (
+        'enforced', 'rejected', 'quarantined'
+      )
+      AND NEW.attempts = OLD.attempts
+      AND NEW.available_at_ms = OLD.available_at_ms
+      AND NEW.dispatch_interlock_acquired_at_ms IS OLD.dispatch_interlock_acquired_at_ms) OR
+    (OLD.status = 'compensating' AND NEW.status = 'quarantined'
+      AND NEW.attempts = OLD.attempts
+      AND NEW.available_at_ms = OLD.available_at_ms
+      AND NEW.dispatch_interlock_acquired_at_ms IS OLD.dispatch_interlock_acquired_at_ms
+      AND NEW.last_safe_error_code = 'stale_enforced_effect_compensated'
+      AND EXISTS (
+        SELECT 1 FROM runtime_compensation_effects effect
+        JOIN runtime_compensation_dispatch compensation_dispatch
+          ON compensation_dispatch.compensation_command_id = effect.compensation_command_id
+        WHERE effect.source_command_id = OLD.command_id
+          AND compensation_dispatch.compensation_id = effect.compensation_id
+          AND compensation_dispatch.status = 'enforced'
+      ))
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'Invalid Runtime Run command dispatch transition');
+END;
+
+DROP TRIGGER runtime_run_command_dispatch_terminal_evidence;
+
+CREATE TRIGGER runtime_run_command_dispatch_terminal_evidence
+BEFORE UPDATE OF status ON runtime_run_command_dispatch
+WHEN
+  (NEW.status = 'enforced' AND (
+    NOT EXISTS (
+      SELECT 1 FROM runtime_run_command_effects effect
+      WHERE effect.command_id = NEW.command_id
+    ) OR
+    NOT EXISTS (
+      SELECT 1
+      FROM runtime_run_commands command
+      JOIN agent_runs run
+        ON run.id = command.agent_run_id
+       AND run.session_id = command.session_id
+      JOIN goal_sets goal_set
+        ON goal_set.agent_run_id = run.id
+       AND goal_set.revision = run.current_goal_set_revision
+      JOIN sessions session ON session.id = run.session_id
+      JOIN runtime_assignments assignment
+        ON assignment.id = run.runtime_assignment_id
+       AND assignment.session_id = run.session_id
+      WHERE command.id = NEW.command_id
+        AND run.lifecycle = command.target_lifecycle
+        AND run.state_version = command.target_run_state_version
+        AND run.current_policy_revision = command.run_policy_revision
+        AND run.current_goal_set_revision = command.goal_set_revision
+        AND goal_set.goal_set_id = command.goal_set_id
+        AND run.runtime_assignment_id = command.runtime_assignment_id
+        AND run.runtime_authorization_generation = command.runtime_authorization_generation
+        AND session.runtime_authorization_generation = command.runtime_authorization_generation
+        AND session.runtime_authorization_state = 'enforced'
+        AND assignment.generation = command.runtime_assignment_generation
+        AND assignment.sandbox_id = command.sandbox_id
+        AND assignment.sandbox_generation = command.sandbox_generation
+        AND assignment.runtime_principal_id = command.runtime_principal_id
+        AND assignment.runtime_authorization_generation = command.runtime_authorization_generation
+        AND assignment.status = 'ready'
+    )
+  )) OR
+  (NEW.status IN ('rejected', 'quarantined')
+    AND NOT (
+      NEW.status = 'quarantined'
+      AND OLD.status = 'compensating'
+      AND NEW.last_safe_error_code = 'stale_enforced_effect_compensated'
+      AND EXISTS (
+        SELECT 1 FROM runtime_compensation_effects effect
+        JOIN runtime_compensation_dispatch compensation_dispatch
+          ON compensation_dispatch.compensation_command_id = effect.compensation_command_id
+        WHERE effect.source_command_id = NEW.command_id
+          AND compensation_dispatch.compensation_id = effect.compensation_id
+          AND compensation_dispatch.status = 'enforced'
+      )
+    )
+    AND NOT EXISTS (
+      SELECT 1 FROM runtime_run_command_receipts receipt
+      WHERE receipt.command_id = NEW.command_id
+        AND (
+          receipt.outcome = NEW.status OR
+          (receipt.outcome = 'duplicate' AND receipt.original_outcome = NEW.status)
+        )
+    ))
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime Run dispatch terminal state lacks durable evidence');
+END;
+`;
+
+const RUNTIME_OUTBOX_IDENTIFIER_TRIM_CODE_POINTS_SQL = [
+  0x20, 0xa0, 0x1680, 0x2000, 0x2001, 0x2002, 0x2003, 0x2004, 0x2005, 0x2006, 0x2007, 0x2008,
+  0x2009, 0x200a, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000, 0xfeff,
+].join(", ");
+
+function runtimeOutboxBoundedTextSql(valueSql: string): string {
+  const controlCharacters = [...Array(32).keys(), 127]
+    .map((codePoint) => `instr(${valueSql}, char(${codePoint})) > 0`)
+    .join(" OR ");
+  return `(
+    typeof(${valueSql}) = 'text' AND
+    length(${valueSql}) >= 1 AND
+    length(CAST(${valueSql} AS BLOB)) <= 300 AND
+    ${valueSql} = trim(${valueSql}) AND
+    unicode(substr(${valueSql}, 1, 1))
+      NOT IN (${RUNTIME_OUTBOX_IDENTIFIER_TRIM_CODE_POINTS_SQL}) AND
+    unicode(substr(${valueSql}, -1, 1))
+      NOT IN (${RUNTIME_OUTBOX_IDENTIFIER_TRIM_CODE_POINTS_SQL}) AND
+    NOT (${controlCharacters})
+  )`;
+}
+
+const RUNTIME_OUTBOX_EVIDENCE_TABLES_SCHEMA_V8 = `
+CREATE INDEX runtime_outbox_created_at_idx ON runtime_outbox(created_at_ms);
+CREATE INDEX runtime_outbox_dispatch_interlock_acquired_at_idx
+  ON runtime_outbox(dispatch_interlock_acquired_at_ms)
+  WHERE dispatch_interlock_acquired_at_ms IS NOT NULL;
+
+CREATE TABLE runtime_outbox_settlements (
+  outbox_id TEXT NOT NULL REFERENCES runtime_outbox(id) ON DELETE RESTRICT,
+  attempt INTEGER NOT NULL CHECK (
+    attempt BETWEEN 1 AND 9007199254740991
+  ),
+  lease_owner TEXT NOT NULL,
+  lease_expires_at_ms INTEGER NOT NULL CHECK (
+    lease_expires_at_ms BETWEEN 1 AND 9007199254740991
+  ),
+  dispatch_interlock_attempt INTEGER,
+  dispatch_interlock_acquired_at_ms INTEGER,
+  outcome TEXT NOT NULL CHECK (outcome IN (
+    'acknowledged', 'retryable-failure', 'terminal-failure',
+    'lease-expired', 'lease-invalid'
+  )),
+  error_code TEXT CHECK (error_code IS NULL OR error_code IN (
+    'runtime_unavailable', 'runtime_timeout', 'runtime_conflict',
+    'runtime_permission_denied', 'runtime_invalid_state', 'runtime_internal'
+  )),
+  command_source_scope TEXT,
+  command_source_key TEXT,
+  recorded_at_ms INTEGER NOT NULL CHECK (
+    recorded_at_ms BETWEEN 0 AND 9007199254740991
+  ),
+  PRIMARY KEY (outbox_id, attempt),
+  CHECK (
+    (dispatch_interlock_attempt IS NULL AND
+      dispatch_interlock_acquired_at_ms IS NULL) OR
+    (dispatch_interlock_attempt BETWEEN 1 AND attempt AND
+      dispatch_interlock_acquired_at_ms IS NOT NULL)
+  ),
+  CHECK (
+    (outcome IN ('acknowledged', 'lease-expired', 'lease-invalid') AND
+      error_code IS NULL) OR
+    (outcome IN ('retryable-failure', 'terminal-failure') AND error_code IS NOT NULL)
+  ),
+  CHECK (
+    (outcome IN ('lease-expired', 'lease-invalid') AND
+      command_source_scope IS NULL AND
+      command_source_key IS NULL) OR
+    (outcome NOT IN ('lease-expired', 'lease-invalid') AND
+      command_source_scope IS NOT NULL AND
+      command_source_key IS NOT NULL)
+  ),
+  FOREIGN KEY (command_source_scope, command_source_key)
+    REFERENCES accepted_commands(source_scope, source_key)
+    ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED
+) STRICT;
+
+CREATE TABLE runtime_outbox_supersession_evidence (
+  target_outbox_id TEXT PRIMARY KEY
+    REFERENCES runtime_outbox(id) ON DELETE RESTRICT,
+  source_outbox_id TEXT NOT NULL
+    REFERENCES runtime_outbox(id) ON DELETE RESTRICT,
+  reason TEXT NOT NULL CHECK (reason IN ('emergency-cutover', 'retired-binding')),
+  target_status TEXT NOT NULL CHECK (
+    target_status IN ('pending', 'processing', 'failed')
+  ),
+  target_attempts INTEGER NOT NULL CHECK (
+    target_attempts BETWEEN 0 AND 9007199254740991
+  ),
+  target_lease_owner TEXT,
+  target_lease_expires_at_ms INTEGER,
+  target_dispatch_interlock_attempt INTEGER,
+  target_dispatch_interlock_acquired_at_ms INTEGER,
+  source_attempts INTEGER NOT NULL CHECK (
+    source_attempts BETWEEN 0 AND 9007199254740991
+  ),
+  source_lease_owner TEXT,
+  source_lease_expires_at_ms INTEGER,
+  source_dispatch_interlock_attempt INTEGER,
+  source_dispatch_interlock_acquired_at_ms INTEGER,
+  command_source_scope TEXT NOT NULL,
+  command_source_key TEXT NOT NULL,
+  recorded_at_ms INTEGER NOT NULL CHECK (
+    recorded_at_ms BETWEEN 0 AND 9007199254740991
+  ),
+  CHECK (target_outbox_id <> source_outbox_id),
+  FOREIGN KEY (command_source_scope, command_source_key)
+    REFERENCES accepted_commands(source_scope, source_key)
+    ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED
+) STRICT;
+`;
+
+const RUNTIME_OUTBOX_DISPATCH_INTERLOCK_TRIGGERS_SCHEMA_V8 = `
+CREATE TRIGGER runtime_outbox_settlements_valid_insert
+BEFORE INSERT ON runtime_outbox_settlements
+WHEN NOT EXISTS (
+  SELECT 1
+  FROM runtime_outbox outbox
+  WHERE outbox.id = NEW.outbox_id
+    AND outbox.status = 'processing'
+    AND outbox.attempts = NEW.attempt
+    AND outbox.lease_owner = NEW.lease_owner
+    AND outbox.lease_expires_at_ms = NEW.lease_expires_at_ms
+    AND outbox.dispatch_interlock_attempt IS NEW.dispatch_interlock_attempt
+    AND outbox.dispatch_interlock_acquired_at_ms IS
+      NEW.dispatch_interlock_acquired_at_ms
+    AND NEW.recorded_at_ms >= outbox.created_at_ms
+    AND (
+      NEW.outcome IN ('lease-expired', 'lease-invalid') OR
+      NOT EXISTS (
+        SELECT 1 FROM accepted_commands accepted
+        WHERE accepted.source_scope = NEW.command_source_scope
+          AND accepted.source_key = NEW.command_source_key
+      )
+    )
+    AND (
+      (
+        NEW.outcome = 'lease-expired' AND
+        NEW.recorded_at_ms >= NEW.lease_expires_at_ms
+      ) OR (
+        NEW.outcome = 'lease-invalid' AND
+        NEW.lease_expires_at_ms > NEW.recorded_at_ms + 360000
+      ) OR (
+        NEW.outcome NOT IN ('lease-expired', 'lease-invalid') AND
+        NEW.recorded_at_ms < NEW.lease_expires_at_ms AND
+        NEW.dispatch_interlock_attempt BETWEEN 1 AND NEW.attempt AND
+        NEW.dispatch_interlock_acquired_at_ms IS NOT NULL AND
+        NEW.dispatch_interlock_acquired_at_ms <= NEW.recorded_at_ms
+      )
+    )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime outbox settlement does not match its exact lease');
+END;
+
+CREATE TRIGGER runtime_outbox_settlements_immutable_update
+BEFORE UPDATE ON runtime_outbox_settlements
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime outbox settlements are immutable');
+END;
+
+CREATE TRIGGER runtime_outbox_settlements_immutable_delete
+BEFORE DELETE ON runtime_outbox_settlements
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime outbox settlements are immutable');
+END;
+
+CREATE TRIGGER runtime_outbox_supersession_evidence_valid_insert
+BEFORE INSERT ON runtime_outbox_supersession_evidence
+WHEN NOT EXISTS (
+  SELECT 1
+  FROM runtime_outbox target
+  JOIN runtime_outbox source ON source.id = NEW.source_outbox_id
+  JOIN session_events source_event
+    ON source_event.session_id = source.session_id
+   AND source_event.sequence = source.session_sequence
+  JOIN runtime_assignments assignment
+    ON assignment.id = json_extract(source.payload_json, '$.runtimeAssignmentId')
+   AND assignment.session_id = source.session_id
+   AND assignment.generation =
+     json_extract(source.payload_json, '$.runtimeAssignmentGeneration')
+   AND assignment.sandbox_id = json_extract(source.payload_json, '$.sandboxId')
+   AND assignment.sandbox_generation =
+     json_extract(source.payload_json, '$.sandboxGeneration')
+  JOIN agent_runs run
+    ON run.id = json_extract(source.payload_json, '$.agentRunId')
+   AND run.session_id = source.session_id
+   AND run.runtime_assignment_id = assignment.id
+  JOIN sessions session ON session.id = source.session_id
+  WHERE target.id = NEW.target_outbox_id
+    AND target.session_id = source.session_id
+    AND target.status = NEW.target_status
+    AND target.attempts = NEW.target_attempts
+    AND target.lease_owner IS NEW.target_lease_owner
+    AND target.lease_expires_at_ms IS NEW.target_lease_expires_at_ms
+    AND target.dispatch_interlock_attempt IS
+      NEW.target_dispatch_interlock_attempt
+    AND target.dispatch_interlock_acquired_at_ms IS
+      NEW.target_dispatch_interlock_acquired_at_ms
+    AND source.attempts = NEW.source_attempts
+    AND source.lease_owner IS NEW.source_lease_owner
+    AND source.lease_expires_at_ms IS NEW.source_lease_expires_at_ms
+    AND source.dispatch_interlock_attempt IS
+      NEW.source_dispatch_interlock_attempt
+    AND source.dispatch_interlock_acquired_at_ms IS
+      NEW.source_dispatch_interlock_acquired_at_ms
+    AND source.kind = 'runtime.session.retire'
+    AND json_extract(source.payload_json, '$.reason') = 'emergency-stop'
+    AND source_event.type = 'run.emergency-stop.requested'
+    AND source_event.source_scope = CASE NEW.reason
+      WHEN 'emergency-cutover' THEN NEW.command_source_scope
+      ELSE source_event.source_scope
+    END
+    AND source_event.source_key = CASE NEW.reason
+      WHEN 'emergency-cutover' THEN NEW.command_source_key
+      ELSE source_event.source_key
+    END
+    AND NEW.recorded_at_ms >= target.created_at_ms
+    AND NOT EXISTS (
+      SELECT 1 FROM accepted_commands accepted
+      WHERE accepted.source_scope = NEW.command_source_scope
+        AND accepted.source_key = NEW.command_source_key
+    )
+    AND assignment.status = 'quarantined'
+    AND run.lifecycle = 'pausing'
+    AND (
+      (
+        NEW.reason = 'emergency-cutover' AND
+        target.session_sequence < source.session_sequence AND
+        target.status IN ('pending', 'processing', 'failed') AND
+        source.status = 'pending' AND source.attempts = 0 AND
+        source.lease_owner IS NULL AND source.lease_expires_at_ms IS NULL AND
+        source.dispatch_interlock_attempt IS NULL AND
+        source.dispatch_interlock_acquired_at_ms IS NULL AND
+        NEW.recorded_at_ms = source.created_at_ms AND
+        source_event.occurred_at_ms = source.created_at_ms AND
+        json_type(source_event.payload_json, '$.revokeAllRunGrants') = 'true' AND
+        json_extract(source_event.payload_json, '$.revokeAllRunGrants') = 1 AND
+        json_extract(target.payload_json, '$.runtimeAuthorizationGeneration') <
+          json_extract(source.payload_json, '$.runtimeAuthorizationGeneration') AND
+        session.runtime_authorization_generation =
+          json_extract(source.payload_json, '$.runtimeAuthorizationGeneration') AND
+        session.runtime_authorization_state = 'quarantined' AND
+        assignment.runtime_authorization_generation =
+          json_extract(source.payload_json, '$.runtimeAuthorizationGeneration') AND
+        run.runtime_authorization_generation =
+          json_extract(source.payload_json, '$.runtimeAuthorizationGeneration')
+      ) OR (
+        NEW.reason = 'retired-binding' AND
+        target.session_sequence > source.session_sequence AND
+        target.kind = 'runtime.authorization.fence' AND
+        json_extract(target.payload_json, '$.reason') = 'assignee-loss' AND
+        json_extract(target.payload_json, '$.runtimeAuthorizationGeneration') >
+          json_extract(source.payload_json, '$.runtimeAuthorizationGeneration') AND
+        source.status = 'processing' AND
+        source.dispatch_interlock_attempt IS NOT NULL AND
+        source.dispatch_interlock_attempt <= source.attempts AND
+        source.dispatch_interlock_acquired_at_ms IS NOT NULL AND
+        source.dispatch_interlock_acquired_at_ms <= NEW.recorded_at_ms AND
+        source.lease_expires_at_ms > NEW.recorded_at_ms AND
+        session.runtime_authorization_generation >=
+          json_extract(target.payload_json, '$.runtimeAuthorizationGeneration') AND
+        session.runtime_authorization_state = 'quarantined' AND
+        assignment.runtime_authorization_generation =
+          json_extract(source.payload_json, '$.runtimeAuthorizationGeneration') AND
+        run.runtime_authorization_generation =
+          json_extract(source.payload_json, '$.runtimeAuthorizationGeneration')
+      )
+    )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime outbox supersession evidence is not exact');
+END;
+
+CREATE TRIGGER runtime_outbox_supersession_evidence_immutable_update
+BEFORE UPDATE ON runtime_outbox_supersession_evidence
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime outbox supersession evidence is immutable');
+END;
+
+CREATE TRIGGER runtime_outbox_supersession_evidence_immutable_delete
+BEFORE DELETE ON runtime_outbox_supersession_evidence
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime outbox supersession evidence is immutable');
+END;
+
+CREATE TRIGGER accepted_commands_runtime_outbox_evidence
+BEFORE INSERT ON accepted_commands
+WHEN EXISTS (
+  SELECT 1
+  FROM runtime_outbox_settlements settlement
+  WHERE settlement.command_source_scope = NEW.source_scope
+    AND settlement.command_source_key = NEW.source_key
+    AND COALESCE((
+      json_type(NEW.payload_json) = 'object' AND
+      (SELECT count(*) = count(DISTINCT key) FROM json_each(NEW.payload_json)) AND
+      (
+      (
+        settlement.outcome = 'acknowledged' AND
+        NEW.command_type = 'runtime.outbox.acknowledge' AND
+        NEW.actor_kind = 'system' AND
+        NEW.actor_user_id = settlement.lease_owner AND
+        json_type(NEW.payload_json, '$.type') = 'text' AND
+        json_extract(NEW.payload_json, '$.type') = 'runtime.outbox.acknowledge' AND
+        json_type(NEW.payload_json, '$.outboxId') = 'text' AND
+        json_extract(NEW.payload_json, '$.outboxId') = settlement.outbox_id AND
+        json_type(NEW.payload_json, '$.workerId') = 'text' AND
+        json_extract(NEW.payload_json, '$.workerId') = settlement.lease_owner AND
+        json_type(NEW.payload_json, '$.expectedAttempt') = 'integer' AND
+        json_extract(NEW.payload_json, '$.expectedAttempt') = settlement.attempt AND
+        json_type(NEW.payload_json, '$.expectedLeaseExpiresAtMs') = 'integer' AND
+        json_extract(NEW.payload_json, '$.expectedLeaseExpiresAtMs') =
+          settlement.lease_expires_at_ms AND
+        NEW.accepted_at_ms = settlement.recorded_at_ms
+      ) OR (
+        settlement.outcome IN ('retryable-failure', 'terminal-failure') AND
+        NEW.command_type = 'runtime.outbox.fail' AND
+        NEW.actor_kind = 'system' AND
+        NEW.actor_user_id = settlement.lease_owner AND
+        json_type(NEW.payload_json, '$.type') = 'text' AND
+        json_extract(NEW.payload_json, '$.type') = 'runtime.outbox.fail' AND
+        json_type(NEW.payload_json, '$.outboxId') = 'text' AND
+        json_extract(NEW.payload_json, '$.outboxId') = settlement.outbox_id AND
+        json_type(NEW.payload_json, '$.workerId') = 'text' AND
+        json_extract(NEW.payload_json, '$.workerId') = settlement.lease_owner AND
+        json_type(NEW.payload_json, '$.expectedAttempt') = 'integer' AND
+        json_extract(NEW.payload_json, '$.expectedAttempt') = settlement.attempt AND
+        json_type(NEW.payload_json, '$.expectedLeaseExpiresAtMs') = 'integer' AND
+        json_extract(NEW.payload_json, '$.expectedLeaseExpiresAtMs') =
+          settlement.lease_expires_at_ms AND
+        json_type(NEW.payload_json, '$.errorCode') = 'text' AND
+        json_extract(NEW.payload_json, '$.errorCode') = settlement.error_code AND
+        json_type(NEW.payload_json, '$.retryable') IN ('true', 'false') AND
+        json_extract(NEW.payload_json, '$.retryable') =
+          CASE settlement.outcome WHEN 'retryable-failure' THEN 1 ELSE 0 END AND
+        NEW.accepted_at_ms = settlement.recorded_at_ms
+      )
+      )
+    ), 0) = 0
+) OR EXISTS (
+  SELECT 1
+  FROM runtime_outbox_supersession_evidence evidence
+  JOIN runtime_outbox source ON source.id = evidence.source_outbox_id
+  JOIN session_events source_event
+    ON source_event.session_id = source.session_id
+   AND source_event.sequence = source.session_sequence
+  WHERE evidence.command_source_scope = NEW.source_scope
+    AND evidence.command_source_key = NEW.source_key
+    AND COALESCE((
+      json_type(NEW.payload_json) = 'object' AND
+      (SELECT count(*) = count(DISTINCT key) FROM json_each(NEW.payload_json)) AND
+      (
+      (
+        evidence.reason = 'emergency-cutover' AND
+        NEW.command_type = 'run.emergency-stop' AND
+        NEW.actor_kind = 'human' AND
+        source_event.actor_kind = NEW.actor_kind AND
+        NEW.actor_user_id = source_event.actor_user_id AND
+        NEW.actor_display_name = source_event.actor_display_name AND
+        source_event.source_scope = NEW.source_scope AND
+        source_event.source_key = NEW.source_key AND
+        json_type(NEW.payload_json, '$.type') = 'text' AND
+        json_extract(NEW.payload_json, '$.type') = 'run.emergency-stop' AND
+        json_type(NEW.payload_json, '$.sessionId') = 'text' AND
+        json_extract(NEW.payload_json, '$.sessionId') = source.session_id AND
+        json_type(NEW.payload_json, '$.agentRunId') = 'text' AND
+        json_extract(NEW.payload_json, '$.agentRunId') =
+          json_extract(source.payload_json, '$.agentRunId') AND
+        json_type(NEW.payload_json, '$.reason') = 'text' AND
+        json_extract(NEW.payload_json, '$.reason') =
+          json_extract(source_event.payload_json, '$.reason') AND
+        json_type(NEW.payload_json, '$.revokeAllRunGrants') = 'true' AND
+        json_extract(NEW.payload_json, '$.revokeAllRunGrants') = 1 AND
+        json_type(NEW.payload_json, '$.runtimeBinding') = 'object' AND
+        (SELECT count(*) = count(DISTINCT key)
+         FROM json_each(NEW.payload_json, '$.runtimeBinding')) AND
+        json_type(
+          NEW.payload_json, '$.runtimeBinding.runtimeAssignmentId'
+        ) = 'text' AND
+        json_extract(NEW.payload_json, '$.runtimeBinding.runtimeAssignmentId') =
+          json_extract(source.payload_json, '$.runtimeAssignmentId') AND
+        json_type(
+          NEW.payload_json, '$.runtimeBinding.runtimeAssignmentGeneration'
+        ) = 'integer' AND
+        json_extract(NEW.payload_json, '$.runtimeBinding.runtimeAssignmentGeneration') =
+          json_extract(source.payload_json, '$.runtimeAssignmentGeneration') AND
+        json_type(NEW.payload_json, '$.runtimeBinding.sandboxId') = 'text' AND
+        json_extract(NEW.payload_json, '$.runtimeBinding.sandboxId') =
+          json_extract(source.payload_json, '$.sandboxId') AND
+        json_type(
+          NEW.payload_json, '$.runtimeBinding.sandboxGeneration'
+        ) = 'integer' AND
+        json_extract(NEW.payload_json, '$.runtimeBinding.sandboxGeneration') =
+          json_extract(source.payload_json, '$.sandboxGeneration') AND
+        NEW.accepted_at_ms = evidence.recorded_at_ms
+      ) OR (
+        evidence.reason = 'retired-binding' AND
+        NEW.command_type = 'runtime.outbox.acknowledge' AND
+        NEW.actor_kind = 'system' AND
+        NEW.actor_user_id = evidence.source_lease_owner AND
+        json_type(NEW.payload_json, '$.type') = 'text' AND
+        json_extract(NEW.payload_json, '$.type') = 'runtime.outbox.acknowledge' AND
+        json_type(NEW.payload_json, '$.outboxId') = 'text' AND
+        json_extract(NEW.payload_json, '$.outboxId') = evidence.source_outbox_id AND
+        json_type(NEW.payload_json, '$.workerId') = 'text' AND
+        json_extract(NEW.payload_json, '$.workerId') = evidence.source_lease_owner AND
+        json_type(NEW.payload_json, '$.expectedAttempt') = 'integer' AND
+        json_extract(NEW.payload_json, '$.expectedAttempt') = evidence.source_attempts AND
+        json_type(NEW.payload_json, '$.expectedLeaseExpiresAtMs') = 'integer' AND
+        json_extract(NEW.payload_json, '$.expectedLeaseExpiresAtMs') =
+          evidence.source_lease_expires_at_ms AND
+        NEW.accepted_at_ms = evidence.recorded_at_ms
+      )
+      )
+    ), 0) = 0
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Accepted command does not match Runtime outbox evidence');
+END;
+
+CREATE TRIGGER accepted_commands_immutable_update
+BEFORE UPDATE ON accepted_commands
+BEGIN
+  SELECT RAISE(ABORT, 'Accepted commands are immutable');
+END;
+
+CREATE TRIGGER accepted_commands_immutable_delete
+BEFORE DELETE ON accepted_commands
+BEGIN
+  SELECT RAISE(ABORT, 'Accepted commands are immutable');
+END;
+
+CREATE TRIGGER runtime_outbox_payload_valid_insert
+BEFORE INSERT ON runtime_outbox
+WHEN CASE
+  WHEN json_valid(NEW.payload_json) = 0 THEN 1
+  ELSE COALESCE((
+    json_type(NEW.payload_json) = 'object' AND
+    (SELECT count(*) = count(DISTINCT key) FROM json_each(NEW.payload_json)) AND
+    json_type(NEW.payload_json, '$.sessionId') = 'text' AND
+    json_extract(NEW.payload_json, '$.sessionId') = NEW.session_id AND
+    json_type(NEW.payload_json, '$.runtimeAuthorizationGeneration') = 'integer' AND
+    json_extract(NEW.payload_json, '$.runtimeAuthorizationGeneration')
+      BETWEEN 1 AND 9007199254740991 AND
+    (
+      (
+        NEW.kind = 'runtime.session.ensure' AND
+        (SELECT count(*) FROM json_each(NEW.payload_json)) = 4 AND
+        NOT EXISTS (
+          SELECT 1 FROM json_each(NEW.payload_json)
+          WHERE key NOT IN (
+            'sessionId', 'runtimeKind', 'tmuxName', 'runtimeAuthorizationGeneration'
+          )
+        ) AND
+        json_type(NEW.payload_json, '$.runtimeKind') = 'text' AND
+        json_extract(NEW.payload_json, '$.runtimeKind') = 'local-tmux' AND
+        json_type(NEW.payload_json, '$.tmuxName') = 'text' AND
+        length(json_extract(NEW.payload_json, '$.tmuxName')) BETWEEN 1 AND 128 AND
+        json_extract(NEW.payload_json, '$.tmuxName') NOT GLOB '*[^a-zA-Z0-9_.-]*'
+      ) OR (
+        NEW.kind = 'runtime.authorization.fence' AND
+        (SELECT count(*) FROM json_each(NEW.payload_json)) = 3 AND
+        NOT EXISTS (
+          SELECT 1 FROM json_each(NEW.payload_json)
+          WHERE key NOT IN ('sessionId', 'reason', 'runtimeAuthorizationGeneration')
+        ) AND
+        json_type(NEW.payload_json, '$.reason') = 'text' AND
+        json_extract(NEW.payload_json, '$.reason') IN ('assignee-loss', 'emergency-stop')
+      ) OR (
+        NEW.kind = 'runtime.session.retire' AND
+        (SELECT count(*) FROM json_each(NEW.payload_json)) = 8 AND
+        NOT EXISTS (
+          SELECT 1 FROM json_each(NEW.payload_json)
+          WHERE key NOT IN (
+            'sessionId', 'runtimeAuthorizationGeneration', 'reason', 'agentRunId',
+            'runtimeAssignmentId', 'runtimeAssignmentGeneration', 'sandboxId',
+            'sandboxGeneration'
+          )
+        ) AND
+        json_type(NEW.payload_json, '$.reason') = 'text' AND
+        json_extract(NEW.payload_json, '$.reason') = 'emergency-stop' AND
+        json_type(NEW.payload_json, '$.agentRunId') = 'text' AND
+        json_type(NEW.payload_json, '$.runtimeAssignmentId') = 'text' AND
+        json_type(NEW.payload_json, '$.runtimeAssignmentGeneration') = 'integer' AND
+        json_extract(NEW.payload_json, '$.runtimeAssignmentGeneration')
+          BETWEEN 1 AND 9007199254740991 AND
+        json_type(NEW.payload_json, '$.sandboxId') = 'text' AND
+        json_type(NEW.payload_json, '$.sandboxGeneration') = 'integer' AND
+        json_extract(NEW.payload_json, '$.sandboxGeneration')
+          BETWEEN 1 AND 9007199254740991 AND
+        NOT EXISTS (
+          SELECT 1
+          FROM json_each(json_array(
+            json_extract(NEW.payload_json, '$.agentRunId'),
+            json_extract(NEW.payload_json, '$.runtimeAssignmentId'),
+            json_extract(NEW.payload_json, '$.sandboxId')
+          )) identifier
+          WHERE NOT ${runtimeOutboxBoundedTextSql("identifier.value")}
+        )
+      )
+    )
+  ), 0) = 0
+END
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime outbox payload contract is invalid');
+END;
+
+CREATE TRIGGER runtime_outbox_dispatch_interlock_valid_insert
+BEFORE INSERT ON runtime_outbox
+WHEN NOT ${runtimeOutboxBoundedTextSql("NEW.id")} OR
+  typeof(NEW.session_sequence) <> 'integer' OR
+  NEW.session_sequence NOT BETWEEN 1 AND 9007199254740991 OR
+  typeof(NEW.created_at_ms) <> 'integer' OR
+  NEW.created_at_ms NOT BETWEEN 0 AND 9007199254740991 OR
+  NEW.status <> 'pending' OR
+  NEW.attempts <> 0 OR
+  NEW.lease_owner IS NOT NULL OR
+  NEW.lease_expires_at_ms IS NOT NULL OR
+  NEW.dispatch_interlock_attempt IS NOT NULL OR
+  NEW.dispatch_interlock_acquired_at_ms IS NOT NULL OR
+  NEW.last_error IS NOT NULL OR
+  NEW.delivered_at_ms IS NOT NULL
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime outbox must begin in the exact pending state');
+END;
+
+CREATE TRIGGER runtime_outbox_source_event_valid_insert
+BEFORE INSERT ON runtime_outbox
+WHEN NOT EXISTS (
+  SELECT 1
+  FROM session_events event
+  WHERE event.session_id = NEW.session_id
+    AND event.sequence = NEW.session_sequence
+    AND event.occurred_at_ms = NEW.created_at_ms
+    AND json_type(event.payload_json) = 'object'
+    AND (SELECT count(*) = count(DISTINCT key) FROM json_each(event.payload_json))
+    AND (
+      (
+        NEW.kind = 'runtime.session.ensure' AND
+        event.type = 'session.started' AND
+        json_type(event.payload_json, '$.sessionId') = 'text' AND
+        json_extract(event.payload_json, '$.sessionId') = NEW.session_id AND
+        json_type(event.payload_json, '$.runtimeKind') = 'text' AND
+        json_extract(event.payload_json, '$.runtimeKind') =
+          json_extract(NEW.payload_json, '$.runtimeKind') AND
+        json_type(event.payload_json, '$.runtimeAuthorizationGeneration') = 'integer' AND
+        json_extract(event.payload_json, '$.runtimeAuthorizationGeneration') =
+          json_extract(NEW.payload_json, '$.runtimeAuthorizationGeneration') AND
+        EXISTS (
+          SELECT 1 FROM sessions session
+          WHERE session.id = NEW.session_id
+            AND session.runtime_kind = json_extract(NEW.payload_json, '$.runtimeKind')
+            AND session.tmux_name = json_extract(NEW.payload_json, '$.tmuxName')
+            AND session.runtime_authorization_generation =
+              json_extract(NEW.payload_json, '$.runtimeAuthorizationGeneration')
+            AND session.runtime_authorization_state = 'pending'
+        )
+      ) OR (
+        NEW.kind = 'runtime.authorization.fence' AND
+        event.type = 'session.runtime-authorization.advanced' AND
+        json_type(event.payload_json, '$.reason') = 'text' AND
+        json_extract(event.payload_json, '$.reason') =
+          json_extract(NEW.payload_json, '$.reason') AND
+        json_type(event.payload_json, '$.runtimeAuthorizationGeneration') = 'integer' AND
+        json_extract(event.payload_json, '$.runtimeAuthorizationGeneration') =
+          json_extract(NEW.payload_json, '$.runtimeAuthorizationGeneration') AND
+        EXISTS (
+          SELECT 1 FROM sessions session
+          WHERE session.id = NEW.session_id
+            AND session.runtime_authorization_generation =
+              json_extract(NEW.payload_json, '$.runtimeAuthorizationGeneration')
+            AND session.runtime_authorization_state IN ('pending', 'quarantined')
+            AND json_type(event.payload_json, '$.enforcementState') = 'text'
+            AND json_extract(event.payload_json, '$.enforcementState') =
+              session.runtime_authorization_state
+        )
+      ) OR (
+        NEW.kind = 'runtime.session.retire' AND
+        json_extract(NEW.payload_json, '$.reason') = 'emergency-stop' AND
+        event.type = 'run.emergency-stop.requested' AND
+        json_type(event.payload_json, '$.agentRunId') = 'text' AND
+        json_extract(event.payload_json, '$.agentRunId') =
+          json_extract(NEW.payload_json, '$.agentRunId') AND
+        json_type(event.payload_json, '$.runtimeAuthorizationGeneration') = 'integer' AND
+        json_extract(event.payload_json, '$.runtimeAuthorizationGeneration') =
+          json_extract(NEW.payload_json, '$.runtimeAuthorizationGeneration') AND
+        json_type(event.payload_json, '$.reason') = 'text' AND
+        json_type(event.payload_json, '$.revokeAllRunGrants') = 'true' AND
+        json_extract(event.payload_json, '$.revokeAllRunGrants') = 1 AND
+        EXISTS (
+          SELECT 1
+          FROM sessions session
+          JOIN runtime_assignments assignment
+            ON assignment.session_id = session.id
+          JOIN agent_runs run
+            ON run.session_id = session.id
+           AND run.runtime_assignment_id = assignment.id
+          WHERE session.id = NEW.session_id
+            AND session.runtime_authorization_generation =
+              json_extract(NEW.payload_json, '$.runtimeAuthorizationGeneration')
+            AND session.runtime_authorization_state = 'quarantined'
+            AND assignment.id =
+              json_extract(NEW.payload_json, '$.runtimeAssignmentId')
+            AND assignment.generation =
+              json_extract(NEW.payload_json, '$.runtimeAssignmentGeneration')
+            AND assignment.sandbox_id =
+              json_extract(NEW.payload_json, '$.sandboxId')
+            AND assignment.sandbox_generation =
+              json_extract(NEW.payload_json, '$.sandboxGeneration')
+            AND assignment.runtime_authorization_generation =
+              json_extract(NEW.payload_json, '$.runtimeAuthorizationGeneration')
+            AND assignment.status = 'quarantined'
+            AND run.id = json_extract(NEW.payload_json, '$.agentRunId')
+            AND run.runtime_authorization_generation =
+              json_extract(NEW.payload_json, '$.runtimeAuthorizationGeneration')
+            AND run.lifecycle = 'pausing'
+        )
+      )
+    )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime outbox source event does not match');
+END;
+
+CREATE TRIGGER runtime_outbox_dispatch_interlock_valid_update
+BEFORE UPDATE OF dispatch_interlock_attempt, dispatch_interlock_acquired_at_ms
+ON runtime_outbox
+WHEN COALESCE((
+  (
+    (NEW.dispatch_interlock_attempt IS NULL) =
+      (NEW.dispatch_interlock_acquired_at_ms IS NULL) AND
+    NEW.dispatch_interlock_attempt IS OLD.dispatch_interlock_attempt AND
+    NEW.dispatch_interlock_acquired_at_ms IS OLD.dispatch_interlock_acquired_at_ms
+  ) OR (
+    OLD.dispatch_interlock_attempt IS NULL AND
+    OLD.dispatch_interlock_acquired_at_ms IS NULL AND
+    OLD.status = 'processing' AND NEW.status = 'processing' AND
+    NEW.attempts = OLD.attempts AND
+    NEW.lease_owner IS OLD.lease_owner AND
+    NEW.lease_expires_at_ms IS OLD.lease_expires_at_ms AND
+    NEW.dispatch_interlock_attempt = OLD.attempts AND
+    NEW.dispatch_interlock_acquired_at_ms >= OLD.created_at_ms AND
+    NEW.dispatch_interlock_acquired_at_ms < OLD.lease_expires_at_ms AND
+    NOT EXISTS (
+      SELECT 1 FROM runtime_outbox_settlements settlement
+      WHERE settlement.outbox_id = OLD.id AND settlement.attempt = OLD.attempts
+    )
+  )
+), 0) = 0
+BEGIN
+  SELECT RAISE(ABORT, 'Invalid Runtime outbox dispatch interlock transition');
+END;
+
+CREATE TRIGGER runtime_outbox_immutable_update
+BEFORE UPDATE ON runtime_outbox
+WHEN NEW.id IS NOT OLD.id OR
+  NEW.session_id IS NOT OLD.session_id OR
+  NEW.session_sequence IS NOT OLD.session_sequence OR
+  NEW.kind IS NOT OLD.kind OR
+  NEW.payload_json IS NOT OLD.payload_json OR
+  NEW.created_at_ms IS NOT OLD.created_at_ms
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime outbox identity and work are immutable');
+END;
+
+CREATE TRIGGER runtime_outbox_immutable_delete
+BEFORE DELETE ON runtime_outbox
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime outbox rows are immutable');
+END;
+
+-- runtime_outbox normalizes its source event identity through
+-- (session_id, session_sequence), so the referenced event_id must be frozen too.
+CREATE TRIGGER runtime_outbox_source_event_immutable_update
+BEFORE UPDATE ON session_events
+WHEN EXISTS (
+  SELECT 1 FROM runtime_outbox outbox
+  WHERE outbox.session_id = OLD.session_id
+    AND outbox.session_sequence = OLD.sequence
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime outbox source events are immutable');
+END;
+
+CREATE TRIGGER runtime_outbox_source_event_immutable_delete
+BEFORE DELETE ON session_events
+WHEN EXISTS (
+  SELECT 1 FROM runtime_outbox outbox
+  WHERE outbox.session_id = OLD.session_id
+    AND outbox.session_sequence = OLD.sequence
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime outbox source events are immutable');
+END;
+
+CREATE TRIGGER runtime_outbox_mutation_valid_update
+BEFORE UPDATE ON runtime_outbox
+WHEN COALESCE((
+  typeof(NEW.attempts) = 'integer' AND
+  NEW.attempts BETWEEN 0 AND 9007199254740991 AND
+  typeof(NEW.created_at_ms) = 'integer' AND
+  NEW.created_at_ms BETWEEN 0 AND 9007199254740991 AND
+  (NEW.lease_owner IS NULL OR ${runtimeOutboxBoundedTextSql("NEW.lease_owner")}) AND
+  (NEW.lease_expires_at_ms IS NULL OR (
+    typeof(NEW.lease_expires_at_ms) = 'integer' AND
+    NEW.lease_expires_at_ms BETWEEN 1 AND 9007199254740991
+  )) AND
+  (NEW.last_error IS NULL OR ${runtimeOutboxBoundedTextSql("NEW.last_error")}) AND
+  (NEW.delivered_at_ms IS NULL OR (
+    typeof(NEW.delivered_at_ms) = 'integer' AND
+    NEW.delivered_at_ms BETWEEN NEW.created_at_ms AND 9007199254740991
+  )) AND
+  (NEW.dispatch_interlock_attempt IS NULL OR (
+    typeof(NEW.dispatch_interlock_attempt) = 'integer' AND
+    NEW.dispatch_interlock_attempt BETWEEN 1 AND NEW.attempts
+  )) AND
+  (NEW.dispatch_interlock_acquired_at_ms IS NULL OR (
+    typeof(NEW.dispatch_interlock_acquired_at_ms) = 'integer' AND
+    NEW.dispatch_interlock_acquired_at_ms
+      BETWEEN NEW.created_at_ms AND 9007199254740991
+  )) AND
+  (
+    -- A processing owner may acquire the interlock or renew one bounded lease.
+    -- Other same-status updates must be exact no-ops.
+    (
+      NEW.status = OLD.status AND
+      NEW.attempts = OLD.attempts AND
+      NEW.lease_owner IS OLD.lease_owner AND
+      NEW.last_error IS OLD.last_error AND
+      NEW.delivered_at_ms IS OLD.delivered_at_ms AND
+      (
+        (
+          OLD.status = 'processing' AND
+          NEW.lease_expires_at_ms >= OLD.lease_expires_at_ms AND
+          NOT EXISTS (
+            SELECT 1 FROM runtime_outbox_settlements settlement
+            WHERE settlement.outbox_id = OLD.id
+              AND settlement.attempt = OLD.attempts
+          )
+        ) OR (
+          OLD.status <> 'processing' AND
+          NEW.lease_expires_at_ms IS OLD.lease_expires_at_ms AND
+          NEW.dispatch_interlock_attempt IS OLD.dispatch_interlock_attempt AND
+          NEW.dispatch_interlock_acquired_at_ms IS
+            OLD.dispatch_interlock_acquired_at_ms
+        )
+      )
+    ) OR
+    -- Ordinary claim.
+    (
+      OLD.status = 'pending' AND NEW.status = 'processing' AND
+      NEW.attempts = OLD.attempts + 1 AND
+      ${runtimeOutboxBoundedTextSql("NEW.lease_owner")} AND
+      NEW.lease_expires_at_ms > NEW.created_at_ms AND
+      NEW.last_error IS OLD.last_error AND
+      NEW.delivered_at_ms IS NULL AND
+      NEW.dispatch_interlock_attempt IS OLD.dispatch_interlock_attempt AND
+      NEW.dispatch_interlock_acquired_at_ms IS
+        OLD.dispatch_interlock_acquired_at_ms
+    ) OR
+    -- Lease expiry and retry scheduling require an immutable exact-attempt settlement.
+    (
+      OLD.status = 'processing' AND NEW.status = 'pending' AND
+      NEW.attempts = OLD.attempts AND
+      NEW.lease_owner IS NULL AND NEW.lease_expires_at_ms IS NULL AND
+      NEW.delivered_at_ms IS NULL AND
+      NEW.dispatch_interlock_attempt IS OLD.dispatch_interlock_attempt AND
+      NEW.dispatch_interlock_acquired_at_ms IS
+        OLD.dispatch_interlock_acquired_at_ms AND
+      EXISTS (
+        SELECT 1 FROM runtime_outbox_settlements settlement
+        WHERE settlement.outbox_id = OLD.id
+          AND settlement.attempt = OLD.attempts
+          AND settlement.lease_owner = OLD.lease_owner
+          AND settlement.lease_expires_at_ms = OLD.lease_expires_at_ms
+          AND settlement.dispatch_interlock_attempt IS
+            OLD.dispatch_interlock_attempt
+          AND settlement.dispatch_interlock_acquired_at_ms IS
+            OLD.dispatch_interlock_acquired_at_ms
+          AND (
+            (settlement.outcome IN ('lease-expired', 'lease-invalid') AND
+              NEW.last_error IS OLD.last_error) OR
+            (settlement.outcome = 'retryable-failure' AND
+              NEW.last_error = settlement.error_code)
+          )
+      )
+    ) OR
+    -- Adapter acknowledgement is terminal only with exact immutable settlement evidence.
+    (
+      OLD.status = 'processing' AND NEW.status = 'delivered' AND
+      NEW.attempts = OLD.attempts AND
+      NEW.lease_owner IS NULL AND NEW.lease_expires_at_ms IS NULL AND
+      NEW.last_error IS NULL AND
+      NEW.dispatch_interlock_attempt IS OLD.dispatch_interlock_attempt AND
+      NEW.dispatch_interlock_acquired_at_ms IS
+        OLD.dispatch_interlock_acquired_at_ms AND
+      EXISTS (
+        SELECT 1 FROM runtime_outbox_settlements settlement
+        WHERE settlement.outbox_id = OLD.id
+          AND settlement.attempt = OLD.attempts
+          AND settlement.lease_owner = OLD.lease_owner
+          AND settlement.lease_expires_at_ms = OLD.lease_expires_at_ms
+          AND settlement.dispatch_interlock_attempt IS
+            OLD.dispatch_interlock_attempt
+          AND settlement.dispatch_interlock_acquired_at_ms IS
+            OLD.dispatch_interlock_acquired_at_ms
+          AND settlement.outcome = 'acknowledged'
+          AND settlement.recorded_at_ms = NEW.delivered_at_ms
+      )
+    ) OR
+    -- A permanent adapter failure likewise requires exact settlement evidence.
+    (
+      OLD.status = 'processing' AND NEW.status = 'failed' AND
+      NEW.attempts = OLD.attempts AND
+      NEW.lease_owner IS NULL AND NEW.lease_expires_at_ms IS NULL AND
+      NEW.last_error IS NOT NULL AND NEW.delivered_at_ms IS NULL AND
+      NEW.dispatch_interlock_attempt IS OLD.dispatch_interlock_attempt AND
+      NEW.dispatch_interlock_acquired_at_ms IS
+        OLD.dispatch_interlock_acquired_at_ms AND
+      EXISTS (
+        SELECT 1 FROM runtime_outbox_settlements settlement
+        WHERE settlement.outbox_id = OLD.id
+          AND settlement.attempt = OLD.attempts
+          AND settlement.lease_owner = OLD.lease_owner
+          AND settlement.lease_expires_at_ms = OLD.lease_expires_at_ms
+          AND settlement.dispatch_interlock_attempt IS
+            OLD.dispatch_interlock_attempt
+          AND settlement.dispatch_interlock_acquired_at_ms IS
+            OLD.dispatch_interlock_acquired_at_ms
+          AND settlement.outcome = 'terminal-failure'
+          AND settlement.error_code = NEW.last_error
+      )
+    ) OR
+    -- Supersession is per-target and cannot be inferred from ambient quarantine.
+    (
+      OLD.status IN ('pending', 'processing', 'failed') AND
+      NEW.status = 'superseded' AND
+      NEW.attempts = OLD.attempts AND
+      NEW.lease_owner IS NULL AND NEW.lease_expires_at_ms IS NULL AND
+      (NEW.last_error IS OLD.last_error OR NEW.last_error IS NULL) AND
+      NEW.dispatch_interlock_attempt IS OLD.dispatch_interlock_attempt AND
+      NEW.dispatch_interlock_acquired_at_ms IS
+        OLD.dispatch_interlock_acquired_at_ms AND
+      EXISTS (
+        SELECT 1 FROM runtime_outbox_supersession_evidence evidence
+        WHERE evidence.target_outbox_id = OLD.id
+          AND evidence.target_status = OLD.status
+          AND evidence.target_attempts = OLD.attempts
+          AND evidence.target_lease_owner IS OLD.lease_owner
+          AND evidence.target_lease_expires_at_ms IS OLD.lease_expires_at_ms
+          AND evidence.target_dispatch_interlock_attempt IS
+            OLD.dispatch_interlock_attempt
+          AND evidence.target_dispatch_interlock_acquired_at_ms IS
+            OLD.dispatch_interlock_acquired_at_ms
+          AND evidence.recorded_at_ms = NEW.delivered_at_ms
+          AND (
+            evidence.reason = 'emergency-cutover' OR
+            (
+              evidence.reason = 'retired-binding' AND
+              EXISTS (
+                SELECT 1
+                FROM runtime_outbox source
+                JOIN runtime_assignments assignment
+                  ON assignment.id =
+                    json_extract(source.payload_json, '$.runtimeAssignmentId')
+                 AND assignment.session_id = source.session_id
+                 AND assignment.generation =
+                    json_extract(source.payload_json, '$.runtimeAssignmentGeneration')
+                 AND assignment.sandbox_id =
+                    json_extract(source.payload_json, '$.sandboxId')
+                 AND assignment.sandbox_generation =
+                    json_extract(source.payload_json, '$.sandboxGeneration')
+                JOIN agent_runs run
+                  ON run.id = json_extract(source.payload_json, '$.agentRunId')
+                 AND run.session_id = source.session_id
+                 AND run.runtime_assignment_id = assignment.id
+                WHERE source.id = evidence.source_outbox_id
+                  AND source.kind = 'runtime.session.retire'
+                  AND json_extract(source.payload_json, '$.reason') = 'emergency-stop'
+                  AND source.status = 'delivered'
+                  AND source.attempts = evidence.source_attempts
+                  AND source.lease_owner IS NULL
+                  AND source.lease_expires_at_ms IS NULL
+                  AND source.dispatch_interlock_attempt IS
+                    evidence.source_dispatch_interlock_attempt
+                  AND source.dispatch_interlock_acquired_at_ms IS
+                    evidence.source_dispatch_interlock_acquired_at_ms
+                  AND source.delivered_at_ms = evidence.recorded_at_ms
+                  AND assignment.status = 'retired'
+                  AND assignment.retired_at_ms = evidence.recorded_at_ms
+                  AND run.lifecycle = 'emergency-stopped'
+                  AND run.terminal_at_ms = evidence.recorded_at_ms
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM runtime_assignments current_assignment
+                    WHERE current_assignment.session_id = source.session_id
+                      AND current_assignment.status IN (
+                        'provisioning', 'ready', 'checkpointing',
+                        'recovering', 'quarantined'
+                      )
+                  )
+              )
+            )
+          )
+      )
+    )
+  )
+), 0) = 0
+BEGIN
+  SELECT RAISE(ABORT, 'Invalid Runtime outbox state transition');
+END;
+`;
+
 const SCHEMA = `
 CREATE TABLE teams (
   id TEXT PRIMARY KEY,
@@ -4020,7 +6730,9 @@ export function openTeamSessionDatabase(
       if (
         migratedVersion !== PRE_RUNTIME_START_SCHEMA_VERSION &&
         migratedVersion !== RUNTIME_START_SCHEMA_VERSION &&
-        migratedVersion !== SCHEMA_VERSION
+        migratedVersion !== RUNTIME_RECEIPT_FOLLOW_SCHEMA_VERSION &&
+        migratedVersion !== RUNTIME_COMPENSATION_SCHEMA_VERSION &&
+        migratedVersion !== RUNTIME_ASSIGNMENT_OUTBOX_INTERLOCK_SCHEMA_VERSION
       ) {
         throw new Error(
           `Unsupported Team Session database schema ${currentVersion}; expected ${SCHEMA_VERSION}`
@@ -4038,6 +6750,16 @@ export function openTeamSessionDatabase(
     const receiptFollowPreparedVersion = db.pragma("user_version", { simple: true }) as number;
     if (receiptFollowPreparedVersion === RUNTIME_START_SCHEMA_VERSION) {
       migrateRuntimeReceiptFollowSchemaV6(db);
+    }
+    const compensationPreparedVersion = db.pragma("user_version", { simple: true }) as number;
+    if (compensationPreparedVersion === RUNTIME_RECEIPT_FOLLOW_SCHEMA_VERSION) {
+      migrateRuntimeCompensationSchemaV7(db);
+    }
+    const assignmentInterlockPreparedVersion = db.pragma("user_version", {
+      simple: true,
+    }) as number;
+    if (assignmentInterlockPreparedVersion === RUNTIME_COMPENSATION_SCHEMA_VERSION) {
+      migrateRuntimeAssignmentOutboxInterlockSchemaV8(db);
     }
 
     const applicationId = db.pragma("application_id", { simple: true }) as number;
@@ -4112,7 +6834,12 @@ function migrateRuntimeStartSchemaV5(db: Database.Database): void {
       if (applicationId !== APPLICATION_ID) {
         throw new Error("File is not a recognized Team Session database");
       }
-      if (currentVersion === RUNTIME_START_SCHEMA_VERSION || currentVersion === SCHEMA_VERSION) {
+      if (
+        currentVersion === RUNTIME_START_SCHEMA_VERSION ||
+        currentVersion === RUNTIME_RECEIPT_FOLLOW_SCHEMA_VERSION ||
+        currentVersion === RUNTIME_COMPENSATION_SCHEMA_VERSION ||
+        currentVersion === RUNTIME_ASSIGNMENT_OUTBOX_INTERLOCK_SCHEMA_VERSION
+      ) {
         return;
       }
       if (currentVersion !== PRE_RUNTIME_START_SCHEMA_VERSION) {
@@ -4145,10 +6872,16 @@ function migrateRuntimeReceiptFollowSchemaV6(db: Database.Database): void {
     if (applicationId !== APPLICATION_ID) {
       throw new Error("File is not a recognized Team Session database");
     }
-    if (currentVersion === SCHEMA_VERSION) return;
+    if (
+      currentVersion === RUNTIME_RECEIPT_FOLLOW_SCHEMA_VERSION ||
+      currentVersion === RUNTIME_COMPENSATION_SCHEMA_VERSION ||
+      currentVersion === RUNTIME_ASSIGNMENT_OUTBOX_INTERLOCK_SCHEMA_VERSION
+    ) {
+      return;
+    }
     if (currentVersion !== RUNTIME_START_SCHEMA_VERSION) {
       throw new Error(
-        `Unsupported Team Session database schema ${currentVersion}; expected ${SCHEMA_VERSION}`
+        `Unsupported Team Session database schema ${currentVersion}; expected ${RUNTIME_RECEIPT_FOLLOW_SCHEMA_VERSION}`
       );
     }
     addRuntimeReceiptFollowV6Columns(db);
@@ -4158,9 +6891,830 @@ function migrateRuntimeReceiptFollowSchemaV6(db: Database.Database): void {
     if (violations.length > 0) {
       throw new Error("Team Session v6 migration failed its foreign key check");
     }
-    db.pragma(`user_version = ${SCHEMA_VERSION}`);
+    db.pragma(`user_version = ${RUNTIME_RECEIPT_FOLLOW_SCHEMA_VERSION}`);
   });
   migrate.immediate();
+}
+
+function migrateRuntimeCompensationSchemaV7(db: Database.Database): void {
+  const migrate = db.transaction(() => {
+    const currentVersion = db.pragma("user_version", { simple: true }) as number;
+    const applicationId = db.pragma("application_id", { simple: true }) as number;
+    if (applicationId !== APPLICATION_ID) {
+      throw new Error("File is not a recognized Team Session database");
+    }
+    if (
+      currentVersion === RUNTIME_COMPENSATION_SCHEMA_VERSION ||
+      currentVersion === RUNTIME_ASSIGNMENT_OUTBOX_INTERLOCK_SCHEMA_VERSION
+    ) {
+      return;
+    }
+    if (currentVersion !== RUNTIME_RECEIPT_FOLLOW_SCHEMA_VERSION) {
+      throw new Error(
+        `Unsupported Team Session database schema ${currentVersion}; expected ${RUNTIME_COMPENSATION_SCHEMA_VERSION}`
+      );
+    }
+
+    db.exec(RUNTIME_COMPENSATION_TABLES_SCHEMA_V7);
+    assertRuntimeLifecycleFencesAreSafeForV7(db);
+    backfillRuntimeBindingSafetyFencesV7(db);
+    backfillRuntimeCompensationIncidentsV7(db);
+    db.exec(RUNTIME_COMPENSATION_TRIGGERS_SCHEMA_V7);
+    db.exec(RUNTIME_COMPENSATION_INTEGRATION_TRIGGERS_SCHEMA_V7);
+    const violations = db.pragma("foreign_key_check") as unknown[];
+    if (violations.length > 0) {
+      throw new Error("Team Session v7 migration failed its foreign key check");
+    }
+    db.pragma(`user_version = ${RUNTIME_COMPENSATION_SCHEMA_VERSION}`);
+  });
+  migrate.immediate();
+}
+
+function migrateRuntimeAssignmentOutboxInterlockSchemaV8(db: Database.Database): void {
+  const migrate = db.transaction(() => {
+    const currentVersion = db.pragma("user_version", { simple: true }) as number;
+    const applicationId = db.pragma("application_id", { simple: true }) as number;
+    if (applicationId !== APPLICATION_ID) {
+      throw new Error("File is not a recognized Team Session database");
+    }
+    if (currentVersion === RUNTIME_ASSIGNMENT_OUTBOX_INTERLOCK_SCHEMA_VERSION) return;
+    if (currentVersion !== RUNTIME_COMPENSATION_SCHEMA_VERSION) {
+      throw new Error(
+        `Unsupported Team Session database schema ${currentVersion}; expected ${RUNTIME_ASSIGNMENT_OUTBOX_INTERLOCK_SCHEMA_VERSION}`
+      );
+    }
+
+    addRuntimeOutboxDispatchInterlockV8(db);
+    ensureAcceptedCommandLedgerV8(db);
+    db.exec(RUNTIME_OUTBOX_EVIDENCE_TABLES_SCHEMA_V8);
+    db.exec(RUNTIME_OUTBOX_DISPATCH_INTERLOCK_TRIGGERS_SCHEMA_V8);
+    const violations = db.pragma("foreign_key_check") as unknown[];
+    if (violations.length > 0) {
+      throw new Error("Team Session v8 migration failed its foreign key check");
+    }
+    db.pragma(`user_version = ${RUNTIME_ASSIGNMENT_OUTBOX_INTERLOCK_SCHEMA_VERSION}`);
+  });
+  migrate.immediate();
+}
+
+function ensureAcceptedCommandLedgerV8(db: Database.Database): void {
+  const acceptedCommands = db
+    .prepare(
+      `SELECT 1 FROM sqlite_schema
+       WHERE type = 'table' AND name = 'accepted_commands'`
+    )
+    .get();
+  if (!acceptedCommands) {
+    db.exec(`
+      CREATE TABLE accepted_commands (
+        source_scope TEXT NOT NULL,
+        source_key TEXT NOT NULL,
+        payload_digest TEXT NOT NULL CHECK (length(payload_digest) = 64),
+        accepted_sequence INTEGER NOT NULL UNIQUE CHECK (accepted_sequence >= 1),
+        command_type TEXT NOT NULL,
+        actor_kind TEXT NOT NULL CHECK (actor_kind IN ('human', 'system')),
+        actor_user_id TEXT NOT NULL,
+        actor_display_name TEXT NOT NULL,
+        payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
+        result_json TEXT NOT NULL CHECK (json_valid(result_json)),
+        secret_result INTEGER NOT NULL DEFAULT 0 CHECK (secret_result IN (0, 1)),
+        accepted_at_ms INTEGER NOT NULL CHECK (accepted_at_ms >= 0),
+        PRIMARY KEY (source_scope, source_key)
+      ) STRICT;
+    `);
+  }
+  const kernelState = db
+    .prepare(
+      `SELECT 1 FROM sqlite_schema
+       WHERE type = 'table' AND name = 'kernel_state'`
+    )
+    .get();
+  if (!kernelState) {
+    db.exec(`
+      CREATE TABLE kernel_state (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        next_accepted_sequence INTEGER NOT NULL CHECK (next_accepted_sequence >= 1)
+      ) STRICT;
+      INSERT INTO kernel_state (singleton, next_accepted_sequence)
+      SELECT 1, COALESCE(MAX(accepted_sequence), 0) + 1 FROM accepted_commands;
+    `);
+  }
+}
+
+function addRuntimeOutboxDispatchInterlockV8(db: Database.Database): void {
+  const outboxTable = db
+    .prepare(
+      `SELECT 1 FROM sqlite_schema
+       WHERE type = 'table' AND name = 'runtime_outbox'`
+    )
+    .get();
+  if (!outboxTable) {
+    // The original v2 Session schema predates the assignment outbox. Build the
+    // current additive table here so a genuine v2 database reaches the same v8
+    // invariant as a fresh install.
+    db.exec(`
+      CREATE TABLE runtime_outbox (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        session_sequence INTEGER NOT NULL CHECK (session_sequence >= 1),
+        kind TEXT NOT NULL CHECK (kind IN (
+          'runtime.session.ensure',
+          'runtime.session.retire',
+          'runtime.authorization.fence'
+        )),
+        payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
+        status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN (
+          'pending', 'processing', 'delivered', 'superseded', 'failed'
+        )),
+        attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+        lease_owner TEXT,
+        lease_expires_at_ms INTEGER,
+        dispatch_interlock_attempt INTEGER CHECK (
+          dispatch_interlock_attempt IS NULL OR (
+            dispatch_interlock_attempt >= 1 AND dispatch_interlock_attempt <= attempts
+          )
+        ),
+        dispatch_interlock_acquired_at_ms INTEGER CHECK (
+          dispatch_interlock_acquired_at_ms IS NULL OR
+          dispatch_interlock_acquired_at_ms >= created_at_ms
+        ),
+        last_error TEXT,
+        created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+        delivered_at_ms INTEGER,
+        UNIQUE (session_id, session_sequence, kind),
+        FOREIGN KEY (session_id, session_sequence)
+          REFERENCES session_events(session_id, sequence) ON DELETE RESTRICT
+      ) STRICT;
+    `);
+  }
+  addColumnIfMissing(
+    db,
+    "runtime_outbox",
+    "dispatch_interlock_attempt",
+    `ALTER TABLE runtime_outbox
+       ADD COLUMN dispatch_interlock_attempt INTEGER CHECK (
+         dispatch_interlock_attempt IS NULL OR (
+           dispatch_interlock_attempt >= 1 AND dispatch_interlock_attempt <= attempts
+         )
+       )`
+  );
+  addColumnIfMissing(
+    db,
+    "runtime_outbox",
+    "dispatch_interlock_acquired_at_ms",
+    `ALTER TABLE runtime_outbox
+       ADD COLUMN dispatch_interlock_acquired_at_ms INTEGER CHECK (
+         dispatch_interlock_acquired_at_ms IS NULL OR
+         dispatch_interlock_acquired_at_ms >= created_at_ms
+       )`
+  );
+
+  assertRuntimeOutboxPayloadsAreSafeForV8(db);
+  assertRuntimeOutboxStatesAreSafeForV8(db);
+  assertRuntimeOutboxSourcesAreSafeForV8(db);
+
+  // v7 had no assignment point-of-no-return marker. Every non-terminal row that has
+  // already been attempted is therefore ambiguous and may only be reconciled.
+  // Using the immutable creation time avoids inventing a false observation
+  // time while still preserving the fact that dispatch may have happened.
+  db.prepare(
+    `UPDATE runtime_outbox
+     SET dispatch_interlock_attempt = attempts,
+         dispatch_interlock_acquired_at_ms = created_at_ms
+     WHERE status IN ('pending', 'processing') AND attempts > 0
+       AND dispatch_interlock_attempt IS NULL
+       AND dispatch_interlock_acquired_at_ms IS NULL`
+  ).run();
+}
+
+interface RuntimeOutboxMigrationRow {
+  id: string;
+  session_id: string;
+  kind: string;
+  payload_json: string;
+}
+
+function assertRuntimeOutboxPayloadsAreSafeForV8(db: Database.Database): void {
+  const rows = db
+    .prepare(
+      `SELECT id, session_id, kind, payload_json
+       FROM runtime_outbox
+       ORDER BY rowid`
+    )
+    .all() as RuntimeOutboxMigrationRow[];
+  for (const row of rows) {
+    const sqliteShape = db
+      .prepare(
+        `SELECT
+           json_valid(?) = 1 AND
+           json_type(?) = 'object' AND
+           (SELECT count(*) = count(DISTINCT key) FROM json_each(?)) AND
+           json_type(?, '$.sessionId') = 'text' AND
+           json_type(?, '$.runtimeAuthorizationGeneration') = 'integer' AND
+           CASE ?
+             WHEN 'runtime.session.ensure' THEN
+               json_type(?, '$.runtimeKind') = 'text' AND
+               json_type(?, '$.tmuxName') = 'text'
+             WHEN 'runtime.authorization.fence' THEN
+               json_type(?, '$.reason') = 'text'
+             WHEN 'runtime.session.retire' THEN
+               json_type(?, '$.reason') = 'text' AND
+               json_type(?, '$.agentRunId') = 'text' AND
+               json_type(?, '$.runtimeAssignmentId') = 'text' AND
+               json_type(?, '$.runtimeAssignmentGeneration') = 'integer' AND
+               json_type(?, '$.sandboxId') = 'text' AND
+               json_type(?, '$.sandboxGeneration') = 'integer'
+             ELSE 0
+           END AS valid`
+      )
+      .get(
+        row.payload_json,
+        row.payload_json,
+        row.payload_json,
+        row.payload_json,
+        row.payload_json,
+        row.kind,
+        row.payload_json,
+        row.payload_json,
+        row.payload_json,
+        row.payload_json,
+        row.payload_json,
+        row.payload_json,
+        row.payload_json,
+        row.payload_json,
+        row.payload_json
+      ) as { valid: number };
+    if (sqliteShape.valid !== 1) {
+      throw invalidRuntimeOutboxPayloadForMigration(row.id);
+    }
+    let payload: unknown;
+    try {
+      payload = JSON.parse(row.payload_json);
+    } catch {
+      throw invalidRuntimeOutboxPayloadForMigration(row.id);
+    }
+    if (!isRuntimeOutboxPayloadForMigration(row, payload)) {
+      throw invalidRuntimeOutboxPayloadForMigration(row.id);
+    }
+  }
+}
+
+function isRuntimeOutboxPayloadForMigration(
+  row: RuntimeOutboxMigrationRow,
+  payload: unknown
+): boolean {
+  if (!isRuntimeOutboxPayloadRecord(payload) || payload.sessionId !== row.session_id) return false;
+  if (!isPositiveSafeInteger(payload.runtimeAuthorizationGeneration)) return false;
+
+  switch (row.kind) {
+    case "runtime.session.ensure":
+      return (
+        hasExactRuntimeOutboxPayloadKeys(payload, [
+          "sessionId",
+          "runtimeKind",
+          "tmuxName",
+          "runtimeAuthorizationGeneration",
+        ]) &&
+        payload.runtimeKind === "local-tmux" &&
+        isValidTmuxSessionName(payload.tmuxName)
+      );
+    case "runtime.authorization.fence":
+      return (
+        hasExactRuntimeOutboxPayloadKeys(payload, [
+          "sessionId",
+          "reason",
+          "runtimeAuthorizationGeneration",
+        ]) &&
+        (payload.reason === "assignee-loss" || payload.reason === "emergency-stop")
+      );
+    case "runtime.session.retire":
+      return (
+        hasExactRuntimeOutboxPayloadKeys(payload, [
+          "sessionId",
+          "runtimeAuthorizationGeneration",
+          "reason",
+          "agentRunId",
+          "runtimeAssignmentId",
+          "runtimeAssignmentGeneration",
+          "sandboxId",
+          "sandboxGeneration",
+        ]) &&
+        payload.reason === "emergency-stop" &&
+        isRuntimeOutboxMigrationIdentifier(payload.agentRunId) &&
+        isRuntimeOutboxMigrationIdentifier(payload.runtimeAssignmentId) &&
+        isPositiveSafeInteger(payload.runtimeAssignmentGeneration) &&
+        isRuntimeOutboxMigrationIdentifier(payload.sandboxId) &&
+        isPositiveSafeInteger(payload.sandboxGeneration)
+      );
+    default:
+      return false;
+  }
+}
+
+function isRuntimeOutboxPayloadRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasExactRuntimeOutboxPayloadKeys(
+  payload: Record<string, unknown>,
+  expectedKeys: readonly string[]
+): boolean {
+  const actualKeys = Object.keys(payload);
+  return (
+    actualKeys.length === expectedKeys.length &&
+    expectedKeys.every((key) => Object.prototype.hasOwnProperty.call(payload, key))
+  );
+}
+
+function isPositiveSafeInteger(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) >= 1;
+}
+
+function isRuntimeOutboxMigrationIdentifier(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length >= 1 &&
+    Buffer.byteLength(value, "utf8") <= 300 &&
+    value.trim() === value &&
+    !/[\u0000-\u001f\u007f]/.test(value)
+  );
+}
+
+function assertRuntimeOutboxStatesAreSafeForV8(db: Database.Database): void {
+  const invalid = db
+    .prepare(
+      `SELECT id
+       FROM runtime_outbox
+       WHERE NOT (
+         ${runtimeOutboxBoundedTextSql("id")} AND
+         typeof(session_sequence) = 'integer' AND
+         session_sequence BETWEEN 1 AND 9007199254740991 AND
+         typeof(attempts) = 'integer' AND
+         attempts BETWEEN 0 AND 9007199254740991 AND
+         typeof(created_at_ms) = 'integer' AND
+         created_at_ms BETWEEN 0 AND 9007199254740991 AND
+         (last_error IS NULL OR ${runtimeOutboxBoundedTextSql("last_error")}) AND
+         CASE status
+           WHEN 'pending' THEN
+             lease_owner IS NULL AND lease_expires_at_ms IS NULL AND
+             delivered_at_ms IS NULL
+           WHEN 'processing' THEN
+             attempts >= 1 AND ${runtimeOutboxBoundedTextSql("lease_owner")} AND
+             typeof(lease_expires_at_ms) = 'integer' AND
+             lease_expires_at_ms BETWEEN MAX(created_at_ms, 1) AND 9007199254740991 AND
+             delivered_at_ms IS NULL
+           WHEN 'delivered' THEN
+             attempts >= 1 AND lease_owner IS NULL AND lease_expires_at_ms IS NULL AND
+             last_error IS NULL AND typeof(delivered_at_ms) = 'integer' AND
+             delivered_at_ms BETWEEN created_at_ms AND 9007199254740991
+           WHEN 'superseded' THEN
+             lease_owner IS NULL AND lease_expires_at_ms IS NULL AND
+             typeof(delivered_at_ms) = 'integer' AND
+             delivered_at_ms BETWEEN created_at_ms AND 9007199254740991
+           WHEN 'failed' THEN
+             attempts >= 1 AND lease_owner IS NULL AND lease_expires_at_ms IS NULL AND
+             last_error IS NOT NULL AND delivered_at_ms IS NULL
+           ELSE 0
+         END
+       )
+       ORDER BY rowid
+       LIMIT 1`
+    )
+    .get() as { id: unknown } | undefined;
+  if (invalid) {
+    throw new Error(
+      `Cannot migrate Runtime outbox ${safeRuntimeOutboxMigrationIdentity(
+        invalid.id
+      )}: durable state is invalid`
+    );
+  }
+}
+
+function assertRuntimeOutboxSourcesAreSafeForV8(db: Database.Database): void {
+  const invalid = db
+    .prepare(
+      `SELECT outbox.id
+       FROM runtime_outbox outbox
+       WHERE NOT EXISTS (
+         SELECT 1
+         FROM session_events event
+         WHERE event.session_id = outbox.session_id
+           AND event.sequence = outbox.session_sequence
+           AND event.occurred_at_ms = outbox.created_at_ms
+           AND json_type(event.payload_json) = 'object'
+           AND (SELECT count(*) = count(DISTINCT key) FROM json_each(event.payload_json))
+           AND (
+             (
+               outbox.kind = 'runtime.session.ensure' AND
+               event.type = 'session.started' AND
+               json_type(event.payload_json, '$.sessionId') = 'text' AND
+               json_extract(event.payload_json, '$.sessionId') = outbox.session_id AND
+               json_type(event.payload_json, '$.runtimeKind') = 'text' AND
+               json_extract(event.payload_json, '$.runtimeKind') =
+                 json_extract(outbox.payload_json, '$.runtimeKind') AND
+               json_type(
+                 event.payload_json, '$.runtimeAuthorizationGeneration'
+               ) = 'integer' AND
+               json_extract(event.payload_json, '$.runtimeAuthorizationGeneration') =
+                 json_extract(outbox.payload_json, '$.runtimeAuthorizationGeneration')
+             ) OR (
+               outbox.kind = 'runtime.authorization.fence' AND
+               event.type = 'session.runtime-authorization.advanced' AND
+               json_type(event.payload_json, '$.reason') = 'text' AND
+               json_extract(event.payload_json, '$.reason') =
+                 json_extract(outbox.payload_json, '$.reason') AND
+               json_type(
+                 event.payload_json, '$.runtimeAuthorizationGeneration'
+               ) = 'integer' AND
+               json_extract(event.payload_json, '$.runtimeAuthorizationGeneration') =
+                 json_extract(outbox.payload_json, '$.runtimeAuthorizationGeneration') AND
+               json_type(event.payload_json, '$.enforcementState') = 'text' AND
+               json_extract(event.payload_json, '$.enforcementState') IN (
+                 'pending', 'quarantined'
+               )
+             ) OR (
+               outbox.kind = 'runtime.session.retire' AND
+               json_extract(outbox.payload_json, '$.reason') = 'emergency-stop' AND
+               event.type = 'run.emergency-stop.requested' AND
+               json_type(event.payload_json, '$.agentRunId') = 'text' AND
+               json_extract(event.payload_json, '$.agentRunId') =
+                 json_extract(outbox.payload_json, '$.agentRunId') AND
+               json_type(
+                 event.payload_json, '$.runtimeAuthorizationGeneration'
+               ) = 'integer' AND
+               json_extract(event.payload_json, '$.runtimeAuthorizationGeneration') =
+                 json_extract(outbox.payload_json, '$.runtimeAuthorizationGeneration') AND
+               json_type(event.payload_json, '$.reason') = 'text' AND
+               json_type(event.payload_json, '$.revokeAllRunGrants') = 'true' AND
+               json_extract(event.payload_json, '$.revokeAllRunGrants') = 1 AND
+               EXISTS (
+                 SELECT 1
+                 FROM runtime_assignments assignment
+                 JOIN agent_runs run
+                   ON run.runtime_assignment_id = assignment.id
+                  AND run.session_id = assignment.session_id
+                 WHERE assignment.id =
+                     json_extract(outbox.payload_json, '$.runtimeAssignmentId')
+                   AND assignment.session_id = outbox.session_id
+                   AND assignment.generation =
+                     json_extract(outbox.payload_json, '$.runtimeAssignmentGeneration')
+                   AND assignment.sandbox_id =
+                     json_extract(outbox.payload_json, '$.sandboxId')
+                   AND assignment.sandbox_generation =
+                     json_extract(outbox.payload_json, '$.sandboxGeneration')
+                   AND run.id = json_extract(outbox.payload_json, '$.agentRunId')
+               )
+             )
+           )
+       )
+       ORDER BY outbox.rowid
+       LIMIT 1`
+    )
+    .get() as { id: unknown } | undefined;
+  if (invalid) {
+    throw new Error(
+      `Cannot migrate Runtime outbox ${safeRuntimeOutboxMigrationIdentity(
+        invalid.id
+      )}: source event is invalid`
+    );
+  }
+}
+
+function invalidRuntimeOutboxPayloadForMigration(rowId: unknown): Error {
+  return new Error(
+    `Cannot migrate Runtime outbox ${safeRuntimeOutboxMigrationIdentity(
+      rowId
+    )}: payload contract is invalid`
+  );
+}
+
+function safeRuntimeOutboxMigrationIdentity(rowId: unknown): string {
+  return typeof rowId === "string" && /^[a-zA-Z0-9_.:-]{1,300}$/.test(rowId)
+    ? rowId
+    : `sha256:${createHash("sha256").update(String(rowId)).digest("hex").slice(0, 16)}`;
+}
+
+function assertRuntimeLifecycleFencesAreSafeForV7(db: Database.Database): void {
+  const invalid = db
+    .prepare(
+      `SELECT receipt.id
+       FROM runtime_run_command_receipts receipt
+       WHERE (receipt.outcome = 'enforced' OR
+           (receipt.outcome = 'duplicate' AND receipt.original_outcome = 'enforced'))
+         AND (
+           COALESCE(json_type(
+             receipt.receipt_json,
+             CASE WHEN receipt.outcome = 'duplicate'
+               THEN '$.originalReceipt.enforcedFence' ELSE '$.enforcedFence' END
+           ) = 'integer', 0) = 0 OR
+           json_extract(
+             receipt.receipt_json,
+             CASE WHEN receipt.outcome = 'duplicate'
+               THEN '$.originalReceipt.enforcedFence' ELSE '$.enforcedFence' END
+           ) < 1 OR
+           json_extract(
+             receipt.receipt_json,
+             CASE WHEN receipt.outcome = 'duplicate'
+               THEN '$.originalReceipt.enforcedFence' ELSE '$.enforcedFence' END
+           ) > 9007199254740991
+         )
+       LIMIT 1`
+    )
+    .get();
+  if (invalid) {
+    throw new Error("Team Session v7 migration found an unsafe Runtime enforcement fence");
+  }
+}
+
+function backfillRuntimeBindingSafetyFencesV7(db: Database.Database): void {
+  db.exec(`
+    INSERT INTO runtime_binding_safety_fences (
+      team_id, project_id, session_id, runtime_assignment_id,
+      runtime_assignment_generation, sandbox_id, sandbox_generation,
+      runtime_principal_id, allocated_fence, updated_at_ms
+    )
+    SELECT
+      assignment.team_id,
+      assignment.project_id,
+      assignment.session_id,
+      assignment.id,
+      assignment.generation,
+      assignment.sandbox_id,
+      assignment.sandbox_generation,
+      assignment.runtime_principal_id,
+      MAX(
+        1,
+        session.control_epoch,
+        session.steering_revision,
+        session.runtime_authorization_generation,
+        COALESCE((
+          SELECT MAX(run.state_version)
+          FROM agent_runs run
+          WHERE run.session_id = assignment.session_id
+            AND run.runtime_assignment_id = assignment.id
+        ), 1),
+        COALESCE((
+          SELECT MAX(command.target_run_state_version)
+          FROM runtime_run_commands command
+          WHERE command.session_id = assignment.session_id
+            AND command.runtime_assignment_id = assignment.id
+            AND command.runtime_assignment_generation = assignment.generation
+            AND command.sandbox_id = assignment.sandbox_id
+            AND command.sandbox_generation = assignment.sandbox_generation
+            AND command.runtime_principal_id = assignment.runtime_principal_id
+        ), 1),
+        COALESCE((
+          SELECT MAX(json_extract(
+            receipt.receipt_json,
+            CASE WHEN receipt.outcome = 'duplicate'
+              THEN '$.originalReceipt.enforcedFence' ELSE '$.enforcedFence' END
+          ))
+          FROM runtime_run_command_receipts receipt
+          JOIN runtime_run_commands command ON command.id = receipt.command_id
+          WHERE command.session_id = assignment.session_id
+            AND command.runtime_assignment_id = assignment.id
+            AND command.runtime_assignment_generation = assignment.generation
+            AND command.sandbox_id = assignment.sandbox_id
+            AND command.sandbox_generation = assignment.sandbox_generation
+            AND command.runtime_principal_id = assignment.runtime_principal_id
+            AND (receipt.outcome = 'enforced' OR
+              (receipt.outcome = 'duplicate' AND receipt.original_outcome = 'enforced'))
+        ), 1)
+      ),
+      MAX(assignment.created_at_ms, session.created_at_ms)
+    FROM runtime_assignments assignment
+    JOIN sessions session ON session.id = assignment.session_id;
+  `);
+}
+
+function backfillRuntimeCompensationIncidentsV7(db: Database.Database): void {
+  const alreadyApplied = db
+    .prepare(
+      `SELECT dispatch.command_id
+       FROM runtime_run_command_dispatch dispatch
+       JOIN runtime_run_command_effects effect ON effect.command_id = dispatch.command_id
+       WHERE dispatch.status = 'compensating'
+       LIMIT 1`
+    )
+    .get();
+  if (alreadyApplied) {
+    throw new Error(
+      "Team Session v7 migration found a compensating dispatch with an applied lifecycle effect"
+    );
+  }
+
+  const candidates = db
+    .prepare(
+      `SELECT
+         command.id AS source_command_id,
+         receipt.id AS source_receipt_id,
+         command.session_id,
+         assignment.team_id,
+         assignment.project_id,
+         command.agent_run_id,
+         command.run_policy_revision,
+         command.runtime_assignment_id,
+         command.runtime_assignment_generation,
+         command.sandbox_id,
+         command.sandbox_generation,
+         command.runtime_principal_id,
+         command.runtime_authorization_generation,
+         command.command_digest AS source_command_digest,
+         command.authority_digest AS lifecycle_command_claims_digest,
+         receipt.receipt_digest AS lifecycle_receipt_digest,
+         command.required_effect_enforcer_set_digest AS source_required_digest,
+         receipt.required_effect_enforcer_set_digest AS receipt_required_digest,
+         receipt.enforcement_subject_digest AS lifecycle_enforcement_subject_digest,
+         receipt.aggregate_proof_digest AS lifecycle_aggregate_proof_digest,
+         receipt.proof_verified_at_ms AS source_proof_verified_at_ms,
+         receipt.received_at_ms,
+         json_extract(
+           receipt.receipt_json,
+           CASE WHEN receipt.outcome = 'duplicate'
+             THEN '$.originalReceipt.enforcedFence' ELSE '$.enforcedFence' END
+         ) AS source_enforced_fence,
+         json_extract(
+           receipt.receipt_json,
+           CASE WHEN receipt.outcome = 'duplicate'
+             THEN '$.originalReceipt.effectRef' ELSE '$.effectRef' END
+         ) AS source_effect_ref_commitment
+       FROM runtime_run_commands command
+       JOIN runtime_run_command_dispatch dispatch ON dispatch.command_id = command.id
+       JOIN runtime_assignments assignment ON assignment.id = command.runtime_assignment_id
+       JOIN runtime_run_command_receipts receipt ON receipt.id = (
+         SELECT candidate.id
+         FROM runtime_run_command_receipts candidate
+         WHERE candidate.command_id = command.id
+           AND (
+             candidate.outcome = 'enforced' OR
+             (candidate.outcome = 'duplicate' AND candidate.original_outcome = 'enforced')
+           )
+         ORDER BY candidate.version ASC, candidate.id ASC
+         LIMIT 1
+       )
+       WHERE dispatch.status = 'compensating'
+         AND NOT EXISTS (
+           SELECT 1 FROM runtime_run_command_effects effect
+           WHERE effect.command_id = command.id
+         )
+       ORDER BY
+         assignment.team_id, assignment.project_id, command.session_id,
+         command.runtime_assignment_id, command.runtime_assignment_generation,
+         command.sandbox_id, command.sandbox_generation, command.runtime_principal_id,
+         receipt.received_at_ms, command.id`
+    )
+    .all() as Array<Record<string, unknown>>;
+
+  const insert = db.prepare(`
+    INSERT INTO runtime_compensation_incidents (
+      compensation_id, incident_digest, source_command_id, source_receipt_id, trust_state,
+      session_id, team_id, project_id, agent_run_id, run_policy_revision,
+      runtime_assignment_id, runtime_assignment_generation,
+      sandbox_id, sandbox_generation, runtime_principal_id,
+      runtime_authorization_generation, source_command_digest,
+      lifecycle_command_claims_digest, lifecycle_receipt_digest,
+      source_enforced_fence, safety_fence,
+      source_effect_ref_commitment, source_required_effect_enforcer_set_digest,
+      lifecycle_enforcement_subject_digest, lifecycle_aggregate_proof_digest,
+      source_proof_verified_at_ms, created_at_ms
+    ) VALUES (
+      @compensation_id, @incident_digest, @source_command_id, @source_receipt_id, @trust_state,
+      @session_id, @team_id, @project_id, @agent_run_id, @run_policy_revision,
+      @runtime_assignment_id, @runtime_assignment_generation,
+      @sandbox_id, @sandbox_generation, @runtime_principal_id,
+      @runtime_authorization_generation, @source_command_digest,
+      @lifecycle_command_claims_digest, @lifecycle_receipt_digest,
+      @source_enforced_fence, @safety_fence,
+      @source_effect_ref_commitment, @source_required_effect_enforcer_set_digest,
+      @lifecycle_enforcement_subject_digest, @lifecycle_aggregate_proof_digest,
+      @source_proof_verified_at_ms, @created_at_ms
+    )
+  `);
+
+  const allocateSafetyFence = db.prepare(`
+    UPDATE runtime_binding_safety_fences
+    SET allocated_fence = allocated_fence + 1,
+        updated_at_ms = MAX(updated_at_ms, @updated_at_ms)
+    WHERE team_id = @team_id
+      AND project_id = @project_id
+      AND session_id = @session_id
+      AND runtime_assignment_id = @runtime_assignment_id
+      AND runtime_assignment_generation = @runtime_assignment_generation
+      AND sandbox_id = @sandbox_id
+      AND sandbox_generation = @sandbox_generation
+      AND runtime_principal_id = @runtime_principal_id
+      AND allocated_fence < 9007199254740991
+    RETURNING allocated_fence
+  `);
+  for (const candidate of candidates) {
+    const proofVerifiedAtMs = candidate.source_proof_verified_at_ms;
+    const receivedAtMs = candidate.received_at_ms;
+    const sourceRequiredDigest = candidate.source_required_digest;
+    const receiptRequiredDigest = candidate.receipt_required_digest;
+    const effectRefCommitment = candidate.source_effect_ref_commitment;
+    const sourceEnforcedFence = candidate.source_enforced_fence;
+    if (
+      typeof sourceEnforcedFence !== "number" ||
+      !Number.isSafeInteger(sourceEnforcedFence) ||
+      sourceEnforcedFence < 1
+    ) {
+      throw new Error("Team Session v7 migration found invalid source enforcement evidence");
+    }
+    const allocation = allocateSafetyFence.get({
+      ...candidate,
+      updated_at_ms: receivedAtMs,
+    }) as { allocated_fence: number } | undefined;
+    if (!allocation || allocation.allocated_fence <= sourceEnforcedFence) {
+      throw new Error("Team Session v7 migration could not allocate a safe compensation fence");
+    }
+    const safetyFence = allocation.allocated_fence;
+    const verified =
+      isSha256(sourceRequiredDigest) &&
+      receiptRequiredDigest === sourceRequiredDigest &&
+      isSha256(candidate.lifecycle_enforcement_subject_digest) &&
+      isSha256(candidate.lifecycle_aggregate_proof_digest) &&
+      typeof proofVerifiedAtMs === "number" &&
+      typeof receivedAtMs === "number" &&
+      proofVerifiedAtMs >= 0 &&
+      proofVerifiedAtMs <= receivedAtMs &&
+      isRuntimeEffectRefCommitment(effectRefCommitment);
+    const compensationId = `migration-v7:${createHash("sha256")
+      .update("terminalx/runtime-compensation-migration-id/v1\0", "utf8")
+      .update(String(candidate.source_command_id), "utf8")
+      .update("\0", "utf8")
+      .update(String(candidate.source_receipt_id), "utf8")
+      .digest("hex")}`;
+    const incidentSnapshot = {
+      version: 1,
+      compensationId,
+      sourceCommandId: candidate.source_command_id,
+      sourceReceiptId: candidate.source_receipt_id,
+      trustState: verified ? "verified" : "legacy-untrusted",
+      binding: {
+        teamId: candidate.team_id,
+        projectId: candidate.project_id,
+        sessionId: candidate.session_id,
+        runtimeAssignmentId: candidate.runtime_assignment_id,
+        runtimeAssignmentGeneration: candidate.runtime_assignment_generation,
+        sandboxId: candidate.sandbox_id,
+        sandboxGeneration: candidate.sandbox_generation,
+        runtimePrincipalId: candidate.runtime_principal_id,
+      },
+      observedRuntimeAuthorizationGeneration: candidate.runtime_authorization_generation,
+      lifecycleCommandClaimsDigest: candidate.lifecycle_command_claims_digest,
+      lifecycleReceiptDigest: candidate.lifecycle_receipt_digest,
+      sourceEnforcedFence,
+      safetyFence,
+      sourceRequiredEffectEnforcerSetDigest: verified ? sourceRequiredDigest : null,
+      lifecycleEnforcementSubjectDigest: verified
+        ? candidate.lifecycle_enforcement_subject_digest
+        : null,
+      lifecycleAggregateProofDigest: verified ? candidate.lifecycle_aggregate_proof_digest : null,
+      sourceEffectRefCommitment: verified ? effectRefCommitment : null,
+      createdAtMs: receivedAtMs,
+    };
+    const incidentDigest = digestRuntimeCompensationIncident(incidentSnapshot);
+    insert.run({
+      ...candidate,
+      compensation_id: compensationId,
+      incident_digest: incidentDigest,
+      trust_state: verified ? "verified" : "legacy-untrusted",
+      source_effect_ref_commitment: verified ? effectRefCommitment : null,
+      source_required_effect_enforcer_set_digest: verified ? sourceRequiredDigest : null,
+      lifecycle_enforcement_subject_digest: verified
+        ? candidate.lifecycle_enforcement_subject_digest
+        : null,
+      lifecycle_aggregate_proof_digest: verified
+        ? candidate.lifecycle_aggregate_proof_digest
+        : null,
+      source_proof_verified_at_ms: verified ? proofVerifiedAtMs : null,
+      safety_fence: safetyFence,
+      created_at_ms: receivedAtMs,
+    });
+  }
+
+  const uncovered = db
+    .prepare(
+      `SELECT dispatch.command_id
+       FROM runtime_run_command_dispatch dispatch
+       LEFT JOIN runtime_compensation_incidents incident
+         ON incident.source_command_id = dispatch.command_id
+       WHERE dispatch.status = 'compensating'
+         AND incident.source_command_id IS NULL
+       LIMIT 1`
+    )
+    .get();
+  if (uncovered) {
+    throw new Error("Team Session v7 migration found a compensating dispatch without evidence");
+  }
+}
+
+function isSha256(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
+}
+
+function isRuntimeEffectRefCommitment(value: unknown): value is string {
+  return typeof value === "string" && /^effect:v1:[0-9a-f]{64}$/.test(value);
 }
 
 function parkLegacyRuntimeDispatchesForV6Migration(db: Database.Database): void {

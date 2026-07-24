@@ -15,33 +15,41 @@ phase.
 | 3     | Orca/Paseo-style multiplayer workspace                                  | Complete |
 | 4     | Portable Agent Run, policy, Goal, recovery, and projection contracts    | Complete |
 | 5     | Runtime command/receipt executor and durable Gate 1a journal foundation | Complete |
+| 6     | Portable end-to-end Runtime-truth kernel                                | Complete |
 
 The completed phases are not an external-pilot release. LocalTmux is a trusted development
 adapter, and Agent Run mutations remain closed to HTTP/browser clients.
 
-## Remaining production phases
-
 ### Phase 6 — End-to-end Runtime truth
 
-Close release Gate 1.
+Complete the portable Runtime-truth kernel required by release Gate 1.
 
-Status: in progress. The current implementation state and deliberately closed boundaries are tracked
-in [Phase 6 Runtime lifecycle implementation status](../multiplayer/phase-6-runtime-lifecycle.md).
+Status: complete. The implementation and deliberately closed production boundary are tracked in
+[Phase 6 Runtime lifecycle implementation status](../multiplayer/phase-6-runtime-lifecycle.md).
 
 - Add a durable `starting` Run identity and receipt-backed `run.start` lifecycle.
 - Make the v4/v5 command journal the only ordinary path for start/pause/resume/stop effects.
 - Add command, assignment, follow, and compensation workers with crash-safe leases.
+- Bind outbox settlement and supersession to immutable accepted-command evidence and exact source
+  events; reject poisoned legacy rows transactionally during schema migration.
 - Reconstruct terminal/process write fences from SQLite after restart.
+- Fence LocalTmux operations with an immutable `$id` plus a random per-session incarnation across
+  resolver, WebSocket, PTY, and teardown boundaries.
 - Treat provider timeouts as ambiguous outcomes and reconcile the same command identity.
 - Expose Run controls only after exact enforced-receipt tests pass.
 
+## Remaining production phases
+
 ### Phase 7 — Daytona hosted isolation
 
-Close release Gate 2.
+Close the hosted evidence boundary of release Gate 1 and release Gate 2.
 
 - Create and verify the public TerminalX Daytona fork based on
   `b5a5d9e78d76c8bcf351f2049620250e0f34eea4`.
 - Pin the fork commit and signed SDK/supervisor artifacts with SBOM and provenance.
+- Compose the hosted adapter, complete signed trust group, and `RuntimeSupervisorRoot` into the
+  production server; keep hosted transports unavailable until root readiness, and stop the root
+  before closing the Team Session kernel.
 - Implement hosted ensure/follow/pause/resume/stop/retire and timeout reconciliation.
 - Keep Daytona Sandbox identifiers adapter-private behind opaque TerminalX handles.
 - Enforce isolated filesystem, process namespace, identity, network, and resource ceilings.
@@ -115,7 +123,7 @@ Complete the externally usable application around the closed gates.
 
 | Gate                        | Owning phases | Current state                 |
 | --------------------------- | ------------- | ----------------------------- |
-| 1. Runtime truth            | 5–6           | Gate 1a complete; Gate 1 open |
+| 1. Runtime truth            | 5–7           | Gate 1a complete; Gate 1 open |
 | 2. Hosted isolation         | 7             | Open                          |
 | 3. Brokered secrets         | 8             | Open                          |
 | 4. Approval provenance      | 9             | Open                          |

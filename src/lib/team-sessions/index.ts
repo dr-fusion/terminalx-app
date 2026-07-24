@@ -32,8 +32,12 @@ export type {
   PublicSessionShareView,
   RuntimeOutboxClaimOptions,
   RuntimeOutboxDelivery,
+  RuntimeOutboxDispatchInterlockOptions,
+  RuntimeOutboxDispatchMode,
   RuntimeOutboxErrorCode,
   RuntimeOutboxKind,
+  RuntimeOutboxLeaseRenewal,
+  RuntimeOutboxLeaseRenewalOptions,
   SessionCommand,
   SessionAdmissionQuery,
   SessionAdmissionView,
@@ -79,6 +83,14 @@ export type {
   TeamSessionKernel,
 } from "./module";
 export { projectPublicSessionRunState } from "./public-run-state";
+export {
+  RuntimeWriteStateSnapshotError,
+  SqliteRuntimeWriteStateSnapshotSource,
+  createSqliteRuntimeWriteStateSnapshotSource,
+  type CreateSqliteRuntimeWriteStateSnapshotSourceOptions,
+  type RuntimeWriteStateSnapshotErrorCode,
+  type RuntimeWriteStateSnapshotSource,
+} from "./sqlite-runtime-write-state-source";
 export type {
   ActionClass,
   ActionControlCommandPayload,

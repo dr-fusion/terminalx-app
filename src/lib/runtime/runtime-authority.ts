@@ -121,7 +121,7 @@ function assertAuthorityEnvelope(
     invalid("Runtime authority envelope is invalid");
   }
 
-  if (issuer === "team-session") return;
+  if (issuer === "team-session" && expectedCapability !== "safety.quarantine") return;
   if (
     issuer === "platform-security" &&
     platformSecurityAllowed &&

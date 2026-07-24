@@ -3,7 +3,6 @@ import type { RuntimeBinding } from "../team-sessions/contracts";
 import type {
   AggregateEnforcementProof,
   NonDuplicateRuntimeReceipt,
-  Runtime,
   RuntimeHandle,
   RuntimeLifecycleCommand,
   RuntimeReceipt,
@@ -13,6 +12,11 @@ import {
   type ActionManifest as DigestibleActionManifest,
 } from "./action-policy";
 import { assertRuntimeCommandAuthorityBinding } from "./runtime-authority";
+import {
+  captureRuntimeCommandDataFunction,
+  type RuntimeCommandCapability,
+  type RuntimeCommandDataFunction,
+} from "./runtime-command-dispatch";
 import {
   commitRuntimeEffectRef,
   RuntimeEnforcementProofError,
@@ -24,6 +28,7 @@ import {
   type RuntimeEnforcementSubject,
   type SynchronousRuntimeEnforcementProofVerifier,
 } from "./runtime-enforcement-proof";
+import { suppressNativePromiseRejection } from "./runtime-native-promise";
 
 export { digestAggregateEnforcementProof } from "./runtime-enforcement-proof";
 
@@ -163,7 +168,7 @@ export type RuntimeAuthorityVerifier = (
 
 export type RuntimeCommandClock = () => number;
 
-type RuntimeDispatch = (
+export type RuntimeLifecycleDispatch = (
   handle: RuntimeHandle,
   command: RuntimeLifecycleCommand,
   signal: AbortSignal
@@ -176,7 +181,33 @@ type RuntimeDispatch = (
  * validated snapshot. Persistence remains a separate journal responsibility.
  */
 export async function executeRuntimeCommand(
-  runtime: Runtime,
+  runtime: RuntimeCommandCapability,
+  handle: RuntimeHandle,
+  command: RuntimeLifecycleCommand,
+  verifyAuthority: RuntimeAuthorityVerifier,
+  clock: RuntimeCommandClock,
+  verifyEnforcementProof?: RuntimeEnforcementProofVerifier,
+  runtimeCommandSignal?: AbortSignal
+): Promise<RuntimeReceipt> {
+  const dispatch = captureRuntimeLifecycleDispatch(runtime);
+  return executeCapturedRuntimeCommand(
+    dispatch,
+    handle,
+    command,
+    verifyAuthority,
+    clock,
+    verifyEnforcementProof,
+    runtimeCommandSignal
+  );
+}
+
+/**
+ * Execute through a Runtime command data-function captured by the composition
+ * root. Supervisors use this entrypoint so no provider property lookup can
+ * occur after their durable final pre-dispatch interlock.
+ */
+export async function executeCapturedRuntimeCommand(
+  dispatch: RuntimeLifecycleDispatch,
   handle: RuntimeHandle,
   command: RuntimeLifecycleCommand,
   verifyAuthority: RuntimeAuthorityVerifier,
@@ -187,13 +218,13 @@ export async function executeRuntimeCommand(
   if (typeof verifyAuthority !== "function" || typeof clock !== "function") {
     fail("invalid_input");
   }
+  if (typeof dispatch !== "function") fail("invalid_input");
   const dispatchSignal = runtimeCommandSignal ?? new AbortController().signal;
   if (!isNativeAbortSignal(dispatchSignal)) fail("invalid_input");
   if (dispatchSignal.aborted) fail("runtime_command_failed");
 
   const handleSnapshot = snapshotPortable(handle, "invalid_input");
   const commandSnapshot = snapshotPortable(command, "invalid_input");
-  const dispatch = captureRuntimeDispatch(runtime);
   const initialNowMs = sampleClock(clock);
   const preflight = preflightCommand(handleSnapshot, commandSnapshot, initialNowMs);
   const verificationInput = Object.freeze({
@@ -335,9 +366,9 @@ function verifyRuntimeReceiptEnforcementProofSynchronouslyByEffectRefForm(
   }
   if (verified !== true) {
     // The SQLite follow boundary cannot suspend its transaction. Fail closed,
-    // but consume an async/thenable verifier's eventual rejection so this safe
-    // classification cannot also become an unhandled process-level failure.
-    void Promise.resolve(verified).catch(() => undefined);
+    // but observe a genuine Promise rejection without assimilating a custom
+    // thenable or invoking provider-controlled code after rollback.
+    suppressNativePromiseRejection(verified);
     fail("enforcement_proof_verification_failed");
   }
 }
@@ -1553,18 +1584,24 @@ function sameBinding(left: RuntimeBinding, right: RuntimeBinding): boolean {
   return BINDING_FIELDS.every((field) => left[field] === right[field]);
 }
 
-function captureRuntimeDispatch(runtime: Runtime): RuntimeDispatch {
+export function captureRuntimeLifecycleDispatch(
+  runtime: RuntimeCommandCapability
+): RuntimeLifecycleDispatch {
   try {
-    if ((typeof runtime !== "object" && typeof runtime !== "function") || runtime === null) {
-      fail("invalid_input");
-    }
-    const method = Reflect.get(runtime as object, "command");
-    if (typeof method !== "function") fail("invalid_input");
-    return (handle, command, signal) =>
-      Reflect.apply(method, runtime, [handle, command, signal]) as Promise<RuntimeReceipt>;
+    const dispatch = captureRuntimeCommandDataFunction(runtime);
+    return (handle, command, signal) => commandResult(dispatch, handle, command, signal);
   } catch {
     fail("invalid_input");
   }
+}
+
+function commandResult(
+  dispatch: RuntimeCommandDataFunction,
+  handle: RuntimeHandle,
+  command: RuntimeLifecycleCommand,
+  signal: AbortSignal
+): Promise<RuntimeReceipt> {
+  return dispatch(handle, command, signal) as Promise<RuntimeReceipt>;
 }
 
 function isNativeAbortSignal(value: unknown): value is AbortSignal {

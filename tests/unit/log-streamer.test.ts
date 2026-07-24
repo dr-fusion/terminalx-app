@@ -4,7 +4,9 @@ import * as path from "path";
 import * as os from "os";
 
 // Use realpathSync because macOS /var -> /private/var symlink causes path validation to fail.
-const TEST_LOG_DIR = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "terminalx-logs-test-")));
+const TEST_LOG_DIR = fs.realpathSync(
+  fs.mkdtempSync(path.join(os.tmpdir(), "terminalx-logs-test-"))
+);
 
 beforeAll(() => {
   process.env.TERMINUS_LOG_PATHS = TEST_LOG_DIR;
@@ -47,9 +49,7 @@ describe("createLogStream", () => {
 
   it("rejects paths outside allowed log directories", async () => {
     const { createLogStream } = await import("@/lib/log-streamer");
-    expect(() => createLogStream("/etc/passwd")).toThrow(
-      "not within allowed log directories"
-    );
+    expect(() => createLogStream("/etc/passwd")).toThrow("not within allowed log directories");
   });
 
   it("accepts valid log files", async () => {
