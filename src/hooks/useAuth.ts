@@ -6,7 +6,9 @@ import { useRouter } from "next/navigation";
 export type AuthMode = "none" | "password" | "local" | "google";
 
 export interface AuthUser {
+  userId: string;
   username: string;
+  displayName: string;
   role: "admin" | "user";
 }
 
@@ -40,8 +42,13 @@ export function useAuth(): UseAuthReturn {
         const data = await res.json();
         if (!cancelled) {
           setAuthMode(data.authMode ?? data.mode ?? "none");
-          if (data.username) {
-            setUser({ username: data.username, role: data.role || "user" });
+          if (data.userId && data.username) {
+            setUser({
+              userId: data.userId,
+              username: data.username,
+              displayName: data.displayName ?? data.username,
+              role: data.role || "user",
+            });
           } else {
             setUser(null);
           }

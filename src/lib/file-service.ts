@@ -36,6 +36,15 @@ function sensitiveFileAccessAllowed(): boolean {
   return process.env.TERMINALX_ALLOW_SENSITIVE_FILE_ACCESS === "true";
 }
 
+function isSqliteDatabaseFile(candidate: string, database: string): boolean {
+  return (
+    candidate === database ||
+    candidate === `${database}-wal` ||
+    candidate === `${database}-shm` ||
+    candidate === `${database}-journal`
+  );
+}
+
 export function isSensitivePath(filePath: string): boolean {
   if (sensitiveFileAccessAllowed()) return false;
 
@@ -45,10 +54,13 @@ export function isSensitivePath(filePath: string): boolean {
     process.env.TERMINALX_TELEGRAM_MESSAGE_DB_PATH ??
       path.join(process.cwd(), "data", "telegram-messages.sqlite")
   );
+  const teamSessionDb = path.resolve(
+    process.env.TERMINALX_TEAM_SESSION_DB_PATH ??
+      path.join(process.cwd(), "data", "team-sessions.sqlite")
+  );
   if (
-    resolved === telegramAuditDb ||
-    resolved === `${telegramAuditDb}-wal` ||
-    resolved === `${telegramAuditDb}-shm`
+    isSqliteDatabaseFile(resolved, telegramAuditDb) ||
+    isSqliteDatabaseFile(resolved, teamSessionDb)
   ) {
     return true;
   }

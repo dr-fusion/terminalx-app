@@ -17,11 +17,14 @@ interface AuthenticatedRequest extends IncomingMessage {
 
 // Import server-side modules
 import {
+  createCanonicalPty,
   createPty,
   resizePty,
   destroyPty,
+  destroyCanonicalPtys,
   setMaxSessions,
   destroyAllPtys,
+  type PtyInstance,
 } from "../src/lib/pty-manager";
 import { execFileSync } from "child_process";
 import { applyGlobalOptions, tmuxTarget } from "../src/lib/tmux";
@@ -36,6 +39,25 @@ import { registerEnsureTopic } from "../src/lib/telegram/bot-bridge";
 import { getTelegramConfig, telegramConfigFingerprint } from "../src/lib/telegram/config";
 import { getConfiguredMaxSessions } from "../src/lib/security-config";
 import { assertValidStartupConfiguration } from "../src/lib/startup-validation";
+import { closeTeamSessions, getTeamSessions } from "../src/lib/team-sessions/service";
+import {
+  isMultiplayerTransportEnabled,
+  markMultiplayerTransportAvailable,
+} from "../src/lib/team-sessions/feature";
+import { createTeamSessionTerminalGateway } from "../src/lib/team-session-terminal-gateway";
+import {
+  LocalTmuxRuntime,
+  createRuntimeOutboxWorker,
+  createRuntimeWriteStateRegistry,
+  getCanonicalTmuxSocketName,
+  type RuntimeOutboxWorker,
+} from "../src/lib/runtime";
+import {
+  createTeamSessionWebSockets,
+  type CanonicalTerminalPty,
+  type CanonicalTerminalPtyAdapter,
+  type TeamSessionWebSockets,
+} from "./team-session-websockets";
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -71,6 +93,8 @@ const TERMINUS_SCROLLBACK = parseInt(process.env.TERMINUS_SCROLLBACK || "10000",
 const TERMINUS_MAX_SESSIONS = getConfiguredMaxSessions();
 const TERMINUS_READ_ONLY = process.env.TERMINUS_READ_ONLY === "true";
 const TERMINUS_HOST = process.env.TERMINUS_HOST || "127.0.0.1";
+const MULTIPLAYER_ENABLED = isMultiplayerTransportEnabled();
+markMultiplayerTransportAvailable(MULTIPLAYER_ENABLED);
 
 setMaxSessions(TERMINUS_MAX_SESSIONS);
 // Bump tmux's global history-limit so newly-spawned sessions keep deep
@@ -151,6 +175,102 @@ async function authenticateWebSocket(req: IncomingMessage, socket: Socket): Prom
 const dev = process.env.NODE_ENV !== "production";
 const app = next({ dev, dir: path.resolve(__dirname, "..") });
 const handle = app.getRequestHandler();
+
+interface MultiplayerServices {
+  readonly webSockets: TeamSessionWebSockets;
+  readonly worker: RuntimeOutboxWorker;
+  close(): Promise<void>;
+}
+
+function createCanonicalPtyAdapter(): CanonicalTerminalPtyAdapter {
+  const instances = new WeakMap<CanonicalTerminalPty, PtyInstance>();
+  const requireInstance = (terminal: CanonicalTerminalPty): PtyInstance => {
+    const instance = instances.get(terminal);
+    if (!instance) throw new Error("Canonical terminal unavailable");
+    return instance;
+  };
+
+  return {
+    create({ tmuxName, shell, cols, rows, binding }) {
+      const instance = createCanonicalPty(tmuxName, shell, cols, rows, binding);
+      const terminal: CanonicalTerminalPty = {
+        onData: (listener) => instance.process.onData(listener),
+        onExit: (listener) => instance.process.onExit(listener),
+      };
+      instances.set(terminal, instance);
+      return terminal;
+    },
+    write(terminal, data) {
+      requireInstance(terminal).process.write(data);
+    },
+    resize(terminal, cols, rows) {
+      resizePty(requireInstance(terminal).id, cols, rows);
+    },
+    interrupt(terminal) {
+      requireInstance(terminal).process.write("\x03");
+    },
+    destroy(terminal) {
+      const instance = instances.get(terminal);
+      if (!instance) return;
+      instances.delete(terminal);
+      destroyPty(instance.id);
+    },
+  };
+}
+
+function createMultiplayerServices(): MultiplayerServices {
+  const teamSessions = getTeamSessions();
+  const writeStates = createRuntimeWriteStateRegistry();
+  const terminalGateway = createTeamSessionTerminalGateway({
+    teamSessions,
+    isRuntimeWriteAllowed: (input) => !TERMINUS_READ_ONLY && writeStates.isWriteAllowed(input),
+  });
+  const runtime = new LocalTmuxRuntime({
+    fenceCallbacks: {
+      updateWriteState: (update) => writeStates.update(update),
+      async terminateCanonicalPtys(input) {
+        destroyCanonicalPtys({
+          teamSessionId: input.sessionId,
+          runtimeAuthorizationGeneration: input.runtimeAuthorizationGeneration,
+          includeCurrentGeneration: input.reason === "retire",
+        });
+      },
+      async runtimeEnsureState(input) {
+        return teamSessions.runtimeEnsureState(input);
+      },
+      async isCurrentRuntimeBinding(input) {
+        return teamSessions.isCurrentRuntimeBinding(input);
+      },
+    },
+  });
+  const worker = createRuntimeOutboxWorker({
+    kernel: teamSessions,
+    runtime,
+    workerId: `local-tmux-runtime-${process.pid}`,
+    onOperationalError: () => console.error("[team-sessions/runtime] InternalError"),
+  });
+  const webSockets = createTeamSessionWebSockets({
+    teamSessions,
+    terminalGateway,
+    pty: createCanonicalPtyAdapter(),
+    resolveTmuxSocketName: (sessionId) => getCanonicalTmuxSocketName(sessionId),
+    shell: TERMINUS_SHELL,
+    reportInternalError: () => console.error("[team-sessions/ws] InternalError"),
+  });
+
+  let closePromise: Promise<void> | undefined;
+  return {
+    webSockets,
+    worker,
+    close() {
+      closePromise ??= (async () => {
+        await Promise.allSettled([worker.stop(), webSockets.close()]);
+        closeTeamSessions();
+      })();
+      return closePromise;
+    },
+  };
+}
 
 // ── WebSocket Servers (noServer mode) ───────────────────────────────────────
 
@@ -471,6 +591,9 @@ filesWss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
 // ── Start Server ────────────────────────────────────────────────────────────
 
 app.prepare().then(() => {
+  const multiplayerServices = MULTIPLAYER_ENABLED ? createMultiplayerServices() : null;
+  multiplayerServices?.worker.start();
+
   const server = createServer((req, res) => {
     const parsedUrl = parseUrl(req.url || "", true);
 
@@ -540,6 +663,29 @@ app.prepare().then(() => {
   server.on("upgrade", async (req: IncomingMessage, socket: Socket, head) => {
     const parsedUrl = parseUrl(req.url || "", true);
     const pathname = parsedUrl.pathname || "";
+
+    if (pathname.startsWith("/ws/team-sessions/")) {
+      if (!multiplayerServices) {
+        socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
+        socket.destroy();
+        return;
+      }
+      try {
+        if (await multiplayerServices.webSockets.handleUpgrade(req, socket, head)) return;
+      } catch {
+        socket.write("HTTP/1.1 500 Internal Server Error\r\n\r\n");
+      }
+      socket.destroy();
+      return;
+    }
+
+    if (pathname.startsWith("/ws/terminal/") && MULTIPLAYER_ENABLED) {
+      // Canonical mode never authenticates or reaches the legacy
+      // session-name/role transport, including its URL-token compatibility.
+      socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
+      socket.destroy();
+      return;
+    }
 
     // Only authenticate our WebSocket paths (not Next.js HMR)
     const isOurWs =
@@ -641,28 +787,38 @@ app.prepare().then(() => {
     console.log(`  Max PTYs:   ${TERMINUS_MAX_SESSIONS}`);
     console.log(`  Read-only:  ${TERMINUS_READ_ONLY}`);
     console.log(`  Auth:       ${AUTH_MODE}`);
+    console.log(`  Multiplayer:${MULTIPLAYER_ENABLED ? " enabled" : " disabled"}`);
     console.log(`  Mode:       ${dev ? "development" : "production"}`);
   });
 
   // Graceful shutdown
+  let shuttingDown = false;
   const shutdown = () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     console.log("\nShutting down...");
     clearInterval(telegramConfigPoll);
-    void stopTelegramBot();
-    destroyAllPtys();
-    destroyAllLogStreams();
-    if (sharedWatcher) {
-      sharedWatcher.close();
-      sharedWatcher = null;
-    }
-    terminalWss.close();
-    logsWss.close();
-    filesWss.close();
-    server.close(() => {
-      process.exit(0);
-    });
     // Force exit after 5s
-    setTimeout(() => process.exit(1), 5000);
+    const forceExit = setTimeout(() => process.exit(1), 5000);
+    const serverClosed = new Promise<void>((resolve) => server.close(() => resolve()));
+    void (async () => {
+      const watcherClose = sharedWatcher?.close() ?? Promise.resolve();
+      sharedWatcher = null;
+      await Promise.allSettled([
+        multiplayerServices?.close() ?? Promise.resolve(),
+        stopTelegramBot(),
+        watcherClose,
+      ]);
+      closeTeamSessions();
+      destroyAllPtys();
+      destroyAllLogStreams();
+      terminalWss.close();
+      logsWss.close();
+      filesWss.close();
+      await serverClosed;
+      clearTimeout(forceExit);
+      process.exit(0);
+    })();
   };
 
   process.on("SIGTERM", shutdown);
