@@ -25,6 +25,9 @@ adapter, and Agent Run mutations remain closed to HTTP/browser clients.
 
 Close release Gate 1.
 
+Status: in progress. The current implementation state and deliberately closed boundaries are tracked
+in [Phase 6 Runtime lifecycle implementation status](../multiplayer/phase-6-runtime-lifecycle.md).
+
 - Add a durable `starting` Run identity and receipt-backed `run.start` lifecycle.
 - Make the v4/v5 command journal the only ordinary path for start/pause/resume/stop effects.
 - Add command, assignment, follow, and compensation workers with crash-safe leases.

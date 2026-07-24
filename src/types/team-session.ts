@@ -188,6 +188,7 @@ export interface TeamSessionRunLimitsSummary {
 
 export type TeamSessionAgentRunMode = "supervised" | "autonomous" | "yolo";
 export type TeamSessionAgentRunLifecycle =
+  | "starting"
   | "active"
   | "pausing"
   | "paused"
@@ -223,6 +224,11 @@ export interface TeamSessionAgentRunView {
   agentRunId: string;
   lifecycle: TeamSessionAgentRunLifecycle;
   stateVersion: number;
+  pendingOperation: {
+    kind: "start" | "pause" | "resume" | "stop";
+    status: "queued" | "awaiting-runtime" | "compensating";
+    requestedAtMs: number;
+  } | null;
   mode: TeamSessionAgentRunMode;
   completionPolicy: TeamSessionRunCompletionPolicy;
   runPolicyRevision: number;

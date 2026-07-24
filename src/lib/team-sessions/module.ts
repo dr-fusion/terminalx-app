@@ -4,6 +4,13 @@ import type Database from "better-sqlite3";
 import { openTeamSessionDatabase } from "./sqlite";
 import { isValidTmuxSessionName } from "../tmux";
 import { projectPublicSessionRunState } from "./public-run-state";
+import type { RuntimeLifecycleCommand } from "../runtime/contracts";
+import type { RuntimeCommandAuthorityIssuer } from "../runtime/runtime-command-authority";
+import type { RuntimeLifecycleJournal } from "../runtime/runtime-lifecycle-supervisor";
+import {
+  createSqliteRuntimeLifecycleJournal,
+  type SqliteRuntimeLifecycleJournal,
+} from "./sqlite-runtime-lifecycle-journal";
 import {
   assertValidRunPolicyCommit,
   isRunPolicyWidening,
@@ -57,9 +64,11 @@ import {
   type WorkspaceDiscoveryView,
   type WorkspaceProjectView,
   type AgentRunLifecycle,
+  type AgentRunPolicySnapshot,
   type GoalDefinition,
   type GoalEvidence,
   type GoalItem,
+  type GoalSet,
   type RunPolicyDraft,
 } from "./types";
 
@@ -71,6 +80,15 @@ export interface CreateTeamSessionsOptions {
   clock?: () => number;
   idGenerator?: () => string;
   invitationTokenGenerator?: () => string;
+  /** Required before any ordinary Runtime-backed Run lifecycle intent is accepted. */
+  runtimeCommandAuthorityIssuer?: RuntimeCommandAuthorityIssuer;
+  runtimeLifecycleCommandTtlMs?: number;
+}
+
+/** Security-sensitive composition result used only by the Runtime worker root. */
+export interface TeamSessionKernel {
+  readonly teamSessions: TeamSessions;
+  readonly runtimeLifecycleJournal: RuntimeLifecycleJournal;
 }
 
 const ROLE_RANK: Record<TeamRole, number> = {
@@ -91,6 +109,8 @@ const DEFAULT_HANDOFF_TTL_MS = 24 * 60 * 60 * 1_000;
 const MAX_CONVERSATION_BODY_BYTES = 16 * 1_024;
 const MAX_PENDING_DIRECTIVES_PER_AUTHOR = 64;
 const MAX_PENDING_DIRECTIVES_PER_SESSION = 256;
+const DEFAULT_RUNTIME_LIFECYCLE_COMMAND_TTL_MS = 30_000;
+const MAX_RUNTIME_LIFECYCLE_COMMAND_TTL_MS = 5 * 60_000;
 const LOCAL_TMUX_PROJECT_CEILING_REVISION = "local-tmux-ceiling:v1";
 const LOCAL_TMUX_PROJECT_CEILING_DIGEST = sha256(
   "terminalx:local-tmux:trusted-shared-host:no-yolo:v1"
@@ -126,12 +146,25 @@ export function createTeamSessions(options: CreateTeamSessionsOptions = {}): Tea
   return new SqliteTeamSessions(options);
 }
 
+export function createTeamSessionKernel(
+  options: CreateTeamSessionsOptions = {}
+): TeamSessionKernel {
+  const teamSessions = new SqliteTeamSessions(options);
+  return Object.freeze({
+    teamSessions,
+    runtimeLifecycleJournal: teamSessions.runtimeJournalForSupervisor(),
+  });
+}
+
 class SqliteTeamSessions implements TeamSessions {
   private readonly database: ReturnType<typeof openTeamSessionDatabase>;
   private readonly db: Database.Database;
   private readonly clock: () => number;
   private readonly idGenerator: () => string;
   private readonly invitationTokenGenerator: () => string;
+  private readonly runtimeCommandAuthorityIssuer?: RuntimeCommandAuthorityIssuer;
+  private readonly runtimeLifecycleCommandTtlMs: number;
+  private readonly runtimeLifecycle: SqliteRuntimeLifecycleJournal;
   private closed = false;
 
   constructor(options: CreateTeamSessionsOptions) {
@@ -146,6 +179,21 @@ class SqliteTeamSessions implements TeamSessions {
     this.idGenerator = options.idGenerator ?? crypto.randomUUID;
     this.invitationTokenGenerator =
       options.invitationTokenGenerator ?? (() => crypto.randomBytes(32).toString("base64url"));
+    this.runtimeCommandAuthorityIssuer = options.runtimeCommandAuthorityIssuer;
+    this.runtimeLifecycleCommandTtlMs = boundedIntegerOption(
+      options.runtimeLifecycleCommandTtlMs ?? DEFAULT_RUNTIME_LIFECYCLE_COMMAND_TTL_MS,
+      1,
+      MAX_RUNTIME_LIFECYCLE_COMMAND_TTL_MS,
+      "Runtime lifecycle command TTL"
+    );
+    this.runtimeLifecycle = createSqliteRuntimeLifecycleJournal({
+      db: this.db,
+      idGenerator: () => this.nextId("runtime-journal"),
+    });
+  }
+
+  runtimeJournalForSupervisor(): RuntimeLifecycleJournal {
+    return this.runtimeLifecycle;
   }
 
   async dispatch(command: SessionCommand): Promise<CommandResult> {
@@ -2544,6 +2592,7 @@ class SqliteTeamSessions implements TeamSessions {
     command: Extract<SessionCommand, { type: "run.start" }>,
     now: number
   ): CommandResult {
+    const authorityIssuer = this.requireRuntimeCommandAuthorityIssuer();
     const session = this.requireSession(command.sessionId);
     this.requireSessionManager(command.sessionId, command.actor.userId);
     if (session.status !== "active") {
@@ -2575,6 +2624,7 @@ class SqliteTeamSessions implements TeamSessions {
 
     const agentRunId = this.nextId("run");
     const goalSetId = this.nextId("goal-set");
+    const runtimeCommandId = this.nextId("runtime-command");
     const goals: GoalItem[] = command.initialGoals.map((goal) => ({
       ...goal,
       acceptanceCriteria: [...goal.acceptanceCriteria],
@@ -2585,11 +2635,12 @@ class SqliteTeamSessions implements TeamSessions {
     this.db
       .prepare(
         `INSERT INTO agent_runs
-           (id, session_id, team_id, project_id, runtime_assignment_id, lifecycle,
+           (id, session_id, team_id, project_id, runtime_assignment_id,
+            start_command_id, lifecycle,
             state_version, current_policy_revision, current_goal_set_revision,
             runtime_authorization_generation, final_review_version,
             created_by_user_id, created_at_ms, updated_at_ms, terminal_at_ms)
-         VALUES (?, ?, ?, ?, ?, 'active', 1, 1, 1, ?, 1, ?, ?, ?, NULL)`
+         VALUES (?, ?, ?, ?, ?, ?, 'starting', 1, 1, 1, ?, 1, ?, ?, ?, NULL)`
       )
       .run(
         agentRunId,
@@ -2597,6 +2648,7 @@ class SqliteTeamSessions implements TeamSessions {
         session.team_id,
         session.project_id,
         assignment.id,
+        runtimeCommandId,
         assignment.runtime_authorization_generation,
         command.actor.userId,
         now,
@@ -2609,7 +2661,7 @@ class SqliteTeamSessions implements TeamSessions {
       goals,
       now,
     });
-    this.insertRunPolicyRevision({
+    const policySnapshot = this.insertRunPolicyRevision({
       agentRunId,
       sessionId: command.sessionId,
       revision: 1,
@@ -2618,37 +2670,68 @@ class SqliteTeamSessions implements TeamSessions {
       goalSetId,
       goalSetRevision: 1,
       goalSetDigest,
+      goals,
       assignment,
       yoloConfirmationRef: command.commit.yoloConfirmation?.challengeId,
       now,
     });
-    const runStateRevision = this.advanceRunStateRevision(command.sessionId);
-    const event = this.appendEvent(command.sessionId, command, now, "run.started", {
+    const requestEvent = this.appendEvent(
+      command.sessionId,
+      command,
+      now,
+      "run.runtime-command.requested",
+      {
+        commandId: runtimeCommandId,
+        agentRunId,
+        operation: "run.start",
+        targetLifecycle: "active",
+        fromRunStateVersion: 1,
+        toRunStateVersion: 2,
+        lifecycle: "starting",
+        stateVersion: 1,
+        runPolicyRevision: 1,
+        goalSetRevision: 1,
+      }
+    );
+    const claims: Omit<Extract<RuntimeLifecycleCommand, { kind: "run.start" }>, "authority"> = {
+      kind: "run.start",
+      commandId: runtimeCommandId,
+      binding: policySnapshot.binding,
+      projectCeilingRevision: policySnapshot.projectCeilingRevision,
+      runtimeAuthorizationGeneration: policySnapshot.runtimeAuthorizationGeneration,
+      causationId: requestEvent.eventId,
+      actor: { kind: command.actor.kind, actorRef: command.actor.userId },
+      issuedAtMs: now,
+      deadlineAtMs: this.runtimeLifecycleDeadline(now),
       agentRunId,
-      lifecycle: "active",
-      stateVersion: 1,
       runPolicyRevision: 1,
-      policyDigest: command.commit.policyDigest,
-      mode: command.commit.policy.mode,
-      completionPolicy: command.commit.policy.completionPolicy.kind,
-      goalSetId,
-      goalSetRevision: 1,
-      goalSetDigest,
-      goalCount: goals.length,
-      runStateRevision,
+      fromRunStateVersion: 1,
+      toRunStateVersion: 2,
+      policy: policySnapshot,
+    };
+    const runtimeCommand: Extract<RuntimeLifecycleCommand, { kind: "run.start" }> = {
+      ...claims,
+      authority: authorityIssuer.issue(claims),
+    };
+    const intent = this.runtimeLifecycle.enqueue({
+      command: runtimeCommand,
+      sourceSessionSequence: requestEvent.sequence,
     });
+    const runStateRevision = this.advanceRunStateRevision(command.sessionId);
     return result(
       command,
       {
         sessionId: command.sessionId,
         agentRunId,
-        lifecycle: "active",
+        lifecycle: "starting",
         stateVersion: 1,
         runPolicyRevision: 1,
         goalSetRevision: 1,
         runStateRevision,
+        runtimeCommandId: intent.commandId,
+        runtimeCommandStatus: "pending",
       },
-      [event]
+      [requestEvent]
     );
   }
 
@@ -2659,6 +2742,18 @@ class SqliteTeamSessions implements TeamSessions {
     const session = this.requireSession(command.sessionId);
     this.requireSessionManager(command.sessionId, command.actor.userId);
     const run = this.requireMutableAgentRun(command.sessionId, command.agentRunId);
+    if (run.lifecycle === "starting" || run.lifecycle === "pausing") {
+      throw new TeamSessionError(
+        "conflict",
+        "Run policy cannot change while Runtime lifecycle enforcement is pending"
+      );
+    }
+    if (this.hasUnresolvedRuntimeLifecycle(run.id as string)) {
+      throw new TeamSessionError(
+        "conflict",
+        "Run policy cannot change while Runtime lifecycle truth is unresolved"
+      );
+    }
     assertExpectedRevision(
       run.current_policy_revision as number,
       command.expectedRunPolicyRevision,
@@ -2727,6 +2822,7 @@ class SqliteTeamSessions implements TeamSessions {
       goalSetId: goalSet.goalSetId,
       goalSetRevision: goalSet.revision,
       goalSetDigest: goalSet.digest,
+      goals: goalSet.goals,
       assignment,
       yoloConfirmationRef: command.commit.yoloConfirmation?.challengeId,
       now,
@@ -2789,7 +2885,7 @@ class SqliteTeamSessions implements TeamSessions {
     const session = this.requireSession(command.sessionId);
     this.requireSessionManager(command.sessionId, command.actor.userId);
     const run = this.requireMutableAgentRun(command.sessionId, command.agentRunId);
-    this.requireReadyRunRuntimeBinding(session, run);
+    const assignment = this.requireReadyRunRuntimeBinding(session, run);
     assertExpectedVersion(
       run.state_version as number,
       command.expectedRunStateVersion,
@@ -2798,7 +2894,7 @@ class SqliteTeamSessions implements TeamSessions {
     if (run.lifecycle !== "active") {
       throw new TeamSessionError("conflict", "Only an active Run can be paused");
     }
-    return this.transitionAgentRunLifecycle(command, run, "paused", now, "run.paused");
+    return this.requestRuntimeLifecycleTransition(command, run, assignment, now);
   }
 
   private resumeAgentRun(
@@ -2860,7 +2956,7 @@ class SqliteTeamSessions implements TeamSessions {
         "A Run requires an active Session, enforced Runtime, and accountable Assignee"
       );
     }
-    return this.transitionAgentRunLifecycle(command, run, "active", now, "run.resumed");
+    return this.requestRuntimeLifecycleTransition(command, run, assignment, now);
   }
 
   private stopAgentRun(
@@ -2870,7 +2966,7 @@ class SqliteTeamSessions implements TeamSessions {
     const session = this.requireSession(command.sessionId);
     this.requireSessionManager(command.sessionId, command.actor.userId);
     const run = this.requireMutableAgentRun(command.sessionId, command.agentRunId);
-    this.requireReadyRunRuntimeBinding(session, run);
+    const assignment = this.requireReadyRunRuntimeBinding(session, run);
     assertExpectedVersion(
       run.state_version as number,
       command.expectedRunStateVersion,
@@ -2879,7 +2975,7 @@ class SqliteTeamSessions implements TeamSessions {
     if (run.lifecycle === "pausing") {
       throw new TeamSessionError("conflict", "Emergency-stop enforcement is already in progress");
     }
-    return this.transitionAgentRunLifecycle(command, run, "stopped", now, "run.stopped");
+    return this.requestRuntimeLifecycleTransition(command, run, assignment, now);
   }
 
   private emergencyStopAgentRun(
@@ -2935,6 +3031,24 @@ class SqliteTeamSessions implements TeamSessions {
          WHERE session_id = ? AND status IN ('pending', 'processing', 'failed')`
       )
       .run(now, command.sessionId);
+    this.db
+      .prepare(
+        `UPDATE runtime_run_command_dispatch
+         SET status = 'superseded', lease_owner = NULL, lease_expires_at_ms = NULL,
+             last_safe_error_code = 'emergency_fenced_before_dispatch',
+             updated_at_ms = ?, terminal_at_ms = ?
+         WHERE agent_run_id = ? AND status = 'pending'`
+      )
+      .run(now, now, command.agentRunId);
+    this.db
+      .prepare(
+        `UPDATE runtime_run_command_dispatch
+         SET status = 'awaiting-receipt', lease_owner = NULL, lease_expires_at_ms = NULL,
+             last_safe_error_code = 'emergency_fenced_dispatch_uncertain',
+             available_at_ms = MAX(available_at_ms, ?), updated_at_ms = ?
+         WHERE agent_run_id = ? AND status = 'processing'`
+      )
+      .run(now, now, command.agentRunId);
     const transitioned = this.updateAgentRunLifecycle(
       run,
       "pausing",
@@ -4952,7 +5066,7 @@ class SqliteTeamSessions implements TeamSessions {
         `SELECT * FROM agent_runs
          WHERE session_id = ?
          ORDER BY CASE
-           WHEN lifecycle IN ('active', 'pausing', 'paused', 'agent-work-finished') THEN 0
+           WHEN lifecycle IN ('starting', 'active', 'pausing', 'paused', 'agent-work-finished') THEN 0
            ELSE 1
          END ASC,
          created_at_ms DESC,
@@ -5017,10 +5131,27 @@ class SqliteTeamSessions implements TeamSessions {
       throw new TeamSessionError("conflict", "Run policy revision is unavailable");
     }
     const lifecycle = run.lifecycle as AgentRunLifecycle;
+    const pendingLifecycle = this.db
+      .prepare(
+        `SELECT command.operation, command.created_at_ms, dispatch.status
+         FROM runtime_run_commands command
+         JOIN runtime_run_command_dispatch dispatch ON dispatch.command_id = command.id
+         WHERE command.agent_run_id = ?
+           AND dispatch.status IN ('pending', 'processing', 'awaiting-receipt', 'compensating')
+         ORDER BY command.command_sequence DESC LIMIT 1`
+      )
+      .get(run.id) as SqlRow | undefined;
     return {
       agentRunId: run.id as string,
       lifecycle,
       stateVersion: run.state_version as number,
+      pendingLifecycleOperation: pendingLifecycle
+        ? {
+            kind: runtimeLifecycleOperationKind(pendingLifecycle.operation as string),
+            status: runtimeLifecycleProjectionStatus(pendingLifecycle.status as string),
+            requestedAtMs: pendingLifecycle.created_at_ms as number,
+          }
+        : null,
       attention: {
         openRequestIds: attentionRows.map((row) => row.id as string),
         blockingRequestIds: attentionRows
@@ -5310,7 +5441,7 @@ class SqliteTeamSessions implements TeamSessions {
       .prepare(
         `SELECT * FROM agent_runs
          WHERE session_id = ?
-           AND lifecycle IN ('active', 'pausing', 'paused', 'agent-work-finished')
+           AND lifecycle IN ('starting', 'active', 'pausing', 'paused', 'agent-work-finished')
          ORDER BY created_at_ms DESC, id DESC LIMIT 1`
       )
       .get(sessionId) as SqlRow | undefined;
@@ -5321,7 +5452,7 @@ class SqliteTeamSessions implements TeamSessions {
       .prepare(
         `SELECT * FROM agent_runs
          WHERE id = ? AND session_id = ?
-           AND lifecycle IN ('active', 'pausing', 'paused', 'agent-work-finished')`
+           AND lifecycle IN ('starting', 'active', 'pausing', 'paused', 'agent-work-finished')`
       )
       .get(agentRunId, sessionId) as SqlRow | undefined;
     if (!run) deny();
@@ -5336,6 +5467,21 @@ class SqliteTeamSessions implements TeamSessions {
       throw new TeamSessionError("conflict", "Run Runtime Assignment is unavailable");
     }
     return assignment;
+  }
+
+  private requireRuntimeCommandAuthorityIssuer(): RuntimeCommandAuthorityIssuer {
+    if (!this.runtimeCommandAuthorityIssuer) {
+      throw new TeamSessionError("conflict", "Runtime lifecycle authority is not configured");
+    }
+    return this.runtimeCommandAuthorityIssuer;
+  }
+
+  private runtimeLifecycleDeadline(issuedAtMs: number): number {
+    const deadlineAtMs = issuedAtMs + this.runtimeLifecycleCommandTtlMs;
+    if (!Number.isSafeInteger(deadlineAtMs) || deadlineAtMs <= issuedAtMs) {
+      throw new TeamSessionError("invalid-command", "Runtime lifecycle deadline is invalid");
+    }
+    return deadlineAtMs;
   }
 
   private ensureCurrentRuntimeAssignment(session: SqlRow, now: number): SqlRow {
@@ -5477,38 +5623,53 @@ class SqliteTeamSessions implements TeamSessions {
     goalSetId: string;
     goalSetRevision: number;
     goalSetDigest: string;
+    goals: ReadonlyArray<GoalItem | MutableGoalItem>;
     assignment: SqlRow;
     yoloConfirmationRef?: string;
     now: number;
-  }): void {
-    const snapshotDigest = sha256(
-      canonicalJson({
-        agentRunId: input.agentRunId,
+  }): AgentRunPolicySnapshot {
+    const initialGoalSet: GoalSet = {
+      goalSetId: input.goalSetId,
+      agentRunId: input.agentRunId,
+      revision: input.goalSetRevision,
+      ...(input.goalSetRevision === 1 ? {} : { previousRevision: input.goalSetRevision - 1 }),
+      digest: input.goalSetDigest,
+      goals: input.goals.map((goal) => ({
+        ...goal,
+        acceptanceCriteria: [...goal.acceptanceCriteria],
+        dependencyGoalIds: [...goal.dependencyGoalIds],
+      })),
+    };
+    const snapshotWithoutDigest = {
+      agentRunId: input.agentRunId,
+      revision: input.revision,
+      ...(input.previousRevision === undefined ? {} : { previousRevision: input.previousRevision }),
+      ...input.policy,
+      policyBodyDigest: input.policyDigest,
+      initialGoalSet,
+      scopedExternalRules: [],
+      projectCeilingRevision: LOCAL_TMUX_PROJECT_CEILING_REVISION,
+      projectCeilingDigest: LOCAL_TMUX_PROJECT_CEILING_DIGEST,
+      binding: {
+        teamId: input.assignment.team_id as string,
+        projectId: input.assignment.project_id as string,
         sessionId: input.sessionId,
-        revision: input.revision,
-        previousRevision: input.previousRevision ?? null,
-        policyBodyDigest: input.policyDigest,
-        policy: input.policy,
-        scopedExternalRules: [],
-        initialGoalSet: {
-          goalSetId: input.goalSetId,
-          revision: input.goalSetRevision,
-          digest: input.goalSetDigest,
-        },
-        projectCeilingRevision: LOCAL_TMUX_PROJECT_CEILING_REVISION,
-        projectCeilingDigest: LOCAL_TMUX_PROJECT_CEILING_DIGEST,
-        binding: {
-          runtimeAssignmentId: input.assignment.id,
-          runtimeAssignmentGeneration: input.assignment.generation,
-          sandboxId: input.assignment.sandbox_id,
-          sandboxGeneration: input.assignment.sandbox_generation,
-          runtimePrincipalId: input.assignment.runtime_principal_id,
-        },
-        runtimeAuthorizationGeneration: input.assignment.runtime_authorization_generation,
-        yoloConfirmationRef: input.yoloConfirmationRef ?? null,
-        createdAtMs: input.now,
-      })
-    );
+        runtimeAssignmentId: input.assignment.id as string,
+        runtimeAssignmentGeneration: input.assignment.generation as number,
+        sandboxId: input.assignment.sandbox_id as string,
+        sandboxGeneration: input.assignment.sandbox_generation as number,
+        runtimePrincipalId: input.assignment.runtime_principal_id as string,
+      },
+      runtimeAuthorizationGeneration: input.assignment.runtime_authorization_generation as number,
+      ...(input.yoloConfirmationRef === undefined
+        ? {}
+        : { yoloConfirmationRef: input.yoloConfirmationRef }),
+      createdAtMs: input.now,
+    } satisfies Omit<AgentRunPolicySnapshot, "digest">;
+    const snapshot: AgentRunPolicySnapshot = {
+      ...snapshotWithoutDigest,
+      digest: sha256(canonicalJson(snapshotWithoutDigest)),
+    };
     this.db
       .prepare(
         `INSERT INTO run_policy_revisions
@@ -5527,7 +5688,7 @@ class SqliteTeamSessions implements TeamSessions {
         input.sessionId,
         input.revision,
         input.previousRevision ?? null,
-        snapshotDigest,
+        snapshot.digest,
         input.policyDigest,
         input.policy.mode,
         input.policy.completionPolicy.kind,
@@ -5546,6 +5707,7 @@ class SqliteTeamSessions implements TeamSessions {
         input.yoloConfirmationRef ?? null,
         input.now
       );
+    return snapshot;
   }
 
   private readRunPolicyDraft(agentRunId: string, revision: number): RunPolicyDraft {
@@ -5583,6 +5745,18 @@ class SqliteTeamSessions implements TeamSessions {
   }
 
   private requireReadyRunRuntimeBinding(session: SqlRow, run: SqlRow): SqlRow {
+    if (run.lifecycle === "starting" || run.lifecycle === "pausing") {
+      throw new TeamSessionError(
+        "conflict",
+        "Run mutation is unavailable while Runtime lifecycle enforcement is pending"
+      );
+    }
+    if (this.hasUnresolvedRuntimeLifecycle(run.id as string)) {
+      throw new TeamSessionError(
+        "conflict",
+        "Run mutation is unavailable while Runtime lifecycle truth is unresolved"
+      );
+    }
     const assignment = this.requireRuntimeAssignment(run.runtime_assignment_id as string);
     const policySnapshot = this.db
       .prepare(
@@ -5610,6 +5784,18 @@ class SqliteTeamSessions implements TeamSessions {
       );
     }
     return assignment;
+  }
+
+  private hasUnresolvedRuntimeLifecycle(agentRunId: string): boolean {
+    return Boolean(
+      this.db
+        .prepare(
+          `SELECT 1 FROM runtime_run_command_dispatch
+           WHERE agent_run_id = ?
+             AND status IN ('pending', 'processing', 'awaiting-receipt', 'compensating')`
+        )
+        .get(agentRunId)
+    );
   }
 
   private insertGoalSetSnapshot(input: {
@@ -5775,36 +5961,127 @@ class SqliteTeamSessions implements TeamSessions {
     );
   }
 
-  private transitionAgentRunLifecycle(
+  private requestRuntimeLifecycleTransition(
     command: Extract<SessionCommand, { type: "run.pause" | "run.resume" | "run.stop" }>,
     run: SqlRow,
-    lifecycle: AgentRunLifecycle,
-    now: number,
-    eventType: string
+    assignment: SqlRow,
+    now: number
   ): CommandResult {
-    const transitioned = this.updateAgentRunLifecycle(run, lifecycle, now);
-    const invalidatedGrantCount =
-      lifecycle === "stopped" ? this.invalidateMutableRunGrants(run.id as string, now) : 0;
-    const runStateRevision = this.advanceRunStateRevision(command.sessionId);
-    const event = this.appendEvent(command.sessionId, command, now, eventType, {
-      agentRunId: run.id,
-      lifecycle,
-      stateVersion: transitioned.stateVersion,
-      reason: "reason" in command ? (command.reason ?? null) : null,
-      invalidatedGrantCount,
-      runStateRevision,
+    const authorityIssuer = this.requireRuntimeCommandAuthorityIssuer();
+    const unresolved = this.db
+      .prepare(
+        `SELECT 1 FROM runtime_run_command_dispatch
+         WHERE agent_run_id = ?
+           AND status IN ('pending', 'processing', 'awaiting-receipt', 'compensating')`
+      )
+      .get(run.id);
+    if (unresolved) {
+      throw new TeamSessionError(
+        "conflict",
+        "This Run already has a lifecycle operation awaiting Runtime truth"
+      );
+    }
+    const policy = this.db
+      .prepare(
+        `SELECT project_ceiling_revision FROM run_policy_revisions
+         WHERE agent_run_id = ? AND revision = ?`
+      )
+      .get(run.id, run.current_policy_revision) as SqlRow | undefined;
+    if (!policy) {
+      throw new TeamSessionError("conflict", "Run policy revision is unavailable");
+    }
+    const runtimeCommandId = this.nextId("runtime-command");
+    const targetLifecycle =
+      command.type === "run.pause"
+        ? "paused"
+        : command.type === "run.resume"
+          ? "active"
+          : "stopped";
+    const fromRunStateVersion = run.state_version as number;
+    const toRunStateVersion = fromRunStateVersion + 1;
+    const requestEvent = this.appendEvent(
+      command.sessionId,
+      command,
+      now,
+      "run.runtime-command.requested",
+      {
+        commandId: runtimeCommandId,
+        agentRunId: run.id,
+        operation: command.type,
+        targetLifecycle,
+        fromRunStateVersion,
+        toRunStateVersion,
+        lifecycle: run.lifecycle,
+        stateVersion: fromRunStateVersion,
+        runPolicyRevision: run.current_policy_revision,
+        goalSetRevision: run.current_goal_set_revision,
+        reason: "reason" in command ? (command.reason ?? null) : null,
+      }
+    );
+    const common = {
+      commandId: runtimeCommandId,
+      binding: {
+        teamId: assignment.team_id as string,
+        projectId: assignment.project_id as string,
+        sessionId: command.sessionId,
+        runtimeAssignmentId: assignment.id as string,
+        runtimeAssignmentGeneration: assignment.generation as number,
+        sandboxId: assignment.sandbox_id as string,
+        sandboxGeneration: assignment.sandbox_generation as number,
+        runtimePrincipalId: assignment.runtime_principal_id as string,
+      },
+      projectCeilingRevision: policy.project_ceiling_revision as string,
+      runtimeAuthorizationGeneration: run.runtime_authorization_generation as number,
+      causationId: requestEvent.eventId,
+      actor: { kind: command.actor.kind, actorRef: command.actor.userId },
+      issuedAtMs: now,
+      deadlineAtMs: this.runtimeLifecycleDeadline(now),
+      agentRunId: run.id as string,
+      runPolicyRevision: run.current_policy_revision as number,
+      fromRunStateVersion,
+      toRunStateVersion,
+    } as const;
+    let runtimeCommand: RuntimeLifecycleCommand;
+    if (command.type === "run.pause") {
+      const claims: Omit<Extract<RuntimeLifecycleCommand, { kind: "run.pause" }>, "authority"> = {
+        ...common,
+        kind: "run.pause",
+        reason: "human",
+      };
+      runtimeCommand = { ...claims, authority: authorityIssuer.issue(claims) };
+    } else if (command.type === "run.resume") {
+      const claims: Omit<Extract<RuntimeLifecycleCommand, { kind: "run.resume" }>, "authority"> = {
+        ...common,
+        kind: "run.resume",
+        accountableAssigneePresent: true,
+      };
+      runtimeCommand = { ...claims, authority: authorityIssuer.issue(claims) };
+    } else {
+      const claims: Omit<Extract<RuntimeLifecycleCommand, { kind: "run.stop" }>, "authority"> = {
+        ...common,
+        kind: "run.stop",
+        reason: "human",
+      };
+      runtimeCommand = { ...claims, authority: authorityIssuer.issue(claims) };
+    }
+    const intent = this.runtimeLifecycle.enqueue({
+      command: runtimeCommand,
+      sourceSessionSequence: requestEvent.sequence,
     });
+    const runStateRevision = this.advanceRunStateRevision(command.sessionId);
     return result(
       command,
       {
         sessionId: command.sessionId,
         agentRunId: run.id,
-        lifecycle,
-        stateVersion: transitioned.stateVersion,
-        invalidatedGrantCount,
+        lifecycle: run.lifecycle,
+        stateVersion: fromRunStateVersion,
+        requestedLifecycle: targetLifecycle,
+        runtimeCommandId: intent.commandId,
+        runtimeCommandStatus: "pending",
         runStateRevision,
       },
-      [event]
+      [requestEvent]
     );
   }
 
@@ -7267,6 +7544,38 @@ function isTerminalRunLifecycle(lifecycle: AgentRunLifecycle): boolean {
   );
 }
 
+function runtimeLifecycleOperationKind(value: string): "start" | "pause" | "resume" | "stop" {
+  switch (value) {
+    case "run.start":
+      return "start";
+    case "run.pause":
+      return "pause";
+    case "run.resume":
+      return "resume";
+    case "run.stop":
+      return "stop";
+    default:
+      throw new TeamSessionError("conflict", "Runtime lifecycle operation is invalid");
+  }
+}
+
+function runtimeLifecycleProjectionStatus(
+  value: string
+): "queued" | "awaiting-runtime" | "compensating" {
+  switch (value) {
+    case "pending":
+      return "queued";
+    case "processing":
+      return "queued";
+    case "awaiting-receipt":
+      return "awaiting-runtime";
+    case "compensating":
+      return "compensating";
+    default:
+      throw new TeamSessionError("conflict", "Runtime lifecycle dispatch state is invalid");
+  }
+}
+
 function commandDigest(command: SessionCommand): string {
   const { actor, idempotency: _idempotency, occurredAtMs: _occurredAtMs, ...payload } = command;
   return sha256(
@@ -7299,6 +7608,18 @@ function deny(): never {
 function clamp(value: number, minimum: number, maximum: number): number {
   if (!Number.isFinite(value)) return minimum;
   return Math.min(maximum, Math.max(minimum, Math.floor(value)));
+}
+
+function boundedIntegerOption(
+  value: number,
+  minimum: number,
+  maximum: number,
+  label: string
+): number {
+  if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+    throw new TypeError(`${label} is invalid`);
+  }
+  return value;
 }
 
 function isConstraintError(error: unknown): boolean {

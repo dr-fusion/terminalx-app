@@ -15,7 +15,13 @@ const MAX_CRITERIA_PER_GOAL = 32;
 const MAX_DEPENDENCIES_PER_GOAL = 99;
 const MAX_EVIDENCE_PER_GOAL = 100;
 
-const MUTABLE_RUN_LIFECYCLES = new Set(["active", "pausing", "paused", "agent-work-finished"]);
+const MUTABLE_RUN_LIFECYCLES = new Set([
+  "starting",
+  "active",
+  "pausing",
+  "paused",
+  "agent-work-finished",
+]);
 
 /**
  * Convert the internal actor-scoped Run query into the deliberately smaller
@@ -126,6 +132,7 @@ function projectCurrentRun(run: SessionRunStateView): PublicSessionAgentRunView 
     lifecycle: enumValue(
       run.lifecycle,
       [
+        "starting",
         "active",
         "pausing",
         "paused",
@@ -138,6 +145,25 @@ function projectCurrentRun(run: SessionRunStateView): PublicSessionAgentRunView 
       "Run lifecycle"
     ),
     stateVersion: positiveInteger(run.stateVersion, "Run state version"),
+    pendingOperation:
+      run.pendingLifecycleOperation === null
+        ? null
+        : {
+            kind: enumValue(
+              run.pendingLifecycleOperation.kind,
+              ["start", "pause", "resume", "stop"] as const,
+              "Pending Run operation"
+            ),
+            status: enumValue(
+              run.pendingLifecycleOperation.status,
+              ["queued", "awaiting-runtime", "compensating"] as const,
+              "Pending Run operation status"
+            ),
+            requestedAtMs: nonNegativeInteger(
+              run.pendingLifecycleOperation.requestedAtMs,
+              "Pending Run operation time"
+            ),
+          },
     mode,
     completionPolicy,
     runPolicyRevision: positiveInteger(run.runPolicyRevision, "Run policy revision"),

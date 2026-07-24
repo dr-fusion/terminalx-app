@@ -9,9 +9,11 @@ import {
   type RuntimeAuthorityVerificationInput,
   type RuntimeCommand,
   type RuntimeHandle,
+  type RuntimeLifecycleCommand,
   type RuntimePostStartLifecycleCommand,
   type RuntimeReceipt,
 } from "@/lib/runtime";
+import { digestActionManifest } from "@/lib/runtime/action-policy";
 
 const binding = {
   teamId: "team-1",
@@ -184,7 +186,7 @@ describe("Runtime command execution", () => {
     const started = new Promise<void>((resolve) => {
       verificationStarted = resolve;
     });
-    let verifiedSnapshot: RuntimePostStartLifecycleCommand | undefined;
+    let verifiedSnapshot: RuntimeLifecycleCommand | undefined;
     const accepted = receipt({ outcome: "accepted", effectRef: "effect-1" });
     const dispatch = vi.fn(async () => accepted);
     const adapter = {
@@ -324,6 +326,252 @@ describe("Runtime command execution", () => {
     ).rejects.toMatchObject({ code: "invalid_input" });
     expect(verifier).not.toHaveBeenCalled();
     expect(adapter.command).not.toHaveBeenCalled();
+  });
+
+  it("executes a complete immutable run.start snapshot", async () => {
+    const start = startCommand();
+    const accepted = receipt({ outcome: "accepted", effectRef: "effect-start" });
+    const adapter = runtimeReturning(accepted);
+    const verifier = vi.fn((_input: RuntimeAuthorityVerificationInput) => true);
+
+    await expect(
+      executeRuntimeCommand(adapter, handle, start, verifier, () => 100)
+    ).resolves.toEqual(accepted);
+    expect(verifier).toHaveBeenCalledOnce();
+    const verified = verifier.mock.calls[0]?.[0].command;
+    expect(verified).toMatchObject({ kind: "run.start", policy: start.policy });
+    expect(Object.isFrozen(verified)).toBe(true);
+    if (verified?.kind === "run.start") {
+      expect(Object.isFrozen(verified.policy)).toBe(true);
+      expect(Object.isFrozen(verified.policy.initialGoalSet.goals)).toBe(true);
+    }
+    expect(adapter.command).toHaveBeenCalledOnce();
+  });
+
+  it("rejects inconsistent run.start policies and capability claims before dispatch", async () => {
+    const start = startCommand();
+    const firstGoal = start.policy.initialGoalSet.goals[0]!;
+    const invalidStarts: RuntimeLifecycleCommand[] = [
+      asLifecycle({
+        ...start,
+        policy: { ...start.policy, agentRunId: "run-other" },
+      }),
+      asLifecycle({
+        ...start,
+        policy: { ...start.policy, binding: { ...binding, sandboxGeneration: 5 } },
+      }),
+      asLifecycle({
+        ...start,
+        policy: { ...start.policy, unexpected: true },
+      }),
+      asLifecycle({
+        ...start,
+        policy: {
+          ...start.policy,
+          limits: {
+            ...start.policy.limits,
+            modelTokens: { kind: "capped", value: -1 },
+          },
+        },
+      }),
+      asLifecycle({
+        ...start,
+        policy: {
+          ...start.policy,
+          initialGoalSet: {
+            ...start.policy.initialGoalSet,
+            goals: [{ ...firstGoal, acceptanceCriteria: [] }],
+          },
+        },
+      }),
+      asLifecycle({
+        ...start,
+        policy: { ...start.policy, yoloConfirmationRef: "unexpected-confirmation" },
+      }),
+      asLifecycle({
+        ...start,
+        policy: { ...start.policy, mode: "yolo" },
+      }),
+      asLifecycle({
+        ...start,
+        runPolicyRevision: 2,
+        policy: { ...start.policy, revision: 2 },
+      }),
+      asLifecycle({
+        ...start,
+        fromRunStateVersion: 2,
+        toRunStateVersion: 3,
+      }),
+      asLifecycle({
+        ...start,
+        policy: {
+          ...start.policy,
+          initialGoalSet: {
+            ...start.policy.initialGoalSet,
+            revision: 2,
+          },
+        },
+      }),
+      asLifecycle({
+        ...start,
+        policy: {
+          ...start.policy,
+          initialGoalSet: {
+            ...start.policy.initialGoalSet,
+            goals: [{ ...firstGoal, version: 2, status: "in-progress" }],
+          },
+        },
+      }),
+    ];
+
+    for (const invalidStart of invalidStarts) {
+      const verifier = vi.fn(() => true);
+      const adapter = runtimeReturning(receipt({ outcome: "accepted", effectRef: "effect-start" }));
+      await expect(
+        executeRuntimeCommand(adapter, handle, invalidStart, verifier, () => 100)
+      ).rejects.toMatchObject({
+        code: "invalid_input",
+        dispatchCertainty: "not-dispatched",
+      });
+      expect(verifier).not.toHaveBeenCalled();
+      expect(adapter.command).not.toHaveBeenCalled();
+    }
+
+    const nonIsolated = {
+      ...handle,
+      capabilities: { ...handle.capabilities, isolatedExecution: false },
+    } satisfies RuntimeHandle;
+    await expect(
+      executeRuntimeCommand(
+        runtimeReturning(receipt({ outcome: "accepted", effectRef: "effect-start" })),
+        nonIsolated,
+        start,
+        () => true,
+        () => 100
+      )
+    ).rejects.toMatchObject({
+      code: "invalid_input",
+      dispatchCertainty: "not-dispatched",
+    });
+  });
+
+  it("validates exact-bound YOLO start authorization without exposing grant material", async () => {
+    const start = yoloStartCommand();
+    if (!start.yoloAuthorization) throw new Error("Expected YOLO authorization fixture");
+    const yoloHandle = {
+      ...handle,
+      capabilities: { ...handle.capabilities, yoloEligible: true },
+    } satisfies RuntimeHandle;
+    const accepted = receipt({ outcome: "accepted", effectRef: "effect-yolo-start" });
+
+    await expect(
+      executeRuntimeCommand(
+        runtimeReturning(accepted),
+        yoloHandle,
+        start,
+        () => true,
+        () => 100
+      )
+    ).resolves.toEqual(accepted);
+
+    const { yoloAuthorization: _authorization, ...missingAuthorization } = start;
+    const missingAuthorizationAdapter = runtimeReturning(accepted);
+    await expect(
+      executeRuntimeCommand(
+        missingAuthorizationAdapter,
+        yoloHandle,
+        asLifecycle(missingAuthorization),
+        () => true,
+        () => 100
+      )
+    ).rejects.toMatchObject({
+      code: "invalid_input",
+      dispatchCertainty: "not-dispatched",
+    });
+    expect(missingAuthorizationAdapter.command).not.toHaveBeenCalled();
+
+    const ineligibleAdapter = runtimeReturning(accepted);
+    await expect(
+      executeRuntimeCommand(
+        ineligibleAdapter,
+        handle,
+        start,
+        () => true,
+        () => 100
+      )
+    ).rejects.toMatchObject({
+      code: "invalid_input",
+      dispatchCertainty: "not-dispatched",
+    });
+    expect(ineligibleAdapter.command).not.toHaveBeenCalled();
+
+    const tampered = asLifecycle({
+      ...start,
+      yoloAuthorization: {
+        ...start.yoloAuthorization,
+        manifest: {
+          ...start.yoloAuthorization?.manifest,
+          operation: "deployment.replace-production",
+        },
+      },
+    });
+    const tamperedAdapter = runtimeReturning(accepted);
+    await expect(
+      executeRuntimeCommand(
+        tamperedAdapter,
+        yoloHandle,
+        tampered,
+        () => true,
+        () => 100
+      )
+    ).rejects.toMatchObject({
+      code: "invalid_input",
+      dispatchCertainty: "not-dispatched",
+    });
+    expect(tamperedAdapter.command).not.toHaveBeenCalled();
+
+    const overPolicyLimit = asLifecycle({
+      ...start,
+      policy: {
+        ...start.policy,
+        limits: {
+          ...start.policy.limits,
+          outboundBytes: { kind: "capped", value: 0 },
+        },
+      },
+    });
+    const underBudgeted = asLifecycle({
+      ...start,
+      yoloAuthorization: {
+        ...start.yoloAuthorization,
+        grant: {
+          ...start.yoloAuthorization.grant,
+          budget: {
+            ...start.yoloAuthorization.grant.budget,
+            perEffectLimit: {
+              ...start.yoloAuthorization.grant.budget.perEffectLimit,
+              outboundBytes: 0,
+            },
+          },
+        },
+      },
+    });
+    for (const invalidBudget of [overPolicyLimit, underBudgeted]) {
+      const budgetAdapter = runtimeReturning(accepted);
+      await expect(
+        executeRuntimeCommand(
+          budgetAdapter,
+          yoloHandle,
+          invalidBudget,
+          () => true,
+          () => 100
+        )
+      ).rejects.toMatchObject({
+        code: "invalid_input",
+        dispatchCertainty: "not-dispatched",
+      });
+      expect(budgetAdapter.command).not.toHaveBeenCalled();
+    }
   });
 
   it("requires a lifecycle enforced receipt to advance the exact Run-state fence", async () => {
@@ -587,6 +835,9 @@ describe("Runtime command execution", () => {
     await expect(providerFailure).rejects.toEqual(
       new RuntimeCommandExecutionError("runtime_command_failed")
     );
+    await expect(providerFailure).rejects.toMatchObject({
+      dispatchCertainty: "dispatch-uncertain",
+    });
     await expect(providerFailure).rejects.not.toHaveProperty("cause");
 
     const verifierFailure = executeRuntimeCommand(
@@ -601,11 +852,156 @@ describe("Runtime command execution", () => {
     await expect(verifierFailure).rejects.toEqual(
       new RuntimeCommandExecutionError("authority_verification_failed")
     );
+    await expect(verifierFailure).rejects.toMatchObject({
+      dispatchCertainty: "not-dispatched",
+    });
   });
 });
 
 function asPostStart(value: unknown): RuntimePostStartLifecycleCommand {
   return value as RuntimePostStartLifecycleCommand;
+}
+
+function asLifecycle(value: unknown): RuntimeLifecycleCommand {
+  return value as RuntimeLifecycleCommand;
+}
+
+function startCommand(): Extract<RuntimeLifecycleCommand, { kind: "run.start" }> {
+  const { reason: _reason, ...base } = command;
+  return {
+    ...base,
+    kind: "run.start",
+    runPolicyRevision: 1,
+    fromRunStateVersion: 1,
+    toRunStateVersion: 2,
+    authority: { ...command.authority, capability: "run.start" },
+    policy: {
+      agentRunId: command.agentRunId,
+      revision: 1,
+      digest: "1".repeat(64),
+      policyBodyDigest: "2".repeat(64),
+      mode: "autonomous",
+      completionPolicy: { kind: "continue-until-all-goals-achieved" },
+      scopedExternalPolicyRef: "scoped-policy-1",
+      limits: {
+        wallClock: { kind: "unconfigured" },
+        modelTokens: { kind: "unconfigured" },
+        modelSpend: { kind: "unconfigured" },
+        outboundBytes: { kind: "unconfigured" },
+        actionCounts: {
+          local: { kind: "unconfigured" },
+          "scoped-external": { kind: "unconfigured" },
+          protected: { kind: "unconfigured" },
+          forbidden: { kind: "unconfigured" },
+        },
+      },
+      initialGoalSet: {
+        goalSetId: "goal-set-1",
+        agentRunId: command.agentRunId,
+        revision: 1,
+        digest: "3".repeat(64),
+        goals: [
+          {
+            goalId: "goal-1",
+            position: 1,
+            title: "Complete the bounded task",
+            acceptanceCriteria: ["The focused tests pass"],
+            dependencyGoalIds: [],
+            version: 1,
+            status: "pending",
+          },
+        ],
+      },
+      scopedExternalRules: [],
+      projectCeilingRevision: command.projectCeilingRevision,
+      projectCeilingDigest: "4".repeat(64),
+      binding,
+      runtimeAuthorizationGeneration: command.runtimeAuthorizationGeneration,
+      createdAtMs: command.issuedAtMs,
+    },
+  } as const satisfies Extract<RuntimeLifecycleCommand, { kind: "run.start" }>;
+}
+
+function yoloStartCommand(): Extract<RuntimeLifecycleCommand, { kind: "run.start" }> {
+  const start = startCommand();
+  const effect = {
+    wallClock: { milliseconds: 1 },
+    modelTokens: 0,
+    modelSpend: { currency: "USD", minorUnits: 0 },
+    outboundBytes: 1,
+    actionCounts: {
+      local: 0,
+      "scoped-external": 0,
+      protected: 1,
+      forbidden: 0,
+    },
+  } as const;
+  const unsignedManifest = {
+    version: 1,
+    manifestId: "manifest-1",
+    actionClass: "protected",
+    provider: "deployment-provider",
+    operation: "deployment.create-preview",
+    exactTarget: "preview:project-1/session-1",
+    actionSchema: {
+      schemaId: "deployment-preview-v1",
+      schemaVersion: 1,
+      schemaDigest: "5".repeat(64),
+      canonicalizationProfile: "terminalx-canonical-effect-v1",
+      unknownFields: "reject",
+    },
+    canonicalEffectInputDigest: "6".repeat(64),
+    effectIdempotencyKey: "effect-key-1",
+    expectedEffect: effect,
+    expiresAtMs: 350,
+  } as const;
+  const manifest = {
+    ...unsignedManifest,
+    digest: digestActionManifest(unsignedManifest),
+  } as const;
+  return {
+    ...start,
+    policy: {
+      ...start.policy,
+      mode: "yolo",
+      yoloConfirmationRef: "yolo-confirmation-1",
+    },
+    yoloAuthorization: {
+      manifest,
+      grant: {
+        grantId: "grant-1",
+        teamId: binding.teamId,
+        projectId: binding.projectId,
+        sessionId: binding.sessionId,
+        agentRunId: command.agentRunId,
+        runPolicyRevision: start.runPolicyRevision,
+        runtimeAssignmentId: binding.runtimeAssignmentId,
+        runtimeAssignmentGeneration: binding.runtimeAssignmentGeneration,
+        sandboxId: binding.sandboxId,
+        sandboxGeneration: binding.sandboxGeneration,
+        runtimePrincipalId: binding.runtimePrincipalId,
+        runtimeAuthorizationGeneration: command.runtimeAuthorizationGeneration,
+        approvalRequestId: "approval-request-1",
+        approvalRequestVersion: 1,
+        provider: manifest.provider,
+        operation: manifest.operation,
+        target: manifest.exactTarget,
+        budget: { perEffectLimit: effect, cumulativeLimit: effect },
+        usageLedgerRef: "usage-ledger-1",
+        issuerActorRef: "user-1",
+        issuerApprovalAuthorityRevision: "approval-authority-1",
+        expiresAtMs: 350,
+        signature: "signed-grant",
+        createdAtMs: command.issuedAtMs,
+        actionClass: "protected",
+        scope: {
+          kind: "once",
+          manifestDigest: manifest.digest,
+          effectIdempotencyKey: manifest.effectIdempotencyKey,
+        },
+      },
+    },
+  } as const satisfies Extract<RuntimeLifecycleCommand, { kind: "run.start" }>;
 }
 
 type WithoutReceiptBase<Receipt> = Receipt extends NonDuplicateRuntimeReceipt
