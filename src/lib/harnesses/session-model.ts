@@ -9,6 +9,20 @@
 
 import type { CommandOptions } from "./types";
 
+const SAFE_HARNESS_ID = /^[A-Za-z0-9][A-Za-z0-9._+-]*$/;
+const SAFE_HARNESS_ARGUMENT = /^[A-Za-z0-9][A-Za-z0-9.\/:@_+-]*$/;
+
+/**
+ * Return whether an untrusted value is safe to append as one unquoted harness
+ * argument. Model slugs may use common provider syntax (`/`, `:`, `.`, `@`,
+ * `_`, `+`, `-`), but must start with an alphanumeric character and may never
+ * contain whitespace or shell syntax. Invalid values are omitted, not thrown,
+ * because session creation may already have produced worktree side effects.
+ */
+export function isSafeHarnessArgumentToken(value: unknown): value is string {
+  return typeof value === "string" && !/\s/.test(value) && SAFE_HARNESS_ARGUMENT.test(value);
+}
+
 export interface SplitModelId {
   /** Harness id prefix, e.g. "claude". */
   harness: string;
@@ -26,7 +40,14 @@ export function splitModelId(modelId: string | null | undefined): SplitModelId |
   if (typeof modelId !== "string") return null;
   const idx = modelId.indexOf(":");
   if (idx <= 0 || idx === modelId.length - 1) return null;
-  return { harness: modelId.slice(0, idx), slug: modelId.slice(idx + 1) };
+
+  const harness = modelId.slice(0, idx);
+  const slug = modelId.slice(idx + 1);
+  if (/\s/.test(harness) || !SAFE_HARNESS_ID.test(harness) || !isSafeHarnessArgumentToken(slug)) {
+    return null;
+  }
+
+  return { harness, slug };
 }
 
 /** The resolved Models settings relevant to launching a session. */

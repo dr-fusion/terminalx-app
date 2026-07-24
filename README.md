@@ -127,6 +127,14 @@ Now accessible at `https://your-machine.tailnet.ts.net`. TerminalX still require
 
 TerminalX runs **directly on your server** via node-pty + tmux. No SSH tunneling, no cloud dependencies. Terminal sessions persist through browser disconnects because they're backed by tmux.
 
+### Local AI-session safety boundary
+
+TerminalX-generated LocalTmux launches do not request Claude Code's permission-bypass mode or Codex's YOLO mode. The legacy Session API field that requested permission skipping is rejected before any worktree, port, tmux, metadata, or Telegram side effect.
+
+LocalTmux is still trusted, single-host execution—not a Sandbox or a tenant-isolation boundary. The launched CLI inherits the host user's and Project's own harness configuration, hooks, credentials, filesystem access, and network access. Treat that configuration as local operator authority. Hosted bypass modes must be implemented separately inside a verified isolated Sandbox; they must not be added back as LocalTmux harness flags.
+
+Tmux preserves already-running processes across application upgrades. After upgrading from a version that launched Claude with `--dangerously-skip-permissions` or Codex with `--yolo`, stop and recreate those managed AI sessions; changing the launcher cannot alter an existing process's arguments.
+
 ## Configuration
 
 All settings via environment variables. See [`.env.example`](.env.example) for the full list.

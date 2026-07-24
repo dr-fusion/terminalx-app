@@ -6,6 +6,7 @@
 // fields render as dashes (we do not fabricate account values).
 
 import { execFileSync } from "child_process";
+import { isSafeExecutableToken } from "./command";
 import { getHarness } from "./registry";
 
 export interface HarnessStatus {
@@ -34,10 +35,10 @@ export interface HarnessStatus {
 function resolveBin(id: string, declared: string | null): string | null {
   if (declared === null) return null;
   if (id === "opencode") {
-    const override = process.env.TERMINALX_OPENCODE_BIN?.trim();
-    if (override) return override;
+    const override = process.env.TERMINALX_OPENCODE_BIN;
+    if (override && isSafeExecutableToken(override)) return override;
   }
-  return declared;
+  return isSafeExecutableToken(declared) ? declared : null;
 }
 
 /** `command -v <bin>` → absolute path, or undefined when not on PATH. */

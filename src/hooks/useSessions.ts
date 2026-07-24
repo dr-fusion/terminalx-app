@@ -32,7 +32,6 @@ export interface TmuxSession {
 }
 
 export interface CreateSessionOptions {
-  dangerouslySkipPermissions?: boolean;
   cwd?: string;
   worktree?: {
     create: boolean;
@@ -255,7 +254,6 @@ export function useSessions(): UseSessionsReturn {
           body: JSON.stringify({
             name,
             kind,
-            dangerouslySkipPermissions: options.dangerouslySkipPermissions,
             cwd: options.cwd,
             worktree: options.worktree,
             skipSetup: options.skipSetup,

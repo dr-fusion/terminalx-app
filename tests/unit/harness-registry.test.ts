@@ -37,18 +37,13 @@ describe("harness registry", () => {
     expect(bash?.auth).toBe("none");
   });
 
-  it("declares the claude skip-permissions flag in data, not code", () => {
-    const claude = getHarness("claude");
-    expect(claude?.command.optionFlags).toEqual([
-      { when: "dangerouslySkipPermissions", flag: "--dangerously-skip-permissions" },
-    ]);
-    // codex/cursor do NOT carry the flag.
-    expect(getHarness("codex")?.command.optionFlags ?? []).toEqual([]);
-    expect(getHarness("cursor")?.command.optionFlags ?? []).toEqual([]);
-  });
-
-  it("declares --yolo as a default Codex argument", () => {
-    expect(getHarness("codex")?.command.baseArgs).toEqual(["--yolo"]);
+  it("does not register permission-skipping flags for LocalTmux harnesses", () => {
+    const registry = JSON.stringify(HARNESSES);
+    expect(registry).not.toContain("dangerouslySkipPermissions");
+    expect(registry).not.toContain("--dangerously-skip-permissions");
+    for (const harness of HARNESSES) {
+      expect(harness.command.baseArgs ?? []).not.toContain("--yolo");
+    }
   });
 
   it("listHarnesses returns the full descriptor list", () => {

@@ -8,10 +8,8 @@
 /** Authentication strategy mirrored from Conductor's Claude Code tab. */
 export type HarnessAuthMethod = "cli" | "api-key" | "none";
 
-/** Options consumed by the command builder; gated per-harness via optionFlags. */
+/** Options consumed by the command builder. */
 export interface CommandOptions {
-  /** claude-only today; data-driven via optionFlags. */
-  dangerouslySkipPermissions?: boolean;
   /**
    * Issue #11: the harness-native model slug to launch (e.g. "opus-4-8-1m"),
    * already stripped of its provider prefix. Emitted only when the harness
@@ -31,16 +29,6 @@ export interface HarnessCommandSpec {
   bin: string | null;
   /** Extra args appended unconditionally. */
   baseArgs?: string[];
-  /**
-   * Flags that are conditionally appended from CommandOptions.
-   * Keeps the `--dangerously-skip-permissions` special-case data-driven
-   * instead of a hard-coded `kind === "claude"` check.
-   */
-  optionFlags?: Array<{
-    /** key in CommandOptions that gates this flag */
-    when: keyof CommandOptions;
-    flag: string;
-  }>;
   /**
    * Issue #11: the CLI flag that selects a model, e.g. "--model" (claude/opencode)
    * or "-m" (codex). When set AND CommandOptions.model is non-empty, the builder

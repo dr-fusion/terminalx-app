@@ -5,6 +5,12 @@
 **Backs GitHub issue:** #4
 **Conductor analog:** Settings → **Harnesses** page (Claude Code / Codex / Cursor / OpenCode[NEW] tabs) + the **Providers** picker reached from the OpenCode tab.
 
+> **Safety correction (2026-07-23):** The LocalTmux implementation no longer
+> exposes or consumes `dangerouslySkipPermissions`, and Codex no longer starts
+> with `--yolo`. The correction in `00-corrections.md` supersedes the older
+> payload, UI, `optionFlags`, and command examples retained below as design
+> history.
+
 ---
 
 ## 0. Summary

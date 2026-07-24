@@ -142,7 +142,7 @@ describe("POST /api/sessions", () => {
     mocks.getConfiguredMaxSessions.mockReturnValue(20);
     mocks.resolveSafePath.mockReturnValue(tmpDir);
     mocks.isValidKind.mockReturnValue(true);
-    mocks.commandForKind.mockReturnValue("codex --yolo");
+    mocks.commandForKind.mockReturnValue("codex");
     mocks.listMetadata.mockReturnValue([]);
     mocks.resolveSessionModelSettings.mockReturnValue({
       modelId: "claude:opus-4-8-1m",
@@ -187,11 +187,13 @@ describe("POST /api/sessions", () => {
 
     expect(res.status).toBe(201);
     expect(mocks.commandForKind).toHaveBeenCalledWith("codex", {
-      dangerouslySkipPermissions: true,
       planMode: false,
       model: undefined,
     });
-    expect(mocks.createSession).toHaveBeenCalledWith("agent", "codex --yolo", tmpDir);
+    expect(mocks.createSession).toHaveBeenCalledWith("agent", "codex", tmpDir);
+    expect(mocks.saveMeta).toHaveBeenCalledWith(
+      expect.objectContaining({ name: "agent", modelId: undefined })
+    );
     expect(mocks.bridgedEnsureTopic).toHaveBeenCalledWith(
       { username: "admin", role: "admin" },
       "agent",
@@ -203,6 +205,54 @@ describe("POST /api/sessions", () => {
       viewMode: "chat",
       created: true,
     });
+  });
+
+  it("persists only the validated model passed to the harness", async () => {
+    mocks.resolveSessionModelSettings.mockReturnValue({
+      modelId: "codex:gpt-5-codex",
+      effort: "high",
+      personality: "pragmatic",
+      planMode: false,
+      fastMode: false,
+      modelExplicit: true,
+    });
+    mocks.modelOptionsForKind.mockReturnValue({ planMode: false, model: "gpt-5-codex" });
+
+    const { POST } = await import("@/app/api/sessions/route");
+    const res = await POST(mockReq({ name: "model-session", kind: "codex", cwd: tmpDir }));
+
+    expect(res.status).toBe(201);
+    expect(mocks.saveMeta).toHaveBeenCalledWith(
+      expect.objectContaining({ name: "model-session", modelId: "codex:gpt-5-codex" })
+    );
+  });
+
+  it("rejects permission skipping before any session or worktree effect", async () => {
+    const { POST } = await import("@/app/api/sessions/route");
+    const res = await POST(
+      mockReq({
+        name: "agent",
+        kind: "claude",
+        cwd: tmpDir,
+        dangerouslySkipPermissions: true,
+        worktree: { create: true, branch: "feature/unsafe" },
+      })
+    );
+    const body = await res.json();
+
+    expect(res.status).toBe(400);
+    expect(body).toEqual({
+      error:
+        "LocalTmux sessions cannot skip harness permissions; dangerouslySkipPermissions is not allowed",
+    });
+    expect(mocks.getUserScoping).not.toHaveBeenCalled();
+    expect(mocks.listSessions).not.toHaveBeenCalled();
+    expect(mocks.resolveSafePath).not.toHaveBeenCalled();
+    expect(mocks.createGitWorktreeForSession).not.toHaveBeenCalled();
+    expect(mocks.allocateWorkspacePort).not.toHaveBeenCalled();
+    expect(mocks.commandForKind).not.toHaveBeenCalled();
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(mocks.saveMeta).not.toHaveBeenCalled();
   });
 
   it("surfaces a main refresh failure without creating the session", async () => {
