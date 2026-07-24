@@ -9,6 +9,7 @@ import {
   TeamSessionError,
   type ActorContext,
   type ProjectAccessView,
+  type PublicSessionRunStateView,
   type SessionAdmissionView,
   type SessionDetailView,
   type SessionCommand,
@@ -28,7 +29,9 @@ const SAFE_IDENTIFIER_PATTERN = /^[^\u0000-\u001f\u007f]{1,300}$/;
 
 type HumanCommandType = Exclude<
   SessionCommand["type"],
-  "runtime.outbox.acknowledge" | "runtime.outbox.fail"
+  | "runtime.outbox.acknowledge"
+  | "runtime.outbox.fail"
+  | Extract<SessionCommand["type"], `run.${string}` | `goal.${string}`>
 >;
 
 const HUMAN_COMMAND_FIELDS = {
@@ -817,6 +820,27 @@ export async function handleSessionGet(
       throw new HttpProblem(404, "resource-unavailable", "Resource is unavailable");
     }
     return jsonResponse({ session: visibleSession });
+  });
+}
+
+export async function handleSessionRunState(
+  request: Request,
+  sessionId: string,
+  dependencies: TeamSessionHttpDependencies = {}
+): Promise<Response> {
+  return withHttpErrors(dependencies, async () => {
+    const actor = await requireActor(request, dependencies);
+    const normalizedSessionId = requireIdentifier(sessionId, "Session id");
+    const runState: PublicSessionRunStateView | null = await sessions(dependencies).inspect({
+      schemaVersion: TEAM_SESSION_SCHEMA_VERSION,
+      type: "session.public-run-state",
+      actor,
+      sessionId: normalizedSessionId,
+    });
+    if (!runState) {
+      throw new HttpProblem(404, "resource-unavailable", "Resource is unavailable");
+    }
+    return jsonResponse({ runState });
   });
 }
 

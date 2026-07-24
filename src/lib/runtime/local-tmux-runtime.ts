@@ -79,10 +79,23 @@ export interface CanonicalPtyTermination {
 export interface LocalTmuxFenceCallbacks {
   updateWriteState(update: RuntimeWriteStateUpdate): void;
   terminateCanonicalPtys(input: CanonicalPtyTermination): Promise<void>;
+  /** Checked before and after ensure so a superseded worker cannot resurrect a Session. */
+  runtimeEnsureState(input: {
+    sessionId: string;
+    tmuxName: string;
+    runtimeAuthorizationGeneration: number;
+  }): Promise<"pending" | "enforced" | "stale">;
   /** Required before a destructive retire; false fails closed without touching tmux. */
   isCurrentRuntimeBinding(input: {
     sessionId: string;
     runtimeAuthorizationGeneration: number;
+    emergencyStop?: {
+      agentRunId: string;
+      runtimeAssignmentId: string;
+      runtimeAssignmentGeneration: number;
+      sandboxId: string;
+      sandboxGeneration: number;
+    };
   }): Promise<boolean>;
 }
 
@@ -205,12 +218,25 @@ export class LocalTmuxRuntime {
   ): Promise<void> {
     const { sessionId, tmuxName, runtimeAuthorizationGeneration } = delivery.payload;
     validateBinding(sessionId, tmuxName, runtimeAuthorizationGeneration);
+    const initialState = await this.callbacks.runtimeEnsureState({
+      sessionId,
+      tmuxName,
+      runtimeAuthorizationGeneration,
+    });
+    if (initialState === "stale") {
+      throw new RuntimeEffectError("runtime_invalid_state", false);
+    }
     const server = await this.serverState(sessionId);
     if (server === "canonical") {
       const existing = await this.sessionById(sessionId);
       if (existing) {
         this.assertOwnedBinding(existing, sessionId, tmuxName, runtimeAuthorizationGeneration);
         if (existing.runtimeAuthorizationGeneration === runtimeAuthorizationGeneration) {
+          await this.requireEnsureStillCurrentOrCleanup(
+            sessionId,
+            tmuxName,
+            runtimeAuthorizationGeneration
+          );
           this.updateWriteState({
             sessionId,
             runtimeAuthorizationGeneration,
@@ -219,6 +245,10 @@ export class LocalTmuxRuntime {
         }
         return;
       }
+    }
+
+    if (initialState === "enforced") {
+      throw new RuntimeEffectError("runtime_invalid_state", false);
     }
 
     const created = await this.run(
@@ -238,12 +268,67 @@ export class LocalTmuxRuntime {
     if (!verified) throw new RuntimeEffectError("runtime_invalid_state", false);
     this.assertOwnedBinding(verified, sessionId, tmuxName, runtimeAuthorizationGeneration);
     if (verified.runtimeAuthorizationGeneration === runtimeAuthorizationGeneration) {
+      await this.requireEnsureStillCurrentOrCleanup(
+        sessionId,
+        tmuxName,
+        runtimeAuthorizationGeneration
+      );
       this.updateWriteState({
         sessionId,
         runtimeAuthorizationGeneration,
         state: "active",
       });
     }
+  }
+
+  private async requireEnsureStillCurrentOrCleanup(
+    sessionId: string,
+    tmuxName: string,
+    runtimeAuthorizationGeneration: number
+  ): Promise<void> {
+    const state = await this.callbacks.runtimeEnsureState({
+      sessionId,
+      tmuxName,
+      runtimeAuthorizationGeneration,
+    });
+    if (state === "pending" || state === "enforced") {
+      return;
+    }
+
+    await this.cleanupSupersededEnsure(sessionId, tmuxName, runtimeAuthorizationGeneration);
+    throw new RuntimeEffectError("runtime_invalid_state", false);
+  }
+
+  private async cleanupSupersededEnsure(
+    sessionId: string,
+    tmuxName: string,
+    runtimeAuthorizationGeneration: number
+  ): Promise<void> {
+    const state = await this.serverState(sessionId);
+    if (state === "absent") return;
+    const session = await this.sessionById(sessionId);
+    if (!session) return;
+    if (
+      session.tmuxName !== tmuxName ||
+      session.runtimeAuthorizationGeneration !== runtimeAuthorizationGeneration
+    ) {
+      return;
+    }
+
+    this.updateWriteState({
+      sessionId,
+      runtimeAuthorizationGeneration,
+      state: "retired",
+    });
+    await this.detachClients(sessionId, tmuxName);
+    await this.callbacks.terminateCanonicalPtys({
+      sessionId,
+      tmuxName,
+      runtimeAuthorizationGeneration,
+      reason: "retire",
+    });
+    const kill = await this.run(sessionId, ["kill-session", "-t", canonicalTmuxTarget(tmuxName)]);
+    if (!kill.ok && !isNoServer(kill)) throw executionFailure(kill);
   }
 
   private async fence(
@@ -284,10 +369,20 @@ export class LocalTmuxRuntime {
     const { sessionId, runtimeAuthorizationGeneration } = delivery.payload;
     validateGeneration(runtimeAuthorizationGeneration);
     validateCanonicalSessionId(sessionId);
+    if (delivery.payload.reason !== "emergency-stop") {
+      throw new RuntimeEffectError("runtime_invalid_state", false);
+    }
     if (
       !(await this.callbacks.isCurrentRuntimeBinding({
         sessionId,
         runtimeAuthorizationGeneration,
+        emergencyStop: {
+          agentRunId: delivery.payload.agentRunId,
+          runtimeAssignmentId: delivery.payload.runtimeAssignmentId,
+          runtimeAssignmentGeneration: delivery.payload.runtimeAssignmentGeneration,
+          sandboxId: delivery.payload.sandboxId,
+          sandboxGeneration: delivery.payload.sandboxGeneration,
+        },
       }))
     ) {
       throw new RuntimeEffectError("runtime_invalid_state", false);
@@ -309,9 +404,6 @@ export class LocalTmuxRuntime {
         state: "retired",
       });
       return;
-    }
-    if (session.runtimeAuthorizationGeneration !== runtimeAuthorizationGeneration) {
-      throw new RuntimeEffectError("runtime_invalid_state", false);
     }
     this.updateWriteState({
       sessionId,
@@ -570,7 +662,12 @@ function parseSessionListLine(line: string): CanonicalSessionMetadata {
 }
 
 function isNoServer(result: Exclude<ExactCommandResult, { ok: true }>): boolean {
-  return /no server running|no sessions|error connecting/i.test(result.stderr);
+  const stderr = result.stderr.trim();
+  return (
+    /^no server running on [^\r\n]+$/i.test(stderr) ||
+    /^no sessions$/i.test(stderr) ||
+    /^error connecting to [^\r\n]+ \(No such file or directory\)$/i.test(stderr)
+  );
 }
 
 function executionFailure(result: Exclude<ExactCommandResult, { ok: true }>): RuntimeEffectError {

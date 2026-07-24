@@ -565,6 +565,22 @@ describe("Team Session kernel", () => {
     try {
       database.exec(`
         PRAGMA foreign_keys = OFF;
+        DROP TABLE grant_reviews;
+        DROP TABLE action_grant_states;
+        DROP TABLE action_grants;
+        DROP TABLE attention_requests;
+        DROP TABLE approval_requests;
+        DROP TABLE action_manifests;
+        DROP TABLE goal_evidence;
+        DROP TABLE goals;
+        DROP TABLE goal_sets;
+        DROP TABLE run_policy_revisions;
+        DROP TABLE agent_runs;
+        DROP TABLE runtime_authorization_epochs;
+        DROP TABLE runtime_assignments;
+        DROP TRIGGER sessions_runtime_configuration_immutable;
+        DROP TRIGGER sessions_runtime_authorization_monotonic;
+        ALTER TABLE sessions DROP COLUMN run_state_revision;
         DROP TABLE conversation_suggestion_resolutions;
         DROP TABLE conversation_directives;
         DROP TABLE conversation_identities;
@@ -2212,7 +2228,7 @@ describe("Team Session kernel", () => {
 
     const database = new Database(filename, { readonly: true });
     try {
-      expect(database.pragma("user_version", { simple: true })).toBe(2);
+      expect(database.pragma("user_version", { simple: true })).toBe(3);
       expect(database.pragma("foreign_key_check")).toEqual([]);
       expect(
         database
