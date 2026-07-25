@@ -16,7 +16,7 @@ describe("canonical identity schema", () => {
   it("creates the versioned User and authentication identity authority", () => {
     database = openTeamSessionDatabase({ filename: ":memory:" });
 
-    expect(database.db.pragma("user_version", { simple: true })).toBe(14);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(15);
     expect(
       database.db
         .prepare(
@@ -293,6 +293,7 @@ describe("canonical identity schema", () => {
         ) VALUES (
           'project-1', 'google-google-subject-1', 'maintainer', 'active', 2, 100, NULL
         );
+        DROP TABLE installation_webhook_auth_digests;
         DROP TABLE provider_webhook_deliveries;
         DROP TABLE mobile_auth_migrations;
         DROP TABLE paired_devices;
@@ -315,7 +316,7 @@ describe("canonical identity schema", () => {
 
       database = openTeamSessionDatabase({ filename });
 
-      expect(database.db.pragma("user_version", { simple: true })).toBe(14);
+      expect(database.db.pragma("user_version", { simple: true })).toBe(15);
       expect(database.db.prepare("SELECT id, name FROM teams").all()).toEqual([
         { id: "team-1", name: "Team" },
       ]);
@@ -384,6 +385,7 @@ describe("canonical identity schema", () => {
           'google-compatible-identity', 'google-compatible-subject', 'google',
           'compatible-subject', 'active', 1, 100, 100, 100, NULL
         );
+        DROP TABLE installation_webhook_auth_digests;
         DROP TABLE provider_webhook_deliveries;
         DROP TABLE mobile_auth_migrations;
         DROP TABLE paired_devices;
@@ -402,7 +404,7 @@ describe("canonical identity schema", () => {
 
       database = openTeamSessionDatabase({ filename });
 
-      expect(database.db.pragma("user_version", { simple: true })).toBe(14);
+      expect(database.db.pragma("user_version", { simple: true })).toBe(15);
       expect(database.db.prepare("SELECT * FROM legacy_google_identity_bridges").all()).toEqual([
         {
           google_subject: "compatible-subject",
@@ -438,6 +440,7 @@ describe("canonical identity schema", () => {
           'opaque-preview-identity', 'opaque-preview-user', 'google',
           'preview-subject', 'active', 1, 100, 100, 100, NULL
         );
+        DROP TABLE installation_webhook_auth_digests;
         DROP TABLE provider_webhook_deliveries;
         DROP TABLE mobile_auth_migrations;
         DROP TABLE paired_devices;
