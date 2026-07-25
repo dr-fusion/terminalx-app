@@ -5,7 +5,10 @@ import {
 } from "./identity-authority";
 import { createStoredAuthenticationSessionValidator } from "./auth-session-validator";
 import { createConnectionAuthority, type ConnectionAuthority } from "./connections/authority";
-import { resolveConfiguredBrokerReceiptVerifier } from "./connections/secret-broker-composition";
+import {
+  resolveConfiguredBrokerReceiptVerifier,
+  resolveConfiguredProviderProofVerifier,
+} from "./connections/secret-broker-composition";
 import { createMobileAuthAuthority, type MobileAuthAuthority } from "./mobile-auth/authority";
 import { readLegacyDeviceImport } from "./mobile-auth/legacy-devices";
 import { openTeamSessionDatabase, type TeamSessionDatabase } from "./team-sessions/sqlite";
@@ -71,6 +74,10 @@ function createService(filename: string): CanonicalIdentityService {
     // credential-handle registration fails exactly as it does today.
     const verifyCredentialHandleRegistration =
       resolveConfiguredBrokerReceiptVerifier() ?? undefined;
+    // Composed only when a Secret Broker is configured. It routes on the
+    // authority-built provider to the Telegram deep-link and Slack OIDC
+    // verifiers; without it, identity Link Challenge completion fails closed.
+    const verifyProviderProof = resolveConfiguredProviderProofVerifier() ?? undefined;
     return {
       filename,
       database,
@@ -78,6 +85,7 @@ function createService(filename: string): CanonicalIdentityService {
       connectionAuthority: createConnectionAuthority({
         db: database.db,
         verifyCredentialHandleRegistration,
+        verifyProviderProof,
         validateAuthenticationSnapshot: (snapshot) =>
           validateAuthenticationSnapshot({
             canonicalUserId: snapshot.userId,
