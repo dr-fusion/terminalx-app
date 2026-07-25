@@ -36,6 +36,37 @@ Phase 8.
   network I/O happens only inside the broker. Fails closed (retryable) if the
   reference cannot be resolved.
 
+## Credential Proxy (Slice 8D)
+
+When the bootstrap config sets `proxy.enabled: true`, the same process also serves
+the **Credential Proxy** on a sibling socket (`proxy.sock`) in the broker root
+under the identical `SO_PEERCRED` admission. The proxy uses a Credential Handle
+to perform an approved, destination-scoped provider request without revealing the
+credential to the caller.
+
+- Operations are a **closed, typed registry** (`telegram.sendMessage`,
+  `telegram.editMessageText`, `telegram.getFile`, `telegram.downloadFile`,
+  `slack.chat.postMessage`, `slack.chat.update`, `slack.conversations.info`).
+  There is no generic "HTTP request with a credential" operation.
+- Each call revalidates the authority fences (handle `active`, provider match,
+  `expectationDigest` match) against broker-durable state before attaching the
+  credential, and fails closed with an audited `denied` result otherwise.
+- Results are a closed envelope; provider responses are projected to allowlisted
+  fields; errors are bounded classification tokens. Authorization headers, signing
+  keys, and the token-bearing Telegram file URL never leave the process.
+- Every call is recorded in an append-only, immutable `proxy-accounting.sqlite`
+  (request/response byte counts excluding credential bytes, result class,
+  ambiguity, authority ids). This is the Gate 5 receipt source; no reservation
+  math is performed here.
+
+Config: `proxy: { enabled, originOverrides?, requestTimeoutMs? }`. `originOverrides`
+maps an operation host to a request origin for a hermetic test or a private egress
+gateway without weakening the operation host allowlist. See
+`../../docs/adr/0003-credential-proxy-typed-operations.md`.
+
+See `ADR 0003` for why the proxy runs inside the broker process and why no generic
+authenticated-request operation exists.
+
 ## Building the native helper
 
 ```sh

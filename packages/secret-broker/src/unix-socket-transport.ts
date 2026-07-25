@@ -10,12 +10,30 @@ export interface SecretBrokerDenialEvent {
   readonly code: string;
 }
 
+/** A protocol-specific connection runner for one admitted socket. */
+export type SecretBrokerConnectionRunner = (io: {
+  readonly input: Socket;
+  readonly output: Socket;
+  readonly signal: AbortSignal;
+}) => Promise<void>;
+
 export interface StartSecretBrokerUnixServerOptions {
   readonly socketPath: string;
   readonly expectedOwnerUid?: number;
   readonly expectedParentPid?: number;
   readonly verifyPeerCredentials: SecretBrokerPeerCredentialVerifier;
-  readonly handler: SecretBrokerRequestHandler;
+  /**
+   * The registration handler served over the default NDJSON runner. Provide this
+   * for the Secret Broker socket. For a sibling protocol (e.g. the Credential
+   * Proxy), provide {@link runConnection} instead.
+   */
+  readonly handler?: SecretBrokerRequestHandler;
+  /**
+   * A protocol-specific connection runner that closes over its own handler.
+   * Takes precedence over {@link handler} when set, so the same peer-credential
+   * admission logic can serve a different, non-registration protocol.
+   */
+  readonly runConnection?: SecretBrokerConnectionRunner;
   readonly maxConnections?: number;
   /** Structured, secret-free audit sink (defaults to stderr in the daemon). */
   readonly onDenial?: (event: SecretBrokerDenialEvent) => void;
@@ -42,6 +60,9 @@ export async function startSecretBrokerUnixServer(
     throw new SecretBrokerProtocolError("permission-denied");
   }
   if (typeof options.verifyPeerCredentials !== "function") throw new TypeError();
+  if (typeof options.handler !== "function" && typeof options.runConnection !== "function") {
+    throw new TypeError();
+  }
   assertPrivateParentDirectory(socketPath, expectedOwnerUid);
   removeStaleSocket(socketPath, expectedOwnerUid);
 
@@ -104,12 +125,16 @@ async function admit(
   }
   socket.resume();
   try {
-    await runSecretBrokerConnection({
-      input: socket,
-      output: socket,
-      handler: options.handler,
-      signal: controller.signal,
-    });
+    if (options.runConnection) {
+      await options.runConnection({ input: socket, output: socket, signal: controller.signal });
+    } else if (options.handler) {
+      await runSecretBrokerConnection({
+        input: socket,
+        output: socket,
+        handler: options.handler,
+        signal: controller.signal,
+      });
+    }
   } catch (error) {
     options.onDenial?.({
       reason: "connection-error",

@@ -45,6 +45,15 @@ export interface SecretBrokerStateStore {
   getByOperationId(operationId: string): RegistrationRow | null;
   getByHandleId(handleId: string): RegistrationRow | null;
   getByReceiptId(receiptId: string): RegistrationRow | null;
+  /**
+   * Broker-private credential-use seam for the Credential Proxy (Slice 8D).
+   * Returns the stored adapter-opaque secret material for an `active` handle so
+   * the proxy — running inside this same non-exporting process — can resolve it
+   * for a single approved outbound request. Returns `null` for any non-active
+   * handle. This value never crosses the protocol boundary; the closed-response
+   * guard makes returning it over the wire impossible.
+   */
+  getActiveSecretMaterial(handleId: string): Buffer | null;
   finalize(handleId: string, receiptId: string): RegistrationRow;
   finalizeRotation(handleId: string, receiptId: string): RegistrationRow;
   abort(receiptId: string): RegistrationRow;
@@ -183,6 +192,12 @@ export function openSecretBrokerStateStore(
     getByReceiptId(receiptId: string): RegistrationRow | null {
       const row = selectByReceipt.get(receiptId) as RawRow | undefined;
       return row ? toRow(row) : null;
+    },
+    getActiveSecretMaterial(handleId: string): Buffer | null {
+      const row = selectByHandle.get(handleId) as RawRow | undefined;
+      if (!row || row.status !== "active" || row.secret_material === null) return null;
+      // Return a copy so the caller can zero it without touching the driver's buffer.
+      return Buffer.from(row.secret_material);
     },
 
     finalize(handleId: string, receiptId: string): RegistrationRow {

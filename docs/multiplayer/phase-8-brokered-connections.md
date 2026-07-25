@@ -1,8 +1,8 @@
 # Phase 8 brokered secrets and connections
 
 Status: in progress. The canonical authentication identity foundation, the Slice 8B local connection
-authority, and the Slice 8C Secret Broker process are complete. The Credential Proxy process, real
-provider adapters, and hosted exfiltration evidence remain closed. Release Gate 3 is open, and hosted
+authority, the Slice 8C Secret Broker process, and the Slice 8D Credential Proxy are complete. Real
+provider adapters and hosted exfiltration evidence remain closed. Release Gate 3 is open, and hosted
 Runtimes must continue to advertise `brokeredCredentials: false` and `proxyOnlyEgress: false`.
 
 ## Authority boundaries
@@ -224,11 +224,58 @@ Deliberately closed in 8C: there is no operation that uses a credential (that is
 Proxy), no real Slack/Telegram provider adapters (8E), and no hosted enforcement evidence (8F/8G).
 `brokeredCredentials` and `proxyOnlyEgress` remain `false` everywhere and Release Gate 3 stays open.
 
+## Slice 8D — Credential Proxy
+
+Status: complete. The Credential Proxy is the destination-scoped effect boundary that uses a
+Credential Handle to perform an approved outbound provider request without revealing the credential
+to the caller. It runs **inside the Secret Broker process** on a sibling Unix socket (`proxy.sock`)
+in the same `0700` broker root under the same `SO_PEERCRED` admission, so the credential value and
+the at-rest key never leave that address space. The design and its rationale are recorded in
+[`ADR 0003`](../adr/0003-credential-proxy-typed-operations.md).
+
+- **Typed, closed operation registry.** There is no generic "HTTP request with a credential"
+  operation. The registry is a closed set of named **Typed Provider Operations**
+  (`telegram.sendMessage`, `telegram.editMessageText`, `telegram.getFile`, `telegram.downloadFile`,
+  `slack.chat.postMessage`, `slack.chat.update`, `slack.conversations.info`). Each declares its
+  provider, an exact destination host (`api.telegram.org`, `slack.com`), method, credential
+  placement, a bounded/validated parameter schema, and a bounded response projection. Path segments
+  are fixed constants; the one path-bound parameter (`file_path`) is strictly validated against
+  traversal. This eliminates the confused-deputy/SSRF class by construction.
+- **Fences revalidated per send.** Every call carries the exact authority snapshot (handle
+  id + generation, installation id + revision, binding id + revision where applicable, provider,
+  and `expectationDigest`). Before attaching the credential the proxy revalidates against
+  broker-durable state that the handle is `active`, that its provider matches the destination, and
+  that its stored `expectationDigest` matches. A revoked/rotated handle or a stale authority target
+  fails closed with an audited `denied` result and the credential is never attached.
+- **No exposure, by construction.** The result is a closed envelope enforced by a runtime guard;
+  raw provider responses are projected to allowlisted fields, never forwarded; errors are projected
+  to bounded classification tokens. Authorization headers, signing keys, upstream error bodies, and
+  the token-bearing Telegram file URL never appear in any result, log, or error. Logs carry digests
+  and byte counts only.
+- **Outbound accounting.** Each call is durably recorded in an append-only, immutable, monotonically
+  ordered broker-side accounting log and returned in the typed result: request/response byte counts
+  (credential bytes excluded), operation, destination, result class, ambiguity, timestamps, and the
+  authority identifiers. This is the receipt source Release Gate 5 (Phase 9) will consume; 8D does
+  not build Gate 5 reservation math.
+- **Bounded, fail-closed network I/O.** Network I/O happens only inside the broker through an
+  injectable client (real `fetch` in production, hermetic fakes in tests): TLS only (loopback `http`
+  allowed only for an explicitly configured origin), redirects never followed, no environment proxy
+  honored, response size cap enforced before buffering, bounded timeouts, and an ambiguous
+  timeout-after-send classified `retryable` + `ambiguous` and recorded as ambiguous.
+
+Deliberately closed in 8D: no caller migrates onto the proxy — the legacy Telegram path is
+unchanged, and no HTTP route exposes the proxy to a browser. The `onepassword-connect` kind holds
+only an external reference and is not resolvable for use in 8D (fails closed with
+`unsupported-credential-kind`). Real provider adapters and least-privilege scopes (8E), hosted
+enforcement evidence (8F/8G), and Gate 5 reservation math (Phase 9) remain out of scope.
+`brokeredCredentials` and `proxyOnlyEgress` remain `false` everywhere and Release Gate 3 stays open.
+
 ## Remaining implementation slices
 
 - **8C — Secret Broker:** complete; see the Slice 8C section above.
-- **8D — Credential Proxy:** permit only typed, destination-scoped provider operations and account
-  outbound bytes and results without exposing authorization headers or signing keys.
+- **8D — Credential Proxy:** complete; see the Slice 8D section above. Permits only typed,
+  destination-scoped provider operations and accounts outbound bytes and results without exposing
+  authorization headers or signing keys.
 - **8E — providers:** implement Telegram and Slack installation, linking, rotation, revocation,
   webhook verification, replay protection, and least-privilege scopes without importing legacy
   plaintext provider state into the authority model.
