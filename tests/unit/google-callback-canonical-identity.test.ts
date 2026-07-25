@@ -55,6 +55,9 @@ describe("Google callback canonical identity", () => {
       authSubject?: string;
       userGeneration?: number;
       authIdentityGeneration?: number;
+      auth_time?: number;
+      iat?: number;
+      jti?: string;
     };
     expect(payload).toMatchObject({
       userId: "google-google-subject-1",
@@ -63,7 +66,12 @@ describe("Google callback canonical identity", () => {
       authSubject: "google-subject-1",
       userGeneration: 1,
       authIdentityGeneration: 1,
+      auth_time: expect.any(Number),
+      iat: expect.any(Number),
+      jti: expect.any(String),
     });
+    expect(payload.iat! - payload.auth_time!).toBeGreaterThanOrEqual(0);
+    expect(payload.iat! - payload.auth_time!).toBeLessThanOrEqual(1);
   });
 
   it("keeps the pre-v11 Google User id so existing team and project access remains effective", async () => {

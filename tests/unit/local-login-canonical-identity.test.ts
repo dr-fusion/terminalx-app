@@ -51,13 +51,21 @@ describe("local login canonical identity", () => {
       authSubject?: string;
       userGeneration?: number;
       authIdentityGeneration?: number;
+      auth_time?: number;
+      iat?: number;
+      jti?: string;
     };
     expect(payload).toMatchObject({
       authProvider: "local",
       authSubject: "alice",
       userGeneration: 1,
       authIdentityGeneration: 1,
+      auth_time: expect.any(Number),
+      iat: expect.any(Number),
+      jti: expect.any(String),
     });
+    expect(payload.iat! - payload.auth_time!).toBeGreaterThanOrEqual(0);
+    expect(payload.iat! - payload.auth_time!).toBeLessThanOrEqual(1);
     await expect(verifyJwt(token!)).resolves.toMatchObject({ username: "alice", role: "user" });
   });
 });

@@ -3,12 +3,18 @@ import {
   createCanonicalIdentityAuthority,
   type CanonicalIdentityAuthority,
 } from "./identity-authority";
+import { createStoredAuthenticationSessionValidator } from "./auth-session-validator";
+import { createConnectionAuthority, type ConnectionAuthority } from "./connections/authority";
+import { createMobileAuthAuthority, type MobileAuthAuthority } from "./mobile-auth/authority";
+import { readLegacyDeviceImport } from "./mobile-auth/legacy-devices";
 import { openTeamSessionDatabase, type TeamSessionDatabase } from "./team-sessions/sqlite";
 
 interface CanonicalIdentityService {
   readonly filename: string;
   readonly database: TeamSessionDatabase;
   readonly authority: CanonicalIdentityAuthority;
+  readonly connectionAuthority: ConnectionAuthority;
+  readonly mobileAuthAuthority: MobileAuthAuthority;
   activeOperations: number;
   closeRequested: boolean;
   closed: boolean;
@@ -55,10 +61,27 @@ function closeService(service: CanonicalIdentityService): void {
 function createService(filename: string): CanonicalIdentityService {
   const database = openTeamSessionDatabase({ filename });
   try {
+    const mobileAuthAuthority = createMobileAuthAuthority({ db: database.db });
+    const validateAuthenticationSnapshot = createStoredAuthenticationSessionValidator({
+      getDevice: (deviceId) => mobileAuthAuthority.getDevice(deviceId),
+    });
     return {
       filename,
       database,
       authority: createCanonicalIdentityAuthority({ db: database.db }),
+      connectionAuthority: createConnectionAuthority({
+        db: database.db,
+        validateAuthenticationSnapshot: (snapshot) =>
+          validateAuthenticationSnapshot({
+            canonicalUserId: snapshot.userId,
+            canonicalUsername: snapshot.username,
+            provider: snapshot.authProvider,
+            credentialJtiDigest: snapshot.credentialJtiDigest,
+            credentialExpiresAtMs: snapshot.credentialExpiresAtMs,
+            device: snapshot.device,
+          }),
+      }),
+      mobileAuthAuthority,
       activeOperations: 0,
       closeRequested: false,
       closed: false,
@@ -121,6 +144,58 @@ export function withCanonicalIdentityAuthority<T>(
     releaseService(service);
     throw error;
   }
+}
+
+/**
+ * Run a connection-authority operation against the same migrated, validated,
+ * process-owned SQLite connection as canonical authentication. This avoids a
+ * second in-process database owner and lets each authority method validate
+ * identity, Team, Session, and connection fences in its own transaction. A
+ * returned routing/attribution snapshot does not make a later Team command or
+ * provider effect atomic; those consumers must revalidate at their effect
+ * boundary.
+ */
+export function withConnectionAuthority<T>(operation: (authority: ConnectionAuthority) => T): T {
+  const service = acquireService();
+  service.activeOperations += 1;
+  try {
+    const result = operation(service.connectionAuthority);
+    if (isPromiseLike(result)) {
+      return Promise.resolve(result).finally(() => releaseService(service)) as T;
+    }
+    releaseService(service);
+    return result;
+  } catch (error) {
+    releaseService(service);
+    throw error;
+  }
+}
+
+/** Run a mobile pairing/device operation on the process-owned SQLite connection. */
+export function withMobileAuthAuthority<T>(operation: (authority: MobileAuthAuthority) => T): T {
+  const service = acquireService();
+  service.activeOperations += 1;
+  try {
+    const result = operation(service.mobileAuthAuthority);
+    if (isPromiseLike(result)) {
+      return Promise.resolve(result).finally(() => releaseService(service)) as T;
+    }
+    releaseService(service);
+    return result;
+  } catch (error) {
+    releaseService(service);
+    throw error;
+  }
+}
+
+/**
+ * Import the legacy devices.json projection exactly once after canonical User
+ * provisioning. Plaintext legacy pairing codes are intentionally not read.
+ */
+export function initializeLegacyMobileAuthState(): void {
+  if (withMobileAuthAuthority((authority) => authority.hasImportedLegacyDevices())) return;
+  const legacy = readLegacyDeviceImport();
+  withMobileAuthAuthority((authority) => authority.importLegacyDevices(legacy));
 }
 
 /**

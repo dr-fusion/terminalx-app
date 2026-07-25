@@ -16,7 +16,7 @@ describe("canonical identity schema", () => {
   it("creates the versioned User and authentication identity authority", () => {
     database = openTeamSessionDatabase({ filename: ":memory:" });
 
-    expect(database.db.pragma("user_version", { simple: true })).toBe(12);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(13);
     expect(
       database.db
         .prepare(
@@ -293,6 +293,15 @@ describe("canonical identity schema", () => {
         ) VALUES (
           'project-1', 'google-google-subject-1', 'maintainer', 'active', 2, 100, NULL
         );
+        DROP TABLE mobile_auth_migrations;
+        DROP TABLE paired_devices;
+        DROP TABLE mobile_pairing_codes;
+        DROP TABLE connection_authority_ledger;
+        DROP TABLE channel_bindings;
+        DROP TABLE identity_connections;
+        DROP TABLE link_challenges;
+        DROP TABLE channel_installations;
+        DROP TABLE credential_handles;
         DROP TABLE legacy_google_identity_bridges;
         DROP TABLE local_auth_credentials;
         DROP TABLE auth_identities;
@@ -305,7 +314,7 @@ describe("canonical identity schema", () => {
 
       database = openTeamSessionDatabase({ filename });
 
-      expect(database.db.pragma("user_version", { simple: true })).toBe(12);
+      expect(database.db.pragma("user_version", { simple: true })).toBe(13);
       expect(database.db.prepare("SELECT id, name FROM teams").all()).toEqual([
         { id: "team-1", name: "Team" },
       ]);
@@ -374,6 +383,15 @@ describe("canonical identity schema", () => {
           'google-compatible-identity', 'google-compatible-subject', 'google',
           'compatible-subject', 'active', 1, 100, 100, 100, NULL
         );
+        DROP TABLE mobile_auth_migrations;
+        DROP TABLE paired_devices;
+        DROP TABLE mobile_pairing_codes;
+        DROP TABLE connection_authority_ledger;
+        DROP TABLE channel_bindings;
+        DROP TABLE identity_connections;
+        DROP TABLE link_challenges;
+        DROP TABLE channel_installations;
+        DROP TABLE credential_handles;
         DROP TABLE legacy_google_identity_bridges;
         PRAGMA user_version = 11;
       `);
@@ -382,7 +400,7 @@ describe("canonical identity schema", () => {
 
       database = openTeamSessionDatabase({ filename });
 
-      expect(database.db.pragma("user_version", { simple: true })).toBe(12);
+      expect(database.db.pragma("user_version", { simple: true })).toBe(13);
       expect(database.db.prepare("SELECT * FROM legacy_google_identity_bridges").all()).toEqual([
         {
           google_subject: "compatible-subject",
@@ -418,6 +436,15 @@ describe("canonical identity schema", () => {
           'opaque-preview-identity', 'opaque-preview-user', 'google',
           'preview-subject', 'active', 1, 100, 100, 100, NULL
         );
+        DROP TABLE mobile_auth_migrations;
+        DROP TABLE paired_devices;
+        DROP TABLE mobile_pairing_codes;
+        DROP TABLE connection_authority_ledger;
+        DROP TABLE channel_bindings;
+        DROP TABLE identity_connections;
+        DROP TABLE link_challenges;
+        DROP TABLE channel_installations;
+        DROP TABLE credential_handles;
         DROP TABLE legacy_google_identity_bridges;
         PRAGMA user_version = 11;
       `);

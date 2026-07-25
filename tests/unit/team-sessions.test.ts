@@ -590,6 +590,15 @@ describe("Team Session kernel", () => {
     try {
       database.exec(`
         PRAGMA foreign_keys = OFF;
+        DROP TABLE mobile_auth_migrations;
+        DROP TABLE paired_devices;
+        DROP TABLE mobile_pairing_codes;
+        DROP TABLE connection_authority_ledger;
+        DROP TABLE channel_bindings;
+        DROP TABLE identity_connections;
+        DROP TABLE link_challenges;
+        DROP TABLE channel_installations;
+        DROP TABLE credential_handles;
         DROP TABLE legacy_google_identity_bridges;
         DROP TABLE local_auth_credentials;
         DROP TABLE auth_identities;
@@ -2814,7 +2823,7 @@ describe("Team Session kernel", () => {
 
     const database = new Database(filename, { readonly: true });
     try {
-      expect(database.pragma("user_version", { simple: true })).toBe(12);
+      expect(database.pragma("user_version", { simple: true })).toBe(13);
       expect(database.pragma("foreign_key_check")).toEqual([]);
       expect(
         database

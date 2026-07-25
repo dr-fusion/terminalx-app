@@ -61,9 +61,20 @@ Close the hosted evidence boundary of release Gate 1 and release Gate 2.
 
 Close release Gate 3 and complete the Slack/Telegram/credential connection model.
 
-Status: in progress. The canonical authentication identity foundation is implemented; the exact
-scope and remaining closed boundaries are tracked in
+Status: in progress. The canonical authentication identity foundation and Slice 8B schema-v13 local
+connection authority are complete. Provider adapters, Secret Broker and Credential Proxy
+enforcement, and hosted exfiltration evidence remain closed. Release Gate 3 is open, and
+`brokeredCredentials` and `proxyOnlyEgress` must remain `false`. The exact scope and remaining
+closed boundaries are tracked in
 [Phase 8 brokered secrets and connections](../multiplayer/phase-8-brokered-connections.md).
+
+The completed Slice 8B hardening binds pairing and Link Challenges to the exact source-JWT expiry, rejects
+source-less legacy pairing upgrades, revalidates after local verifier boundaries, and makes logout
+revocation depend on durable digest-only tombstones. Pairing codes are digest-only, single-use
+SQLite rows with active and rolling issuance limits; paired-device registration and irreversible
+revocation use the same transactional database as canonical Users, so concurrent workers cannot
+lose a device or revive paired authority. These authentication safeguards do not constitute a
+Secret Broker, provider adapter, or closure of Gate 3.
 
 - Store only opaque credential handles in TerminalX state.
 - Add approved secret-manager adapters and a destination-scoped credential proxy.

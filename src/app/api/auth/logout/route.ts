@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { revokeToken, verifyJwt } from "@/lib/auth";
+import { revokeToken } from "@/lib/auth";
 import { audit } from "@/lib/audit-log";
 
 export async function POST(req: NextRequest) {
@@ -9,16 +9,25 @@ export async function POST(req: NextRequest) {
     ? authorization.slice(7).trim()
     : undefined;
   const token = cookieToken || bearerToken;
-  const actor = token ? await verifyJwt(token) : null;
+  let revocation: Awaited<ReturnType<typeof revokeToken>> = null;
 
-  // Only persist a revocation for a currently valid token. The endpoint is
-  // public so clients can always clear a bad cookie; accepting arbitrary JTIs
-  // here would let anonymous callers grow the revocation store indefinitely.
-  if (token && actor) {
-    revokeToken(token);
+  // revokeToken verifies the signature, registered claims, and validity window
+  // without relying on mutable authorization state, then fsyncs a digest-only tombstone.
+  // Never clear the cookie or report success if that durable write fails: a
+  // copied bearer token would otherwise remain live outside the browser.
+  if (token) {
+    try {
+      revocation = await revokeToken(token);
+    } catch {
+      audit("logout_failed", { detail: "token revocation persistence unavailable" });
+      return NextResponse.json(
+        { success: false, error: "Logout could not be completed safely. Try again." },
+        { status: 503, headers: { "Cache-Control": "no-store, max-age=0" } }
+      );
+    }
   }
 
-  audit("logout", { username: actor?.username, userId: actor?.userId });
+  audit("logout", { username: revocation?.username, userId: revocation?.userId });
 
   const res = NextResponse.json(
     { success: true },

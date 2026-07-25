@@ -69,7 +69,10 @@ export async function downloadFromTelegram(
 
   const filename = safeFileName(preferredName ?? name);
   const dest = path.join(safeDir, filename);
-  fs.writeFileSync(dest, buf, { mode: 0o600 });
+  assertNotSensitivePath(dest);
+  // Exclusive creation rejects both existing files and symlinks, closing the
+  // check/write race where an allowed name points at an authority store.
+  fs.writeFileSync(dest, buf, { mode: 0o600, flag: "wx" });
   const root = path.resolve(process.env.TERMINUS_ROOT || process.env.HOME || "/");
   return { savedTo: path.relative(root, dest) || filename, bytes: buf.length };
 }

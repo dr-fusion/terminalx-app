@@ -29,7 +29,9 @@ vi.mock("@/lib/team-sessions/sqlite", async (importOriginal) => {
 import {
   closeCanonicalIdentityAuthorityService,
   initializeCanonicalIdentityAuthorityService,
+  initializeLegacyMobileAuthState,
   withCanonicalIdentityAuthority,
+  withMobileAuthAuthority,
 } from "@/lib/identity-service";
 import type { CanonicalIdentityAuthority } from "@/lib/identity-authority";
 
@@ -50,6 +52,8 @@ describe("canonical identity database service", () => {
     sqliteHarness.failClose = false;
     closeCanonicalIdentityAuthorityService();
     delete process.env.TERMINALX_TEAM_SESSION_DB_PATH;
+    delete process.env.TERMINALX_DEVICES_FILE;
+    delete process.env.TERMINALX_DEVICE_REVOCATIONS_DIR;
     fs.rmSync(temporaryDirectory, { recursive: true, force: true });
   });
 
@@ -156,5 +160,39 @@ describe("canonical identity database service", () => {
     const replacement = withCanonicalIdentityAuthority((authority) => authority);
     expect(replacement).not.toBe(firstAuthority);
     expect(sqliteHarness.openCount).toBe(2);
+  });
+
+  it("does not reread a corrupt legacy device source after its immutable import marker", () => {
+    const identity = withCanonicalIdentityAuthority((authority) =>
+      authority.provisionPasswordIdentity()
+    );
+    const devicesFile = path.join(temporaryDirectory, "devices.json");
+    process.env.TERMINALX_DEVICES_FILE = devicesFile;
+    fs.writeFileSync(
+      devicesFile,
+      JSON.stringify([
+        {
+          id: "legacy-device-1",
+          userId: identity.user.id,
+          username: identity.user.username,
+          name: "Legacy phone",
+          createdAt: 100,
+          lastSeenAt: 200,
+          revokedAt: null,
+        },
+      ])
+    );
+
+    initializeLegacyMobileAuthState();
+    expect(
+      withMobileAuthAuthority((authority) => authority.getDevice("legacy-device-1"))
+    ).toMatchObject({ userId: identity.user.id });
+
+    fs.writeFileSync(devicesFile, "corrupt-after-success");
+    closeCanonicalIdentityAuthorityService();
+    expect(() => initializeLegacyMobileAuthState()).not.toThrow();
+    expect(
+      withMobileAuthAuthority((authority) => authority.getDevice("legacy-device-1"))
+    ).not.toBeNull();
   });
 });

@@ -5,6 +5,11 @@ const MAX_FILE_SIZE = 1 * 1024 * 1024; // 1MB
 const SENSITIVE_DATA_FILES = new Set([
   "users.json",
   ".revoked-tokens.json",
+  ".revoked-tokens.json.d",
+  "devices.json",
+  "devices.json.revocations",
+  "pairing-codes.json",
+  "pairing-codes.json.consumed",
   "telegram-state.json",
   "ai-sessions.json",
   "snippets.json",
@@ -47,6 +52,30 @@ function isSqliteDatabaseFile(candidate: string, database: string): boolean {
   );
 }
 
+function isSamePathOrDescendant(candidate: string, directory: string): boolean {
+  return candidate === directory || candidate.startsWith(`${directory}${path.sep}`);
+}
+
+function isExactFileOrAtomicTemporary(candidate: string, filename: string): boolean {
+  if (candidate === filename) return true;
+  return (
+    path.dirname(candidate) === path.dirname(filename) &&
+    path.basename(candidate).startsWith(`.${path.basename(filename)}.`) &&
+    path.basename(candidate).endsWith(".tmp")
+  );
+}
+
+function relativePathStartsWithSensitiveDataEntry(relativePath: string): boolean {
+  if (!relativePath || relativePath.startsWith("..") || path.isAbsolute(relativePath)) return false;
+  const first = relativePath.split(path.sep).filter(Boolean)[0];
+  return Boolean(
+    first &&
+    [...SENSITIVE_DATA_FILES].some(
+      (sensitive) => first === sensitive || first.startsWith(`${sensitive}.`)
+    )
+  );
+}
+
 export function isSensitivePath(filePath: string): boolean {
   if (sensitiveFileAccessAllowed()) return false;
 
@@ -60,9 +89,47 @@ export function isSensitivePath(filePath: string): boolean {
     /* turbopackIgnore: true */ process.env.TERMINALX_TEAM_SESSION_DB_PATH ??
       path.join(process.cwd(), "data", "team-sessions.sqlite")
   );
+  const revokedTokensFile = path.resolve(
+    /* turbopackIgnore: true */ process.env.TERMINALX_REVOKED_TOKENS_FILE ??
+      path.join(process.cwd(), "data", ".revoked-tokens.json")
+  );
+  const revokedTokenTombstones = path.resolve(
+    /* turbopackIgnore: true */ process.env.TERMINALX_REVOKED_TOKEN_TOMBSTONE_DIR ??
+      `${revokedTokensFile}.d`
+  );
+  const devicesFile = path.resolve(
+    /* turbopackIgnore: true */ process.env.TERMINALX_DEVICES_FILE ??
+      path.join(process.cwd(), "data", "devices.json")
+  );
+  const deviceRevocations = path.resolve(
+    /* turbopackIgnore: true */ process.env.TERMINALX_DEVICE_REVOCATIONS_DIR ??
+      `${devicesFile}.revocations`
+  );
+  const pairingCodesFile = path.resolve(
+    /* turbopackIgnore: true */ process.env.TERMINALX_PAIRING_CODES_FILE ??
+      path.join(process.cwd(), "data", "pairing-codes.json")
+  );
+  const pairingConsumptions = path.resolve(
+    /* turbopackIgnore: true */ process.env.TERMINALX_PAIRING_CONSUMPTIONS_DIR ??
+      `${pairingCodesFile}.consumed`
+  );
+  const legacyUsersFile = path.resolve(
+    /* turbopackIgnore: true */ process.env.TERMINALX_LEGACY_USERS_FILE ??
+      path.join(process.cwd(), "data", "users.json")
+  );
   if (
     isSqliteDatabaseFile(resolved, telegramAuditDb) ||
-    isSqliteDatabaseFile(resolved, teamSessionDb)
+    isSqliteDatabaseFile(resolved, teamSessionDb) ||
+    isExactFileOrAtomicTemporary(resolved, revokedTokensFile) ||
+    isSamePathOrDescendant(resolved, revokedTokenTombstones) ||
+    isExactFileOrAtomicTemporary(resolved, devicesFile) ||
+    isSamePathOrDescendant(resolved, deviceRevocations) ||
+    isExactFileOrAtomicTemporary(resolved, pairingCodesFile) ||
+    isSamePathOrDescendant(resolved, pairingConsumptions) ||
+    isExactFileOrAtomicTemporary(resolved, legacyUsersFile) ||
+    relativePathStartsWithSensitiveDataEntry(
+      path.relative(path.resolve(process.cwd(), "data"), resolved)
+    )
   ) {
     return true;
   }
@@ -76,12 +143,10 @@ export function isSensitivePath(filePath: string): boolean {
   if (base === ".terminalx-secret") return true;
   if (parts.includes(".git") || parts.includes(".ssh") || parts.includes(".gnupg")) return true;
   if (parts.length >= 2 && parts[0] === ".config" && parts[1] === "secrets") return true;
-  const secondPart = parts[1];
   if (
     parts.length >= 2 &&
     parts[0] === "data" &&
-    secondPart &&
-    SENSITIVE_DATA_FILES.has(secondPart)
+    relativePathStartsWithSensitiveDataEntry(parts.slice(1).join(path.sep))
   ) {
     return true;
   }
