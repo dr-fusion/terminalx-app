@@ -358,7 +358,12 @@ checks `iss`/`aud`/`exp`/`iat` plus a `nonce` bound to the Link Challenge digest
 verified non-secret identity for `verifySlackOidcProof`. The `POST /api/connections/identity-connections/slack/callback`
 route verifies the id_token through the broker, builds the `VerifiedSlackOidcProof`, and completes
 the Link Challenge through the connection authority — mirroring the Telegram deep-link route
-discipline (Telegram linking is already route-complete through the webhook).
+discipline (Telegram linking is already route-complete through the webhook). The production
+composition (`src/lib/identity-service.ts`) now injects a provider-dispatching `verifyProviderProof`
+into `createConnectionAuthority` (routing on `expected.provider` to the Telegram deep-link and Slack
+OIDC verifiers), composed only when a Secret Broker is configured; without a broker, link
+completion fails closed exactly as before. This closes the last authority verifier that the
+routes/handlers assumed but production composition did not inject.
 
 ## Slice 8F — hosted enforcement
 
