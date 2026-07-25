@@ -101,9 +101,7 @@ export interface IngestInboundDeps {
     externalThreadId?: string;
   }) => InboundAttributionResolution | null;
   /** Look up the active Binding inbound policy for the anonymous fail-closed path. */
-  readonly bindingInboundPolicy: (
-    bindingId: string
-  ) => {
+  readonly bindingInboundPolicy: (bindingId: string) => {
     mode: "comments-only" | "comments-and-directives" | "notifications-only";
     requireLinkedIdentity: boolean;
   } | null;
