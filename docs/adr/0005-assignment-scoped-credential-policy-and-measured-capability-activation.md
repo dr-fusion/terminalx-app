@@ -111,6 +111,20 @@ the verified non-secret identity for `verifySlackOidcProof`. The Slack
 link-callback route verifies through the broker and completes the Link Challenge
 through the connection authority, mirroring the Telegram deep-link discipline.
 
+The production composition closes this end to end: `identity-service.ts` injects
+a provider-dispatching `verifyProviderProof` into `createConnectionAuthority`,
+following the `resolveConfiguredBrokerReceiptVerifier` pattern. It routes on the
+authority-built `expected.provider` to the Telegram deep-link and Slack OIDC
+verifiers — both synchronous and pure, since the network work (secret-token
+check, id_token/JWKS verification) already happened upstream — and is composed
+only when a Secret Broker is configured. Without a broker it returns null, so
+link completion fails closed exactly as before (there is no active installation
+credential handle to link against). An audit of `CreateConnectionAuthorityOptions`
+confirms this was the one authority verifier the routes assumed but production
+composition did not inject; `verifyCredentialHandleRegistration` and
+`validateAuthenticationSnapshot` were already composed, and `clock`/`idGenerator`/
+`randomBytes` intentionally use their non-security defaults.
+
 ## Consequences
 
 - A hosted Run exercises a brokered credential only under its exact, current
