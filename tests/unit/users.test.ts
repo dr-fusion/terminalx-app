@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { closeCanonicalIdentityAuthorityService } from "@/lib/identity-service";
 
 describe("SQL-backed local Users", () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "terminalx-users-"));
@@ -27,6 +28,7 @@ describe("SQL-backed local Users", () => {
   });
 
   afterAll(() => {
+    closeCanonicalIdentityAuthorityService();
     delete process.env.TERMINALX_TEAM_SESSION_DB_PATH;
     delete process.env.TERMINALX_LEGACY_USERS_FILE;
     fs.rmSync(directory, { recursive: true, force: true });

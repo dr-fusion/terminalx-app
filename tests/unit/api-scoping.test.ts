@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
+import { closeCanonicalIdentityAuthorityService } from "@/lib/identity-service";
 
 /**
  * Handler-level tests for scoping behavior of /api/snippets and /api/logs.
@@ -122,6 +123,7 @@ describe("logs GET admin gate", () => {
   });
 
   afterEach(() => {
+    closeCanonicalIdentityAuthorityService();
     fs.rmSync(authDirectory, { recursive: true, force: true });
     delete process.env.TERMINALX_AUTH_MODE;
     delete process.env.TERMINALX_TEAM_SESSION_DB_PATH;

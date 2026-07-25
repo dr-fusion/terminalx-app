@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { closeCanonicalIdentityAuthorityService } from "@/lib/identity-service";
 
 describe("local login canonical identity", () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "terminalx-local-login-"));
@@ -21,6 +22,7 @@ describe("local login canonical identity", () => {
   });
 
   afterAll(() => {
+    closeCanonicalIdentityAuthorityService();
     delete process.env.TERMINALX_AUTH_MODE;
     delete process.env.TERMINALX_JWT_SECRET;
     delete process.env.TERMINALX_TEAM_SESSION_DB_PATH;

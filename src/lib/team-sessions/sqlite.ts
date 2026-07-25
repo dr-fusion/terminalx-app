@@ -6,7 +6,7 @@ import { digestRuntimeCompensationIncident } from "../runtime/runtime-compensati
 import { RUNTIME_RECEIPT_OBSERVATION_MAX_CURSOR_CODE_POINTS } from "../runtime/runtime-receipt-observation-contract";
 import { isValidTmuxSessionName } from "../tmux";
 
-const SCHEMA_VERSION = 11;
+const SCHEMA_VERSION = 12;
 const PRE_RUNTIME_START_SCHEMA_VERSION = 4;
 const RUNTIME_START_SCHEMA_VERSION = 5;
 const RUNTIME_RECEIPT_FOLLOW_SCHEMA_VERSION = 6;
@@ -15,6 +15,7 @@ const RUNTIME_ASSIGNMENT_OUTBOX_INTERLOCK_SCHEMA_VERSION = 8;
 const HOSTED_RUNTIME_ASSIGNMENT_SCHEMA_VERSION = 9;
 const PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION = 10;
 const CANONICAL_IDENTITY_SCHEMA_VERSION = 11;
+const GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION = 12;
 const APPLICATION_ID = 0x54585331; // "TXS1"
 
 const CANONICAL_IDENTITY_SCHEMA_V11 = `
@@ -187,6 +188,44 @@ CREATE TRIGGER identity_migrations_immutable_delete
 BEFORE DELETE ON identity_migrations
 BEGIN
   SELECT RAISE(ABORT, 'Identity migration history is immutable');
+END;
+`;
+
+const GOOGLE_IDENTITY_CONTINUITY_SCHEMA_V12 = `
+CREATE TABLE legacy_google_identity_bridges (
+  google_subject TEXT PRIMARY KEY CHECK (length(google_subject) BETWEEN 1 AND 1024),
+  legacy_user_id TEXT NOT NULL UNIQUE CHECK (
+    length(legacy_user_id) BETWEEN 1 AND 300 AND
+    legacy_user_id = 'google-' || google_subject
+  ),
+  auth_identity_id TEXT NOT NULL UNIQUE REFERENCES auth_identities(id) ON DELETE RESTRICT,
+  bridged_at_ms INTEGER NOT NULL CHECK (bridged_at_ms >= 0)
+) STRICT;
+
+CREATE TRIGGER legacy_google_identity_bridges_exact_identity
+BEFORE INSERT ON legacy_google_identity_bridges
+WHEN NOT EXISTS (
+  SELECT 1
+  FROM auth_identities identity
+  WHERE identity.id = NEW.auth_identity_id
+    AND identity.user_id = NEW.legacy_user_id
+    AND identity.provider = 'google'
+    AND identity.subject = NEW.google_subject
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Legacy Google identity bridge does not match its authentication identity');
+END;
+
+CREATE TRIGGER legacy_google_identity_bridges_immutable_update
+BEFORE UPDATE ON legacy_google_identity_bridges
+BEGIN
+  SELECT RAISE(ABORT, 'Legacy Google identity bridge history is immutable');
+END;
+
+CREATE TRIGGER legacy_google_identity_bridges_immutable_delete
+BEFORE DELETE ON legacy_google_identity_bridges
+BEGIN
+  SELECT RAISE(ABORT, 'Legacy Google identity bridge history is immutable');
 END;
 `;
 
@@ -7207,7 +7246,8 @@ export function openTeamSessionDatabase(
         migratedVersion !== RUNTIME_ASSIGNMENT_OUTBOX_INTERLOCK_SCHEMA_VERSION &&
         migratedVersion !== HOSTED_RUNTIME_ASSIGNMENT_SCHEMA_VERSION &&
         migratedVersion !== PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION &&
-        migratedVersion !== CANONICAL_IDENTITY_SCHEMA_VERSION
+        migratedVersion !== CANONICAL_IDENTITY_SCHEMA_VERSION &&
+        migratedVersion !== GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION
       ) {
         throw new Error(
           `Unsupported Team Session database schema ${currentVersion}; expected ${SCHEMA_VERSION}`
@@ -7249,6 +7289,12 @@ export function openTeamSessionDatabase(
     }) as number;
     if (canonicalIdentityPreparedVersion === PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION) {
       migrateCanonicalIdentitySchemaV11(db);
+    }
+    const googleIdentityContinuityPreparedVersion = db.pragma("user_version", {
+      simple: true,
+    }) as number;
+    if (googleIdentityContinuityPreparedVersion === CANONICAL_IDENTITY_SCHEMA_VERSION) {
+      migrateGoogleIdentityContinuitySchemaV12(db);
     }
 
     const applicationId = db.pragma("application_id", { simple: true }) as number;
@@ -7334,7 +7380,8 @@ function migrateRuntimeStartSchemaV5(db: Database.Database): void {
         currentVersion === RUNTIME_ASSIGNMENT_OUTBOX_INTERLOCK_SCHEMA_VERSION ||
         currentVersion === HOSTED_RUNTIME_ASSIGNMENT_SCHEMA_VERSION ||
         currentVersion === PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION ||
-        currentVersion === CANONICAL_IDENTITY_SCHEMA_VERSION
+        currentVersion === CANONICAL_IDENTITY_SCHEMA_VERSION ||
+        currentVersion === GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION
       ) {
         return;
       }
@@ -7374,7 +7421,8 @@ function migrateRuntimeReceiptFollowSchemaV6(db: Database.Database): void {
       currentVersion === RUNTIME_ASSIGNMENT_OUTBOX_INTERLOCK_SCHEMA_VERSION ||
       currentVersion === HOSTED_RUNTIME_ASSIGNMENT_SCHEMA_VERSION ||
       currentVersion === PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION ||
-      currentVersion === CANONICAL_IDENTITY_SCHEMA_VERSION
+      currentVersion === CANONICAL_IDENTITY_SCHEMA_VERSION ||
+      currentVersion === GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION
     ) {
       return;
     }
@@ -7407,7 +7455,8 @@ function migrateRuntimeCompensationSchemaV7(db: Database.Database): void {
       currentVersion === RUNTIME_ASSIGNMENT_OUTBOX_INTERLOCK_SCHEMA_VERSION ||
       currentVersion === HOSTED_RUNTIME_ASSIGNMENT_SCHEMA_VERSION ||
       currentVersion === PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION ||
-      currentVersion === CANONICAL_IDENTITY_SCHEMA_VERSION
+      currentVersion === CANONICAL_IDENTITY_SCHEMA_VERSION ||
+      currentVersion === GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION
     ) {
       return;
     }
@@ -7443,7 +7492,8 @@ function migrateRuntimeAssignmentOutboxInterlockSchemaV8(db: Database.Database):
       currentVersion === RUNTIME_ASSIGNMENT_OUTBOX_INTERLOCK_SCHEMA_VERSION ||
       currentVersion === HOSTED_RUNTIME_ASSIGNMENT_SCHEMA_VERSION ||
       currentVersion === PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION ||
-      currentVersion === CANONICAL_IDENTITY_SCHEMA_VERSION
+      currentVersion === CANONICAL_IDENTITY_SCHEMA_VERSION ||
+      currentVersion === GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION
     )
       return;
     if (currentVersion !== RUNTIME_COMPENSATION_SCHEMA_VERSION) {
@@ -7485,7 +7535,8 @@ function migrateHostedRuntimeAssignmentSchemaV9(db: Database.Database): void {
       if (
         currentVersion === HOSTED_RUNTIME_ASSIGNMENT_SCHEMA_VERSION ||
         currentVersion === PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION ||
-        currentVersion === CANONICAL_IDENTITY_SCHEMA_VERSION
+        currentVersion === CANONICAL_IDENTITY_SCHEMA_VERSION ||
+        currentVersion === GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION
       )
         return;
       if (currentVersion !== RUNTIME_ASSIGNMENT_OUTBOX_INTERLOCK_SCHEMA_VERSION) {
@@ -7579,7 +7630,8 @@ function migrateProviderBoundEffectActivationSchemaV10(db: Database.Database): v
     const currentVersion = db.pragma("user_version", { simple: true }) as number;
     if (
       currentVersion === PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION ||
-      currentVersion === CANONICAL_IDENTITY_SCHEMA_VERSION
+      currentVersion === CANONICAL_IDENTITY_SCHEMA_VERSION ||
+      currentVersion === GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION
     ) {
       return;
     }
@@ -7810,7 +7862,11 @@ function migrateProviderBoundEffectActivationSchemaV10(db: Database.Database): v
 function migrateCanonicalIdentitySchemaV11(db: Database.Database): void {
   const migrate = db.transaction(() => {
     const currentVersion = db.pragma("user_version", { simple: true }) as number;
-    if (currentVersion === CANONICAL_IDENTITY_SCHEMA_VERSION) return;
+    if (
+      currentVersion === CANONICAL_IDENTITY_SCHEMA_VERSION ||
+      currentVersion === GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION
+    )
+      return;
     if (currentVersion !== PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION) {
       throw new Error(
         `Unsupported Team Session database schema ${currentVersion}; expected ${PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION}`
@@ -7823,6 +7879,69 @@ function migrateCanonicalIdentitySchemaV11(db: Database.Database): void {
       throw new Error("Team Session v11 migration failed its foreign key check");
     }
     db.pragma(`user_version = ${CANONICAL_IDENTITY_SCHEMA_VERSION}`);
+  });
+  migrate.exclusive();
+}
+
+interface V11GoogleIdentityRow {
+  id: string;
+  user_id: string;
+  subject: string;
+}
+
+function migrateGoogleIdentityContinuitySchemaV12(db: Database.Database): void {
+  const migrate = db.transaction(() => {
+    const currentVersion = db.pragma("user_version", { simple: true }) as number;
+    if (currentVersion === GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION) return;
+    if (currentVersion !== CANONICAL_IDENTITY_SCHEMA_VERSION) {
+      throw new Error(
+        `Unsupported Team Session database schema ${currentVersion}; expected ${CANONICAL_IDENTITY_SCHEMA_VERSION}`
+      );
+    }
+
+    const googleIdentities = db
+      .prepare(
+        `SELECT id, user_id, subject
+         FROM auth_identities
+         WHERE provider = 'google'
+         ORDER BY id`
+      )
+      .all() as V11GoogleIdentityRow[];
+    for (const identity of googleIdentities) {
+      const expectedUserId = `google-${identity.subject}`;
+      if (
+        identity.subject.length < 1 ||
+        identity.subject.length > 1024 ||
+        identity.subject !== identity.subject.trim() ||
+        /[\u0000-\u001f\u007f]/.test(identity.subject) ||
+        expectedUserId.length > 300 ||
+        identity.user_id !== expectedUserId
+      ) {
+        // The pushed v11 preview could create opaque Google User IDs. Guessing
+        // which SQL and non-SQL owner references to rewrite would risk either
+        // orphaning authority or transferring it to the wrong User, so require
+        // an explicit operator repair instead of silently accepting that state.
+        throw new Error(
+          "Team Session v12 migration requires explicit repair of an incompatible v11 Google identity"
+        );
+      }
+    }
+
+    db.exec(GOOGLE_IDENTITY_CONTINUITY_SCHEMA_V12);
+    db.prepare(
+      `INSERT INTO legacy_google_identity_bridges (
+         google_subject, legacy_user_id, auth_identity_id, bridged_at_ms
+       )
+       SELECT subject, user_id, id, created_at_ms
+       FROM auth_identities
+       WHERE provider = 'google'
+       ORDER BY id`
+    ).run();
+    const violations = db.pragma("foreign_key_check") as unknown[];
+    if (violations.length > 0) {
+      throw new Error("Team Session v12 migration failed its foreign key check");
+    }
+    db.pragma(`user_version = ${GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION}`);
   });
   migrate.exclusive();
 }

@@ -44,6 +44,18 @@ The local compatibility bridge is accepted only while local authentication is th
 Changing authentication mode, revoking either generation, or replacing an identity therefore
 invalidates the old token immediately.
 
+Google OAuth keeps the pre-v11 compatibility User ID `google-${verifiedGoogleSubject}`. That ID is
+derived only inside the verified-subject provisioning transaction; callers cannot nominate an ID.
+This preserves ownership in both the Team Session database and durable non-SQL stores such as
+devices and GitHub integrations without rewriting attribution. Each mapping is recorded in an
+immutable schema-v12 `legacy_google_identity_bridges` row, and provisioning fails closed if the
+derived ID is already owned by another canonical User or an existing Google identity points
+anywhere else. The v11-to-v12 migration creates bridges for compatible rows. A preview-era v11
+Google identity with an opaque User ID fails migration with an explicit repair requirement because
+silently choosing between its SQL and non-SQL owner references could orphan or transfer authority.
+Version 11 was preview-only; an affected preview operator must restore or discard that preview
+database rather than expect an online authority rewrite.
+
 This slice intentionally does not add Slack or Telegram account linking, store provider tokens, or
 enable hosted credential capabilities.
 

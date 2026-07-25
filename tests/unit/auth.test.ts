@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, afterAll, afterEach } from "vitest";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
+import { SignJWT } from "jose";
 
 // Set up temp data dir before importing auth module
 const TEST_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "terminalx-auth-test-"));
@@ -16,7 +17,16 @@ let hashPassword: typeof import("@/lib/auth").hashPassword;
 let comparePassword: typeof import("@/lib/auth").comparePassword;
 let parseCookies: typeof import("@/lib/auth").parseCookies;
 let revokeToken: typeof import("@/lib/auth").revokeToken;
+let getJwtSecret: typeof import("@/lib/auth").getJwtSecret;
 let canonicalLocalPayload: import("@/lib/auth").JwtPayload;
+
+async function signRawJwt(payload: Record<string, unknown>): Promise<string> {
+  return new SignJWT(payload)
+    .setProtectedHeader({ alg: "HS256" })
+    .setIssuedAt()
+    .setExpirationTime("24h")
+    .sign(getJwtSecret());
+}
 
 beforeAll(async () => {
   const auth = await import("@/lib/auth");
@@ -26,6 +36,7 @@ beforeAll(async () => {
   comparePassword = auth.comparePassword;
   parseCookies = auth.parseCookies;
   revokeToken = auth.revokeToken;
+  getJwtSecret = auth.getJwtSecret;
   const { openTeamSessionDatabase } = await import("@/lib/team-sessions/sqlite");
   const { createCanonicalIdentityAuthority } = await import("@/lib/identity-authority");
   const database = openTeamSessionDatabase({
@@ -65,7 +76,9 @@ beforeAll(async () => {
   }
 });
 
-afterAll(() => {
+afterAll(async () => {
+  const { closeCanonicalIdentityAuthorityService } = await import("@/lib/identity-service");
+  closeCanonicalIdentityAuthorityService();
   fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
   delete process.env.TERMINALX_JWT_SECRET;
   delete process.env.TERMINALX_TEAM_SESSION_DB_PATH;
@@ -93,7 +106,7 @@ describe("JWT sign and verify", () => {
   });
 
   it("returns null for tampered token", async () => {
-    const token = await signJwt({ userId: "single-user", username: "user", role: "user" });
+    const token = await signJwt(canonicalLocalPayload);
     const tampered = token.slice(0, -5) + "XXXXX";
     const result = await verifyJwt(tampered);
     expect(result).toBeNull();
@@ -110,20 +123,34 @@ describe("JWT sign and verify", () => {
   });
 
   it("returns null for non-existent user", async () => {
-    const token = await signJwt({ userId: "deleted-user-id", username: "ghost", role: "user" });
+    const token = await signJwt({
+      userId: "deleted-user-id",
+      username: "ghost",
+      role: "user",
+      authProvider: "local",
+      authSubject: "deleted-user-id",
+      userGeneration: 1,
+      authIdentityGeneration: 1,
+    });
     const result = await verifyJwt(token);
     expect(result).toBeNull();
   });
 
   it("fails closed when any canonical identity snapshot claim is malformed", async () => {
-    const malformed = await signJwt({
+    const malformed = await signRawJwt({
       userId: "single-user",
       username: "admin",
       role: "admin",
-      authProvider: "unsupported" as never,
+      authProvider: "unsupported",
     });
 
     await expect(verifyJwt(malformed)).resolves.toBeNull();
+  });
+
+  it("refuses to issue a JWT without a complete canonical identity snapshot", async () => {
+    await expect(
+      signJwt({ userId: "single-user", username: "admin", role: "admin" } as never)
+    ).rejects.toThrow("JWT authentication identity snapshot is invalid");
   });
 
   it("generation-fences a provisioned Google authentication identity", async () => {
@@ -159,7 +186,7 @@ describe("JWT sign and verify", () => {
       });
 
       await expect(verifyJwt(token)).resolves.toMatchObject({
-        userId: "canonical-google-user",
+        userId: "google-google-subject-1",
         username: "alice@example.com",
         displayName: "Alice",
         authProvider: "google",
@@ -193,7 +220,7 @@ describe("JWT sign and verify", () => {
         idGenerator: () => "auth-test-password-identity",
       });
       const provisioned = authority.provisionPasswordIdentity();
-      const legacyToken = await signJwt({
+      const legacyToken = await signRawJwt({
         userId: "single-user",
         username: "admin",
         role: "admin",
@@ -222,7 +249,7 @@ describe("JWT sign and verify", () => {
   });
 
   it("includes JTI claim for revocation", async () => {
-    const token = await signJwt({ userId: "single-user", username: "user", role: "user" });
+    const token = await signJwt(canonicalLocalPayload);
     const parts = token.split(".");
     const payload = JSON.parse(Buffer.from(parts[1]!, "base64url").toString());
     expect(payload.jti).toBeTruthy();
@@ -230,7 +257,7 @@ describe("JWT sign and verify", () => {
   });
 
   it("sets 24h expiry", async () => {
-    const token = await signJwt({ userId: "single-user", username: "user", role: "user" });
+    const token = await signJwt(canonicalLocalPayload);
     const parts = token.split(".");
     const payload = JSON.parse(Buffer.from(parts[1]!, "base64url").toString());
     const expiry = payload.exp - payload.iat;

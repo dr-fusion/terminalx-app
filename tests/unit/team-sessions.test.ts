@@ -590,6 +590,7 @@ describe("Team Session kernel", () => {
     try {
       database.exec(`
         PRAGMA foreign_keys = OFF;
+        DROP TABLE legacy_google_identity_bridges;
         DROP TABLE local_auth_credentials;
         DROP TABLE auth_identities;
         DROP TABLE users;
@@ -2813,7 +2814,7 @@ describe("Team Session kernel", () => {
 
     const database = new Database(filename, { readonly: true });
     try {
-      expect(database.pragma("user_version", { simple: true })).toBe(11);
+      expect(database.pragma("user_version", { simple: true })).toBe(12);
       expect(database.pragma("foreign_key_check")).toEqual([]);
       expect(
         database

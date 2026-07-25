@@ -17,6 +17,7 @@ const MIN_SECRET_LENGTH = 32;
 const MIN_PASSWORD_LENGTH = 8;
 const TERMINALX_DATABASE_APPLICATION_ID = 0x54585331;
 const CANONICAL_IDENTITY_SCHEMA_VERSION = 11;
+const CURRENT_TERMINALX_DATABASE_SCHEMA_VERSION = 12;
 const CANONICAL_IDENTITY_DATABASE_ERROR =
   "Canonical identity database failed validation; refusing local-auth startup.";
 
@@ -57,7 +58,7 @@ function hasCanonicalLocalUser(cwd = process.cwd()): boolean {
     if (
       !Number.isSafeInteger(schemaVersion) ||
       schemaVersion < 1 ||
-      schemaVersion > CANONICAL_IDENTITY_SCHEMA_VERSION
+      schemaVersion > CURRENT_TERMINALX_DATABASE_SCHEMA_VERSION
     ) {
       throw new Error("Unsupported TerminalX database schema version.");
     }

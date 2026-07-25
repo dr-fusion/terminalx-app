@@ -117,20 +117,44 @@ function isTokenRevoked(token: string): boolean {
 
 // ── JWT Sign / Verify ───────────────────────────────────────────────────────
 
-export interface JwtPayload {
+interface JwtSubjectPayload {
   userId: string;
   username: string;
   displayName?: string;
   role: string;
-  authProvider?: "local" | "google" | "password";
-  authSubject?: string;
-  userGeneration?: number;
-  authIdentityGeneration?: number;
   /** Set on tokens issued via mobile pairing — used to revoke a single device. */
   deviceId?: string;
 }
 
+export interface CanonicalAuthenticationClaims {
+  authProvider: "local" | "google" | "password";
+  authSubject: string;
+  userGeneration: number;
+  authIdentityGeneration: number;
+}
+
+/** Every newly issued authenticated JWT is structurally generation-fenced. */
+export interface JwtPayload extends JwtSubjectPayload, CanonicalAuthenticationClaims {}
+
+/** Verification temporarily supports pre-v11 local JWTs without identity claims. */
+export type VerifiedJwtPayload = JwtSubjectPayload & Partial<CanonicalAuthenticationClaims>;
+
 export async function signJwt(payload: JwtPayload): Promise<string> {
+  if (
+    (payload.authProvider !== "local" &&
+      payload.authProvider !== "google" &&
+      payload.authProvider !== "password") ||
+    payload.authProvider !== configuredAuthMode() ||
+    typeof payload.authSubject !== "string" ||
+    payload.authSubject.length < 1 ||
+    payload.authSubject.length > 1024 ||
+    !Number.isSafeInteger(payload.userGeneration) ||
+    payload.userGeneration < 1 ||
+    !Number.isSafeInteger(payload.authIdentityGeneration) ||
+    payload.authIdentityGeneration < 1
+  ) {
+    throw new TypeError("JWT authentication identity snapshot is invalid");
+  }
   const secret = getJwtSecret();
   return new SignJWT({ ...payload })
     .setProtectedHeader({ alg: "HS256" })
@@ -140,7 +164,7 @@ export async function signJwt(payload: JwtPayload): Promise<string> {
     .sign(secret);
 }
 
-export async function verifyJwt(token: string): Promise<JwtPayload | null> {
+export async function verifyJwt(token: string): Promise<VerifiedJwtPayload | null> {
   try {
     if (isTokenRevoked(token)) {
       return null;
@@ -157,7 +181,7 @@ export async function verifyJwt(token: string): Promise<JwtPayload | null> {
     ) {
       return null;
     }
-    const result: JwtPayload = {
+    const result: VerifiedJwtPayload = {
       userId: payload.userId,
       username: payload.username,
       role: payload.role,

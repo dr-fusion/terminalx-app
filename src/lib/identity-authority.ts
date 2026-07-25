@@ -140,6 +140,12 @@ interface LegacyMigrationRow {
   imported_count: number;
 }
 
+interface LegacyGoogleBridgeRow {
+  google_subject: string;
+  legacy_user_id: string;
+  auth_identity_id: string;
+}
+
 interface LocalUserRow {
   id: string;
   username: string;
@@ -179,6 +185,16 @@ export function createCanonicalIdentityAuthority(
        id, user_id, provider, subject, status, generation,
        created_at_ms, updated_at_ms, last_authenticated_at_ms, revoked_at_ms
      ) VALUES (?, ?, 'google', ?, 'active', 1, ?, ?, ?, NULL)`
+  );
+  const findLegacyGoogleBridge = options.db.prepare(
+    `SELECT google_subject, legacy_user_id, auth_identity_id
+     FROM legacy_google_identity_bridges
+     WHERE google_subject = ?`
+  );
+  const insertLegacyGoogleBridge = options.db.prepare(
+    `INSERT INTO legacy_google_identity_bridges (
+       google_subject, legacy_user_id, auth_identity_id, bridged_at_ms
+     ) VALUES (?, ?, ?, ?)`
   );
   const insertLocalIdentity = options.db.prepare(
     `INSERT INTO auth_identities (
@@ -326,11 +342,19 @@ export function createCanonicalIdentityAuthority(
 
   const provisionGoogleIdentity = options.db.transaction(
     (input: ProvisionGoogleIdentityInput): ProvisionedIdentity => {
-      const subject = requiredString(input.subject, "Google subject", 1024);
+      const subject = googleSubject(input.subject);
       const email = requiredString(input.email, "Google email", 320).toLowerCase();
       const displayName = requiredString(input.displayName, "Google display name", 320);
       assertLegacyRole(input.legacyRole);
       const now = safeTimestamp(clock());
+      // Before schema v11, every SQL and non-SQL durable owner reference used
+      // this exact ID. Deriving it only from Google's verified subject keeps
+      // all of those stores continuous without caller-selected aliases or
+      // non-atomic rewrites.
+      const legacyUserId = `google-${subject}`;
+      if (legacyUserId.length > 300) {
+        throw new Error("Legacy Google User ID cannot be represented canonically");
+      }
 
       const existingIdentity = findIdentity.get("google", subject) as IdentityRow | undefined;
       if (existingIdentity) {
@@ -340,6 +364,21 @@ export function createCanonicalIdentityAuthority(
         const existingUser = findUser.get(existingIdentity.user_id) as UserRow | undefined;
         if (!existingUser || existingUser.status !== "active") {
           throw new Error("Canonical User is unavailable");
+        }
+        if (existingUser.id !== legacyUserId) {
+          throw new Error("Google authentication identity conflicts with legacy User continuity");
+        }
+        const bridge = findLegacyGoogleBridge.get(subject) as LegacyGoogleBridgeRow | undefined;
+        if (
+          bridge &&
+          (bridge.google_subject !== subject ||
+            bridge.legacy_user_id !== legacyUserId ||
+            bridge.auth_identity_id !== existingIdentity.id)
+        ) {
+          throw new Error("Legacy Google identity bridge is inconsistent");
+        }
+        if (!bridge) {
+          insertLegacyGoogleBridge.run(subject, legacyUserId, existingIdentity.id, now);
         }
         if (
           existingUser.username !== email ||
@@ -362,11 +401,14 @@ export function createCanonicalIdentityAuthority(
         return requireProvisionedIdentity(options.db, existingIdentity.id, existingUser.id);
       }
 
-      const userId = requiredString(idGenerator(), "generated User ID", 300);
+      if (findUser.get(legacyUserId)) {
+        throw new Error("Legacy Google User ID collides with an existing canonical User");
+      }
       const identityId = requiredString(idGenerator(), "generated authentication identity ID", 300);
-      insertUser.run(userId, email, displayName, input.legacyRole, now, now, null);
-      insertIdentity.run(identityId, userId, subject, now, now, now);
-      return requireProvisionedIdentity(options.db, identityId, userId);
+      insertUser.run(legacyUserId, email, displayName, input.legacyRole, now, now, null);
+      insertIdentity.run(identityId, legacyUserId, subject, now, now, now);
+      insertLegacyGoogleBridge.run(subject, legacyUserId, identityId, now);
+      return requireProvisionedIdentity(options.db, identityId, legacyUserId);
     }
   );
   const provisionPasswordIdentity = options.db.transaction((): ProvisionedIdentity => {
@@ -692,6 +734,19 @@ function requiredString(value: unknown, label: string, maxLength: number): strin
   const normalized = value.trim();
   if (!normalized || normalized.length > maxLength) throw new TypeError(`${label} is invalid`);
   return normalized;
+}
+
+function googleSubject(value: unknown): string {
+  if (
+    typeof value !== "string" ||
+    value.length < 1 ||
+    value.length > 1024 ||
+    value !== value.trim() ||
+    /[\u0000-\u001f\u007f]/.test(value)
+  ) {
+    throw new TypeError("Google subject is invalid");
+  }
+  return value;
 }
 
 function safeTimestamp(value: number): number {

@@ -9,10 +9,10 @@ import type { Socket } from "net";
 import { StringDecoder } from "string_decoder";
 import { audit } from "../src/lib/audit-log";
 import { canAccessSession } from "../src/lib/session-scope";
-import type { JwtPayload } from "../src/lib/auth";
+import type { VerifiedJwtPayload } from "../src/lib/auth";
 
 interface AuthenticatedRequest extends IncomingMessage {
-  user?: JwtPayload;
+  user?: VerifiedJwtPayload;
 }
 
 // Import server-side modules
@@ -33,6 +33,10 @@ import { createLogStream, destroyLogStream, destroyAllLogStreams } from "../src/
 import { startRecorder, sweepExpiredRecordings } from "../src/lib/session-recorder";
 import { verifyJwt, parseCookies } from "../src/lib/auth";
 import { getAuthMode } from "../src/lib/auth-config";
+import {
+  closeCanonicalIdentityAuthorityService,
+  initializeCanonicalIdentityAuthorityService,
+} from "../src/lib/identity-service";
 import { ensureDefaultAdmin } from "../src/lib/users";
 import { startTelegramBot, stopTelegramBot, ensureTopicForSession } from "../src/lib/telegram/bot";
 import { acceptTelegramWebhookUpdate } from "../src/lib/telegram/webhook-acceptance";
@@ -699,6 +703,12 @@ let uninstallProductionHostedRuntimeFactory: (() => void) | undefined;
 void app
   .prepare()
   .then(async () => {
+    if (AUTH_MODE !== "none") {
+      // Database migration and integrity checks are a startup gate, not work
+      // an unauthenticated login request may trigger after the server listens.
+      initializeCanonicalIdentityAuthorityService();
+      await ensureDefaultAdmin();
+    }
     // Hosted production owns one explicit, fail-closed composition. Install it
     // before any service selection so an enabled but incomplete deployment can
     // never fall through to LocalTmux or begin listening without its graph.
@@ -860,11 +870,6 @@ void app
       }
     });
 
-    // Ensure default admin user in local mode
-    ensureDefaultAdmin().catch((err) => {
-      console.error("[auth] Failed to create default admin:", err);
-    });
-
     const sweep = sweepExpiredRecordings();
     if (sweep.deleted > 0) {
       console.log(`[recorder] swept ${sweep.deleted} expired recording(s)`);
@@ -950,6 +955,7 @@ void app
               destroyProcessResources: () => {
                 destroyAllPtys();
                 destroyAllLogStreams();
+                closeCanonicalIdentityAuthorityService();
               },
               reportFailure: (stage: ServerShutdownStage) => {
                 console.error(`[shutdown] ${stage} did not settle cleanly`);
@@ -970,6 +976,11 @@ void app
   })
   .catch(() => {
     markMultiplayerTransportAvailable(false);
+    try {
+      closeCanonicalIdentityAuthorityService();
+    } catch {
+      // Preserve the generic startup failure and never expose database details.
+    }
     try {
       uninstallProductionHostedRuntimeFactory?.();
     } catch {

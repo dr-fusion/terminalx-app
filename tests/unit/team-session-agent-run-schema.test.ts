@@ -39,10 +39,10 @@ describe("Team Session Agent Run schema", () => {
     fs.rmSync(directory, { recursive: true, force: true });
   });
 
-  it("initializes Runtime records and the canonical identity authority at schema v11", () => {
+  it("initializes Runtime records and the canonical identity authority at schema v12", () => {
     database = openTeamSessionDatabase({ filename });
 
-    expect(database.db.pragma("user_version", { simple: true })).toBe(11);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(12);
     const tables = database.db
       .prepare(
         `SELECT name FROM sqlite_schema
@@ -140,12 +140,12 @@ describe("Team Session Agent Run schema", () => {
     expect(commandTable.sql).toContain("target_run_state_version = 2");
   });
 
-  it("migrates a genuine v2 Session schema through v11 in one open", () => {
+  it("migrates a genuine v2 Session schema through v12 in one open", () => {
     createAgentRunSchemaV2Fixture(filename);
 
     database = openTeamSessionDatabase({ filename });
 
-    expect(database.db.pragma("user_version", { simple: true })).toBe(11);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(12);
     expect(
       database.db
         .prepare(`SELECT name FROM sqlite_schema WHERE type = 'table' AND name = 'agent_runs'`)
@@ -167,7 +167,7 @@ describe("Team Session Agent Run schema", () => {
     expect(database.db.pragma("foreign_key_check")).toEqual([]);
   });
 
-  it("accepts schema v11 when a peer finishes migration after this opener prepared v4", () => {
+  it("accepts schema v12 when a peer finishes migration after this opener prepared v4", () => {
     createRuntimeRunSchemaV4Fixture(filename);
     const pragmaDescriptor = Object.getOwnPropertyDescriptor(Database.prototype, "pragma");
     if (!pragmaDescriptor?.value) throw new Error("Expected better-sqlite3 pragma method");
@@ -180,7 +180,7 @@ describe("Team Session Agent Run schema", () => {
           peerAdvanceStarted = true;
           const peer = openTeamSessionDatabase({ filename });
           try {
-            expect(peer.db.pragma("user_version", { simple: true })).toBe(11);
+            expect(peer.db.pragma("user_version", { simple: true })).toBe(12);
             peerAdvanced = true;
           } finally {
             peer.close();
@@ -197,12 +197,12 @@ describe("Team Session Agent Run schema", () => {
 
     expect(peerAdvanceStarted).toBe(true);
     expect(peerAdvanced).toBe(true);
-    expect(database.db.pragma("user_version", { simple: true })).toBe(11);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(12);
     expect(database.db.pragma("foreign_key_check")).toEqual([]);
     expect(database.db.pragma("quick_check", { simple: true })).toBe("ok");
   });
 
-  it("accepts schema v11 when a peer wins after this opener reaches the v6 boundary", () => {
+  it("accepts schema v12 when a peer wins after this opener reaches the v6 boundary", () => {
     createRuntimeCompensationSchemaV6Fixture(filename);
     const pragmaDescriptor = Object.getOwnPropertyDescriptor(Database.prototype, "pragma");
     if (!pragmaDescriptor?.value) throw new Error("Expected better-sqlite3 pragma method");
@@ -216,7 +216,7 @@ describe("Team Session Agent Run schema", () => {
           if (versionReads === 2) {
             const peer = openTeamSessionDatabase({ filename });
             try {
-              expect(peer.db.pragma("user_version", { simple: true })).toBe(11);
+              expect(peer.db.pragma("user_version", { simple: true })).toBe(12);
               peerAdvanced = true;
             } finally {
               peer.close();
@@ -233,11 +233,11 @@ describe("Team Session Agent Run schema", () => {
     }
 
     expect(peerAdvanced).toBe(true);
-    expect(database.db.pragma("user_version", { simple: true })).toBe(11);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(12);
     expect(database.db.pragma("foreign_key_check")).toEqual([]);
   });
 
-  it("upgrades an exact committed v7 database through v11 and marks attempted assignment work ambiguous", () => {
+  it("upgrades an exact committed v7 database through v12 and marks attempted assignment work ambiguous", () => {
     createRuntimeAssignmentOutboxSchemaV7Fixture(filename);
     const legacy = new Database(filename);
     try {
@@ -288,7 +288,7 @@ describe("Team Session Agent Run schema", () => {
 
     database = openTeamSessionDatabase({ filename });
 
-    expect(database.db.pragma("user_version", { simple: true })).toBe(11);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(12);
     expect(
       database.db
         .prepare(
@@ -1686,7 +1686,7 @@ describe("Team Session Agent Run schema", () => {
     }
   });
 
-  it("accepts v11 when a peer wins after this opener observes the committed v7 boundary", () => {
+  it("accepts v12 when a peer wins after this opener observes the committed v7 boundary", () => {
     createRuntimeAssignmentOutboxSchemaV7Fixture(filename);
     const pragmaDescriptor = Object.getOwnPropertyDescriptor(Database.prototype, "pragma");
     if (!pragmaDescriptor?.value) throw new Error("Expected better-sqlite3 pragma method");
@@ -1703,7 +1703,7 @@ describe("Team Session Agent Run schema", () => {
             peerAdvanceStarted = true;
             const peer = openTeamSessionDatabase({ filename });
             try {
-              expect(peer.db.pragma("user_version", { simple: true })).toBe(11);
+              expect(peer.db.pragma("user_version", { simple: true })).toBe(12);
               peerAdvanced = true;
             } finally {
               peer.close();
@@ -1721,12 +1721,12 @@ describe("Team Session Agent Run schema", () => {
 
     expect(peerAdvanceStarted).toBe(true);
     expect(peerAdvanced).toBe(true);
-    expect(database.db.pragma("user_version", { simple: true })).toBe(11);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(12);
     expect(database.db.pragma("foreign_key_check")).toEqual([]);
     expect(database.db.pragma("quick_check", { simple: true })).toBe("ok");
   });
 
-  it("migrates genuine v5 through v11 without fabricating observation trust", () => {
+  it("migrates genuine v5 through v12 without fabricating observation trust", () => {
     createRuntimeReceiptFollowSchemaV5Fixture(filename);
     const before = new Database(filename, { readonly: true });
     try {
@@ -1744,7 +1744,7 @@ describe("Team Session Agent Run schema", () => {
     }
 
     database = openTeamSessionDatabase({ filename });
-    expect(database.db.pragma("user_version", { simple: true })).toBe(11);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(12);
     expect(
       database.db.prepare(`SELECT COUNT(*) AS count FROM runtime_principal_observation_keys`).get()
     ).toEqual({ count: 0 });
@@ -1775,7 +1775,7 @@ describe("Team Session Agent Run schema", () => {
     }
 
     database = openTeamSessionDatabase({ filename });
-    expect(database.db.pragma("user_version", { simple: true })).toBe(11);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(12);
     expect(
       database.db
         .prepare(
@@ -2441,7 +2441,7 @@ describe("Team Session Agent Run schema", () => {
 
     database = openTeamSessionDatabase({ filename });
 
-    expect(database.db.pragma("user_version", { simple: true })).toBe(11);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(12);
     expect(
       database.db
         .prepare(`SELECT name FROM sqlite_schema WHERE type = 'table' AND name = ?`)
@@ -2479,12 +2479,12 @@ describe("Team Session Agent Run schema", () => {
     expect(database.db.pragma("foreign_key_check")).toEqual([]);
   });
 
-  it("migrates a populated v4 Runtime journal through v11 without losing truth", () => {
+  it("migrates a populated v4 Runtime journal through v12 without losing truth", () => {
     const beforeMigration = createPopulatedRuntimeRunSchemaV4Fixture(filename);
 
     database = openTeamSessionDatabase({ filename });
 
-    expect(database.db.pragma("user_version", { simple: true })).toBe(11);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(12);
     expect(
       database.db
         .prepare(`SELECT * FROM runtime_run_commands WHERE id = ?`)
@@ -2532,7 +2532,7 @@ describe("Team Session Agent Run schema", () => {
 
       database = openTeamSessionDatabase({ filename });
 
-      expect(database.db.pragma("user_version", { simple: true })).toBe(11);
+      expect(database.db.pragma("user_version", { simple: true })).toBe(12);
       expect(
         database.db
           .prepare(
@@ -5401,6 +5401,7 @@ function createRuntimeRunSchemaV3Fixture(filename: string): {
   const db = new Database(filename);
   try {
     db.exec(`
+      DROP TABLE legacy_google_identity_bridges;
       DROP TABLE local_auth_credentials;
       DROP TABLE auth_identities;
       DROP TABLE users;

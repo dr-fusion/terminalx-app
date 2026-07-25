@@ -116,7 +116,7 @@ describe("startup validation", () => {
     expect(result.errors).toEqual([]);
   });
 
-  it("fails explicitly when the current canonical identity schema cannot be queried", async () => {
+  it("fails explicitly when a canonical identity schema cannot be queried", async () => {
     fs.mkdirSync(path.join(tmp, "data"));
     const database = new Database(path.join(tmp, "data", "team-sessions.sqlite"));
     database.pragma("application_id = 0x54585331");
