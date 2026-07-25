@@ -29,6 +29,7 @@ import {
   type ProxyResultClass,
   snapshotProxyExecuteRequest,
 } from "./proxy-protocol";
+import type { AssignmentEligibilityStore } from "./assignment-eligibility-store";
 
 const AUTHORITY_DIGEST_DOMAIN = "terminalx/credential-proxy-authority-snapshot/v1\0";
 const DEFAULT_TIMEOUT_MS = 10_000;
@@ -62,6 +63,12 @@ export interface CreateCredentialProxyOptions {
   readonly clock?: () => number;
   readonly requestTimeoutMs?: number;
   readonly audit?: (event: CredentialProxyAuditEvent) => void;
+  /**
+   * Slice 8F Runtime-Assignment-scoped eligibility. When present, a
+   * `hosted-assignment` caller must pass the assignment generation-fence before
+   * the credential is attached. Absent, hosted-assignment callers fail closed.
+   */
+  readonly assignmentEligibility?: AssignmentEligibilityStore;
 }
 
 export interface CredentialProxyResult {
@@ -106,6 +113,7 @@ export function createCredentialProxy(options: CreateCredentialProxyOptions): Cr
   }
   const audit = options.audit ?? ((): void => undefined);
   const { store, accounting, network, resolveCredential } = options;
+  const assignmentEligibility = options.assignmentEligibility ?? null;
 
   const now = (): number => {
     const value = clock();
@@ -191,6 +199,46 @@ export function createCredentialProxy(options: CreateCredentialProxyOptions): Cr
         operation.destinationHost,
         operation.provider
       );
+    }
+
+    // Slice 8F: a hosted Run may exercise the handle only under the exact
+    // Runtime Assignment identity, generation-fenced by the eligibility store.
+    // Human-session callers (the 8E HTTP flows) are unfenced here.
+    if (request.caller?.class === "hosted-assignment") {
+      if (!assignmentEligibility) {
+        return deny(
+          request,
+          digest,
+          startedAtMs,
+          "authority-mismatch",
+          operation.destinationHost,
+          operation.provider
+        );
+      }
+      let outcome;
+      try {
+        outcome = assignmentEligibility.evaluate(
+          {
+            handleId: request.authority.handleId,
+            runtimeAssignmentId: request.caller.runtimeAssignmentId,
+            runtimeAssignmentGeneration: request.caller.runtimeAssignmentGeneration,
+            sandboxIdentityDigest: request.caller.sandboxIdentityDigest,
+          },
+          startedAtMs
+        );
+      } catch {
+        outcome = "denied-mismatch" as const;
+      }
+      if (outcome !== "eligible") {
+        return deny(
+          request,
+          digest,
+          startedAtMs,
+          "authority-mismatch",
+          operation.destinationHost,
+          operation.provider
+        );
+      }
     }
 
     let plan: ProxyRequestPlan;
