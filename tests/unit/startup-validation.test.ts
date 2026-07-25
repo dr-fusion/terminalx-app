@@ -49,4 +49,33 @@ describe("startup validation", () => {
 
     expect(result.errors).toEqual([]);
   });
+
+  it("accepts local auth with an active SQL-backed User after legacy migration", async () => {
+    fs.mkdirSync(path.join(tmp, "data"));
+    const filename = path.join(tmp, "data", "team-sessions.sqlite");
+    const { openTeamSessionDatabase } = await import("@/lib/team-sessions/sqlite");
+    const { createCanonicalIdentityAuthority } = await import("@/lib/identity-authority");
+    const database = openTeamSessionDatabase({ filename });
+    try {
+      const ids = ["canonical-user-1", "local-identity-1"];
+      createCanonicalIdentityAuthority({
+        db: database.db,
+        idGenerator: () => ids.shift()!,
+      }).createLocalUser({
+        username: "alice",
+        passwordHash: "$2b$12$01234567890123456789012345678901234567890123456789012",
+        legacyRole: "admin",
+      });
+    } finally {
+      database.close();
+    }
+    process.env.TERMINALX_AUTH_MODE = "local";
+    process.env.TERMINALX_JWT_SECRET = "x".repeat(40);
+    delete process.env.TERMINALX_ADMIN_PASSWORD;
+    const { validateStartupConfiguration } = await import("@/lib/startup-validation");
+
+    const result = validateStartupConfiguration({ host: "127.0.0.1", cwd: tmp });
+
+    expect(result.errors).toEqual([]);
+  });
 });

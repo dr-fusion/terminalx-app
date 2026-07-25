@@ -1,5 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
+import Database from "better-sqlite3";
 import { getAllowedEmails, getAuthMode } from "./auth-config";
 
 export interface StartupValidationOptions {
@@ -19,7 +20,7 @@ function dataPath(cwd = process.cwd(), file: string): string {
   return path.join(cwd, "data", file);
 }
 
-function hasExistingLocalUser(cwd = process.cwd()): boolean {
+function hasLegacyLocalUser(cwd = process.cwd()): boolean {
   const usersFile = dataPath(cwd, "users.json");
   try {
     const raw = fs.readFileSync(usersFile, "utf-8");
@@ -27,6 +28,39 @@ function hasExistingLocalUser(cwd = process.cwd()): boolean {
     return Array.isArray(parsed) && parsed.length > 0;
   } catch {
     return false;
+  }
+}
+
+function hasCanonicalLocalUser(cwd = process.cwd()): boolean {
+  const configured = process.env.TERMINALX_TEAM_SESSION_DB_PATH;
+  const filename = configured
+    ? path.resolve(cwd, configured)
+    : dataPath(cwd, "team-sessions.sqlite");
+  if (!fs.existsSync(filename)) return false;
+  let database: Database.Database | undefined;
+  try {
+    database = new Database(filename, { readonly: true, fileMustExist: true });
+    const applicationId = database.pragma("application_id", { simple: true }) as number;
+    if (applicationId !== 0x54585331) return false;
+    return Boolean(
+      database
+        .prepare(
+          `SELECT 1
+           FROM users user
+           JOIN auth_identities identity ON identity.user_id = user.id
+           JOIN local_auth_credentials credential
+             ON credential.user_id = user.id AND credential.auth_identity_id = identity.id
+           WHERE user.status = 'active'
+             AND identity.status = 'active'
+             AND identity.provider = 'local'
+           LIMIT 1`
+        )
+        .get()
+    );
+  } catch {
+    return false;
+  } finally {
+    database?.close();
   }
 }
 
@@ -70,7 +104,7 @@ export function validateStartupConfiguration(
   }
 
   if (authMode === "local") {
-    const hasUsers = hasExistingLocalUser(cwd);
+    const hasUsers = hasCanonicalLocalUser(cwd) || hasLegacyLocalUser(cwd);
     if (!hasUsers && !hasLongEnoughPassword(process.env.TERMINALX_ADMIN_PASSWORD)) {
       errors.push(
         `TERMINALX_ADMIN_PASSWORD must be set and at least ${MIN_PASSWORD_LENGTH} characters for first local-auth startup.`

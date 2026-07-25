@@ -1,10 +1,14 @@
-import * as fs from "fs";
-import * as path from "path";
+import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
 import { hashPassword } from "./auth";
-import { getAuthMode, getAdminUsername, getAdminPassword } from "./auth-config";
-import { ensureSecureDir } from "./secure-dir";
-
-// ── Types ───────────────────────────────────────────────────────────────────
+import { getAdminPassword, getAdminUsername, getAuthMode } from "./auth-config";
+import {
+  type CanonicalIdentityAuthority,
+  type LegacyLocalUserRecord,
+  type ProvisionedIdentity,
+} from "./identity-authority";
+import { withCanonicalIdentityAuthority } from "./identity-service";
 
 export interface User {
   id: string;
@@ -17,77 +21,45 @@ export interface User {
 
 export type SafeUser = Omit<User, "passwordHash">;
 
-// ── File Path ───────────────────────────────────────────────────────────────
+const LEGACY_USERS_FILE_ENV = "TERMINALX_LEGACY_USERS_FILE";
 
-const DATA_DIR = path.join(process.cwd(), "data");
-const USERS_FILE = path.join(DATA_DIR, "users.json");
-
-function ensureDataDir(): void {
-  ensureSecureDir(DATA_DIR);
-}
-
-// ── In-process Write Lock ───────────────────────────────────────────────────
-
-let writeLock: Promise<void> = Promise.resolve();
-
-function withLock<T>(fn: () => Promise<T>): Promise<T> {
-  const next = writeLock.then(fn, fn);
-  writeLock = next.then(
-    () => {},
-    () => {}
+function legacyUsersFilename(): string {
+  return (
+    process.env[LEGACY_USERS_FILE_ENV] ??
+    path.join(/* turbopackIgnore: true */ process.cwd(), "data", "users.json")
   );
-  return next;
 }
 
-// ── Atomic File Write ───────────────────────────────────────────────────────
-
-function atomicWriteUsers(users: User[]): void {
-  ensureDataDir();
-  const tmpFile = USERS_FILE + ".tmp";
-  fs.writeFileSync(tmpFile, JSON.stringify(users, null, 2), { encoding: "utf-8", mode: 0o600 });
-  fs.renameSync(tmpFile, USERS_FILE);
-  invalidateCache();
-}
-
-// ── User Cache (mtime-based to avoid disk reads on every auth check) ────────
-
-let cachedUsers: User[] | null = null;
-let cachedMtime: number = 0;
-
-function invalidateCache(): void {
-  cachedUsers = null;
-  cachedMtime = 0;
-}
-
-// ── CRUD ────────────────────────────────────────────────────────────────────
-
-export function getUsers(): User[] {
-  ensureDataDir();
-  if (!fs.existsSync(USERS_FILE)) {
-    cachedUsers = [];
-    return [];
+function readLegacyUsers(): { sourceDigest: string; users: LegacyLocalUserRecord[] } {
+  const filename = legacyUsersFilename();
+  let raw = "[]";
+  if (fs.existsSync(/* turbopackIgnore: true */ filename)) {
+    raw = fs.readFileSync(/* turbopackIgnore: true */ filename, "utf8");
   }
+  let parsed: unknown;
   try {
-    const stat = fs.statSync(USERS_FILE);
-    const mtime = stat.mtimeMs;
-    if (cachedUsers && mtime === cachedMtime) {
-      return cachedUsers;
-    }
-    const raw = fs.readFileSync(USERS_FILE, "utf-8");
-    cachedUsers = JSON.parse(raw) as User[];
-    cachedMtime = mtime;
-    return cachedUsers;
+    parsed = JSON.parse(raw);
   } catch {
-    return [];
+    throw new Error("Legacy User migration source is invalid");
   }
+  if (!Array.isArray(parsed)) throw new Error("Legacy User migration source is invalid");
+  return {
+    sourceDigest: crypto.createHash("sha256").update(raw).digest("hex"),
+    users: parsed as LegacyLocalUserRecord[],
+  };
 }
 
-export function getUserByUsername(username: string): User | undefined {
-  return getUsers().find((u) => u.username === username);
+function withIdentityAuthority<T>(operation: (authority: CanonicalIdentityAuthority) => T): T {
+  return withCanonicalIdentityAuthority((authority) => {
+    if (!authority.hasImportedLegacyLocalUsers()) {
+      authority.importLegacyLocalUsers(readLegacyUsers());
+    }
+    return operation(authority);
+  });
 }
 
-export function getUserById(id: string): User | undefined {
-  return getUsers().find((u) => u.id === id);
+function asUser(record: LegacyLocalUserRecord): User {
+  return { ...record };
 }
 
 function stripHash(user: User): SafeUser {
@@ -95,68 +67,53 @@ function stripHash(user: User): SafeUser {
   return safe;
 }
 
+export function getUsers(): User[] {
+  return withIdentityAuthority((authority) => authority.listLocalUsers().map(asUser));
+}
+
+export function getUserByUsername(username: string): User | undefined {
+  return withIdentityAuthority((authority) => {
+    const user = authority.getLocalUserByUsername(username);
+    return user ? asUser(user) : undefined;
+  });
+}
+
+export function getUserById(id: string): User | undefined {
+  return withIdentityAuthority((authority) => {
+    const user = authority.getLocalUserById(id);
+    return user ? asUser(user) : undefined;
+  });
+}
+
+export function getLocalAuthenticationIdentity(userId: string): ProvisionedIdentity | null {
+  return withIdentityAuthority((authority) => authority.getLocalAuthenticationIdentity(userId));
+}
+
 export async function createUser(
   username: string,
   password: string,
   role: "admin" | "user"
 ): Promise<SafeUser> {
-  return withLock(async () => {
-    const users = getUsers();
-    if (users.find((u) => u.username === username)) {
-      throw new Error("Username already exists");
-    }
-
-    const passwordHash = await hashPassword(password);
-    const user: User = {
-      id: crypto.randomUUID(),
-      username,
-      role,
-      passwordHash,
-      createdAt: new Date().toISOString(),
-      lastLogin: null,
-    };
-    users.push(user);
-    atomicWriteUsers(users);
-    return stripHash(user);
-  });
+  const passwordHash = await hashPassword(password);
+  const user = withIdentityAuthority((authority) =>
+    authority.createLocalUser({ username, passwordHash, legacyRole: role })
+  );
+  return stripHash(asUser(user));
 }
 
-// NOTE: Deleting a user does not revoke their active JWT tokens since we don't
-// track which tokens belong to which user. Tokens will remain valid until they
-// expire (7 days). The in-memory blacklist only covers explicit logout. A future
-// improvement would be to track token-to-user mappings for forced revocation.
+/** Soft-revoke the canonical User and every authentication identity it owns. */
 export async function deleteUser(id: string): Promise<void> {
-  return withLock(async () => {
-    const users = getUsers();
-    const idx = users.findIndex((u) => u.id === id);
-    if (idx === -1) throw new Error("User not found");
-    users.splice(idx, 1);
-    atomicWriteUsers(users);
-  });
+  withIdentityAuthority((authority) => authority.revokeUser(id));
 }
 
 export async function updateUserRole(id: string, role: "admin" | "user"): Promise<SafeUser> {
-  return withLock(async () => {
-    const users = getUsers();
-    const user = users.find((u) => u.id === id);
-    if (!user) throw new Error("User not found");
-    user.role = role;
-    atomicWriteUsers(users);
-    return stripHash(user);
-  });
+  const user = withIdentityAuthority((authority) => authority.updateLocalUserRole(id, role));
+  return stripHash(asUser(user));
 }
 
 export async function updateLastLogin(id: string): Promise<void> {
-  return withLock(async () => {
-    const users = getUsers();
-    const user = users.find((u) => u.id === id);
-    if (!user) return;
-    user.lastLogin = new Date().toISOString();
-    atomicWriteUsers(users);
-  });
+  withIdentityAuthority((authority) => authority.recordLocalLogin(id));
 }
-
-// ── Auto-create Admin on First Startup ──────────────────────────────────────
 
 let initialized = false;
 
@@ -164,11 +121,8 @@ export async function ensureDefaultAdmin(): Promise<void> {
   if (initialized) return;
   initialized = true;
 
-  const mode = getAuthMode();
-  if (mode !== "local") return;
-
-  const users = getUsers();
-  if (users.length > 0) return;
+  if (getAuthMode() !== "local") return;
+  if (getUsers().length > 0) return;
 
   const username = getAdminUsername();
   const password = getAdminPassword();
