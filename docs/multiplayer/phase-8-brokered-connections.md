@@ -1,9 +1,10 @@
 # Phase 8 brokered secrets and connections
 
 Status: in progress. The canonical authentication identity foundation, the Slice 8B local connection
-authority, the Slice 8C Secret Broker process, and the Slice 8D Credential Proxy are complete. Real
-provider adapters and hosted exfiltration evidence remain closed. Release Gate 3 is open, and hosted
-Runtimes must continue to advertise `brokeredCredentials: false` and `proxyOnlyEgress: false`.
+authority, the Slice 8C Secret Broker process, the Slice 8D Credential Proxy, and the Slice 8E
+Telegram/Slack provider adapters and end-to-end connection flow are complete. Hosted exfiltration
+evidence remains closed. Release Gate 3 is open, and hosted Runtimes must continue to advertise
+`brokeredCredentials: false` and `proxyOnlyEgress: false`.
 
 ## Authority boundaries
 
@@ -271,15 +272,68 @@ only an external reference and is not resolvable for use in 8D (fails closed wit
 enforcement evidence (8F/8G), and Gate 5 reservation math (Phase 9) remain out of scope.
 `brokeredCredentials` and `proxyOnlyEgress` remain `false` everywhere and Release Gate 3 stays open.
 
+## Slice 8E — Telegram/Slack provider adapters and end-to-end flow
+
+Status: complete. Slice 8E turns the local authority, broker, and proxy into a usable connection
+flow for Telegram and Slack, without importing any legacy plaintext provider state into the authority
+model. The credential-acquisition design and its rationale are recorded in
+[`ADR 0004`](../adr/0004-provider-credential-acquisition-in-broker.md).
+
+- **Credential acquisition inside the broker.** Three new closed-response operations on the broker
+  socket (`exchange.slack-oauth`, `exchange.telegram-bot-token`, `webhook.verify-slack`) perform the
+  provider network call inside the broker and return only a Registration Receipt plus non-secret
+  installation identity. The raw bot token, refresh token, Slack signing secret, and Telegram
+  `secret_token` never cross the socket. The Slack signing secret is sealed at-rest bound to the
+  installation; the Telegram `secret_token` is generated in-broker, set on Telegram, and reduced to a
+  digest the main process stores. The residual Telegram token input-path exposure is documented in
+  ADR 0004.
+- **Provider adapters.** `src/lib/connections/providers/{telegram,slack}` implement the injected
+  `verifyProviderProof` (deep-link `/start` for Telegram, Sign in with Slack OIDC for Slack — both
+  bound to the challenge digest and installation identity, constructing a `VerifiedProviderIdentity`
+  only from provider-verified material), webhook verification (Telegram secret-token digest
+  comparison; Slack v0 HMAC via the broker), inbound normalization, and outbound send mapped to a
+  typed 8D proxy operation with the exact per-send authority snapshot.
+- **Least-privilege scopes.** Slack installs with `chat:write` + `channels:read` (what the typed
+  proxy operations need) plus reviewed event subscriptions; identity linking uses `openid`/`profile`.
+  Telegram models the bot's fixed capability set (`bot:send-message`, `bot:edit-message`,
+  `bot:receive-updates`, `bot:get-file`) as reviewed scopes plus an `identity:telegram` link scope.
+- **Replay protection.** Linking proofs replay-fence via the 8B provider-proof digest namespace.
+  Webhooks add durable, bounded, digest-only dedup of Slack `event_id` and Telegram `update_id` per
+  installation (schema v14 `provider_webhook_deliveries`, write-once with immutability triggers, plus
+  a Telegram monotonic-ordinal column), the Slack ±300s timestamp window, and the Telegram monotonic
+  `update_id`. Duplicate/replayed deliveries are acknowledged-but-dropped; the authoritative
+  "never processed twice" guarantee is the idempotent kernel command keyed by the provider replay id,
+  so a crash between processing and marking is at-least-once acknowledged and never a double Session
+  event.
+- **End-to-end flow.** Inbound: verified webhook → normalize → replay dedup →
+  `resolveInboundAttribution` (linked path) or the separate fail-closed anonymous path
+  (acknowledged/audited only when the Binding permits unlinked inbound, never a directive, never a
+  Session mutation) → append a comment/directive through the kernel command surface with exact
+  attribution. Outbound: a per-message delivery step resolves the Binding outbound policy (fencing
+  disabled/mentions-only, artifact gating, and stale revisions), sends through the 8D proxy, and
+  retries only on `retryable` within a bounded budget, never on `denied` (a rotation/revocation
+  mid-flight resolves to `authority-mismatch` and is terminal). An integration test exercises install
+  → link → bind → inbound comment → outbound delivery across the real broker child process with fake
+  Slack + Telegram servers.
+
+Deliberately closed in 8E: `brokeredCredentials` and `proxyOnlyEgress` remain `false`, Release Gate 3
+stays open, and no provider network call in CI touches a real provider. Full retirement of the legacy
+host-global Telegram integration is re-scoped to land with 8F hosted enforcement (see below): it backs
+a live deployment, so 8E only hardens it (descriptor-relative download creation closing the
+parent-rename race) and fences it behind the `TERMINALX_LEGACY_TELEGRAM` flag with a deprecation
+startup warning; hosted Runtimes never get the legacy path because hosted enforcement composes only
+the brokered path.
+
 ## Remaining implementation slices
 
 - **8C — Secret Broker:** complete; see the Slice 8C section above.
 - **8D — Credential Proxy:** complete; see the Slice 8D section above. Permits only typed,
   destination-scoped provider operations and accounts outbound bytes and results without exposing
   authorization headers or signing keys.
-- **8E — providers:** implement Telegram and Slack installation, linking, rotation, revocation,
-  webhook verification, replay protection, and least-privilege scopes without importing legacy
-  plaintext provider state into the authority model.
+- **8E — providers:** complete; see the Slice 8E section above. Telegram and Slack installation,
+  linking, rotation, revocation, webhook verification, replay protection, and least-privilege scopes,
+  with credential acquisition inside the broker and no legacy plaintext provider state in the
+  authority model.
 - **8F — hosted enforcement:** bind broker and proxy policy to the exact Runtime Assignment and make
   capability activation depend on measured enforcement evidence.
 - **8G — adversarial evidence:** seed canaries and prove they cannot escape through files,
