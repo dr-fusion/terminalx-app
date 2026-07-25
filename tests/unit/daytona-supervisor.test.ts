@@ -372,7 +372,7 @@ describe("Daytona supervisor process boundaries", () => {
     writeFileSync(
       executable,
       [
-        "#!/usr/bin/env node",
+        `#!${process.execPath}`,
         'let input = "";',
         'process.stdin.setEncoding("utf8");',
         'process.stdin.on("data", (chunk) => { input += chunk; });',
