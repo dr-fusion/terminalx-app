@@ -157,6 +157,28 @@ export function telegramConfigFingerprint(): string {
   return JSON.stringify(getTelegramConfig());
 }
 
+/**
+ * Whether the legacy host-global Telegram integration is enabled.
+ *
+ * The legacy integration is deprecated: it is a single host-global bot token and
+ * username allowlist that predates the Phase 8 connection authority and never
+ * feeds it. It backs a live production deployment, so it defaults to today's
+ * behavior (enabled). Set `TERMINALX_LEGACY_TELEGRAM=false` (or `0`/`off`/`no`)
+ * to disable it entirely. Its full retirement lands with Slice 8F hosted
+ * enforcement; hosted Runtimes never get this path.
+ */
+export function legacyTelegramIntegrationEnabled(): boolean {
+  const raw = process.env.TERMINALX_LEGACY_TELEGRAM;
+  if (raw === undefined) return true;
+  const normalized = raw.trim().toLowerCase();
+  return !(
+    normalized === "false" ||
+    normalized === "0" ||
+    normalized === "off" ||
+    normalized === "no"
+  );
+}
+
 export function parseTelegramAllowedUsers(raw: string): Map<number, string> {
   const map = new Map<number, string>();
   for (const entry of raw.split(",")) {

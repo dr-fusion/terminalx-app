@@ -182,10 +182,11 @@ separate and is not migrated, inferred, or trusted as Team/User/Session connecti
 provider adapters and legacy retirement remain Slice 8E work.
 
 The legacy Telegram download path rejects exact sensitive destinations and final-component symlinks
-with exclusive creation. A same-host actor with the TerminalX OS user's existing filesystem rights
-can still race a parent-directory rename between validation and creation. That is nonblocking for
-the explicitly trusted LocalTmux adapter, but it must be replaced with descriptor-relative creation
-or retired with the legacy adapter before any untrusted same-host Runtime is supported.
+with exclusive creation. As of Slice 8E the parent-directory rename race is closed: creation is now
+descriptor-relative (`openat`-style — the parent directory is opened to pin its inode and the file is
+created relative to that descriptor with `O_CREAT|O_EXCL|O_NOFOLLOW`), so a same-host actor cannot
+redirect the write by renaming the parent between validation and creation. See Slice 8E below for the
+remaining legacy retirement re-scope.
 
 ## Slice 8C — Secret Broker
 
