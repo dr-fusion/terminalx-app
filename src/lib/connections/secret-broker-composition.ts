@@ -11,6 +11,9 @@ import {
   readBrokerVerificationKey,
   type BrokerReceiptVerifier,
 } from "./secret-broker-verifier";
+import type { ProviderProofExpectation, VerifiedProviderIdentity } from "./authority";
+import { verifyTelegramDeepLinkProof } from "./providers/telegram-adapter";
+import { verifySlackOidcProof } from "./providers/slack-adapter";
 
 export const SECRET_BROKER_ROOT_ENV = "TERMINALX_SECRET_BROKER_ROOT";
 export const SECRET_BROKER_SOCKET_ENV = "TERMINALX_SECRET_BROKER_SOCKET";
@@ -45,6 +48,41 @@ export function resolveConfiguredBrokerReceiptVerifier(): BrokerReceiptVerifier 
   const verificationPublicKey = readBrokerVerificationKey(rootDir);
   if (!verificationPublicKey) return null;
   return createBrokerReceiptVerifier({ verificationPublicKey });
+}
+
+/**
+ * Build the synchronous, provider-dispatching `verifyProviderProof` for
+ * completing identity Link Challenges. It routes on the authority-built
+ * `expected.provider` to the Telegram deep-link verifier (proof produced by the
+ * authenticated webhook) and the Slack OIDC verifier (proof produced by the
+ * in-broker id_token verification in the callback route). Both verifiers are
+ * pure and synchronous — the network work (secret-token check, JWKS/id_token
+ * verification) already happened upstream — so this is safe to call inside the
+ * authority's SQLite transaction. Any provider outside the closed set returns
+ * null.
+ *
+ * Returns null when no Secret Broker is configured, so link completion keeps
+ * failing closed exactly as it does today: without a broker there is no active
+ * installation credential handle to link against, and the authority also refuses
+ * completion when this verifier is absent.
+ */
+export function resolveConfiguredProviderProofVerifier():
+  | ((input: {
+      proof: unknown;
+      expected: Readonly<ProviderProofExpectation>;
+    }) => VerifiedProviderIdentity | null)
+  | null {
+  if (!configuredSecretBrokerRoot()) return null;
+  return ({ proof, expected }) => {
+    switch (expected.provider) {
+      case "telegram":
+        return verifyTelegramDeepLinkProof({ proof, expected });
+      case "slack":
+        return verifySlackOidcProof({ proof, expected });
+      default:
+        return null;
+    }
+  };
 }
 
 /** Build the broker socket client, or null when no broker is configured. */
