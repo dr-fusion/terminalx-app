@@ -590,6 +590,7 @@ describe("Team Session kernel", () => {
     try {
       database.exec(`
         PRAGMA foreign_keys = OFF;
+        DROP TABLE provider_webhook_deliveries;
         DROP TABLE mobile_auth_migrations;
         DROP TABLE paired_devices;
         DROP TABLE mobile_pairing_codes;
@@ -2823,7 +2824,7 @@ describe("Team Session kernel", () => {
 
     const database = new Database(filename, { readonly: true });
     try {
-      expect(database.pragma("user_version", { simple: true })).toBe(13);
+      expect(database.pragma("user_version", { simple: true })).toBe(14);
       expect(database.pragma("foreign_key_check")).toEqual([]);
       expect(
         database

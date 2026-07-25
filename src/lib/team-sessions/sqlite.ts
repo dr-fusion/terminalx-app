@@ -15,7 +15,7 @@ import { digestRuntimeCompensationIncident } from "../runtime/runtime-compensati
 import { RUNTIME_RECEIPT_OBSERVATION_MAX_CURSOR_CODE_POINTS } from "../runtime/runtime-receipt-observation-contract";
 import { isValidTmuxSessionName } from "../tmux";
 
-const SCHEMA_VERSION = 13;
+const SCHEMA_VERSION = 14;
 const PRE_RUNTIME_START_SCHEMA_VERSION = 4;
 const RUNTIME_START_SCHEMA_VERSION = 5;
 const RUNTIME_RECEIPT_FOLLOW_SCHEMA_VERSION = 6;
@@ -26,6 +26,7 @@ const PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION = 10;
 const CANONICAL_IDENTITY_SCHEMA_VERSION = 11;
 const GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION = 12;
 const CONNECTION_AUTHORITY_SCHEMA_VERSION = 13;
+const WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION = 14;
 const APPLICATION_ID = 0x54585331; // "TXS1"
 
 const CANONICAL_IDENTITY_SCHEMA_V11 = `
@@ -1592,6 +1593,51 @@ CREATE TRIGGER mobile_auth_migrations_immutable_delete
 BEFORE DELETE ON mobile_auth_migrations
 BEGIN
   SELECT RAISE(ABORT, 'Mobile authentication migration history is immutable');
+END;
+`;
+
+/**
+ * Schema v14 (Slice 8E): durable, bounded, digest-only replay dedup of provider
+ * webhook deliveries, scoped per Channel Installation. Rows are write-once
+ * (immutability triggers) and store only a digest of the provider replay id
+ * (Slack `event_id` / Telegram `update_id`), never message content. The optional
+ * `monotonic_ordinal` carries the Telegram `update_id` value for monotonic
+ * tolerance. `UNIQUE (installation_id, delivery_digest)` is the dedup fence.
+ *
+ * This is an optimization layer: the true "never processed twice" guarantee rests
+ * on the idempotent Team Session kernel command (source scope/key), so a crash
+ * between processing and marking is at-least-once acknowledged, never a double
+ * Session event.
+ */
+const WEBHOOK_REPLAY_DEDUP_SCHEMA_V14 = `
+CREATE TABLE provider_webhook_deliveries (
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  installation_id TEXT NOT NULL REFERENCES channel_installations(id) ON DELETE RESTRICT,
+  provider TEXT NOT NULL CHECK (provider IN ('slack', 'telegram')),
+  delivery_digest TEXT NOT NULL CHECK (
+    length(delivery_digest) = 64 AND delivery_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  monotonic_ordinal INTEGER CHECK (monotonic_ordinal IS NULL OR monotonic_ordinal >= 0),
+  received_at_ms INTEGER NOT NULL CHECK (received_at_ms >= 0),
+  UNIQUE (installation_id, delivery_digest)
+) STRICT;
+
+CREATE INDEX provider_webhook_deliveries_by_installation
+  ON provider_webhook_deliveries(installation_id, sequence);
+
+CREATE INDEX provider_webhook_deliveries_by_ordinal
+  ON provider_webhook_deliveries(installation_id, provider, monotonic_ordinal);
+
+CREATE TRIGGER provider_webhook_deliveries_immutable_update
+BEFORE UPDATE ON provider_webhook_deliveries
+BEGIN
+  SELECT RAISE(ABORT, 'Provider webhook delivery dedup is immutable');
+END;
+
+CREATE TRIGGER provider_webhook_deliveries_immutable_delete
+BEFORE DELETE ON provider_webhook_deliveries
+BEGIN
+  SELECT RAISE(ABORT, 'Provider webhook delivery dedup is immutable');
 END;
 `;
 
@@ -8614,7 +8660,8 @@ export function openTeamSessionDatabase(
         migratedVersion !== PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION &&
         migratedVersion !== CANONICAL_IDENTITY_SCHEMA_VERSION &&
         migratedVersion !== GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION &&
-        migratedVersion !== CONNECTION_AUTHORITY_SCHEMA_VERSION
+        migratedVersion !== CONNECTION_AUTHORITY_SCHEMA_VERSION &&
+        migratedVersion !== WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION
       ) {
         throw new Error(
           `Unsupported Team Session database schema ${currentVersion}; expected ${SCHEMA_VERSION}`
@@ -8668,6 +8715,12 @@ export function openTeamSessionDatabase(
     }) as number;
     if (connectionAuthorityPreparedVersion === GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION) {
       migrateConnectionAuthoritySchemaV13(db);
+    }
+    const webhookReplayDedupPreparedVersion = db.pragma("user_version", {
+      simple: true,
+    }) as number;
+    if (webhookReplayDedupPreparedVersion === CONNECTION_AUTHORITY_SCHEMA_VERSION) {
+      migrateWebhookReplayDedupSchemaV14(db);
     }
 
     const applicationId = db.pragma("application_id", { simple: true }) as number;
@@ -8755,7 +8808,8 @@ function migrateRuntimeStartSchemaV5(db: Database.Database): void {
         currentVersion === PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION ||
         currentVersion === CANONICAL_IDENTITY_SCHEMA_VERSION ||
         currentVersion === GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION ||
-        currentVersion === CONNECTION_AUTHORITY_SCHEMA_VERSION
+        currentVersion === CONNECTION_AUTHORITY_SCHEMA_VERSION ||
+        currentVersion === WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION
       ) {
         return;
       }
@@ -8797,7 +8851,8 @@ function migrateRuntimeReceiptFollowSchemaV6(db: Database.Database): void {
       currentVersion === PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION ||
       currentVersion === CANONICAL_IDENTITY_SCHEMA_VERSION ||
       currentVersion === GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION ||
-      currentVersion === CONNECTION_AUTHORITY_SCHEMA_VERSION
+      currentVersion === CONNECTION_AUTHORITY_SCHEMA_VERSION ||
+      currentVersion === WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION
     ) {
       return;
     }
@@ -8832,7 +8887,8 @@ function migrateRuntimeCompensationSchemaV7(db: Database.Database): void {
       currentVersion === PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION ||
       currentVersion === CANONICAL_IDENTITY_SCHEMA_VERSION ||
       currentVersion === GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION ||
-      currentVersion === CONNECTION_AUTHORITY_SCHEMA_VERSION
+      currentVersion === CONNECTION_AUTHORITY_SCHEMA_VERSION ||
+      currentVersion === WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION
     ) {
       return;
     }
@@ -8870,7 +8926,8 @@ function migrateRuntimeAssignmentOutboxInterlockSchemaV8(db: Database.Database):
       currentVersion === PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION ||
       currentVersion === CANONICAL_IDENTITY_SCHEMA_VERSION ||
       currentVersion === GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION ||
-      currentVersion === CONNECTION_AUTHORITY_SCHEMA_VERSION
+      currentVersion === CONNECTION_AUTHORITY_SCHEMA_VERSION ||
+      currentVersion === WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION
     )
       return;
     if (currentVersion !== RUNTIME_COMPENSATION_SCHEMA_VERSION) {
@@ -8914,7 +8971,8 @@ function migrateHostedRuntimeAssignmentSchemaV9(db: Database.Database): void {
         currentVersion === PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION ||
         currentVersion === CANONICAL_IDENTITY_SCHEMA_VERSION ||
         currentVersion === GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION ||
-        currentVersion === CONNECTION_AUTHORITY_SCHEMA_VERSION
+        currentVersion === CONNECTION_AUTHORITY_SCHEMA_VERSION ||
+        currentVersion === WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION
       )
         return;
       if (currentVersion !== RUNTIME_ASSIGNMENT_OUTBOX_INTERLOCK_SCHEMA_VERSION) {
@@ -9010,7 +9068,8 @@ function migrateProviderBoundEffectActivationSchemaV10(db: Database.Database): v
       currentVersion === PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION ||
       currentVersion === CANONICAL_IDENTITY_SCHEMA_VERSION ||
       currentVersion === GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION ||
-      currentVersion === CONNECTION_AUTHORITY_SCHEMA_VERSION
+      currentVersion === CONNECTION_AUTHORITY_SCHEMA_VERSION ||
+      currentVersion === WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION
     ) {
       return;
     }
@@ -9244,7 +9303,8 @@ function migrateCanonicalIdentitySchemaV11(db: Database.Database): void {
     if (
       currentVersion === CANONICAL_IDENTITY_SCHEMA_VERSION ||
       currentVersion === GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION ||
-      currentVersion === CONNECTION_AUTHORITY_SCHEMA_VERSION
+      currentVersion === CONNECTION_AUTHORITY_SCHEMA_VERSION ||
+      currentVersion === WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION
     )
       return;
     if (currentVersion !== PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION) {
@@ -9274,7 +9334,8 @@ function migrateGoogleIdentityContinuitySchemaV12(db: Database.Database): void {
     const currentVersion = db.pragma("user_version", { simple: true }) as number;
     if (
       currentVersion === GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION ||
-      currentVersion === CONNECTION_AUTHORITY_SCHEMA_VERSION
+      currentVersion === CONNECTION_AUTHORITY_SCHEMA_VERSION ||
+      currentVersion === WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION
     )
       return;
     if (currentVersion !== CANONICAL_IDENTITY_SCHEMA_VERSION) {
@@ -9333,7 +9394,12 @@ function migrateGoogleIdentityContinuitySchemaV12(db: Database.Database): void {
 function migrateConnectionAuthoritySchemaV13(db: Database.Database): void {
   const migrate = db.transaction(() => {
     const currentVersion = db.pragma("user_version", { simple: true }) as number;
-    if (currentVersion === CONNECTION_AUTHORITY_SCHEMA_VERSION) return;
+    if (
+      currentVersion === CONNECTION_AUTHORITY_SCHEMA_VERSION ||
+      currentVersion === WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION
+    ) {
+      return;
+    }
     if (currentVersion !== GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION) {
       throw new Error(
         `Unsupported Team Session database schema ${currentVersion}; expected ${GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION}`
@@ -9350,6 +9416,27 @@ function migrateConnectionAuthoritySchemaV13(db: Database.Database): void {
       throw new Error("Team Session v13 migration failed its foreign key check");
     }
     db.pragma(`user_version = ${CONNECTION_AUTHORITY_SCHEMA_VERSION}`);
+  });
+  migrate.exclusive();
+}
+
+function migrateWebhookReplayDedupSchemaV14(db: Database.Database): void {
+  const migrate = db.transaction(() => {
+    const currentVersion = db.pragma("user_version", { simple: true }) as number;
+    if (currentVersion === WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION) return;
+    if (currentVersion !== CONNECTION_AUTHORITY_SCHEMA_VERSION) {
+      throw new Error(
+        `Unsupported Team Session database schema ${currentVersion}; expected ${CONNECTION_AUTHORITY_SCHEMA_VERSION}`
+      );
+    }
+    // Additive, digest-only replay dedup for provider webhook deliveries. It
+    // carries no message content and does not feed the connection authority.
+    db.exec(WEBHOOK_REPLAY_DEDUP_SCHEMA_V14);
+    const violations = db.pragma("foreign_key_check") as unknown[];
+    if (violations.length > 0) {
+      throw new Error("Team Session v14 migration failed its foreign key check");
+    }
+    db.pragma(`user_version = ${WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION}`);
   });
   migrate.exclusive();
 }
