@@ -115,4 +115,29 @@ export {
   type CredentialProxyRequest,
   type CredentialProxyRequestHandler,
 } from "./proxy/proxy-transport";
-export { BROKER_PROXY_SOCKET_FILE, BROKER_PROXY_ACCOUNTING_FILE } from "./broker-root";
+export {
+  BROKER_PROXY_SOCKET_FILE,
+  BROKER_PROXY_ACCOUNTING_FILE,
+  BROKER_WEBHOOK_SECRETS_FILE,
+} from "./broker-root";
+export {
+  createProviderExchange,
+  type ProviderExchange,
+  type CreateProviderExchangeOptions,
+  type PrepareInstallationCredential,
+} from "./exchange/exchange";
+export {
+  createFetchProviderExchangeClient,
+  ProviderExchangeError,
+  type ProviderExchangeClient,
+  type ProviderExchangeErrorKind,
+  type SlackOauthAccessInput,
+  type SlackOauthAccessResult,
+  type TelegramGetMeResult,
+} from "./exchange/provider-exchange-client";
+export {
+  openWebhookSecretStore,
+  type WebhookSecretStore,
+  type OpenWebhookSecretStoreOptions,
+} from "./exchange/webhook-secret-store";
+export { SLACK_INSTALLATION_FIELDS, TELEGRAM_BOT_IDENTITY_FIELDS } from "./protocol";

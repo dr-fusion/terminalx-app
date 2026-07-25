@@ -16,6 +16,8 @@ import { openProxyAccountingStore } from "./proxy/accounting-store";
 import { createFetchProxyNetworkClient } from "./proxy/network-client";
 import { createCredentialProxy, type CredentialProxyAuditEvent } from "./proxy/credential-proxy";
 import { runCredentialProxyConnection } from "./proxy/proxy-transport";
+import { openWebhookSecretStore, type WebhookSecretStore } from "./exchange/webhook-secret-store";
+import { createFetchProviderExchangeClient } from "./exchange/provider-exchange-client";
 
 interface ProxyBootstrapConfig {
   readonly enabled: boolean;
@@ -25,6 +27,16 @@ interface ProxyBootstrapConfig {
    * host allowlist (the operation still declares `api.telegram.org`/`slack.com`).
    */
   readonly originOverrides?: Readonly<Record<string, string>>;
+  readonly requestTimeoutMs?: number;
+}
+
+interface ExchangeBootstrapConfig {
+  readonly enabled: boolean;
+  /** Per-host request-origin overrides for hermetic tests (slack.com/api.telegram.org). */
+  readonly originOverrides?: Readonly<Record<string, string>>;
+  /** Reviewed Slack app OAuth client id/secret env var names. */
+  readonly slackClientIdEnv?: string;
+  readonly slackClientSecretEnv?: string;
   readonly requestTimeoutMs?: number;
 }
 
@@ -43,6 +55,7 @@ interface BootstrapConfig {
   readonly receiptTtlMs?: number;
   readonly reconcileIntervalMs?: number;
   readonly proxy?: ProxyBootstrapConfig;
+  readonly exchange?: ExchangeBootstrapConfig;
 }
 
 /** Structured, secret-free stderr audit line. Never logs receipts or keys. */
@@ -68,12 +81,41 @@ export async function runSecretBrokerDaemon(configPath: string): Promise<() => P
       handleId: event.handleId,
       status: event.status,
     });
+
+  // Slice 8E provider credential-acquisition, composed only when enabled. It
+  // requires the oauth-envelope adapter (the acquired token is sealed as one).
+  let webhookSecretStore: WebhookSecretStore | null = null;
+  let providerExchangeClient: ReturnType<typeof createFetchProviderExchangeClient> | undefined;
+  if (config.exchange && config.exchange.enabled) {
+    if (!config.adapters.oauthEnvelope) throw new SecretBrokerProtocolError("not-ready");
+    webhookSecretStore = openWebhookSecretStore({
+      databasePath: root.webhookSecretsPath,
+      atRestKey: root.atRestKey,
+    });
+    const originOverrides = config.exchange.originOverrides ?? {};
+    providerExchangeClient = createFetchProviderExchangeClient({
+      resolveOrigin: (host: string) => originOverrides[host] ?? `https://${host}`,
+      ...(config.exchange.slackClientIdEnv
+        ? { slackClientId: process.env[config.exchange.slackClientIdEnv] }
+        : {}),
+      ...(config.exchange.slackClientSecretEnv
+        ? { slackClientSecret: process.env[config.exchange.slackClientSecretEnv] }
+        : {}),
+      ...(config.exchange.requestTimeoutMs
+        ? { requestTimeoutMs: config.exchange.requestTimeoutMs }
+        : {}),
+    });
+  }
+
   const broker = createSecretBroker({
     root,
     store,
     adapters,
     receiptTtlMs: config.receiptTtlMs,
     audit,
+    ...(providerExchangeClient && webhookSecretStore
+      ? { providerExchangeClient, webhookSecretStore }
+      : {}),
   });
 
   const verifyPeerCredentials = createPinnedPeerCredentialVerifier({
@@ -124,6 +166,7 @@ export async function runSecretBrokerDaemon(configPath: string): Promise<() => P
     clearInterval(timer);
     await server.close();
     if (proxyRuntime) await proxyRuntime.close();
+    if (webhookSecretStore) webhookSecretStore.close();
     store.close();
   };
 }
@@ -248,7 +291,50 @@ function readBootstrapConfig(configPath: string): BootstrapConfig {
     receiptTtlMs: optionalPositive(field(record, "receiptTtlMs")),
     reconcileIntervalMs: optionalPositive(field(record, "reconcileIntervalMs")),
     proxy: parseProxyConfig(record["proxy"]),
+    exchange: parseExchangeConfig(record["exchange"]),
   });
+}
+
+function parseExchangeConfig(value: unknown): ExchangeBootstrapConfig | undefined {
+  if (value === undefined || value === null) return undefined;
+  const record = exactRecord(value, [
+    "enabled",
+    "originOverrides",
+    "slackClientIdEnv",
+    "slackClientSecretEnv",
+    "requestTimeoutMs",
+  ]);
+  const enabled = field(record, "enabled");
+  if (typeof enabled !== "boolean") throw new TypeError();
+  const overridesRaw = field(record, "originOverrides");
+  let originOverrides: Record<string, string> | undefined;
+  if (overridesRaw !== undefined && overridesRaw !== null) {
+    if (
+      typeof overridesRaw !== "object" ||
+      Array.isArray(overridesRaw) ||
+      Object.getPrototypeOf(overridesRaw) !== Object.prototype
+    ) {
+      throw new TypeError();
+    }
+    originOverrides = {};
+    for (const [key, origin] of Object.entries(overridesRaw as Record<string, unknown>)) {
+      if (typeof origin !== "string" || origin.length < 1) throw new TypeError();
+      originOverrides[key] = origin;
+    }
+  }
+  return Object.freeze({
+    enabled,
+    originOverrides: originOverrides ? Object.freeze(originOverrides) : undefined,
+    slackClientIdEnv: optionalString(field(record, "slackClientIdEnv")),
+    slackClientSecretEnv: optionalString(field(record, "slackClientSecretEnv")),
+    requestTimeoutMs: optionalPositive(field(record, "requestTimeoutMs")),
+  });
+}
+
+function optionalString(value: unknown): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "string" || value.length < 1) throw new TypeError();
+  return value;
 }
 
 /**
@@ -263,7 +349,7 @@ function requireBootstrapKeys(
   if (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) {
     throw new TypeError();
   }
-  const allowed = new Set([...required, "proxy"]);
+  const allowed = new Set([...required, "proxy", "exchange"]);
   const record = value as Record<string, unknown>;
   for (const key of Object.keys(record)) {
     if (!allowed.has(key)) throw new TypeError();

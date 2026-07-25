@@ -11,6 +11,9 @@ import {
 } from "./protocol";
 import type { SecretBrokerRequest, SecretBrokerRequestHandler } from "./ndjson";
 import type { RegistrationRow, SecretBrokerStateStore } from "./state-store";
+import { createProviderExchange, type ProviderExchange } from "./exchange/exchange";
+import type { ProviderExchangeClient } from "./exchange/provider-exchange-client";
+import type { WebhookSecretStore } from "./exchange/webhook-secret-store";
 
 const MIN_TTL_MS = 60 * 1000;
 const MAX_TTL_MS = 30 * 60 * 1000;
@@ -37,6 +40,15 @@ export interface CreateSecretBrokerOptions {
   readonly clock?: () => number;
   readonly receiptTtlMs?: number;
   readonly audit?: (event: SecretBrokerAuditEvent) => void;
+  /**
+   * Slice 8E provider credential-acquisition (optional and additive). When both
+   * are present the broker serves `exchange.slack-oauth`,
+   * `exchange.telegram-bot-token`, and `webhook.verify-slack`; otherwise those
+   * methods fail closed with `not-ready`.
+   */
+  readonly providerExchangeClient?: ProviderExchangeClient;
+  readonly webhookSecretStore?: WebhookSecretStore;
+  readonly exchangeRandomBytes?: (size: number) => Buffer;
 }
 
 export interface SecretBroker {
@@ -136,12 +148,58 @@ export function createSecretBroker(options: CreateSecretBrokerOptions): SecretBr
     );
   }
 
+  const exchange: ProviderExchange | null =
+    options.providerExchangeClient && options.webhookSecretStore
+      ? createProviderExchange({
+          client: options.providerExchangeClient,
+          webhookSecrets: options.webhookSecretStore,
+          clock,
+          ...(options.exchangeRandomBytes ? { randomBytes: options.exchangeRandomBytes } : {}),
+          // Seal the acquired token through the exact two-phase prepare path so the
+          // returned receipt is an ordinary Registration Receipt the main process
+          // verifies and finalizes; the token never crosses the socket.
+          prepareInstallationCredential: async ({
+            operationId,
+            provider,
+            expectationDigest,
+            tokenUtf8,
+          }) => {
+            const base64 = tokenUtf8.toString("base64");
+            tokenUtf8.fill(0);
+            const { receipt } = await prepare(
+              {
+                operationId,
+                provider,
+                brokerKind: "oauth-envelope",
+                usage: "installation",
+                expectationDigest,
+                replaces: null,
+                secretMaterial: base64,
+              },
+              false
+            );
+            return receipt;
+          },
+        })
+      : null;
+
+  function requireExchange(): ProviderExchange {
+    if (!exchange) throw new SecretBrokerProtocolError("not-ready");
+    return exchange;
+  }
+
   const handle: SecretBrokerRequestHandler = async (request: SecretBrokerRequest) => {
     switch (request.method) {
       case "registration.prepare":
         return prepare(request.params, false);
       case "rotation.prepare":
         return prepare(request.params, true);
+      case "exchange.slack-oauth":
+        return requireExchange().slackOauth(request.params);
+      case "exchange.telegram-bot-token":
+        return requireExchange().telegramBotToken(request.params);
+      case "webhook.verify-slack":
+        return requireExchange().verifySlackWebhook(request.params);
       case "registration.finalize": {
         const { handleId, receiptId } = snapshotHandleReceipt(request.params);
         const row = store.finalize(handleId, receiptId);

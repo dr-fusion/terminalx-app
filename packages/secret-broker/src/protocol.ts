@@ -20,6 +20,13 @@ export const SECRET_BROKER_METHODS = Object.freeze([
   "handle.revoke",
   "handle.status",
   "broker.health",
+  // Slice 8E provider credential-acquisition operations. Each performs the
+  // provider network call inside the broker, seals the resulting credential as an
+  // oauth-envelope secret, and returns only a Registration Receipt plus non-secret
+  // installation identity — the raw token never crosses the socket.
+  "exchange.slack-oauth",
+  "exchange.telegram-bot-token",
+  "webhook.verify-slack",
 ] as const);
 
 export type SecretBrokerMethod = (typeof SECRET_BROKER_METHODS)[number];
@@ -174,7 +181,28 @@ export const RESPONSE_SCHEMAS: Readonly<Record<SecretBrokerMethod, readonly stri
     "handle.revoke": ["handleId", "status"],
     "handle.status": ["handleId", "status", "brokerKind", "provider", "usage", "expiresAtMs"],
     "broker.health": ["brokerInstanceId", "brokerEpoch", "signingKeyId", "pendingRegistrations"],
+    "exchange.slack-oauth": ["receipt", "installation"],
+    "exchange.telegram-bot-token": ["receipt", "botIdentity", "webhookSecretTokenDigest"],
+    "webhook.verify-slack": ["valid", "withinReplayWindow"],
   });
+
+/** Non-secret Slack installation identity returned by `exchange.slack-oauth`. */
+export const SLACK_INSTALLATION_FIELDS = Object.freeze([
+  "provider",
+  "externalTenantId",
+  "externalAppId",
+  "externalBotUserId",
+  "grantedScopes",
+] as const);
+
+/** Non-secret Telegram bot identity returned by `exchange.telegram-bot-token`. */
+export const TELEGRAM_BOT_IDENTITY_FIELDS = Object.freeze([
+  "provider",
+  "externalTenantId",
+  "externalAppId",
+  "botId",
+  "username",
+] as const);
 
 /**
  * A registration receipt is itself a closed record. It carries only opaque
@@ -211,8 +239,32 @@ export function assertClosedResponse(method: SecretBrokerMethod, response: unkno
   const allowed = RESPONSE_SCHEMAS[method];
   try {
     const record = exactRecord(response, allowed);
-    if (method === "registration.prepare" || method === "rotation.prepare") {
+    if (
+      method === "registration.prepare" ||
+      method === "rotation.prepare" ||
+      method === "exchange.slack-oauth" ||
+      method === "exchange.telegram-bot-token"
+    ) {
       assertClosedReceipt(field(record, "receipt"));
+    }
+    if (method === "exchange.slack-oauth") {
+      const installation = exactRecord(field(record, "installation"), SLACK_INSTALLATION_FIELDS);
+      const grantedScopes = field(installation, "grantedScopes");
+      if (!Array.isArray(grantedScopes) || grantedScopes.some((s) => typeof s !== "string")) {
+        throw new TypeError();
+      }
+    }
+    if (method === "exchange.telegram-bot-token") {
+      exactRecord(field(record, "botIdentity"), TELEGRAM_BOT_IDENTITY_FIELDS);
+      if (typeof field(record, "webhookSecretTokenDigest") !== "string") throw new TypeError();
+    }
+    if (method === "webhook.verify-slack") {
+      if (
+        typeof field(record, "valid") !== "boolean" ||
+        typeof field(record, "withinReplayWindow") !== "boolean"
+      ) {
+        throw new TypeError();
+      }
     }
   } catch {
     throw new SecretBrokerProtocolError("internal");
