@@ -6,7 +6,7 @@ import { digestRuntimeCompensationIncident } from "../runtime/runtime-compensati
 import { RUNTIME_RECEIPT_OBSERVATION_MAX_CURSOR_CODE_POINTS } from "../runtime/runtime-receipt-observation-contract";
 import { isValidTmuxSessionName } from "../tmux";
 
-const SCHEMA_VERSION = 10;
+const SCHEMA_VERSION = 12;
 const PRE_RUNTIME_START_SCHEMA_VERSION = 4;
 const RUNTIME_START_SCHEMA_VERSION = 5;
 const RUNTIME_RECEIPT_FOLLOW_SCHEMA_VERSION = 6;
@@ -14,7 +14,220 @@ const RUNTIME_COMPENSATION_SCHEMA_VERSION = 7;
 const RUNTIME_ASSIGNMENT_OUTBOX_INTERLOCK_SCHEMA_VERSION = 8;
 const HOSTED_RUNTIME_ASSIGNMENT_SCHEMA_VERSION = 9;
 const PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION = 10;
+const CANONICAL_IDENTITY_SCHEMA_VERSION = 11;
+const GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION = 12;
 const APPLICATION_ID = 0x54585331; // "TXS1"
+
+const CANONICAL_IDENTITY_SCHEMA_V11 = `
+CREATE TABLE users (
+  id TEXT PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 300),
+  username TEXT NOT NULL CHECK (length(username) BETWEEN 1 AND 320),
+  display_name TEXT NOT NULL CHECK (length(display_name) BETWEEN 1 AND 320),
+  legacy_role TEXT NOT NULL CHECK (legacy_role IN ('admin', 'user')),
+  status TEXT NOT NULL CHECK (status IN ('active', 'revoked')),
+  generation INTEGER NOT NULL CHECK (generation >= 1),
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= created_at_ms),
+  last_login_at_ms INTEGER CHECK (last_login_at_ms IS NULL OR last_login_at_ms >= created_at_ms),
+  revoked_at_ms INTEGER,
+  CHECK (
+    (status = 'active' AND revoked_at_ms IS NULL) OR
+    (status = 'revoked' AND revoked_at_ms IS NOT NULL AND revoked_at_ms >= created_at_ms)
+  )
+) STRICT;
+
+CREATE INDEX users_by_status_username ON users(status, username, id);
+
+CREATE TRIGGER users_identity_immutable
+BEFORE UPDATE OF id, created_at_ms ON users
+BEGIN
+  SELECT RAISE(ABORT, 'Canonical User identity is immutable');
+END;
+
+CREATE TRIGGER users_immutable_delete
+BEFORE DELETE ON users
+BEGIN
+  SELECT RAISE(ABORT, 'Canonical User history is immutable');
+END;
+
+CREATE TRIGGER users_revocation_irreversible
+BEFORE UPDATE OF status ON users
+WHEN OLD.status = 'revoked' AND NEW.status <> 'revoked'
+BEGIN
+  SELECT RAISE(ABORT, 'Canonical User revoked state is irreversible');
+END;
+
+CREATE TRIGGER users_generation_monotonic
+BEFORE UPDATE ON users
+WHEN
+  NEW.generation < OLD.generation OR
+  NEW.generation > OLD.generation + 1 OR
+  (
+    (
+      NEW.username IS NOT OLD.username OR
+      NEW.display_name IS NOT OLD.display_name OR
+      NEW.legacy_role IS NOT OLD.legacy_role OR
+      NEW.status IS NOT OLD.status
+    ) AND NEW.generation <> OLD.generation + 1
+  ) OR
+  (
+    NEW.username IS OLD.username AND
+    NEW.display_name IS OLD.display_name AND
+    NEW.legacy_role IS OLD.legacy_role AND
+    NEW.status IS OLD.status AND
+    NEW.generation <> OLD.generation
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'Canonical User generation transition is invalid');
+END;
+
+CREATE TRIGGER users_timestamps_monotonic
+BEFORE UPDATE ON users
+WHEN
+  NEW.updated_at_ms < OLD.updated_at_ms OR
+  (
+    OLD.last_login_at_ms IS NOT NULL AND
+    (NEW.last_login_at_ms IS NULL OR NEW.last_login_at_ms < OLD.last_login_at_ms)
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'Canonical User timestamp transition is invalid');
+END;
+
+CREATE TABLE auth_identities (
+  id TEXT PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 300),
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+  provider TEXT NOT NULL CHECK (provider IN ('local', 'google', 'password')),
+  subject TEXT NOT NULL CHECK (length(subject) BETWEEN 1 AND 1024),
+  status TEXT NOT NULL CHECK (status IN ('active', 'revoked')),
+  generation INTEGER NOT NULL CHECK (generation >= 1),
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= created_at_ms),
+  last_authenticated_at_ms INTEGER CHECK (
+    last_authenticated_at_ms IS NULL OR last_authenticated_at_ms >= created_at_ms
+  ),
+  revoked_at_ms INTEGER,
+  CHECK (
+    (status = 'active' AND revoked_at_ms IS NULL) OR
+    (status = 'revoked' AND revoked_at_ms IS NOT NULL AND revoked_at_ms >= created_at_ms)
+  ),
+  UNIQUE (provider, subject),
+  UNIQUE (id, user_id)
+) STRICT;
+
+CREATE INDEX auth_identities_by_user_status
+  ON auth_identities(user_id, status, provider, id);
+
+CREATE TRIGGER auth_identities_identity_immutable
+BEFORE UPDATE OF id, user_id, provider, subject, created_at_ms ON auth_identities
+BEGIN
+  SELECT RAISE(ABORT, 'Authentication identity provider subject is immutable');
+END;
+
+CREATE TRIGGER auth_identities_immutable_delete
+BEFORE DELETE ON auth_identities
+BEGIN
+  SELECT RAISE(ABORT, 'Authentication identity history is immutable');
+END;
+
+CREATE TRIGGER auth_identities_revocation_irreversible
+BEFORE UPDATE OF status ON auth_identities
+WHEN OLD.status = 'revoked' AND NEW.status <> 'revoked'
+BEGIN
+  SELECT RAISE(ABORT, 'Authentication identity revoked state is irreversible');
+END;
+
+CREATE TRIGGER auth_identities_generation_monotonic
+BEFORE UPDATE ON auth_identities
+WHEN
+  NEW.generation < OLD.generation OR
+  NEW.generation > OLD.generation + 1 OR
+  (NEW.status IS NOT OLD.status AND NEW.generation <> OLD.generation + 1) OR
+  (NEW.status IS OLD.status AND NEW.generation <> OLD.generation)
+BEGIN
+  SELECT RAISE(ABORT, 'Authentication identity generation transition is invalid');
+END;
+
+CREATE TRIGGER auth_identities_timestamps_monotonic
+BEFORE UPDATE ON auth_identities
+WHEN
+  NEW.updated_at_ms < OLD.updated_at_ms OR
+  (
+    OLD.last_authenticated_at_ms IS NOT NULL AND
+    (
+      NEW.last_authenticated_at_ms IS NULL OR
+      NEW.last_authenticated_at_ms < OLD.last_authenticated_at_ms
+    )
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'Authentication identity timestamp transition is invalid');
+END;
+
+CREATE TABLE local_auth_credentials (
+  auth_identity_id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL UNIQUE,
+  password_hash TEXT NOT NULL CHECK (length(password_hash) BETWEEN 20 AND 4096),
+  updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= 0),
+  FOREIGN KEY (auth_identity_id, user_id)
+    REFERENCES auth_identities(id, user_id) ON DELETE RESTRICT
+) STRICT;
+
+CREATE TABLE identity_migrations (
+  migration_key TEXT PRIMARY KEY CHECK (length(migration_key) BETWEEN 1 AND 200),
+  source_digest TEXT NOT NULL CHECK (length(source_digest) = 64),
+  imported_count INTEGER NOT NULL CHECK (imported_count >= 0),
+  completed_at_ms INTEGER NOT NULL CHECK (completed_at_ms >= 0)
+) STRICT;
+
+CREATE TRIGGER identity_migrations_immutable_update
+BEFORE UPDATE ON identity_migrations
+BEGIN
+  SELECT RAISE(ABORT, 'Identity migration history is immutable');
+END;
+
+CREATE TRIGGER identity_migrations_immutable_delete
+BEFORE DELETE ON identity_migrations
+BEGIN
+  SELECT RAISE(ABORT, 'Identity migration history is immutable');
+END;
+`;
+
+const GOOGLE_IDENTITY_CONTINUITY_SCHEMA_V12 = `
+CREATE TABLE legacy_google_identity_bridges (
+  google_subject TEXT PRIMARY KEY CHECK (length(google_subject) BETWEEN 1 AND 1024),
+  legacy_user_id TEXT NOT NULL UNIQUE CHECK (
+    length(legacy_user_id) BETWEEN 1 AND 300 AND
+    legacy_user_id = 'google-' || google_subject
+  ),
+  auth_identity_id TEXT NOT NULL UNIQUE REFERENCES auth_identities(id) ON DELETE RESTRICT,
+  bridged_at_ms INTEGER NOT NULL CHECK (bridged_at_ms >= 0)
+) STRICT;
+
+CREATE TRIGGER legacy_google_identity_bridges_exact_identity
+BEFORE INSERT ON legacy_google_identity_bridges
+WHEN NOT EXISTS (
+  SELECT 1
+  FROM auth_identities identity
+  WHERE identity.id = NEW.auth_identity_id
+    AND identity.user_id = NEW.legacy_user_id
+    AND identity.provider = 'google'
+    AND identity.subject = NEW.google_subject
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Legacy Google identity bridge does not match its authentication identity');
+END;
+
+CREATE TRIGGER legacy_google_identity_bridges_immutable_update
+BEFORE UPDATE ON legacy_google_identity_bridges
+BEGIN
+  SELECT RAISE(ABORT, 'Legacy Google identity bridge history is immutable');
+END;
+
+CREATE TRIGGER legacy_google_identity_bridges_immutable_delete
+BEFORE DELETE ON legacy_google_identity_bridges
+BEGIN
+  SELECT RAISE(ABORT, 'Legacy Google identity bridge history is immutable');
+END;
+`;
 
 const CONVERSATION_SCHEMA = `
 CREATE TABLE conversation_identities (
@@ -6984,6 +7197,7 @@ export function openTeamSessionDatabase(
   try {
     db.pragma("busy_timeout = 5000");
     db.pragma("foreign_keys = ON");
+    db.pragma("recursive_triggers = ON");
     db.pragma("trusted_schema = OFF");
 
     // Version discovery and first initialization share the same write lock so
@@ -7031,7 +7245,9 @@ export function openTeamSessionDatabase(
         migratedVersion !== RUNTIME_COMPENSATION_SCHEMA_VERSION &&
         migratedVersion !== RUNTIME_ASSIGNMENT_OUTBOX_INTERLOCK_SCHEMA_VERSION &&
         migratedVersion !== HOSTED_RUNTIME_ASSIGNMENT_SCHEMA_VERSION &&
-        migratedVersion !== PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION
+        migratedVersion !== PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION &&
+        migratedVersion !== CANONICAL_IDENTITY_SCHEMA_VERSION &&
+        migratedVersion !== GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION
       ) {
         throw new Error(
           `Unsupported Team Session database schema ${currentVersion}; expected ${SCHEMA_VERSION}`
@@ -7068,6 +7284,18 @@ export function openTeamSessionDatabase(
     if (effectActivationPreparedVersion === HOSTED_RUNTIME_ASSIGNMENT_SCHEMA_VERSION) {
       migrateProviderBoundEffectActivationSchemaV10(db);
     }
+    const canonicalIdentityPreparedVersion = db.pragma("user_version", {
+      simple: true,
+    }) as number;
+    if (canonicalIdentityPreparedVersion === PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION) {
+      migrateCanonicalIdentitySchemaV11(db);
+    }
+    const googleIdentityContinuityPreparedVersion = db.pragma("user_version", {
+      simple: true,
+    }) as number;
+    if (googleIdentityContinuityPreparedVersion === CANONICAL_IDENTITY_SCHEMA_VERSION) {
+      migrateGoogleIdentityContinuitySchemaV12(db);
+    }
 
     const applicationId = db.pragma("application_id", { simple: true }) as number;
     if (applicationId !== APPLICATION_ID) {
@@ -7095,6 +7323,10 @@ export function openTeamSessionDatabase(
     const foreignKeys = db.pragma("foreign_keys", { simple: true }) as number;
     if (foreignKeys !== 1) {
       throw new Error("Team Session database requires SQLite foreign key enforcement");
+    }
+    const recursiveTriggers = db.pragma("recursive_triggers", { simple: true }) as number;
+    if (recursiveTriggers !== 1) {
+      throw new Error("Team Session database requires recursive trigger enforcement");
     }
     secureDatabaseFiles(filename);
   } catch (error) {
@@ -7147,7 +7379,9 @@ function migrateRuntimeStartSchemaV5(db: Database.Database): void {
         currentVersion === RUNTIME_COMPENSATION_SCHEMA_VERSION ||
         currentVersion === RUNTIME_ASSIGNMENT_OUTBOX_INTERLOCK_SCHEMA_VERSION ||
         currentVersion === HOSTED_RUNTIME_ASSIGNMENT_SCHEMA_VERSION ||
-        currentVersion === PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION
+        currentVersion === PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION ||
+        currentVersion === CANONICAL_IDENTITY_SCHEMA_VERSION ||
+        currentVersion === GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION
       ) {
         return;
       }
@@ -7186,7 +7420,9 @@ function migrateRuntimeReceiptFollowSchemaV6(db: Database.Database): void {
       currentVersion === RUNTIME_COMPENSATION_SCHEMA_VERSION ||
       currentVersion === RUNTIME_ASSIGNMENT_OUTBOX_INTERLOCK_SCHEMA_VERSION ||
       currentVersion === HOSTED_RUNTIME_ASSIGNMENT_SCHEMA_VERSION ||
-      currentVersion === PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION
+      currentVersion === PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION ||
+      currentVersion === CANONICAL_IDENTITY_SCHEMA_VERSION ||
+      currentVersion === GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION
     ) {
       return;
     }
@@ -7218,7 +7454,9 @@ function migrateRuntimeCompensationSchemaV7(db: Database.Database): void {
       currentVersion === RUNTIME_COMPENSATION_SCHEMA_VERSION ||
       currentVersion === RUNTIME_ASSIGNMENT_OUTBOX_INTERLOCK_SCHEMA_VERSION ||
       currentVersion === HOSTED_RUNTIME_ASSIGNMENT_SCHEMA_VERSION ||
-      currentVersion === PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION
+      currentVersion === PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION ||
+      currentVersion === CANONICAL_IDENTITY_SCHEMA_VERSION ||
+      currentVersion === GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION
     ) {
       return;
     }
@@ -7253,7 +7491,9 @@ function migrateRuntimeAssignmentOutboxInterlockSchemaV8(db: Database.Database):
     if (
       currentVersion === RUNTIME_ASSIGNMENT_OUTBOX_INTERLOCK_SCHEMA_VERSION ||
       currentVersion === HOSTED_RUNTIME_ASSIGNMENT_SCHEMA_VERSION ||
-      currentVersion === PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION
+      currentVersion === PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION ||
+      currentVersion === CANONICAL_IDENTITY_SCHEMA_VERSION ||
+      currentVersion === GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION
     )
       return;
     if (currentVersion !== RUNTIME_COMPENSATION_SCHEMA_VERSION) {
@@ -7294,7 +7534,9 @@ function migrateHostedRuntimeAssignmentSchemaV9(db: Database.Database): void {
       }
       if (
         currentVersion === HOSTED_RUNTIME_ASSIGNMENT_SCHEMA_VERSION ||
-        currentVersion === PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION
+        currentVersion === PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION ||
+        currentVersion === CANONICAL_IDENTITY_SCHEMA_VERSION ||
+        currentVersion === GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION
       )
         return;
       if (currentVersion !== RUNTIME_ASSIGNMENT_OUTBOX_INTERLOCK_SCHEMA_VERSION) {
@@ -7386,7 +7628,13 @@ function migrateHostedRuntimeAssignmentSchemaV9(db: Database.Database): void {
 function migrateProviderBoundEffectActivationSchemaV10(db: Database.Database): void {
   const migrate = db.transaction(() => {
     const currentVersion = db.pragma("user_version", { simple: true }) as number;
-    if (currentVersion === PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION) return;
+    if (
+      currentVersion === PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION ||
+      currentVersion === CANONICAL_IDENTITY_SCHEMA_VERSION ||
+      currentVersion === GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION
+    ) {
+      return;
+    }
     if (currentVersion !== HOSTED_RUNTIME_ASSIGNMENT_SCHEMA_VERSION) {
       throw new Error(
         `Unsupported Team Session database schema ${currentVersion}; expected ${HOSTED_RUNTIME_ASSIGNMENT_SCHEMA_VERSION}`
@@ -7607,6 +7855,93 @@ function migrateProviderBoundEffectActivationSchemaV10(db: Database.Database): v
     `);
 
     db.pragma(`user_version = ${PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION}`);
+  });
+  migrate.exclusive();
+}
+
+function migrateCanonicalIdentitySchemaV11(db: Database.Database): void {
+  const migrate = db.transaction(() => {
+    const currentVersion = db.pragma("user_version", { simple: true }) as number;
+    if (
+      currentVersion === CANONICAL_IDENTITY_SCHEMA_VERSION ||
+      currentVersion === GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION
+    )
+      return;
+    if (currentVersion !== PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION) {
+      throw new Error(
+        `Unsupported Team Session database schema ${currentVersion}; expected ${PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION}`
+      );
+    }
+
+    db.exec(CANONICAL_IDENTITY_SCHEMA_V11);
+    const violations = db.pragma("foreign_key_check") as unknown[];
+    if (violations.length > 0) {
+      throw new Error("Team Session v11 migration failed its foreign key check");
+    }
+    db.pragma(`user_version = ${CANONICAL_IDENTITY_SCHEMA_VERSION}`);
+  });
+  migrate.exclusive();
+}
+
+interface V11GoogleIdentityRow {
+  id: string;
+  user_id: string;
+  subject: string;
+}
+
+function migrateGoogleIdentityContinuitySchemaV12(db: Database.Database): void {
+  const migrate = db.transaction(() => {
+    const currentVersion = db.pragma("user_version", { simple: true }) as number;
+    if (currentVersion === GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION) return;
+    if (currentVersion !== CANONICAL_IDENTITY_SCHEMA_VERSION) {
+      throw new Error(
+        `Unsupported Team Session database schema ${currentVersion}; expected ${CANONICAL_IDENTITY_SCHEMA_VERSION}`
+      );
+    }
+
+    const googleIdentities = db
+      .prepare(
+        `SELECT id, user_id, subject
+         FROM auth_identities
+         WHERE provider = 'google'
+         ORDER BY id`
+      )
+      .all() as V11GoogleIdentityRow[];
+    for (const identity of googleIdentities) {
+      const expectedUserId = `google-${identity.subject}`;
+      if (
+        identity.subject.length < 1 ||
+        identity.subject.length > 1024 ||
+        identity.subject !== identity.subject.trim() ||
+        /[\u0000-\u001f\u007f]/.test(identity.subject) ||
+        expectedUserId.length > 300 ||
+        identity.user_id !== expectedUserId
+      ) {
+        // The pushed v11 preview could create opaque Google User IDs. Guessing
+        // which SQL and non-SQL owner references to rewrite would risk either
+        // orphaning authority or transferring it to the wrong User, so require
+        // an explicit operator repair instead of silently accepting that state.
+        throw new Error(
+          "Team Session v12 migration requires explicit repair of an incompatible v11 Google identity"
+        );
+      }
+    }
+
+    db.exec(GOOGLE_IDENTITY_CONTINUITY_SCHEMA_V12);
+    db.prepare(
+      `INSERT INTO legacy_google_identity_bridges (
+         google_subject, legacy_user_id, auth_identity_id, bridged_at_ms
+       )
+       SELECT subject, user_id, id, created_at_ms
+       FROM auth_identities
+       WHERE provider = 'google'
+       ORDER BY id`
+    ).run();
+    const violations = db.pragma("foreign_key_check") as unknown[];
+    if (violations.length > 0) {
+      throw new Error("Team Session v12 migration failed its foreign key check");
+    }
+    db.pragma(`user_version = ${GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION}`);
   });
   migrate.exclusive();
 }

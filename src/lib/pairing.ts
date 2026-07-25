@@ -16,7 +16,12 @@ interface PairingCode {
   code: string;
   userId: string;
   username: string;
+  displayName?: string;
   role: string;
+  authProvider?: "local" | "google" | "password";
+  authSubject?: string;
+  userGeneration?: number;
+  authIdentityGeneration?: number;
   createdAt: number;
   expiresAt: number;
   consumedAt: number | null;
@@ -60,7 +65,12 @@ function prune(entries: PairingCode[], now: number): PairingCode[] {
 export type CreatePairingCodeInput = {
   userId: string;
   username: string;
+  displayName?: string;
   role: string;
+  authProvider?: "local" | "google" | "password";
+  authSubject?: string;
+  userGeneration?: number;
+  authIdentityGeneration?: number;
 };
 
 export type CreatedPairingCode = {
@@ -76,7 +86,14 @@ export function createPairingCode(input: CreatePairingCodeInput): Promise<Create
       code,
       userId: input.userId,
       username: input.username,
+      ...(input.displayName ? { displayName: input.displayName } : {}),
       role: input.role,
+      ...(input.authProvider ? { authProvider: input.authProvider } : {}),
+      ...(input.authSubject ? { authSubject: input.authSubject } : {}),
+      ...(input.userGeneration !== undefined ? { userGeneration: input.userGeneration } : {}),
+      ...(input.authIdentityGeneration !== undefined
+        ? { authIdentityGeneration: input.authIdentityGeneration }
+        : {}),
       createdAt: now,
       expiresAt: now + CODE_TTL_MS,
       consumedAt: null,
@@ -91,7 +108,12 @@ export function createPairingCode(input: CreatePairingCodeInput): Promise<Create
 export type ConsumedPairingCode = {
   userId: string;
   username: string;
+  displayName?: string;
   role: string;
+  authProvider?: "local" | "google" | "password";
+  authSubject?: string;
+  userGeneration?: number;
+  authIdentityGeneration?: number;
 };
 
 /**
@@ -110,6 +132,17 @@ export function consumePairingCode(code: string): Promise<ConsumedPairingCode | 
     entry.consumedAt = now;
     entries[idx] = entry;
     writeAll(prune(entries, now));
-    return { userId: entry.userId, username: entry.username, role: entry.role };
+    return {
+      userId: entry.userId,
+      username: entry.username,
+      ...(entry.displayName ? { displayName: entry.displayName } : {}),
+      role: entry.role,
+      ...(entry.authProvider ? { authProvider: entry.authProvider } : {}),
+      ...(entry.authSubject ? { authSubject: entry.authSubject } : {}),
+      ...(entry.userGeneration !== undefined ? { userGeneration: entry.userGeneration } : {}),
+      ...(entry.authIdentityGeneration !== undefined
+        ? { authIdentityGeneration: entry.authIdentityGeneration }
+        : {}),
+    };
   });
 }

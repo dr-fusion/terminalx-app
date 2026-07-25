@@ -2,10 +2,16 @@ import { NextRequest, NextResponse } from "next/server";
 import crypto from "crypto";
 import { signJwt, comparePassword } from "@/lib/auth";
 import { getAuthMode, getSinglePassword } from "@/lib/auth-config";
-import { getUserByUsername, updateLastLogin, ensureDefaultAdmin } from "@/lib/users";
+import {
+  ensureDefaultAdmin,
+  getLocalAuthenticationIdentity,
+  getUserByUsername,
+  updateLastLogin,
+} from "@/lib/users";
 import { audit } from "@/lib/audit-log";
 import { isRateLimited } from "@/lib/rate-limit";
 import { isSecureRequest } from "@/lib/security-config";
+import { withCanonicalIdentityAuthority } from "@/lib/identity-service";
 
 // ── Cookie helper ───────────────────────────────────────────────────────────
 
@@ -71,10 +77,25 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "Invalid password" }, { status: 401 });
     }
 
+    let canonicalIdentity;
+    try {
+      canonicalIdentity = withCanonicalIdentityAuthority((authority) =>
+        authority.provisionPasswordIdentity()
+      );
+    } catch {
+      audit("login_failed", { detail: "password mode: canonical identity unavailable" });
+      return NextResponse.json({ error: "Invalid password" }, { status: 401 });
+    }
+
     const token = await signJwt({
-      userId: "single-user",
-      username: "admin",
-      role: "admin",
+      userId: canonicalIdentity.user.id,
+      username: canonicalIdentity.user.username,
+      displayName: canonicalIdentity.user.displayName,
+      role: canonicalIdentity.user.legacyRole,
+      authProvider: canonicalIdentity.identity.provider,
+      authSubject: canonicalIdentity.identity.subject,
+      userGeneration: canonicalIdentity.user.generation,
+      authIdentityGeneration: canonicalIdentity.identity.generation,
     });
 
     audit("login_success", { username: "admin", detail: "password mode" });
@@ -107,10 +128,21 @@ export async function POST(req: NextRequest) {
 
     await updateLastLogin(user.id);
 
+    const canonicalIdentity = getLocalAuthenticationIdentity(user.id);
+    if (!canonicalIdentity) {
+      audit("login_failed", { username: user.username, detail: "canonical identity unavailable" });
+      return NextResponse.json({ error: "Invalid credentials" }, { status: 401 });
+    }
+
     const token = await signJwt({
-      userId: user.id,
-      username: user.username,
-      role: user.role,
+      userId: canonicalIdentity.user.id,
+      username: canonicalIdentity.user.username,
+      displayName: canonicalIdentity.user.displayName,
+      role: canonicalIdentity.user.legacyRole,
+      authProvider: canonicalIdentity.identity.provider,
+      authSubject: canonicalIdentity.identity.subject,
+      userGeneration: canonicalIdentity.user.generation,
+      authIdentityGeneration: canonicalIdentity.identity.generation,
     });
 
     audit("login_success", { username: user.username, userId: user.id });

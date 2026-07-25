@@ -4,6 +4,7 @@ import * as fs from "fs";
 import * as path from "path";
 import * as crypto from "crypto";
 import { ensureSecureDir } from "./secure-dir";
+import { getAuthMode as configuredAuthMode } from "./auth-config";
 
 // ── JWT Secret ──────────────────────────────────────────────────────────────
 
@@ -116,15 +117,44 @@ function isTokenRevoked(token: string): boolean {
 
 // ── JWT Sign / Verify ───────────────────────────────────────────────────────
 
-export interface JwtPayload {
+interface JwtSubjectPayload {
   userId: string;
   username: string;
+  displayName?: string;
   role: string;
   /** Set on tokens issued via mobile pairing — used to revoke a single device. */
   deviceId?: string;
 }
 
+export interface CanonicalAuthenticationClaims {
+  authProvider: "local" | "google" | "password";
+  authSubject: string;
+  userGeneration: number;
+  authIdentityGeneration: number;
+}
+
+/** Every newly issued authenticated JWT is structurally generation-fenced. */
+export interface JwtPayload extends JwtSubjectPayload, CanonicalAuthenticationClaims {}
+
+/** Verification temporarily supports pre-v11 local JWTs without identity claims. */
+export type VerifiedJwtPayload = JwtSubjectPayload & Partial<CanonicalAuthenticationClaims>;
+
 export async function signJwt(payload: JwtPayload): Promise<string> {
+  if (
+    (payload.authProvider !== "local" &&
+      payload.authProvider !== "google" &&
+      payload.authProvider !== "password") ||
+    payload.authProvider !== configuredAuthMode() ||
+    typeof payload.authSubject !== "string" ||
+    payload.authSubject.length < 1 ||
+    payload.authSubject.length > 1024 ||
+    !Number.isSafeInteger(payload.userGeneration) ||
+    payload.userGeneration < 1 ||
+    !Number.isSafeInteger(payload.authIdentityGeneration) ||
+    payload.authIdentityGeneration < 1
+  ) {
+    throw new TypeError("JWT authentication identity snapshot is invalid");
+  }
   const secret = getJwtSecret();
   return new SignJWT({ ...payload })
     .setProtectedHeader({ alg: "HS256" })
@@ -134,17 +164,41 @@ export async function signJwt(payload: JwtPayload): Promise<string> {
     .sign(secret);
 }
 
-export async function verifyJwt(token: string): Promise<JwtPayload | null> {
+export async function verifyJwt(token: string): Promise<VerifiedJwtPayload | null> {
   try {
     if (isTokenRevoked(token)) {
       return null;
     }
     const secret = getJwtSecret();
     const { payload } = await jwtVerify(token, secret);
-    const result: JwtPayload = {
-      userId: payload.userId as string,
-      username: payload.username as string,
-      role: payload.role as string,
+    if (
+      typeof payload.userId !== "string" ||
+      !payload.userId ||
+      typeof payload.username !== "string" ||
+      !payload.username ||
+      typeof payload.role !== "string" ||
+      !payload.role
+    ) {
+      return null;
+    }
+    const result: VerifiedJwtPayload = {
+      userId: payload.userId,
+      username: payload.username,
+      role: payload.role,
+      displayName: typeof payload.displayName === "string" ? payload.displayName : undefined,
+      authProvider:
+        payload.authProvider === "local" ||
+        payload.authProvider === "google" ||
+        payload.authProvider === "password"
+          ? payload.authProvider
+          : undefined,
+      authSubject: typeof payload.authSubject === "string" ? payload.authSubject : undefined,
+      userGeneration:
+        typeof payload.userGeneration === "number" ? payload.userGeneration : undefined,
+      authIdentityGeneration:
+        typeof payload.authIdentityGeneration === "number"
+          ? payload.authIdentityGeneration
+          : undefined,
       deviceId: typeof payload.deviceId === "string" ? payload.deviceId : undefined,
     };
 
@@ -155,20 +209,66 @@ export async function verifyJwt(token: string): Promise<JwtPayload | null> {
       if (!isDeviceActive(result.deviceId)) return null;
     }
 
-    // Check that the user still exists (deleted users should not retain access)
-    // Google OAuth users (userId starts with "google-") and single-user mode skip this check
-    if (result.userId !== "single-user" && !result.userId.startsWith("google-")) {
+    const identityClaimNames = [
+      "authProvider",
+      "authSubject",
+      "userGeneration",
+      "authIdentityGeneration",
+    ] as const;
+    const identityClaimCount = identityClaimNames.filter((claim) =>
+      Object.hasOwn(payload, claim)
+    ).length;
+    if (identityClaimCount > 0) {
+      if (
+        identityClaimCount !== 4 ||
+        !result.authProvider ||
+        !result.authSubject ||
+        !Number.isSafeInteger(result.userGeneration) ||
+        result.userGeneration! < 1 ||
+        !Number.isSafeInteger(result.authIdentityGeneration) ||
+        result.authIdentityGeneration! < 1
+      ) {
+        return null;
+      }
+      if (result.authProvider !== configuredAuthMode()) return null;
+      const { withCanonicalIdentityAuthority } = await import("./identity-service");
+      const resolved = withCanonicalIdentityAuthority((authority) =>
+        authority.resolveAuthenticationIdentity({
+          userId: result.userId,
+          userGeneration: result.userGeneration!,
+          provider: result.authProvider!,
+          subject: result.authSubject!,
+          identityGeneration: result.authIdentityGeneration!,
+        })
+      );
+      if (!resolved) return null;
+      if (resolved.identity.provider === "google") {
+        const { isEmailAllowed } = await import("./auth-config");
+        if (!isEmailAllowed(resolved.user.username)) return null;
+      }
+      result.userId = resolved.user.id;
+      result.username = resolved.user.username;
+      result.displayName = resolved.user.displayName;
+      result.role = resolved.user.legacyRole;
+      result.userGeneration = resolved.user.generation;
+      result.authIdentityGeneration = resolved.identity.generation;
+    } else {
+      // Backward-compatible bridge for pre-v11 local JWTs. Google JWTs were
+      // synthetic and are deliberately not auto-provisioned from email/name;
+      // those Users must complete Google OAuth again.
+      if (
+        configuredAuthMode() !== "local" ||
+        result.userId === "single-user" ||
+        result.userId.startsWith("google-")
+      ) {
+        return null;
+      }
       const { getUserById } = await import("./users");
       const user = getUserById(result.userId);
       if (!user) return null;
-      // Also check if user's role changed since token was issued
+      result.username = user.username;
+      result.displayName = user.username;
       result.role = user.role;
-    }
-
-    // For Google OAuth users, re-verify they are still in the allowed list
-    if (result.userId.startsWith("google-")) {
-      const { isEmailAllowed } = await import("./auth-config");
-      if (!isEmailAllowed(result.username)) return null;
     }
 
     return result;

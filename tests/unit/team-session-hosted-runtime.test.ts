@@ -150,7 +150,7 @@ describe("hosted Team Session Runtime", () => {
     expect(projected?.runtime).not.toHaveProperty("tmuxName");
 
     const database = new Database(filename, { readonly: true });
-    expect(database.pragma("user_version", { simple: true })).toBe(10);
+    expect(database.pragma("user_version", { simple: true })).toBe(12);
     expect(
       database
         .prepare(
@@ -380,6 +380,11 @@ describe("hosted Team Session Runtime", () => {
 
     const v8 = new Database(filename);
     v8.exec(`
+      DROP TABLE legacy_google_identity_bridges;
+      DROP TABLE local_auth_credentials;
+      DROP TABLE auth_identities;
+      DROP TABLE users;
+      DROP TABLE identity_migrations;
       DROP TRIGGER runtime_effect_enforcer_set_activations_immutable_update;
       DROP TRIGGER runtime_effect_enforcer_set_activations_immutable_delete;
       DROP TABLE runtime_effect_enforcer_set_activations;
@@ -436,6 +441,11 @@ describe("hosted Team Session Runtime", () => {
     local.teamSessions.close();
     const v8 = new Database(artifactFilename);
     v8.exec(`
+      DROP TABLE legacy_google_identity_bridges;
+      DROP TABLE local_auth_credentials;
+      DROP TABLE auth_identities;
+      DROP TABLE users;
+      DROP TABLE identity_migrations;
       DROP TRIGGER runtime_effect_enforcer_set_activations_immutable_update;
       DROP TRIGGER runtime_effect_enforcer_set_activations_immutable_delete;
       DROP TABLE runtime_effect_enforcer_set_activations;
@@ -451,7 +461,7 @@ describe("hosted Team Session Runtime", () => {
     createTeamSessionKernel({ filename: artifactFilename }).teamSessions.close();
     const migrated = new Database(artifactFilename, { readonly: true });
     try {
-      expect(migrated.pragma("user_version", { simple: true })).toBe(10);
+      expect(migrated.pragma("user_version", { simple: true })).toBe(12);
       expect(migrated.pragma("foreign_key_check")).toEqual([]);
       expect(migrated.pragma("quick_check", { simple: true })).toBe("ok");
       expect(

@@ -61,6 +61,10 @@ Close the hosted evidence boundary of release Gate 1 and release Gate 2.
 
 Close release Gate 3 and complete the Slack/Telegram/credential connection model.
 
+Status: in progress. The canonical authentication identity foundation is implemented; the exact
+scope and remaining closed boundaries are tracked in
+[Phase 8 brokered secrets and connections](../multiplayer/phase-8-brokered-connections.md).
+
 - Store only opaque credential handles in TerminalX state.
 - Add approved secret-manager adapters and a destination-scoped credential proxy.
 - Make raw tokens, private keys, and secret values unavailable to agents, shells, events, logs,
