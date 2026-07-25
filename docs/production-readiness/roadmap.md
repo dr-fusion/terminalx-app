@@ -148,16 +148,16 @@ Complete the externally usable application around the closed gates.
 
 ## Release-gate ownership
 
-| Gate                        | Owning phases | Current state                 |
-| --------------------------- | ------------- | ----------------------------- |
-| 1. Runtime truth            | 5–7           | Gate 1a complete; Gate 1 open |
-| 2. Hosted isolation         | 7             | Open                          |
-| 3. Brokered secrets         | 8             | Open                          |
-| 4. Approval provenance      | 9             | Open                          |
-| 5. Authoritative limits     | 9             | Open                          |
-| 6. YOLO challenge           | 9             | Open and unexposed            |
-| 7. Emergency recovery       | 10            | Partial foundation; open      |
-| 8. Event/evidence integrity | 10            | Open                          |
+| Gate                        | Owning phases | Current state                                                                  |
+| --------------------------- | ------------- | ------------------------------------------------------------------------------ |
+| 1. Runtime truth            | 5–7           | Gate 1a complete; Gate 1 open                                                  |
+| 2. Hosted isolation         | 7             | Open                                                                           |
+| 3. Brokered secrets         | 8             | Mechanism + hermetic evidence complete; real-runtime evidence pending Phase 12 |
+| 4. Approval provenance      | 9             | Open                                                                           |
+| 5. Authoritative limits     | 9             | Open                                                                           |
+| 6. YOLO challenge           | 9             | Open and unexposed                                                             |
+| 7. Emergency recovery       | 10            | Partial foundation; open                                                       |
+| 8. Event/evidence integrity | 10            | Open                                                                           |
 
 External-pilot readiness additionally requires Phase 11 operations and Phase 12 release evidence.
 No development adapter, warning, feature flag, or manual operating procedure can substitute for a
