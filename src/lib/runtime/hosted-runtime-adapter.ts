@@ -37,6 +37,12 @@ import {
   type HostedRuntimeActivationSink,
   type HostedRuntimeControlPlane,
 } from "./hosted-runtime-control-plane";
+import {
+  deriveMeasuredHostedRuntimeCapabilities,
+  type HostedRuntimeCapabilityActivationQuery,
+  type HostedRuntimeCapabilityActivationSource,
+  type HostedRuntimeCapabilityActivationVerifier,
+} from "./runtime-capability-activation-evidence";
 
 const SHA256 = /^[0-9a-f]{64}$/;
 const INCARNATION = /^[0-9a-f]{64}$/;
@@ -87,6 +93,20 @@ interface ResolvedHostedHandle {
   readonly handle: RuntimeHandle;
 }
 
+/**
+ * Slice 8F measured capability activation seam. When supplied, hosted handle
+ * capabilities are derived from per-assignment signed enforcement evidence
+ * verified against the Phase 7 trust group; absent/stale/tampered evidence
+ * fails closed to `brokeredCredentials: false`/`proxyOnlyEgress: false`. When
+ * omitted, the handle advertises the plan's (always-false) capabilities
+ * unchanged — the honest default until Phase 12's real hosted Runtime produces
+ * measured evidence through this exact machinery.
+ */
+export interface HostedRuntimeCapabilityActivation {
+  readonly source: HostedRuntimeCapabilityActivationSource;
+  readonly verify: HostedRuntimeCapabilityActivationVerifier;
+}
+
 export interface CreateHostedRuntimeAdapterBundleOptions {
   readonly plans: HostedAssignmentPlanSource;
   readonly controlPlane: HostedRuntimeControlPlane;
@@ -95,6 +115,8 @@ export interface CreateHostedRuntimeAdapterBundleOptions {
   /** Stable deployment key. It is copied at construction and zeroed at close. */
   readonly opaqueHandleKey: Uint8Array;
   readonly operationTimeoutMs?: number;
+  /** Optional measured capability-activation evidence seam (Slice 8F). */
+  readonly capabilityActivation?: HostedRuntimeCapabilityActivation;
 }
 
 /**
@@ -165,6 +187,10 @@ class HostedRuntimeAdapterCore {
   ) => void;
   private readonly opaqueHandleKey: Uint8Array;
   private readonly operationTimeoutMs: number;
+  private readonly capabilityActivation: {
+    readonly source: HostedRuntimeCapabilityActivationSource;
+    readonly verify: HostedRuntimeCapabilityActivationVerifier;
+  } | null;
   private readonly serial = new KeyedSerialExecutor();
   private readonly shutdownController = new AbortController();
   private readonly handleVault = new Map<string, ResolvedHostedHandle>();
@@ -178,10 +204,16 @@ class HostedRuntimeAdapterCore {
       "activationSink",
       "opaqueHandleKey",
       ...(Object.hasOwn(unsafeOptions ?? {}, "operationTimeoutMs") ? ["operationTimeoutMs"] : []),
+      ...(Object.hasOwn(unsafeOptions ?? {}, "capabilityActivation")
+        ? ["capabilityActivation"]
+        : []),
     ]);
     this.plans = capturePlanSource(field(options, "plans"));
     this.controlPlane = captureControlPlane(field(options, "controlPlane"));
     this.activationSink = captureActivationSink(field(options, "activationSink"));
+    this.capabilityActivation = captureCapabilityActivation(
+      optionalField(options, "capabilityActivation")
+    );
     const key = field(options, "opaqueHandleKey");
     if (
       !(key instanceof Uint8Array) ||
@@ -252,7 +284,7 @@ class HostedRuntimeAdapterCore {
       const handle = Object.freeze({
         binding: plan.binding,
         opaqueHandleRef,
-        capabilities: plan.capabilities,
+        capabilities: this.resolveCapabilities(plan, match),
       });
       this.handleVault.set(opaqueHandleRef, Object.freeze({ plan, sandbox: match, handle }));
       return handle;
@@ -623,6 +655,37 @@ class HostedRuntimeAdapterCore {
     return Object.freeze({ plan, sandbox: match, handle: cached.handle });
   }
 
+  /**
+   * Derive the advertised handle capabilities. Without a measured-activation
+   * seam the plan's (always-false brokered/proxy) capabilities pass through
+   * unchanged. With one, `brokeredCredentials`/`proxyOnlyEgress` are derived
+   * from per-assignment signed enforcement evidence bound to the exact plan
+   * digest, policy digest, enforcer-set digest, generation, and Sandbox boot
+   * epoch; anything short of valid measured evidence fails closed.
+   */
+  private resolveCapabilities(
+    plan: HostedRuntimeAssignmentPlan,
+    sandbox: HostedControlPlaneSandbox
+  ): RuntimeHandle["capabilities"] {
+    if (!this.capabilityActivation) return plan.capabilities;
+    const activation = sandbox.activation;
+    if (activation === null) return plan.capabilities;
+    const query: HostedRuntimeCapabilityActivationQuery = Object.freeze({
+      binding: plan.binding,
+      runtimeAuthorizationGeneration: plan.runtimeAuthorizationGeneration,
+      assignmentPlanDigest: activation.assignmentPlanDigest,
+      effectEnforcerPolicyDigest: plan.effectEnforcerPolicyDigest,
+      effectEnforcerSetDigest: activation.effectEnforcerSetDigest,
+      bootEpoch: activation.providerRevision,
+    });
+    return deriveMeasuredHostedRuntimeCapabilities(
+      plan.capabilities,
+      query,
+      this.capabilityActivation.source,
+      this.capabilityActivation.verify
+    );
+  }
+
   private opaqueHandleRef(
     plan: HostedRuntimeAssignmentPlan,
     sandbox: HostedControlPlaneSandbox
@@ -737,6 +800,26 @@ function captureActivationSink(
     const result = Reflect.apply(register, receiver, [activation]);
     if (result !== undefined) invalidState();
   };
+}
+
+function captureCapabilityActivation(value: unknown): {
+  readonly source: HostedRuntimeCapabilityActivationSource;
+  readonly verify: HostedRuntimeCapabilityActivationVerifier;
+} | null {
+  if (value === undefined) return null;
+  const receiver = objectValue(value);
+  const verify = captureDataMethod(receiver, "verify");
+  const source = objectValue(runtimeSupervisorDataField(receiver, "source"));
+  const resolveMethod = captureDataMethod(source, "resolve");
+  return Object.freeze({
+    source: Object.freeze({
+      resolve: (query: HostedRuntimeCapabilityActivationQuery) =>
+        Reflect.apply(resolveMethod, source, [query]) as ReturnType<
+          HostedRuntimeCapabilityActivationSource["resolve"]
+        >,
+    }),
+    verify: (evidence) => Reflect.apply(verify, receiver, [evidence]) as boolean,
+  });
 }
 
 function captureControlPlane(value: unknown): CapturedControlPlane {
