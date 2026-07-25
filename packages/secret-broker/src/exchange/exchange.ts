@@ -30,6 +30,8 @@ export type PrepareInstallationCredential = (input: {
   readonly provider: string;
   readonly expectationDigest: string;
   readonly tokenUtf8: Buffer;
+  /** Non-null routes the seal through `rotation.prepare` with this linkage. */
+  readonly replaces: { readonly handleId: string } | null;
 }) => Promise<SecretBrokerReceipt>;
 
 export interface CreateProviderExchangeOptions {
@@ -96,6 +98,7 @@ export function createProviderExchange(options: CreateProviderExchangeOptions): 
         provider: "slack",
         expectationDigest: request.expectationDigest,
         tokenUtf8: Buffer.from(acquired.botToken, "utf8"),
+        replaces: request.replaces,
       });
       return {
         receipt,
@@ -142,6 +145,7 @@ export function createProviderExchange(options: CreateProviderExchangeOptions): 
         provider: "telegram",
         expectationDigest: request.expectationDigest,
         tokenUtf8: Buffer.from(request.botToken, "utf8"),
+        replaces: request.replaces,
       });
       return {
         receipt,
@@ -194,6 +198,20 @@ interface SlackOauthRequest {
   readonly expectationDigest: string;
   readonly signingSecret: string;
   readonly redirectUri: string | undefined;
+  readonly replaces: { readonly handleId: string } | null;
+}
+
+function snapshotReplaces(value: unknown): { readonly handleId: string } | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new SecretBrokerProtocolError("invalid-request");
+  }
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record);
+  if (keys.length !== 1 || keys[0] !== "handleId") {
+    throw new SecretBrokerProtocolError("invalid-request");
+  }
+  return Object.freeze({ handleId: boundedIdentifier(record.handleId) });
 }
 
 function snapshotSlackOauthParams(params: unknown): SlackOauthRequest {
@@ -210,7 +228,7 @@ function snapshotSlackOauthParams(params: unknown): SlackOauthRequest {
         "expectationDigest",
         "signingSecret",
       ],
-      ["redirectUri"]
+      ["redirectUri", "replaces"]
     );
     const code = field(record, "code");
     const signingSecret = field(record, "signingSecret");
@@ -239,6 +257,7 @@ function snapshotSlackOauthParams(params: unknown): SlackOauthRequest {
         typeof redirectUriRaw === "string" && redirectUriRaw.length > 0
           ? redirectUriRaw
           : undefined,
+      replaces: snapshotReplaces("replaces" in record ? record.replaces : null),
     });
   } catch (error) {
     if (error instanceof SecretBrokerProtocolError) throw error;
@@ -277,18 +296,23 @@ interface TelegramRequest {
   readonly expectedAppId: string;
   readonly webhookUrl: string;
   readonly expectationDigest: string;
+  readonly replaces: { readonly handleId: string } | null;
 }
 
 function snapshotTelegramParams(params: unknown): TelegramRequest {
   try {
-    const record = exactRecord(params, [
-      "operationId",
-      "botToken",
-      "expectedTenantId",
-      "expectedAppId",
-      "webhookUrl",
-      "expectationDigest",
-    ]);
+    const record = recordWithOptionalKeys(
+      params,
+      [
+        "operationId",
+        "botToken",
+        "expectedTenantId",
+        "expectedAppId",
+        "webhookUrl",
+        "expectationDigest",
+      ],
+      ["replaces"]
+    );
     const botToken = field(record, "botToken");
     const webhookUrl = field(record, "webhookUrl");
     if (
@@ -308,6 +332,7 @@ function snapshotTelegramParams(params: unknown): TelegramRequest {
       expectedAppId: boundedIdentifier(field(record, "expectedAppId"), 1024),
       webhookUrl,
       expectationDigest: digestField(field(record, "expectationDigest")),
+      replaces: snapshotReplaces("replaces" in record ? record.replaces : null),
     });
   } catch (error) {
     if (error instanceof SecretBrokerProtocolError) throw error;

@@ -178,6 +178,29 @@ export function withConnectionAuthority<T>(operation: (authority: ConnectionAuth
   }
 }
 
+/**
+ * Run a connection-surface read/write-model operation (webhook replay dedup,
+ * webhook auth digests, installation/binding lookups) against the same
+ * process-owned SQLite connection as the authorities. This seam exists for the
+ * Slice 8E connection HTTP/webhook composition only; it must never be used to
+ * bypass an authority's transaction/fence discipline for authority-owned tables.
+ */
+export function withConnectionDatabase<T>(operation: (db: TeamSessionDatabase["db"]) => T): T {
+  const service = acquireService();
+  service.activeOperations += 1;
+  try {
+    const result = operation(service.database.db);
+    if (isPromiseLike(result)) {
+      return Promise.resolve(result).finally(() => releaseService(service)) as T;
+    }
+    releaseService(service);
+    return result;
+  } catch (error) {
+    releaseService(service);
+    throw error;
+  }
+}
+
 /** Run a mobile pairing/device operation on the process-owned SQLite connection. */
 export function withMobileAuthAuthority<T>(operation: (authority: MobileAuthAuthority) => T): T {
   const service = acquireService();

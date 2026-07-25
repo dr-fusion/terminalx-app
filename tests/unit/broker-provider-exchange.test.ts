@@ -219,7 +219,7 @@ describe("broker provider exchange — slack webhook verification", () => {
         body,
         signature: sign("wrong-secret", body, timestamp),
       })
-    ).toEqual({ valid: true === false, withinReplayWindow: true });
+    ).toEqual({ valid: false, withinReplayWindow: true });
   });
 
   it("flags a stale timestamp as outside the replay window", async () => {

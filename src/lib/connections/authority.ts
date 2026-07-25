@@ -146,6 +146,13 @@ export interface CreateChannelInstallationInput {
   credentialBrokerProof: unknown;
   reviewedScopes: readonly string[];
   capabilities: readonly string[];
+  /**
+   * Optional caller-generated Channel Installation ID. The Telegram webhook URL
+   * must embed the installation id before the broker exchange registers it with
+   * the provider, so the installing route pre-generates the id. Validated and
+   * uniqueness-enforced exactly like a generated id.
+   */
+  installationId?: string;
 }
 
 export interface IssueLinkChallengeInput {
@@ -835,7 +842,10 @@ export function createConnectionAuthority(
       const scopes = canonicalStringSet(input.reviewedScopes, "reviewed provider scopes");
       const capabilities = canonicalStringSet(input.capabilities, "reviewed provider capabilities");
       const now = currentTime(clock);
-      const installationId = generatedId(idGenerator, "Channel Installation ID");
+      const installationId =
+        input.installationId === undefined
+          ? generatedId(idGenerator, "Channel Installation ID")
+          : boundedIdentifier(input.installationId, "Channel Installation ID", 300);
       const handle = registerVerifiedCredentialHandle({
         actor,
         actorKind: "human",

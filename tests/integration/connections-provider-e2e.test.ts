@@ -532,4 +532,254 @@ describe("connections provider end-to-end over the real broker child process", (
       })
     ).toMatchObject({ valid: false });
   }, 60_000);
+
+  it("drives install, rotation, and webhook ingress through the real HTTP route handlers", async () => {
+    if (!supported()) return;
+    const { handleCreateInstallation, handleRotateInstallation } =
+      await import("@/lib/connections/installation-http");
+    const { handleTelegramWebhook } = await import("@/lib/connections/webhook-http");
+    const { handleIssueLinkChallenge } = await import("@/lib/connections/http");
+    const { createWebhookAuthStore } = await import("@/lib/connections/webhook-auth");
+
+    const rootDir = temporaryRoot();
+    const telegram = await startFakeTelegram();
+    const slack = await startFakeSlack();
+    await startDaemon(writeBootstrap(rootDir, telegram.origin, slack.origin));
+
+    const brokerClient = createSecretBrokerClient({
+      socketPath: path.join(rootDir, "broker.sock"),
+    });
+    const exchangeClient = createProviderExchangeClient({
+      socketPath: path.join(rootDir, "broker.sock"),
+    });
+    const verificationKey = readBrokerVerificationKey(rootDir);
+    if (!verificationKey) throw new Error("verification key unavailable");
+
+    const database = openTeamSessionDatabase({ filename: ":memory:" });
+    databases.push(database);
+    seedAuthority(database.db);
+    const authority = createConnectionAuthority({
+      db: database.db,
+      verifyCredentialHandleRegistration: createBrokerReceiptVerifier({
+        verificationPublicKey: verificationKey,
+      }),
+      verifyProviderProof: verifyTelegramDeepLinkProof,
+      validateAuthenticationSnapshot: () => true,
+    });
+
+    const actorNow = Date.now();
+    const requestActor = {
+      kind: "human" as const,
+      userId: "user-1",
+      username: "alice",
+      displayName: "Alice",
+      legacyRole: "admin",
+      authentication: {
+        provider: "local" as const,
+        subject: "alice",
+        userGeneration: 1,
+        identityGeneration: 1,
+        authenticatedAtMs: actorNow,
+        credentialIssuedAtMs: actorNow,
+        credentialExpiresAtMs: actorNow + 86_400_000,
+        credentialJtiDigest: "a".repeat(64),
+        device: { provenance: "browser" as const },
+      },
+    };
+    const withConnectionDatabase = <T>(op: (db: Database.Database) => T): T => op(database.db);
+    const withConnectionAuthority = <T>(op: (a: typeof authority) => T): T => op(authority);
+    const installDeps = {
+      resolveActor: async () => requestActor,
+      withConnectionAuthority,
+      withConnectionDatabase,
+      exchangeClient,
+      brokerClient,
+      rateLimitState: new Map<string, number[]>(),
+    };
+
+    // 1) Create the installation through the real POST route handler.
+    const createResponse = await handleCreateInstallation(
+      new Request("https://terminalx.example/api/connections/installations", {
+        method: "POST",
+        body: JSON.stringify({
+          provider: "telegram",
+          teamId: "team-1",
+          botId: BOT_ID,
+          botToken: BOT_TOKEN,
+          webhookBaseUrl: "https://terminalx.example",
+        }),
+      }),
+      installDeps
+    );
+    expect(createResponse.status).toBe(201);
+    const createText = await createResponse.text();
+    expect(createText).not.toContain(BOT_TOKEN);
+    const created = JSON.parse(createText) as { installation: { id: string; revision: number } };
+    const installationId = created.installation.id;
+
+    // The broker set the webhook on the fake provider with an in-broker secret
+    // token; recover the raw token exactly as Telegram would present it.
+    const setWebhookBody = telegram.requests.find((r) => r.url.endsWith("/setWebhook"))!.body;
+    const secretToken = new URLSearchParams(setWebhookBody).get("secret_token")!;
+    expect(secretToken).toMatch(/^[0-9a-f]{64}$/);
+    expect(
+      withConnectionDatabase((db) =>
+        createWebhookAuthStore(db).latestWebhookAuthDigest(installationId, "telegram")
+      )
+    ).toBe(createHash("sha256").update(secretToken, "utf8").digest("hex"));
+
+    // 2) Issue a Link Challenge through the real route handler and complete it
+    // by posting a /start deep link to the real webhook route handler.
+    const challengeResponse = await handleIssueLinkChallenge(
+      new Request("https://terminalx.example/api/connections/link-challenges", {
+        method: "POST",
+        body: JSON.stringify({
+          installationId,
+          expectedInstallationRevision: created.installation.revision,
+          requestedScopes: TELEGRAM_IDENTITY_LINK_SCOPES,
+        }),
+      }),
+      { resolveActor: async () => requestActor, withConnectionAuthority }
+    );
+    expect(challengeResponse.status).toBe(200);
+    const { linkChallenge } = (await challengeResponse.json()) as {
+      linkChallenge: { challenge: string };
+    };
+
+    const dispatched: InboundKernelCommand[] = [];
+    const webhookDeps = {
+      withConnectionAuthority,
+      withConnectionDatabase,
+      exchangeClient,
+      dispatchKernelCommand: async (command: InboundKernelCommand) => {
+        dispatched.push(command);
+        return { accepted: true, replayed: false };
+      },
+    };
+    const webhookRequest = (update: unknown, token = secretToken): Request =>
+      new Request(`https://terminalx.example/api/connections/webhooks/telegram/${installationId}`, {
+        method: "POST",
+        headers: { "x-telegram-bot-api-secret-token": token },
+        body: JSON.stringify(update),
+      });
+
+    // A forged secret token is a uniform 401.
+    expect(
+      (
+        await handleTelegramWebhook(
+          webhookRequest({ update_id: 1 }, "forged"),
+          installationId,
+          webhookDeps
+        )
+      ).status
+    ).toBe(401);
+
+    const linkResponse = await handleTelegramWebhook(
+      webhookRequest({
+        update_id: 600,
+        message: {
+          from: { id: 777 },
+          chat: { id: 777 },
+          text: `/start ${linkChallenge.challenge}`,
+        },
+      }),
+      installationId,
+      webhookDeps
+    );
+    expect(linkResponse.status).toBe(200);
+    expect(
+      database.db
+        .prepare("SELECT user_id, external_subject, status FROM identity_connections")
+        .get()
+    ).toEqual({ user_id: "user-1", external_subject: "777", status: "active" });
+
+    // 3) Bind the conversation and ingest a message through the webhook route.
+    const binding = authority.createChannelBinding({
+      actor: requestActor.authentication
+        ? {
+            userId: requestActor.userId,
+            userGeneration: 1,
+            authProvider: "local",
+            authSubject: "alice",
+            authIdentityGeneration: 1,
+            authenticatedAtMs: actorNow,
+            credentialIssuedAtMs: actorNow,
+            credentialExpiresAtMs: actorNow + 86_400_000,
+            credentialJtiDigest: "a".repeat(64),
+            device: { provenance: "browser" },
+          }
+        : (undefined as never),
+      sessionId: "session-1",
+      installationId,
+      expectedInstallationRevision: created.installation.revision,
+      conversationKind: "channel",
+      externalConversationId: "777",
+      inboundPolicy: { mode: "comments-only", requireLinkedIdentity: true },
+      outboundPolicy: { mode: "disabled", allowArtifacts: false },
+    });
+    expect(binding.status).toBe("active");
+    const ingestResponse = await handleTelegramWebhook(
+      webhookRequest({
+        update_id: 601,
+        message: { from: { id: 777 }, chat: { id: 777 }, text: "ship the release" },
+      }),
+      installationId,
+      webhookDeps
+    );
+    expect(ingestResponse.status).toBe(200);
+    expect(dispatched[0]).toMatchObject({
+      type: "comment.add",
+      sessionId: "session-1",
+      actorUserId: "user-1",
+      body: "ship the release",
+      idempotencyKey: "601",
+    });
+
+    // 4) Rotate through the real rotation route: the old secret token stops
+    // authenticating and the new one (set on the fake provider) takes over.
+    const newBotToken = "998877:AA-Rotated-Bot-Token";
+    const requestsBeforeRotate = telegram.requests.length;
+    const rotateResponse = await handleRotateInstallation(
+      new Request(
+        `https://terminalx.example/api/connections/installations/${installationId}/rotate`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            provider: "telegram",
+            botToken: newBotToken,
+            webhookBaseUrl: "https://terminalx.example",
+            expectedRevision: created.installation.revision,
+            expectedHandleGeneration: 1,
+          }),
+        }
+      ),
+      installationId,
+      installDeps
+    );
+    expect(rotateResponse.status).toBe(200);
+    expect(await rotateResponse.text()).not.toContain(newBotToken);
+    const rotatedSetWebhook = telegram.requests
+      .slice(requestsBeforeRotate)
+      .find((r) => r.url.endsWith("/setWebhook"))!;
+    const rotatedSecretToken = new URLSearchParams(rotatedSetWebhook.body).get("secret_token")!;
+    expect(rotatedSecretToken).not.toBe(secretToken);
+    expect(
+      (
+        await handleTelegramWebhook(
+          webhookRequest({ update_id: 700 }, secretToken),
+          installationId,
+          webhookDeps
+        )
+      ).status
+    ).toBe(401);
+    expect(
+      (
+        await handleTelegramWebhook(
+          webhookRequest({ update_id: 700 }, rotatedSecretToken),
+          installationId,
+          webhookDeps
+        )
+      ).status
+    ).toBe(200);
+  }, 60_000);
 });
