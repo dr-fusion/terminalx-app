@@ -36,9 +36,22 @@ async function loadLogsRoute() {
   return await import("@/app/api/logs/route");
 }
 
-async function authenticatedRequest(username: string, role: string) {
+async function authenticatedRequest(username: string, role: "admin" | "user") {
   const { signJwt } = await import("@/lib/auth");
-  const token = await signJwt({ userId: "single-user", username, role });
+  const { createUser, getLocalAuthenticationIdentity } = await import("@/lib/users");
+  const user = await createUser(username, "test-password-that-is-long-enough", role);
+  const provisioned = getLocalAuthenticationIdentity(user.id);
+  if (!provisioned) throw new Error("Test canonical identity was not provisioned");
+  const token = await signJwt({
+    userId: provisioned.user.id,
+    username: provisioned.user.username,
+    displayName: provisioned.user.displayName,
+    role: provisioned.user.legacyRole,
+    authProvider: provisioned.identity.provider,
+    authSubject: provisioned.identity.subject,
+    userGeneration: provisioned.user.generation,
+    authIdentityGeneration: provisioned.identity.generation,
+  });
   return mockRequest({ cookie: `terminalx-session=${token}` });
 }
 
@@ -100,8 +113,19 @@ describe("snippets GET scoping", () => {
 });
 
 describe("logs GET admin gate", () => {
+  let authDirectory: string;
+
+  beforeEach(() => {
+    authDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "tx-logs-auth-"));
+    process.env.TERMINALX_TEAM_SESSION_DB_PATH = path.join(authDirectory, "team-sessions.sqlite");
+    process.env.TERMINALX_LEGACY_USERS_FILE = path.join(authDirectory, "users.json");
+  });
+
   afterEach(() => {
+    fs.rmSync(authDirectory, { recursive: true, force: true });
     delete process.env.TERMINALX_AUTH_MODE;
+    delete process.env.TERMINALX_TEAM_SESSION_DB_PATH;
+    delete process.env.TERMINALX_LEGACY_USERS_FILE;
   });
 
   it("returns empty list for an authenticated non-admin in local mode", async () => {
