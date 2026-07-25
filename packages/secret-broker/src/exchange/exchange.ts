@@ -14,6 +14,11 @@ import {
 import type { SecretBrokerReceipt } from "../receipt-schema";
 import { ProviderExchangeError, type ProviderExchangeClient } from "./provider-exchange-client";
 import type { WebhookSecretStore } from "./webhook-secret-store";
+import {
+  createSlackOidcVerifier,
+  type SlackOidcJwksClient,
+  type SlackOidcVerifier,
+} from "./slack-oidc";
 
 const SLACK_REPLAY_WINDOW_MS = 5 * 60 * 1000;
 const MAX_WEBHOOK_BODY_BYTES = 256 * 1024;
@@ -41,6 +46,9 @@ export interface CreateProviderExchangeOptions {
   readonly randomBytes?: (size: number) => Buffer;
   readonly clock?: () => number;
   readonly slackReplayWindowMs?: number;
+  /** Injectable JWKS source for Sign in with Slack (OIDC) id_token verification. */
+  readonly slackOidcJwks?: SlackOidcJwksClient;
+  readonly slackOidcJwksTtlMs?: number;
 }
 
 export interface ProviderExchange {
@@ -51,6 +59,7 @@ export interface ProviderExchange {
     webhookAuthDigest: string;
   }>;
   verifySlackWebhook(params: unknown): { valid: boolean; withinReplayWindow: boolean };
+  slackOidc(params: unknown): Promise<{ identity: object }>;
 }
 
 /**
@@ -64,6 +73,15 @@ export function createProviderExchange(options: CreateProviderExchangeOptions): 
   const clock = options.clock ?? Date.now;
   const replayWindowMs = options.slackReplayWindowMs ?? SLACK_REPLAY_WINDOW_MS;
   const { client, webhookSecrets, prepareInstallationCredential } = options;
+  const slackOidcVerifier: SlackOidcVerifier | null = options.slackOidcJwks
+    ? createSlackOidcVerifier({
+        jwks: options.slackOidcJwks,
+        clock,
+        ...(options.slackOidcJwksTtlMs === undefined
+          ? {}
+          : { jwksTtlMs: options.slackOidcJwksTtlMs }),
+      })
+    : null;
 
   return Object.freeze({
     async slackOauth(
@@ -177,7 +195,74 @@ export function createProviderExchange(options: CreateProviderExchangeOptions): 
         secret.fill(0);
       }
     },
+
+    async slackOidc(params: unknown): Promise<{ identity: object }> {
+      if (!slackOidcVerifier) throw new SecretBrokerProtocolError("not-ready");
+      const request = snapshotSlackOidcParams(params);
+      let identity;
+      try {
+        identity = await slackOidcVerifier.verify({
+          idToken: request.idToken,
+          expectedIssuer: request.expectedIssuer,
+          expectedAudience: request.expectedAudience,
+          expectedTenantId: request.expectedTenantId,
+          expectedAppId: request.expectedAppId,
+          challengeDigest: request.challengeDigest,
+        });
+      } catch (error) {
+        throw mapExchangeError(error);
+      }
+      // Only the verified non-secret identity leaves the broker; the raw id_token
+      // never crosses the socket.
+      return {
+        identity: Object.freeze({
+          provider: "slack",
+          externalTenantId: identity.externalTenantId,
+          externalAppId: identity.externalAppId,
+          externalSubject: identity.externalSubject,
+          challenge: identity.challenge,
+          replayId: identity.replayId,
+        }),
+      };
+    },
   });
+}
+
+interface SlackOidcRequest {
+  readonly idToken: string;
+  readonly expectedIssuer: string;
+  readonly expectedAudience: string;
+  readonly expectedTenantId: string;
+  readonly expectedAppId: string;
+  readonly challengeDigest: string;
+}
+
+function snapshotSlackOidcParams(params: unknown): SlackOidcRequest {
+  try {
+    const record = exactRecord(params, [
+      "idToken",
+      "expectedIssuer",
+      "expectedAudience",
+      "expectedTenantId",
+      "expectedAppId",
+      "challengeDigest",
+    ]);
+    const idToken = field(record, "idToken");
+    if (typeof idToken !== "string" || idToken.length < 1 || idToken.length > 16384) {
+      throw new SecretBrokerProtocolError("invalid-request");
+    }
+    return Object.freeze({
+      idToken,
+      expectedIssuer: boundedIdentifier(field(record, "expectedIssuer"), 1024),
+      expectedAudience: boundedIdentifier(field(record, "expectedAudience"), 1024),
+      expectedTenantId: boundedIdentifier(field(record, "expectedTenantId"), 1024),
+      expectedAppId: boundedIdentifier(field(record, "expectedAppId"), 1024),
+      challengeDigest: digestField(field(record, "challengeDigest")),
+    });
+  } catch (error) {
+    if (error instanceof SecretBrokerProtocolError) throw error;
+    throw new SecretBrokerProtocolError("invalid-request");
+  }
 }
 
 function mapExchangeError(error: unknown): SecretBrokerProtocolError {

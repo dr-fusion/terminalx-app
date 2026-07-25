@@ -46,10 +46,21 @@ export interface TelegramGetMeResult {
   readonly username: string;
 }
 
+export interface SlackOidcJwk {
+  readonly kid: string;
+  readonly kty: string;
+  readonly alg?: string;
+  readonly n: string;
+  readonly e: string;
+  readonly use?: string;
+}
+
 export interface ProviderExchangeClient {
   slackOauthAccess(input: SlackOauthAccessInput): Promise<SlackOauthAccessResult>;
   telegramGetMe(botToken: string): Promise<TelegramGetMeResult>;
   telegramSetWebhook(botToken: string, webhookUrl: string, secretToken: string): Promise<void>;
+  /** Fetch Slack's OpenID Connect JWKS for in-broker id_token verification. */
+  fetchSlackOidcJwks(): Promise<{ readonly keys: readonly SlackOidcJwk[] }>;
 }
 
 export interface CreateFetchProviderExchangeClientOptions {
@@ -169,6 +180,12 @@ export function createFetchProviderExchangeClient(
         secret_token: secretToken,
       });
       if (json.ok !== true) throw new ProviderExchangeError("provider-declined");
+    },
+    async fetchSlackOidcJwks(): Promise<{ readonly keys: readonly SlackOidcJwk[] }> {
+      const json = await call("slack.com", "/openid/connect/keys", "GET", null);
+      const keys = json.keys;
+      if (!Array.isArray(keys)) throw new ProviderExchangeError("invalid-response");
+      return { keys: keys as readonly SlackOidcJwk[] };
     },
   });
 }

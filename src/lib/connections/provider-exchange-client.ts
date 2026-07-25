@@ -83,10 +83,29 @@ export interface SlackWebhookVerifyResult {
   readonly withinReplayWindow: boolean;
 }
 
+export interface SlackOidcVerifyInput {
+  readonly idToken: string;
+  readonly expectedIssuer: string;
+  readonly expectedAudience: string;
+  readonly expectedTenantId: string;
+  readonly expectedAppId: string;
+  readonly challengeDigest: string;
+}
+
+export interface SlackOidcVerifiedIdentity {
+  readonly provider: "slack";
+  readonly externalTenantId: string;
+  readonly externalAppId: string;
+  readonly externalSubject: string;
+  readonly challenge: string;
+  readonly replayId: string;
+}
+
 export interface ProviderExchangeClient {
   slackOauth(input: SlackOauthExchangeInput): Promise<SlackOauthExchangeResult>;
   telegramBotToken(input: TelegramBotTokenExchangeInput): Promise<TelegramBotTokenExchangeResult>;
   verifySlackWebhook(input: SlackWebhookVerifyInput): Promise<SlackWebhookVerifyResult>;
+  slackOidc(input: SlackOidcVerifyInput): Promise<SlackOidcVerifiedIdentity>;
 }
 
 export interface CreateProviderExchangeClientOptions {
@@ -153,6 +172,17 @@ export function createProviderExchangeClient(
         webhookAuthDigest: digest,
       });
     },
+    async slackOidc(input: SlackOidcVerifyInput): Promise<SlackOidcVerifiedIdentity> {
+      const result = (await request(socketPath, timeoutMs, "exchange.slack-oidc", {
+        idToken: input.idToken,
+        expectedIssuer: input.expectedIssuer,
+        expectedAudience: input.expectedAudience,
+        expectedTenantId: input.expectedTenantId,
+        expectedAppId: input.expectedAppId,
+        challengeDigest: input.challengeDigest,
+      })) as { identity: unknown };
+      return snapshotSlackOidcIdentity(result.identity);
+    },
     async verifySlackWebhook(input: SlackWebhookVerifyInput): Promise<SlackWebhookVerifyResult> {
       const result = (await request(socketPath, timeoutMs, "webhook.verify-slack", {
         expectationDigest: input.expectationDigest,
@@ -190,6 +220,31 @@ function snapshotSlackInstallation(value: unknown): SlackInstallationIdentity {
     externalAppId: record.externalAppId,
     externalBotUserId: record.externalBotUserId,
     grantedScopes: Object.freeze([...(grantedScopes as string[])]),
+  });
+}
+
+function snapshotSlackOidcIdentity(value: unknown): SlackOidcVerifiedIdentity {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new ProviderExchangeClientError("internal");
+  }
+  const record = value as Record<string, unknown>;
+  if (
+    record.provider !== "slack" ||
+    typeof record.externalTenantId !== "string" ||
+    typeof record.externalAppId !== "string" ||
+    typeof record.externalSubject !== "string" ||
+    typeof record.challenge !== "string" ||
+    typeof record.replayId !== "string"
+  ) {
+    throw new ProviderExchangeClientError("internal");
+  }
+  return Object.freeze({
+    provider: "slack",
+    externalTenantId: record.externalTenantId,
+    externalAppId: record.externalAppId,
+    externalSubject: record.externalSubject,
+    challenge: record.challenge,
+    replayId: record.replayId,
   });
 }
 

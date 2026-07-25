@@ -3,6 +3,8 @@ import { connectionActorSnapshot } from "./request-actor";
 import { withConnectionAuthority as defaultWithConnectionAuthority } from "../identity-service";
 import type { ConnectionActorSnapshot } from "./contracts";
 import type { ConnectionAuthority } from "./authority";
+import type { ProviderExchangeClient } from "./provider-exchange-client";
+import type { VerifiedSlackOidcProof } from "./providers/types";
 
 /**
  * HTTP surface for the connection authority (Slice 8E, decision 5). Every mutation
@@ -281,6 +283,87 @@ export async function handleRevokeInstallation(
     );
     return jsonResponse({ installation });
   });
+}
+
+export interface SlackOidcLinkExpectation {
+  readonly expectedIssuer: string;
+  readonly expectedAudience: string;
+  readonly expectedTenantId: string;
+  readonly expectedAppId: string;
+}
+
+export interface SlackOidcLinkDependencies extends ConnectionHttpDependencies {
+  /** Broker exchange client; the id_token is verified inside the broker. */
+  readonly exchangeClient: ProviderExchangeClient;
+  /**
+   * Resolve the per-installation OIDC expectation (issuer/audience/tenant/app)
+   * for the authenticated actor. Returns null when the actor may not link here.
+   */
+  readonly resolveSlackOidcExpectation: (input: {
+    readonly installationId: string;
+    readonly actor: ConnectionActorSnapshot;
+  }) => SlackOidcLinkExpectation | null;
+}
+
+/**
+ * Complete a Sign in with Slack (OIDC) identity link. Mirroring the Telegram
+ * deep-link route discipline: the id_token is verified inside the broker (JWKS
+ * + iss/aud/exp/nonce bound to the Link Challenge digest), the returned verified
+ * identity becomes the provider proof, and the connection authority
+ * (verifySlackOidcProof) re-binds it to the exact installation and challenge
+ * before persisting. Every failure is fail-closed and disclosure-free.
+ */
+export async function handleCompleteSlackOidcLink(
+  request: Request,
+  deps: SlackOidcLinkDependencies
+): Promise<Response> {
+  return withErrors(async () => {
+    const actor = await requireActor(request, deps);
+    assertMutationOrigin(request);
+    const body = await readJson(request);
+    const installationId = requireString(body.installationId, "invalid-installation");
+    const challenge = requireString(body.challenge, "invalid-challenge");
+    const idToken = requireString(body.idToken, "invalid-id-token");
+    const expectation = deps.resolveSlackOidcExpectation({ installationId, actor });
+    if (!expectation) {
+      throw new ConnectionHttpProblem(404, "not-found", "installation unavailable");
+    }
+    const { createHash } = await import("node:crypto");
+    const challengeDigest = createHash("sha256").update(challenge, "utf8").digest("hex");
+    let identity;
+    try {
+      identity = await deps.exchangeClient.slackOidc({
+        idToken,
+        expectedIssuer: expectation.expectedIssuer,
+        expectedAudience: expectation.expectedAudience,
+        expectedTenantId: expectation.expectedTenantId,
+        expectedAppId: expectation.expectedAppId,
+        challengeDigest,
+      });
+    } catch {
+      // A declined/invalid id_token is a uniform fail-closed 401.
+      throw new ConnectionHttpProblem(401, "link-rejected", "link rejected");
+    }
+    const providerProof: VerifiedSlackOidcProof = {
+      kind: "slack-oidc",
+      externalTenantId: identity.externalTenantId,
+      externalAppId: identity.externalAppId,
+      externalSubject: identity.externalSubject,
+      challenge: identity.challenge,
+      replayId: identity.replayId,
+    };
+    const connection = run(deps, (authority) =>
+      authority.completeLinkChallenge({ challenge, providerProof })
+    );
+    return jsonResponse({ connection });
+  });
+}
+
+function requireString(value: unknown, code: string): string {
+  if (typeof value !== "string" || value.length < 1 || value.length > 16384) {
+    throw new ConnectionHttpProblem(400, code, "invalid field");
+  }
+  return value;
 }
 
 /** Revoke an Identity Connection (only the owning User). */

@@ -154,6 +154,9 @@ export function createSecretBroker(options: CreateSecretBrokerOptions): SecretBr
           client: options.providerExchangeClient,
           webhookSecrets: options.webhookSecretStore,
           clock,
+          // The exchange client also serves Slack's OIDC JWKS for in-broker
+          // id_token verification (Sign in with Slack identity linking).
+          slackOidcJwks: options.providerExchangeClient,
           ...(options.exchangeRandomBytes ? { randomBytes: options.exchangeRandomBytes } : {}),
           // Seal the acquired token through the exact two-phase prepare path so the
           // returned receipt is an ordinary Registration Receipt the main process
@@ -202,6 +205,8 @@ export function createSecretBroker(options: CreateSecretBrokerOptions): SecretBr
         return requireExchange().telegramBotToken(request.params);
       case "webhook.verify-slack":
         return requireExchange().verifySlackWebhook(request.params);
+      case "exchange.slack-oidc":
+        return requireExchange().slackOidc(request.params);
       case "registration.finalize": {
         const { handleId, receiptId } = snapshotHandleReceipt(request.params);
         const row = store.finalize(handleId, receiptId);
