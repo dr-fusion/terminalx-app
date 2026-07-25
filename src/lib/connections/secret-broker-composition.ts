@@ -1,7 +1,11 @@
 import { isAbsolute, join, normalize } from "node:path";
 import type Database from "better-sqlite3";
-import { BROKER_SOCKET_FILE } from "../../../packages/secret-broker/src/broker-root";
+import {
+  BROKER_SOCKET_FILE,
+  BROKER_PROXY_SOCKET_FILE,
+} from "../../../packages/secret-broker/src/broker-root";
 import { createSecretBrokerClient, type SecretBrokerClient } from "./secret-broker-client";
+import { createCredentialProxyClient, type CredentialProxyClient } from "./credential-proxy-client";
 import {
   createBrokerReceiptVerifier,
   readBrokerVerificationKey,
@@ -48,6 +52,21 @@ export function resolveConfiguredSecretBrokerClient(): SecretBrokerClient | null
   const rootDir = configuredSecretBrokerRoot();
   if (!rootDir) return null;
   return createSecretBrokerClient({ socketPath: configuredSocketPath(rootDir) });
+}
+
+function configuredProxySocketPath(rootDir: string): string {
+  return join(rootDir, BROKER_PROXY_SOCKET_FILE);
+}
+
+/**
+ * Build the Credential Proxy socket client, or null when no broker is
+ * configured. No caller migrates onto this in Slice 8D — it is composed for
+ * Slice 8E provider adapters. It is never exposed to a browser HTTP route.
+ */
+export function resolveConfiguredCredentialProxyClient(): CredentialProxyClient | null {
+  const rootDir = configuredSecretBrokerRoot();
+  if (!rootDir) return null;
+  return createCredentialProxyClient({ socketPath: configuredProxySocketPath(rootDir) });
 }
 
 /**

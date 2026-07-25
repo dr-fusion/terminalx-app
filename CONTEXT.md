@@ -108,6 +108,12 @@ The destination-scoped effect boundary that uses a Credential Handle to perform 
 request without revealing the credential to the caller.
 _Avoid_: HTTP proxy, secret injector
 
+**Typed Provider Operation**:
+A named, closed entry in the Credential Proxy's operation registry that pins one provider, one
+destination host, one method, a bounded parameter schema, and a bounded response projection. It is
+the only thing a caller may invoke; there is no generic authenticated-request primitive.
+_Avoid_: API call, generic request, endpoint
+
 **Registration Receipt**:
 A single-use, Secret Broker-signed proof that binds one exact Credential Handle registration
 expectation to a newly prepared handle. The main process verifies it locally to admit the

@@ -63,3 +63,56 @@ export {
 } from "./protocol";
 export { sealAtRest, openAtRest, AT_REST_KEY_BYTES } from "./at-rest";
 export { runSecretBrokerDaemon } from "./daemon";
+export {
+  createCredentialProxy,
+  openCredentialProxyAccounting,
+  type CredentialProxy,
+  type CredentialProxyResult,
+  type CredentialProxyAuditEvent,
+  type CredentialResolver,
+  type CreateCredentialProxyOptions,
+} from "./proxy/credential-proxy";
+export {
+  CREDENTIAL_PROXY_OPERATIONS,
+  CREDENTIAL_PROXY_ALLOWED_HOSTS,
+  OperationInputError,
+  type TypedProviderOperation,
+  type ProxyProvider,
+  type CredentialPlacement,
+  type ProxyRequestPlan,
+  type ProjectionOutcome,
+} from "./proxy/operations";
+export {
+  createFetchProxyNetworkClient,
+  ProxyNetworkError,
+  type ProxyNetworkClient,
+  type ProxyOutboundRequest,
+  type ProxyNetworkResponse,
+} from "./proxy/network-client";
+export {
+  openProxyAccountingStore,
+  type ProxyAccountingStore,
+  type ProxyAccountingRow,
+  type ProxyAccountingInput,
+} from "./proxy/accounting-store";
+export {
+  CREDENTIAL_PROXY_PROTOCOL_VERSION,
+  CREDENTIAL_PROXY_METHODS,
+  PROXY_ERROR_CODES,
+  assertClosedProxyResponse,
+  snapshotProxyExecuteRequest,
+  snapshotProxyResult,
+  isCredentialProxyMethod,
+  type ProxyResult,
+  type CredentialProxyMethod,
+  type ProxyResultClass,
+  type ProxyErrorCode,
+  type ProxyExecuteRequest,
+  type ProxyAuthoritySnapshot,
+} from "./proxy/proxy-protocol";
+export {
+  runCredentialProxyConnection,
+  type CredentialProxyRequest,
+  type CredentialProxyRequestHandler,
+} from "./proxy/proxy-transport";
+export { BROKER_PROXY_SOCKET_FILE, BROKER_PROXY_ACCOUNTING_FILE } from "./broker-root";
