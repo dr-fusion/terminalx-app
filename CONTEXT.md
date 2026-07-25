@@ -107,3 +107,9 @@ _Avoid_: Vault, environment variable store
 The destination-scoped effect boundary that uses a Credential Handle to perform or sign an approved
 request without revealing the credential to the caller.
 _Avoid_: HTTP proxy, secret injector
+
+**Registration Receipt**:
+A single-use, Secret Broker-signed proof that binds one exact Credential Handle registration
+expectation to a newly prepared handle. The main process verifies it locally to admit the
+registration; it is never itself persisted, and TerminalX stores only its digest.
+_Avoid_: Token, session, capability

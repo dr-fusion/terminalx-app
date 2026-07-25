@@ -5,6 +5,7 @@ import {
 } from "./identity-authority";
 import { createStoredAuthenticationSessionValidator } from "./auth-session-validator";
 import { createConnectionAuthority, type ConnectionAuthority } from "./connections/authority";
+import { resolveConfiguredBrokerReceiptVerifier } from "./connections/secret-broker-composition";
 import { createMobileAuthAuthority, type MobileAuthAuthority } from "./mobile-auth/authority";
 import { readLegacyDeviceImport } from "./mobile-auth/legacy-devices";
 import { openTeamSessionDatabase, type TeamSessionDatabase } from "./team-sessions/sqlite";
@@ -65,12 +66,18 @@ function createService(filename: string): CanonicalIdentityService {
     const validateAuthenticationSnapshot = createStoredAuthenticationSessionValidator({
       getDevice: (deviceId) => mobileAuthAuthority.getDevice(deviceId),
     });
+    // Composed only when a Secret Broker is configured and has published its
+    // verification key. Absent it, the connection authority defaults closed and
+    // credential-handle registration fails exactly as it does today.
+    const verifyCredentialHandleRegistration =
+      resolveConfiguredBrokerReceiptVerifier() ?? undefined;
     return {
       filename,
       database,
       authority: createCanonicalIdentityAuthority({ db: database.db }),
       connectionAuthority: createConnectionAuthority({
         db: database.db,
+        verifyCredentialHandleRegistration,
         validateAuthenticationSnapshot: (snapshot) =>
           validateAuthenticationSnapshot({
             canonicalUserId: snapshot.userId,

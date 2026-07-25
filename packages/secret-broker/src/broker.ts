@@ -1,0 +1,310 @@
+import { randomBytes } from "node:crypto";
+import type { BrokerRootContext } from "./broker-root";
+import type { SecretManagerAdapterRegistry, CredentialBrokerKind } from "./adapters";
+import { signSecretBrokerReceipt, type SecretBrokerReceipt } from "./receipt-schema";
+import {
+  boundedIdentifier,
+  digestField,
+  exactRecord,
+  field,
+  SecretBrokerProtocolError,
+} from "./protocol";
+import type { SecretBrokerRequest, SecretBrokerRequestHandler } from "./ndjson";
+import type { RegistrationRow, SecretBrokerStateStore } from "./state-store";
+
+const MIN_TTL_MS = 60 * 1000;
+const MAX_TTL_MS = 30 * 60 * 1000;
+const DEFAULT_TTL_MS = 5 * 60 * 1000;
+const MAX_SECRET_BYTES = 128 * 1024;
+const BROKER_KINDS: readonly CredentialBrokerKind[] = ["oauth-envelope", "onepassword-connect"];
+
+export interface SecretBrokerAuditEvent {
+  readonly action:
+    | "reconcile.reap"
+    | "registration.prepare"
+    | "registration.finalize"
+    | "registration.abort"
+    | "rotation.finalize"
+    | "handle.revoke";
+  readonly handleId: string;
+  readonly status?: string;
+}
+
+export interface CreateSecretBrokerOptions {
+  readonly root: BrokerRootContext;
+  readonly store: SecretBrokerStateStore;
+  readonly adapters: SecretManagerAdapterRegistry;
+  readonly clock?: () => number;
+  readonly receiptTtlMs?: number;
+  readonly audit?: (event: SecretBrokerAuditEvent) => void;
+}
+
+export interface SecretBroker {
+  readonly handle: SecretBrokerRequestHandler;
+  reconcile(now?: number): { readonly reaped: number };
+}
+
+/**
+ * The Secret Broker service: resolves prepare/finalize/abort/rotation/revoke/
+ * status/health requests against broker-private state. Non-exporting by
+ * construction — no handler returns credential material, only opaque handles,
+ * statuses, and a signed receipt.
+ */
+export function createSecretBroker(options: CreateSecretBrokerOptions): SecretBroker {
+  const clock = options.clock ?? Date.now;
+  const receiptTtlMs = options.receiptTtlMs ?? DEFAULT_TTL_MS;
+  if (
+    !Number.isSafeInteger(receiptTtlMs) ||
+    receiptTtlMs < MIN_TTL_MS ||
+    receiptTtlMs > MAX_TTL_MS
+  ) {
+    throw new TypeError();
+  }
+  const { root, store, adapters } = options;
+  const audit = options.audit ?? ((): void => undefined);
+
+  const now = (): number => {
+    const value = clock();
+    if (!Number.isSafeInteger(value) || value < 0) throw new SecretBrokerProtocolError("internal");
+    return value;
+  };
+
+  async function prepare(
+    params: unknown,
+    rotation: boolean
+  ): Promise<{ receipt: SecretBrokerReceipt }> {
+    const request = snapshotPrepareParams(params, rotation);
+    const existing = store.getByOperationId(request.operationId);
+    if (existing) {
+      if (
+        existing.status !== "pending" ||
+        existing.expectationDigest !== request.expectationDigest ||
+        existing.brokerKind !== request.brokerKind ||
+        (existing.replacesHandleId ?? null) !== request.replacesHandleId
+      ) {
+        request.secretMaterial.fill(0);
+        throw new SecretBrokerProtocolError("conflict");
+      }
+      request.secretMaterial.fill(0);
+      return { receipt: signRow(existing) };
+    }
+    const adapter = adapters[request.brokerKind];
+    if (!adapter) {
+      request.secretMaterial.fill(0);
+      throw new SecretBrokerProtocolError("not-ready");
+    }
+    // adapter.prepare zeroes the plaintext; it returns broker-persistable bytes.
+    const prepared = await adapter.prepare(request.secretMaterial);
+    const issuedAtMs = now();
+    const row = store.prepare({
+      operationId: request.operationId,
+      handleId: newHandleId(),
+      receiptId: newReceiptId(),
+      provider: request.provider,
+      brokerKind: request.brokerKind,
+      usage: request.usage,
+      expectationDigest: request.expectationDigest,
+      replacesHandleId: request.replacesHandleId,
+      issuedAtMs,
+      expiresAtMs: issuedAtMs + receiptTtlMs,
+      secretMaterial: prepared.material,
+    });
+    audit({ action: "registration.prepare", handleId: row.handleId, status: row.status });
+    return { receipt: signRow(row) };
+  }
+
+  function signRow(row: RegistrationRow): SecretBrokerReceipt {
+    return signSecretBrokerReceipt(
+      {
+        schema: 1,
+        kind: "terminalx.secret-broker-registration-receipt",
+        brokerInstanceId: root.brokerInstanceId,
+        brokerEpoch: root.brokerEpoch,
+        signingKeyId: root.signingKeyId,
+        operationId: row.operationId,
+        handleId: row.handleId,
+        receiptId: row.receiptId,
+        provider: row.provider,
+        brokerKind: row.brokerKind,
+        usage: row.usage,
+        expectationDigest: row.expectationDigest,
+        hasReplacement: row.replacesHandleId !== null,
+        issuedAtMs: row.issuedAtMs,
+        expiresAtMs: row.expiresAtMs,
+      },
+      root.signingKey
+    );
+  }
+
+  const handle: SecretBrokerRequestHandler = async (request: SecretBrokerRequest) => {
+    switch (request.method) {
+      case "registration.prepare":
+        return prepare(request.params, false);
+      case "rotation.prepare":
+        return prepare(request.params, true);
+      case "registration.finalize": {
+        const { handleId, receiptId } = snapshotHandleReceipt(request.params);
+        const row = store.finalize(handleId, receiptId);
+        audit({ action: "registration.finalize", handleId: row.handleId, status: row.status });
+        return { handleId: row.handleId, status: row.status };
+      }
+      case "rotation.finalize": {
+        const { handleId, receiptId } = snapshotHandleReceipt(request.params);
+        const row = store.finalizeRotation(handleId, receiptId);
+        const replaced = row.replacesHandleId ? store.getByHandleId(row.replacesHandleId) : null;
+        audit({ action: "rotation.finalize", handleId: row.handleId, status: row.status });
+        return {
+          handleId: row.handleId,
+          status: row.status,
+          replacedHandleId: row.replacesHandleId,
+          replacedStatus: replaced ? replaced.status : "revoked",
+        };
+      }
+      case "registration.abort":
+      case "rotation.abort": {
+        const receiptId = snapshotReceiptId(request.params);
+        const row = store.abort(receiptId);
+        audit({ action: "registration.abort", handleId: row.handleId, status: row.status });
+        return { receiptId: row.receiptId, status: row.status };
+      }
+      case "handle.revoke": {
+        const handleId = snapshotHandleId(request.params);
+        const row = store.revoke(handleId);
+        audit({ action: "handle.revoke", handleId: row.handleId, status: row.status });
+        return { handleId: row.handleId, status: row.status };
+      }
+      case "handle.status": {
+        const handleId = snapshotHandleId(request.params);
+        const row = store.getByHandleId(handleId);
+        if (!row) throw new SecretBrokerProtocolError("not-found");
+        return {
+          handleId: row.handleId,
+          status: row.status,
+          brokerKind: row.brokerKind,
+          provider: row.provider,
+          usage: row.usage,
+          expiresAtMs: row.expiresAtMs,
+        };
+      }
+      case "broker.health":
+        exactRecord(request.params, []);
+        return {
+          brokerInstanceId: root.brokerInstanceId,
+          brokerEpoch: root.brokerEpoch,
+          signingKeyId: root.signingKeyId,
+          pendingRegistrations: store.countPending(),
+        };
+      default:
+        throw new SecretBrokerProtocolError("invalid-request");
+    }
+  };
+
+  return Object.freeze({
+    handle,
+    reconcile(nowMs?: number): { readonly reaped: number } {
+      const timestamp = nowMs ?? now();
+      const reaped = store.reapExpiredPending(timestamp);
+      for (const row of reaped) {
+        audit({ action: "reconcile.reap", handleId: row.handleId, status: row.status });
+      }
+      return { reaped: reaped.length };
+    },
+  });
+}
+
+interface PrepareRequest {
+  readonly operationId: string;
+  readonly provider: string;
+  readonly brokerKind: CredentialBrokerKind;
+  readonly usage: string;
+  readonly expectationDigest: string;
+  readonly replacesHandleId: string | null;
+  readonly secretMaterial: Buffer;
+}
+
+function snapshotPrepareParams(params: unknown, rotation: boolean): PrepareRequest {
+  const record = exactRecord(params, [
+    "operationId",
+    "provider",
+    "brokerKind",
+    "usage",
+    "expectationDigest",
+    "replaces",
+    "secretMaterial",
+  ]);
+  const brokerKind = field(record, "brokerKind");
+  if (
+    typeof brokerKind !== "string" ||
+    !BROKER_KINDS.includes(brokerKind as CredentialBrokerKind)
+  ) {
+    throw new SecretBrokerProtocolError("invalid-request");
+  }
+  const replaces = field(record, "replaces");
+  let replacesHandleId: string | null = null;
+  if (rotation) {
+    const replacesRecord = exactRecord(replaces, ["handleId"]);
+    replacesHandleId = boundedIdentifier(field(replacesRecord, "handleId"));
+  } else if (replaces !== null) {
+    throw new SecretBrokerProtocolError("invalid-request");
+  }
+  const secretMaterialBase64 = field(record, "secretMaterial");
+  if (typeof secretMaterialBase64 !== "string") {
+    throw new SecretBrokerProtocolError("invalid-request");
+  }
+  const secretMaterial = Buffer.from(secretMaterialBase64, "base64");
+  if (secretMaterial.byteLength < 1 || secretMaterial.byteLength > MAX_SECRET_BYTES) {
+    secretMaterial.fill(0);
+    throw new SecretBrokerProtocolError("invalid-request");
+  }
+  try {
+    return Object.freeze({
+      operationId: boundedIdentifier(field(record, "operationId")),
+      provider: boundedIdentifier(field(record, "provider")),
+      brokerKind: brokerKind as CredentialBrokerKind,
+      usage: boundedIdentifier(field(record, "usage")),
+      expectationDigest: digestField(field(record, "expectationDigest")),
+      replacesHandleId,
+      secretMaterial,
+    });
+  } catch (error) {
+    secretMaterial.fill(0);
+    if (error instanceof SecretBrokerProtocolError) throw error;
+    throw new SecretBrokerProtocolError("invalid-request");
+  }
+}
+
+function snapshotHandleReceipt(params: unknown): { handleId: string; receiptId: string } {
+  try {
+    const record = exactRecord(params, ["handleId", "receiptId"]);
+    return {
+      handleId: boundedIdentifier(field(record, "handleId")),
+      receiptId: boundedIdentifier(field(record, "receiptId"), 2048),
+    };
+  } catch {
+    throw new SecretBrokerProtocolError("invalid-request");
+  }
+}
+
+function snapshotHandleId(params: unknown): string {
+  try {
+    return boundedIdentifier(field(exactRecord(params, ["handleId"]), "handleId"));
+  } catch {
+    throw new SecretBrokerProtocolError("invalid-request");
+  }
+}
+
+function snapshotReceiptId(params: unknown): string {
+  try {
+    return boundedIdentifier(field(exactRecord(params, ["receiptId"]), "receiptId"), 2048);
+  } catch {
+    throw new SecretBrokerProtocolError("invalid-request");
+  }
+}
+
+function newHandleId(): string {
+  return `hnd_${randomBytes(18).toString("base64url")}`;
+}
+
+function newReceiptId(): string {
+  return `rcp_${randomBytes(32).toString("base64url")}`;
+}

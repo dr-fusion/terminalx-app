@@ -72,6 +72,7 @@ import {
 } from "./team-session-websockets";
 import { runServerShutdownWithin, type ServerShutdownStage } from "./graceful-shutdown";
 import { installConfiguredProductionHostedRuntimeFactory } from "./production-hosted-runtime";
+import { assertConfiguredSecretBrokerReady } from "../src/lib/connections/secret-broker-composition";
 import { composeProductionDaytonaHostedRuntime } from "./production-daytona-hosted-runtime";
 
 // ── Config ──────────────────────────────────────────────────────────────────
@@ -706,6 +707,12 @@ void app
   .prepare()
   .then(async () => {
     if (AUTH_MODE !== "none") {
+      // A configured Secret Broker must be present and have published its
+      // verification key before the connection authority is composed, so a
+      // brokered deployment never serves connection surfaces with a
+      // half-composed credential boundary. The broker process itself is
+      // supervised as a separate service (see packages/secret-broker/README.md).
+      assertConfiguredSecretBrokerReady();
       // Database migration and integrity checks are a startup gate, not work
       // an unauthenticated login request may trigger after the server listens.
       initializeCanonicalIdentityAuthorityService();

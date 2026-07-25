@@ -1,0 +1,74 @@
+import { isAbsolute, join, normalize } from "node:path";
+import type Database from "better-sqlite3";
+import { BROKER_SOCKET_FILE } from "../../../packages/secret-broker/src/broker-root";
+import { createSecretBrokerClient, type SecretBrokerClient } from "./secret-broker-client";
+import {
+  createBrokerReceiptVerifier,
+  readBrokerVerificationKey,
+  type BrokerReceiptVerifier,
+} from "./secret-broker-verifier";
+
+export const SECRET_BROKER_ROOT_ENV = "TERMINALX_SECRET_BROKER_ROOT";
+export const SECRET_BROKER_SOCKET_ENV = "TERMINALX_SECRET_BROKER_SOCKET";
+
+/** The configured broker root, or null when no broker is composed (dev default). */
+export function configuredSecretBrokerRoot(): string | null {
+  const value = process.env[SECRET_BROKER_ROOT_ENV];
+  if (typeof value !== "string" || value.length === 0) return null;
+  if (!isAbsolute(value) || normalize(value) !== value) return null;
+  return value;
+}
+
+function configuredSocketPath(rootDir: string): string {
+  const override = process.env[SECRET_BROKER_SOCKET_ENV];
+  if (typeof override === "string" && override.length > 0) {
+    if (!isAbsolute(override) || normalize(override) !== override)
+      return join(rootDir, BROKER_SOCKET_FILE);
+    return override;
+  }
+  return join(rootDir, BROKER_SOCKET_FILE);
+}
+
+/**
+ * Build the synchronous, local receipt verifier from the broker's published
+ * verification key. Returns null when no broker is configured or its key is not
+ * yet available, so the connection authority keeps failing closed exactly as it
+ * does today without a verifier.
+ */
+export function resolveConfiguredBrokerReceiptVerifier(): BrokerReceiptVerifier | null {
+  const rootDir = configuredSecretBrokerRoot();
+  if (!rootDir) return null;
+  const verificationPublicKey = readBrokerVerificationKey(rootDir);
+  if (!verificationPublicKey) return null;
+  return createBrokerReceiptVerifier({ verificationPublicKey });
+}
+
+/** Build the broker socket client, or null when no broker is configured. */
+export function resolveConfiguredSecretBrokerClient(): SecretBrokerClient | null {
+  const rootDir = configuredSecretBrokerRoot();
+  if (!rootDir) return null;
+  return createSecretBrokerClient({ socketPath: configuredSocketPath(rootDir) });
+}
+
+/**
+ * Startup gate for the production server. When a Secret Broker is configured it
+ * must have published its verification key before any connection surface is
+ * served; otherwise startup fails closed rather than exposing a half-composed
+ * credential boundary. When no broker is configured this is a no-op and the
+ * connection APIs keep failing closed as they do in local development.
+ */
+export function assertConfiguredSecretBrokerReady(): void {
+  const rootDir = configuredSecretBrokerRoot();
+  if (!rootDir) return;
+  if (!readBrokerVerificationKey(rootDir)) {
+    throw new Error(
+      "Secret Broker is configured but its verification key is unavailable; refusing to start."
+    );
+  }
+}
+
+/** Read-only check the reconciler uses to detect a committed authority handle. */
+export function credentialHandleCommitted(db: Database.Database, handleId: string): boolean {
+  const row = db.prepare("SELECT 1 AS present FROM credential_handles WHERE id = ?").get(handleId);
+  return row !== undefined;
+}
