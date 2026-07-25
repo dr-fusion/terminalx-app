@@ -40,10 +40,16 @@ import { registerEnsureTopic } from "../src/lib/telegram/bot-bridge";
 import { getTelegramConfig, telegramConfigFingerprint } from "../src/lib/telegram/config";
 import { getConfiguredMaxSessions } from "../src/lib/security-config";
 import { assertValidStartupConfiguration } from "../src/lib/startup-validation";
-import { closeTeamSessions, getTeamSessionKernel } from "../src/lib/team-sessions/service";
 import {
+  closeTeamSessions,
+  getHostedMultiplayerServiceFactory,
+  getTeamSessionKernel,
+} from "../src/lib/team-sessions/service";
+import {
+  isMultiplayerTransportAvailable,
   isMultiplayerTransportEnabled,
   markMultiplayerTransportAvailable,
+  type MultiplayerRuntimeStatus,
 } from "../src/lib/team-sessions/feature";
 import { createTeamSessionTerminalGateway } from "../src/lib/team-session-terminal-gateway";
 import {
@@ -51,14 +57,16 @@ import {
   createRuntimeOutboxWorker,
   createRuntimeWriteStateRegistry,
   getCanonicalTmuxSocketName,
-  type RuntimeOutboxWorker,
 } from "../src/lib/runtime";
+import type { DaytonaHostedMultiplayerService } from "../src/lib/runtime";
 import {
   createTeamSessionWebSockets,
   type CanonicalTerminalPty,
   type CanonicalTerminalPtyAdapter,
-  type TeamSessionWebSockets,
 } from "./team-session-websockets";
+import { runServerShutdownWithin, type ServerShutdownStage } from "./graceful-shutdown";
+import { installConfiguredProductionHostedRuntimeFactory } from "./production-hosted-runtime";
+import { composeProductionDaytonaHostedRuntime } from "./production-daytona-hosted-runtime";
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -95,6 +103,8 @@ const TERMINUS_MAX_SESSIONS = getConfiguredMaxSessions();
 const TERMINUS_READ_ONLY = process.env.TERMINUS_READ_ONLY === "true";
 const TERMINUS_HOST = process.env.TERMINUS_HOST || "127.0.0.1";
 const MULTIPLAYER_ENABLED = isMultiplayerTransportEnabled();
+const AUXILIARY_SHUTDOWN_BUDGET_MS = 30_000;
+const LOCAL_MULTIPLAYER_SHUTDOWN_BUDGET_MS = 305_000;
 // Availability is published only after the durable write fence is installed
 // and the local Runtime worker has started successfully.
 markMultiplayerTransportAvailable(false);
@@ -180,8 +190,10 @@ const app = next({ dev, dir: path.resolve(__dirname, "..") });
 const handle = app.getRequestHandler();
 
 interface MultiplayerServices {
-  readonly webSockets: TeamSessionWebSockets;
-  readonly worker: RuntimeOutboxWorker;
+  readiness(): boolean;
+  runtimeStatus(): MultiplayerRuntimeStatus;
+  shutdownBudgetMs(): number;
+  handleUpgrade(req: IncomingMessage, socket: Socket, head: Buffer): Promise<boolean>;
   close(): Promise<void>;
 }
 
@@ -221,7 +233,7 @@ function createCanonicalPtyAdapter(): CanonicalTerminalPtyAdapter {
   };
 }
 
-function createMultiplayerServices(): MultiplayerServices {
+function createLocalMultiplayerServices(): MultiplayerServices {
   const kernel = getTeamSessionKernel();
   try {
     const teamSessions = kernel.teamSessions;
@@ -278,12 +290,23 @@ function createMultiplayerServices(): MultiplayerServices {
     });
 
     let closePromise: Promise<void> | undefined;
+    worker.start();
     return {
-      webSockets,
-      worker,
+      readiness: () => worker.running,
+      runtimeStatus: () =>
+        Object.freeze({
+          kind: "local-tmux" as const,
+          isolation: "trusted-shared-host" as const,
+          yoloEligible: false as const,
+        }),
+      shutdownBudgetMs: () => LOCAL_MULTIPLAYER_SHUTDOWN_BUDGET_MS,
+      handleUpgrade: (req, socket, head) => webSockets.handleUpgrade(req, socket, head),
       close() {
         closePromise ??= (async () => {
-          await Promise.allSettled([worker.stop(), webSockets.close()]);
+          const settlements = await Promise.allSettled([worker.stop(), webSockets.close()]);
+          if (settlements.some((settlement) => settlement.status === "rejected")) {
+            throw new TypeError("Local multiplayer service could not stop");
+          }
           closeTeamSessions(kernel);
         })();
         return closePromise;
@@ -295,6 +318,62 @@ function createMultiplayerServices(): MultiplayerServices {
     closeTeamSessions(kernel);
     throw new TypeError("Multiplayer services could not be initialized");
   }
+}
+
+async function createConfiguredMultiplayerServices(): Promise<MultiplayerServices | null> {
+  if (!MULTIPLAYER_ENABLED) return null;
+  const hostedFactory = getHostedMultiplayerServiceFactory();
+  if (hostedFactory !== null) {
+    const hosted = await hostedFactory();
+    try {
+      return adaptHostedMultiplayerService(hosted);
+    } catch {
+      await hosted.close().catch(() => undefined);
+      throw new TypeError("Hosted multiplayer service could not be adapted");
+    }
+  }
+  // The default singleton creates a local-tmux profile. It is a development
+  // convenience only and must never become a production fallback.
+  return dev ? createLocalMultiplayerServices() : null;
+}
+
+function adaptHostedMultiplayerService(
+  hosted: DaytonaHostedMultiplayerService
+): MultiplayerServices {
+  const readiness = hosted.readiness();
+  if (!readiness.ready || readiness.state !== "running") {
+    throw new TypeError("Hosted multiplayer service is not ready");
+  }
+  const runtimeStatus = hosted.runtimeStatus();
+  const shutdownBudgetMs = hosted.shutdownBudgetMs();
+  if (!Number.isSafeInteger(shutdownBudgetMs) || shutdownBudgetMs < 100) {
+    throw new TypeError("Hosted multiplayer shutdown budget is invalid");
+  }
+  return Object.freeze({
+    readiness: () => hosted.readiness().ready,
+    runtimeStatus: () => runtimeStatus,
+    shutdownBudgetMs: () => shutdownBudgetMs,
+    handleUpgrade: (req: IncomingMessage, socket: Socket, head: Buffer) =>
+      hosted.handleIngress(Object.freeze({ request: req, socket, head: new Uint8Array(head) })),
+    close: () => hosted.close(),
+  });
+}
+
+function closeLegacyWebSocketServer(server: WebSocketServer): Promise<void> {
+  return (async () => {
+    let clean = true;
+    for (const client of server.clients) {
+      try {
+        client.terminate();
+      } catch {
+        clean = false;
+      }
+    }
+    await new Promise<void>((resolve, reject) => {
+      server.close((error) => (error ? reject(error) : resolve()));
+    });
+    if (!clean) throw new TypeError("Legacy WebSocket shutdown failed");
+  })();
 }
 
 // ── WebSocket Servers (noServer mode) ───────────────────────────────────────
@@ -615,239 +694,288 @@ filesWss.on("connection", (ws: WebSocket, req: IncomingMessage) => {
 
 // ── Start Server ────────────────────────────────────────────────────────────
 
-app.prepare().then(() => {
-  const multiplayerServices = MULTIPLAYER_ENABLED ? createMultiplayerServices() : null;
-  multiplayerServices?.worker.start();
-  markMultiplayerTransportAvailable(multiplayerServices !== null);
+let uninstallProductionHostedRuntimeFactory: (() => void) | undefined;
 
-  const server = createServer((req, res) => {
-    const parsedUrl = parseUrl(req.url || "", true);
+void app
+  .prepare()
+  .then(async () => {
+    // Hosted production owns one explicit, fail-closed composition. Install it
+    // before any service selection so an enabled but incomplete deployment can
+    // never fall through to LocalTmux or begin listening without its graph.
+    uninstallProductionHostedRuntimeFactory = installConfiguredProductionHostedRuntimeFactory(
+      composeProductionDaytonaHostedRuntime
+    );
+    const multiplayerServices = await createConfiguredMultiplayerServices();
+    const multiplayerReady = multiplayerServices?.readiness() === true;
+    markMultiplayerTransportAvailable(
+      multiplayerReady,
+      multiplayerServices?.runtimeStatus() ?? null
+    );
 
-    // Health endpoint — minimal public info only
-    if (parsedUrl.pathname === "/health") {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ status: "ok" }));
-      return;
-    }
+    const server = createServer((req, res) => {
+      const parsedUrl = parseUrl(req.url || "", true);
 
-    // Telegram webhook is handled here, in the same module instance that
-    // owns the grammy `Bot`. If we let it fall through to Next.js, the
-    // route handler runs in a separately-bundled module where the bot
-    // reference is null and updates are silently dropped.
-    if (parsedUrl.pathname === "/api/telegram/webhook" && req.method === "POST") {
-      const expected = getTelegramConfig().webhookSecret;
-      const got = req.headers["x-telegram-bot-api-secret-token"];
-      if (!expected || got !== expected) {
-        res.writeHead(401, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "unauthorized" }));
+      // Health endpoint — minimal public info only
+      if (parsedUrl.pathname === "/health") {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "ok" }));
         return;
       }
-      let body = "";
-      const decoder = new StringDecoder("utf8");
-      req.on("data", (chunk: Buffer) => {
-        body += decoder.write(chunk);
-      });
-      req.on("end", () => {
-        body += decoder.end();
-        let update: object;
-        try {
-          update = JSON.parse(body) as object;
-        } catch {
-          res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "invalid json" }));
+
+      // Telegram webhook is handled here, in the same module instance that
+      // owns the grammy `Bot`. If we let it fall through to Next.js, the
+      // route handler runs in a separately-bundled module where the bot
+      // reference is null and updates are silently dropped.
+      if (parsedUrl.pathname === "/api/telegram/webhook" && req.method === "POST") {
+        const expected = getTelegramConfig().webhookSecret;
+        const got = req.headers["x-telegram-bot-api-secret-token"];
+        if (!expected || got !== expected) {
+          res.writeHead(401, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "unauthorized" }));
           return;
         }
-
-        const acceptance = acceptTelegramWebhookUpdate(update);
-        if (!acceptance.accepted) {
-          console.error(
-            "[telegram/webhook] could not persist/accept update:",
-            acceptance.errorMessage
-          );
-          res.writeHead(503, { "Content-Type": "application/json", "Retry-After": "1" });
-          res.end(JSON.stringify({ error: "telegram bot unavailable" }));
-          return;
-        }
-
-        // Dispatch async so Telegram gets an acknowledgement within its
-        // deadline. Log only err.message: grammy BotError contains the bot.
-        void acceptance.processing.catch((err: unknown) => {
-          const msg = err instanceof Error ? err.message : String(err);
-          console.error("[telegram/webhook] handleUpdate failed:", msg);
+        let body = "";
+        const decoder = new StringDecoder("utf8");
+        req.on("data", (chunk: Buffer) => {
+          body += decoder.write(chunk);
         });
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: true }));
-      });
-      return;
-    }
+        req.on("end", () => {
+          body += decoder.end();
+          let update: object;
+          try {
+            update = JSON.parse(body) as object;
+          } catch {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "invalid json" }));
+            return;
+          }
 
-    // Let Next.js handle everything else
-    handle(req, res, parsedUrl);
-  });
+          const acceptance = acceptTelegramWebhookUpdate(update);
+          if (!acceptance.accepted) {
+            console.error(
+              "[telegram/webhook] could not persist/accept update:",
+              acceptance.errorMessage
+            );
+            res.writeHead(503, { "Content-Type": "application/json", "Retry-After": "1" });
+            res.end(JSON.stringify({ error: "telegram bot unavailable" }));
+            return;
+          }
 
-  // Handle WebSocket upgrade
-  server.on("upgrade", async (req: IncomingMessage, socket: Socket, head) => {
-    const parsedUrl = parseUrl(req.url || "", true);
-    const pathname = parsedUrl.pathname || "";
+          // Dispatch async so Telegram gets an acknowledgement within its
+          // deadline. Log only err.message: grammy BotError contains the bot.
+          void acceptance.processing.catch((err: unknown) => {
+            const msg = err instanceof Error ? err.message : String(err);
+            console.error("[telegram/webhook] handleUpdate failed:", msg);
+          });
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true }));
+        });
+        return;
+      }
 
-    if (pathname.startsWith("/ws/team-sessions/")) {
-      if (!multiplayerServices) {
+      // Let Next.js handle everything else
+      handle(req, res, parsedUrl);
+    });
+
+    // Handle WebSocket upgrade
+    server.on("upgrade", async (req: IncomingMessage, socket: Socket, head) => {
+      const parsedUrl = parseUrl(req.url || "", true);
+      const pathname = parsedUrl.pathname || "";
+
+      if (pathname.startsWith("/ws/team-sessions/")) {
+        if (!multiplayerServices || !isMultiplayerTransportAvailable()) {
+          socket.write("HTTP/1.1 503 Service Unavailable\r\n\r\n");
+          socket.destroy();
+          return;
+        }
+        try {
+          if (await multiplayerServices.handleUpgrade(req, socket, head)) return;
+        } catch {
+          socket.write("HTTP/1.1 500 Internal Server Error\r\n\r\n");
+        }
+        socket.destroy();
+        return;
+      }
+
+      if (pathname.startsWith("/ws/terminal/") && MULTIPLAYER_ENABLED) {
+        // Canonical mode never authenticates or reaches the legacy
+        // session-name/role transport, including its URL-token compatibility.
         socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
         socket.destroy();
         return;
       }
-      try {
-        if (await multiplayerServices.webSockets.handleUpgrade(req, socket, head)) return;
-      } catch {
-        socket.write("HTTP/1.1 500 Internal Server Error\r\n\r\n");
-      }
-      socket.destroy();
-      return;
-    }
 
-    if (pathname.startsWith("/ws/terminal/") && MULTIPLAYER_ENABLED) {
-      // Canonical mode never authenticates or reaches the legacy
-      // session-name/role transport, including its URL-token compatibility.
-      socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
-      socket.destroy();
-      return;
-    }
+      // Only authenticate our WebSocket paths (not Next.js HMR)
+      const isOurWs =
+        pathname.startsWith("/ws/terminal/") ||
+        pathname.startsWith("/ws/logs/") ||
+        pathname === "/ws/files";
 
-    // Only authenticate our WebSocket paths (not Next.js HMR)
-    const isOurWs =
-      pathname.startsWith("/ws/terminal/") ||
-      pathname.startsWith("/ws/logs/") ||
-      pathname === "/ws/files";
-
-    if (isOurWs) {
-      // Validate Origin header to prevent Cross-Site WebSocket Hijacking (CSWSH).
-      // Browsers send cookies on cross-origin WS requests, so without this check
-      // a malicious page could connect to the terminal using the victim's session.
-      const origin = req.headers.origin;
-      if (origin) {
-        try {
-          const originHost = new URL(origin).host;
-          const serverHost = req.headers.host;
-          if (serverHost && originHost !== serverHost) {
-            audit("ws_origin_rejected", { detail: `origin=${origin} host=${serverHost}` });
+      if (isOurWs) {
+        // Validate Origin header to prevent Cross-Site WebSocket Hijacking (CSWSH).
+        // Browsers send cookies on cross-origin WS requests, so without this check
+        // a malicious page could connect to the terminal using the victim's session.
+        const origin = req.headers.origin;
+        if (origin) {
+          try {
+            const originHost = new URL(origin).host;
+            const serverHost = req.headers.host;
+            if (serverHost && originHost !== serverHost) {
+              audit("ws_origin_rejected", { detail: `origin=${origin} host=${serverHost}` });
+              socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
+              socket.destroy();
+              return;
+            }
+          } catch {
+            audit("ws_origin_rejected", { detail: `malformed origin=${origin}` });
             socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
             socket.destroy();
             return;
           }
-        } catch {
-          audit("ws_origin_rejected", { detail: `malformed origin=${origin}` });
-          socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
-          socket.destroy();
+        }
+
+        const authed = await authenticateWebSocket(req, socket);
+        if (!authed) return;
+      }
+
+      if (pathname.startsWith("/ws/terminal/")) {
+        terminalWss.handleUpgrade(req, socket, head, (ws) => {
+          terminalWss.emit("connection", ws, req);
+        });
+      } else if (pathname.startsWith("/ws/logs/")) {
+        logsWss.handleUpgrade(req, socket, head, (ws) => {
+          logsWss.emit("connection", ws, req);
+        });
+      } else if (pathname === "/ws/files") {
+        filesWss.handleUpgrade(req, socket, head, (ws) => {
+          filesWss.emit("connection", ws, req);
+        });
+      } else {
+        // Pass through to Next.js (needed for HMR WebSocket in dev mode)
+        if (dev) {
+          // Let Next.js handle its own WebSocket upgrades
           return;
         }
+        socket.destroy();
       }
+    });
 
-      const authed = await authenticateWebSocket(req, socket);
-      if (!authed) return;
+    // Ensure default admin user in local mode
+    ensureDefaultAdmin().catch((err) => {
+      console.error("[auth] Failed to create default admin:", err);
+    });
+
+    const sweep = sweepExpiredRecordings();
+    if (sweep.deleted > 0) {
+      console.log(`[recorder] swept ${sweep.deleted} expired recording(s)`);
     }
 
-    if (pathname.startsWith("/ws/terminal/")) {
-      terminalWss.handleUpgrade(req, socket, head, (ws) => {
-        terminalWss.emit("connection", ws, req);
-      });
-    } else if (pathname.startsWith("/ws/logs/")) {
-      logsWss.handleUpgrade(req, socket, head, (ws) => {
-        logsWss.emit("connection", ws, req);
-      });
-    } else if (pathname === "/ws/files") {
-      filesWss.handleUpgrade(req, socket, head, (ws) => {
-        filesWss.emit("connection", ws, req);
-      });
-    } else {
-      // Pass through to Next.js (needed for HMR WebSocket in dev mode)
-      if (dev) {
-        // Let Next.js handle its own WebSocket upgrades
-        return;
-      }
-      socket.destroy();
-    }
-  });
+    warnIfReadableByGroupOrWorld(path.resolve(process.cwd(), ".env"));
+    warnIfReadableByGroupOrWorld(path.resolve(process.cwd(), "data", "users.json"));
+    warnIfReadableByGroupOrWorld(path.resolve(process.cwd(), "data", ".revoked-tokens.json"));
+    warnIfReadableByGroupOrWorld(path.resolve(process.cwd(), "data", "telegram-state.json"));
 
-  // Ensure default admin user in local mode
-  ensureDefaultAdmin().catch((err) => {
-    console.error("[auth] Failed to create default admin:", err);
-  });
+    // Start the Telegram bot if configured. Safe no-op when not.
+    startTelegramBot().catch((err) => {
+      console.error("[telegram] startTelegramBot failed", err);
+    });
+    // Let the Next.js API routes attach sessions through this (bot-owning) graph,
+    // so web-initiated attaches share one streamer owner with Telegram commands.
+    // ensureTopicForSession reads the live `bot` at call time, so registering the
+    // reference now (before startTelegramBot resolves) is fine.
+    registerEnsureTopic(ensureTopicForSession);
+    let telegramConfigState = telegramConfigFingerprint();
+    const telegramConfigPoll = setInterval(() => {
+      const next = telegramConfigFingerprint();
+      if (next === telegramConfigState) return;
+      telegramConfigState = next;
+      stopTelegramBot()
+        .then(() => startTelegramBot())
+        .catch((err) => {
+          console.error("[telegram] restart after config change failed", err);
+        });
+    }, 5000);
 
-  const sweep = sweepExpiredRecordings();
-  if (sweep.deleted > 0) {
-    console.log(`[recorder] swept ${sweep.deleted} expired recording(s)`);
-  }
+    server.listen(PORT, TERMINUS_HOST, () => {
+      console.log(`TerminalX server ready on http://${TERMINUS_HOST}:${PORT}`);
+      console.log(`  Host:       ${TERMINUS_HOST}`);
+      console.log(`  Root:       ${TERMINUS_ROOT}`);
+      console.log(`  Shell:      ${TERMINUS_SHELL}`);
+      console.log(`  Scrollback: ${TERMINUS_SCROLLBACK}`);
+      console.log(`  Max PTYs:   ${TERMINUS_MAX_SESSIONS}`);
+      console.log(`  Read-only:  ${TERMINUS_READ_ONLY}`);
+      console.log(`  Auth:       ${AUTH_MODE}`);
+      console.log(`  Multiplayer:${MULTIPLAYER_ENABLED ? " enabled" : " disabled"}`);
+      console.log(`  Mode:       ${dev ? "development" : "production"}`);
+    });
 
-  warnIfReadableByGroupOrWorld(path.resolve(process.cwd(), ".env"));
-  warnIfReadableByGroupOrWorld(path.resolve(process.cwd(), "data", "users.json"));
-  warnIfReadableByGroupOrWorld(path.resolve(process.cwd(), "data", ".revoked-tokens.json"));
-  warnIfReadableByGroupOrWorld(path.resolve(process.cwd(), "data", "telegram-state.json"));
+    // Graceful shutdown
+    let shuttingDown = false;
+    const shutdown = () => {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      markMultiplayerTransportAvailable(false, multiplayerServices?.runtimeStatus() ?? null);
+      console.log("\nShutting down...");
+      clearInterval(telegramConfigPoll);
+      void (async () => {
+        try {
+          const shutdownDeadlineMs =
+            (multiplayerServices?.shutdownBudgetMs() ?? 0) + AUXILIARY_SHUTDOWN_BUDGET_MS;
+          await runServerShutdownWithin(
+            {
+              beginHttpDrain: () =>
+                new Promise<void>((resolve, reject) => {
+                  server.close((error) => (error ? reject(error) : resolve()));
+                }),
+              closeMultiplayer: async () => {
+                try {
+                  await (multiplayerServices?.close() ?? Promise.resolve());
+                } finally {
+                  uninstallProductionHostedRuntimeFactory?.();
+                  uninstallProductionHostedRuntimeFactory = undefined;
+                }
+              },
+              stopTelegram: () => stopTelegramBot(),
+              closeWatcher: async () => {
+                const watcher = sharedWatcher;
+                sharedWatcher = null;
+                await (watcher?.close() ?? Promise.resolve());
+              },
+              closeLegacyWebSockets: () =>
+                Promise.all([
+                  closeLegacyWebSocketServer(terminalWss),
+                  closeLegacyWebSocketServer(logsWss),
+                  closeLegacyWebSocketServer(filesWss),
+                ]).then(() => undefined),
+              destroyProcessResources: () => {
+                destroyAllPtys();
+                destroyAllLogStreams();
+              },
+              reportFailure: (stage: ServerShutdownStage) => {
+                console.error(`[shutdown] ${stage} did not settle cleanly`);
+              },
+            },
+            shutdownDeadlineMs
+          );
+          process.exit(0);
+        } catch {
+          console.error("[shutdown] TerminalX did not stop cleanly");
+          process.exit(1);
+        }
+      })();
+    };
 
-  // Start the Telegram bot if configured. Safe no-op when not.
-  startTelegramBot().catch((err) => {
-    console.error("[telegram] startTelegramBot failed", err);
-  });
-  // Let the Next.js API routes attach sessions through this (bot-owning) graph,
-  // so web-initiated attaches share one streamer owner with Telegram commands.
-  // ensureTopicForSession reads the live `bot` at call time, so registering the
-  // reference now (before startTelegramBot resolves) is fine.
-  registerEnsureTopic(ensureTopicForSession);
-  let telegramConfigState = telegramConfigFingerprint();
-  const telegramConfigPoll = setInterval(() => {
-    const next = telegramConfigFingerprint();
-    if (next === telegramConfigState) return;
-    telegramConfigState = next;
-    stopTelegramBot()
-      .then(() => startTelegramBot())
-      .catch((err) => {
-        console.error("[telegram] restart after config change failed", err);
-      });
-  }, 5000);
-
-  server.listen(PORT, TERMINUS_HOST, () => {
-    console.log(`TerminalX server ready on http://${TERMINUS_HOST}:${PORT}`);
-    console.log(`  Host:       ${TERMINUS_HOST}`);
-    console.log(`  Root:       ${TERMINUS_ROOT}`);
-    console.log(`  Shell:      ${TERMINUS_SHELL}`);
-    console.log(`  Scrollback: ${TERMINUS_SCROLLBACK}`);
-    console.log(`  Max PTYs:   ${TERMINUS_MAX_SESSIONS}`);
-    console.log(`  Read-only:  ${TERMINUS_READ_ONLY}`);
-    console.log(`  Auth:       ${AUTH_MODE}`);
-    console.log(`  Multiplayer:${MULTIPLAYER_ENABLED ? " enabled" : " disabled"}`);
-    console.log(`  Mode:       ${dev ? "development" : "production"}`);
-  });
-
-  // Graceful shutdown
-  let shuttingDown = false;
-  const shutdown = () => {
-    if (shuttingDown) return;
-    shuttingDown = true;
+    process.on("SIGTERM", shutdown);
+    process.on("SIGINT", shutdown);
+  })
+  .catch(() => {
     markMultiplayerTransportAvailable(false);
-    console.log("\nShutting down...");
-    clearInterval(telegramConfigPoll);
-    // Force exit after 5s
-    const forceExit = setTimeout(() => process.exit(1), 5000);
-    const serverClosed = new Promise<void>((resolve) => server.close(() => resolve()));
-    void (async () => {
-      const watcherClose = sharedWatcher?.close() ?? Promise.resolve();
-      sharedWatcher = null;
-      await Promise.allSettled([
-        multiplayerServices?.close() ?? Promise.resolve(),
-        stopTelegramBot(),
-        watcherClose,
-      ]);
-      closeTeamSessions();
-      destroyAllPtys();
-      destroyAllLogStreams();
-      terminalWss.close();
-      logsWss.close();
-      filesWss.close();
-      await serverClosed;
-      clearTimeout(forceExit);
-      process.exit(0);
-    })();
-  };
-
-  process.on("SIGTERM", shutdown);
-  process.on("SIGINT", shutdown);
-});
+    try {
+      uninstallProductionHostedRuntimeFactory?.();
+    } catch {
+      // Preserve the generic startup failure and never expose configuration details.
+    }
+    uninstallProductionHostedRuntimeFactory = undefined;
+    console.error("[startup] TerminalX server could not start");
+    process.exit(1);
+  });

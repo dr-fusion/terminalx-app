@@ -57,6 +57,51 @@ describe("Team Session browser client", () => {
     });
   });
 
+  it("accepts only the exact hosted Runtime pair and never accepts a hosted tmux field", async () => {
+    const hosted = {
+      ...inboxFixture(),
+      runtime: {
+        kind: "daytona",
+        isolation: "isolated-hosted",
+        yoloEligible: false,
+        authorizationGeneration: 1,
+        authorizationState: "pending",
+      },
+    } as const;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => jsonResponse({ sessions: [hosted] }))
+    );
+    await expect(fetchTeamSessionInbox()).resolves.toEqual([hosted]);
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        jsonResponse({
+          sessions: [
+            {
+              ...hosted,
+              runtime: { ...hosted.runtime, isolation: "trusted-shared-host" },
+            },
+          ],
+        })
+      )
+    );
+    await expect(fetchTeamSessionInbox()).rejects.toMatchObject({ code: "invalid-response" });
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        jsonResponse({
+          sessions: [
+            { ...hosted, runtime: { ...hosted.runtime, tmuxName: "poisoned-hosted-tmux" } },
+          ],
+        })
+      )
+    );
+    await expect(fetchTeamSessionInbox()).rejects.toMatchObject({ code: "invalid-response" });
+  });
+
   it("loads only the strict private Session admission projection", async () => {
     const fixture = admissionFixture();
     const fetchMock = vi.fn(async () => jsonResponse({ admission: fixture }));

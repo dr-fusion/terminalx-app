@@ -104,8 +104,15 @@ TERMINALX_JWT_SECRET="$JWT_SECRET"
 TERMINALX_TELEGRAM_MAX_TOPICS=10
 # Voice-note transcription uses local whisper.cpp. Run:
 #   npm run setup:whisper -- tiny.en
+# Development defaults to data/tools/whisper.cpp. Production must copy the verified
+# binary, model, and manifest into one protected root-owned tree such as /opt/terminalx-whisper.
+# TERMINALX_WHISPER_CPP_ROOT=/opt/terminalx-whisper
+# TERMINALX_WHISPER_CPP_BINARY_PATH=/opt/terminalx-whisper/bin/whisper-cli
+# TERMINALX_WHISPER_CPP_RUNTIME_MANIFEST_PATH=/opt/terminalx-whisper/runtime-manifest.json
 TERMINALX_TELEGRAM_TRANSCRIBE_MODEL=tiny.en
 TERMINALX_TELEGRAM_TRANSCRIBE_LANGUAGE=auto
+TERMINALX_TELEGRAM_TRANSCRIBE_MAX_CONCURRENCY=1
+# TERMINALX_FFMPEG_PATH=/usr/bin/ffmpeg
 EOF
   chmod 600 .env
   echo "Created .env with mode 0600."

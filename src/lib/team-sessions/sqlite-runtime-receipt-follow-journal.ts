@@ -1334,11 +1334,15 @@ export class SqliteRuntimeReceiptFollowJournal {
              AND assignment.sandbox_id = ? AND assignment.sandbox_generation = ?
              AND assignment.runtime_principal_id = ?
              AND assignment.runtime_authorization_generation = ?
-             AND assignment.status = 'ready'
+             AND (
+               (assignment.status = 'provisioning' AND
+                session.runtime_authorization_state = 'pending') OR
+               (assignment.status IN ('ready', 'checkpointing', 'recovering', 'quarantined') AND
+                session.runtime_authorization_state IN ('enforced', 'pending', 'quarantined'))
+             )
              AND session.runtime_authorization_generation = ?
-             AND session.runtime_authorization_state = 'enforced'
              AND session.status <> 'ended'
-             AND epoch.effect_enforcer_set_digest IS NOT NULL
+             AND epoch.effect_enforcer_policy_digest IS NOT NULL
              AND epoch.created_at_ms <= ?
              AND assignment.created_at_ms <= ?
              AND session.created_at_ms <= ?`
@@ -1393,6 +1397,15 @@ const FOLLOW_STREAM_HAS_CURRENT_LIFECYCLE_RECEIPT = `EXISTS (
    AND epoch.sandbox_id = command.sandbox_id
    AND epoch.sandbox_generation = command.sandbox_generation
    AND epoch.runtime_principal_id = command.runtime_principal_id
+  JOIN runtime_effect_enforcer_set_activations activation
+    ON activation.session_id = epoch.session_id
+   AND activation.generation = epoch.generation
+   AND activation.runtime_assignment_id = epoch.runtime_assignment_id
+   AND activation.runtime_assignment_generation = epoch.runtime_assignment_generation
+   AND activation.sandbox_id = epoch.sandbox_id
+   AND activation.sandbox_generation = epoch.sandbox_generation
+   AND activation.runtime_principal_id = epoch.runtime_principal_id
+   AND activation.effect_enforcer_policy_digest = epoch.effect_enforcer_policy_digest
   WHERE current_assignment.id = stream.runtime_assignment_id
     AND current_assignment.session_id = stream.session_id
     AND current_assignment.generation = stream.runtime_assignment_generation
@@ -1408,7 +1421,7 @@ const FOLLOW_STREAM_HAS_CURRENT_LIFECYCLE_RECEIPT = `EXISTS (
     AND current_session.runtime_authorization_state = 'enforced'
     AND command.runtime_authorization_generation = stream.runtime_authorization_generation
     AND command.required_effect_enforcer_set_digest IS NOT NULL
-    AND command.required_effect_enforcer_set_digest = epoch.effect_enforcer_set_digest
+    AND command.required_effect_enforcer_set_digest = activation.effect_enforcer_set_digest
     AND dispatch.status = 'awaiting-receipt'
 )`;
 

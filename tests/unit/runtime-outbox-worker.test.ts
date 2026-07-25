@@ -117,6 +117,76 @@ function emergencyRetireDelivery(
   };
 }
 
+function hostedDelivery(kind: RuntimeOutboxDelivery["kind"]): RuntimeOutboxDelivery {
+  const generation = kind === "runtime.session.ensure" ? 1 : 2;
+  const binding = {
+    teamId: "team-one",
+    projectId: "project-one",
+    sessionId: SESSION_ID,
+    runtimeAssignmentId: "assignment-one",
+    runtimeAssignmentGeneration: 1,
+    sandboxId: "sandbox-one",
+    sandboxGeneration: 1,
+    runtimePrincipalId: "principal-one",
+  } as const;
+  const base = {
+    outboxId: `hosted-${kind}`,
+    sessionId: SESSION_ID,
+    sessionSequence: generation,
+    attempts: 1,
+    leaseOwner: "runtime-worker-1",
+    leaseExpiresAtMs: 2_000_000_030_000,
+    dispatchMode: "apply" as const,
+  };
+  const hosted = {
+    runtimeKind: "daytona" as const,
+    binding,
+    assignmentPlanRef: "hosted-plan-one",
+    assignmentPlanDigest: "a".repeat(64),
+  };
+  switch (kind) {
+    case "runtime.session.ensure":
+      return {
+        ...base,
+        kind,
+        payload: {
+          sessionId: SESSION_ID,
+          runtimeAuthorizationGeneration: generation,
+          ...hosted,
+        },
+      };
+    case "runtime.authorization.fence":
+      return {
+        ...base,
+        kind,
+        payload: {
+          sessionId: SESSION_ID,
+          reason: "assignee-loss",
+          runtimeAuthorizationGeneration: generation,
+          assignmentPlanRuntimeAuthorizationGeneration: 1,
+          ...hosted,
+        },
+      };
+    case "runtime.session.retire":
+      return {
+        ...base,
+        kind,
+        payload: {
+          sessionId: SESSION_ID,
+          runtimeAuthorizationGeneration: generation,
+          reason: "emergency-stop",
+          agentRunId: "run-one",
+          runtimeAssignmentId: binding.runtimeAssignmentId,
+          runtimeAssignmentGeneration: binding.runtimeAssignmentGeneration,
+          sandboxId: binding.sandboxId,
+          sandboxGeneration: binding.sandboxGeneration,
+          assignmentPlanRuntimeAuthorizationGeneration: 1,
+          ...hosted,
+        },
+      };
+  }
+}
+
 function success(stdout = ""): ExactCommandResult {
   return { ok: true, stdout, stderr: "" };
 }
@@ -214,6 +284,25 @@ function runtimeWith(
 }
 
 describe("LocalTmuxRuntime", () => {
+  it.each([
+    "runtime.session.ensure",
+    "runtime.authorization.fence",
+    "runtime.session.retire",
+  ] as const)("fails closed before any local effect for hosted delivery %s", async (kind) => {
+    const executor = new ScriptedExecutor([]);
+    const states: RuntimeWriteStateUpdate[] = [];
+    const { runtime, terminations } = runtimeWith(executor, { states });
+
+    await expect(runtime.apply(hostedDelivery(kind))).rejects.toMatchObject({
+      code: "runtime_invalid_state",
+      retryable: false,
+    });
+
+    expect(executor.requests).toEqual([]);
+    expect(states).toEqual([]);
+    expect(terminations).toEqual([]);
+  });
+
   it("creates and marks an exact canonical session on a dedicated scrubbed tmux server", async () => {
     const executor = new ScriptedExecutor([
       failure("no server running on /tmp/tmux"),
@@ -1213,6 +1302,47 @@ class FakeKernel implements RuntimeOutboxKernel {
 }
 
 describe("RuntimeOutboxWorker", () => {
+  it("accepts hosted payloads and detaches their nested binding before the dispatch interlock", async () => {
+    const job = hostedDelivery("runtime.session.ensure");
+    if (job.kind !== "runtime.session.ensure" || job.payload.runtimeKind !== "daytona") {
+      throw new Error("Expected hosted ensure delivery");
+    }
+    const hostedPayload = job.payload;
+    const originalSandboxId = hostedPayload.binding.sandboxId;
+    let applied: RuntimeOutboxDelivery | undefined;
+    const kernel = new FakeKernel([[job]], (options) => {
+      (hostedPayload.binding as { sandboxId: string }).sandboxId = "attacker-selected-sandbox";
+      return {
+        leaseExpiresAtMs: Math.max(
+          options.expectedLeaseExpiresAtMs,
+          2_000_000_000_000 + options.leaseDurationMs
+        ),
+      };
+    });
+    const worker = new RuntimeOutboxWorker({
+      kernel,
+      runtime: {
+        async apply(input) {
+          applied = input;
+        },
+        async reconcile() {
+          throw new Error("unexpected reconcile");
+        },
+      },
+      workerId: "runtime-worker-1",
+      clock: () => 2_000_000_000_000,
+    });
+
+    await expect(worker.runOnce()).resolves.toMatchObject({ acknowledged: 1 });
+
+    expect(applied?.kind).toBe("runtime.session.ensure");
+    if (applied?.kind !== "runtime.session.ensure" || applied.payload.runtimeKind !== "daytona") {
+      throw new Error("Expected detached hosted ensure delivery");
+    }
+    expect(applied.payload.binding.sandboxId).toBe(originalSandboxId);
+    expect(Object.isFrozen(applied.payload.binding)).toBe(true);
+  });
+
   it("claims leased work and acknowledges the exact attempt", async () => {
     const job = delivery("runtime.session.ensure", 1, 3);
     const kernel = new FakeKernel([[job]]);
@@ -1493,7 +1623,7 @@ describe("RuntimeOutboxWorker", () => {
       expect(adapterCalls).toBe(0);
     }
     expect(getterCalls).toBe(0);
-    expect(proxyTrapCalls).toBe(1);
+    expect(proxyTrapCalls).toBe(0);
   });
 
   it("uses the kernel's exact renewed expiry when its clock advances during renewal", async () => {

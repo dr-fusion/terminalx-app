@@ -75,13 +75,17 @@ export interface TeamSessionViewer extends TeamSessionIdentity {
   capabilities: TeamSessionViewerCapabilities;
 }
 
-export interface TeamSessionRuntime {
-  kind: "local-tmux";
-  isolation: "trusted-shared-host";
+interface TeamSessionRuntimeBase {
   yoloEligible: false;
   authorizationGeneration: number;
   authorizationState: "enforced" | "pending" | "quarantined";
 }
+
+export type TeamSessionRuntime = TeamSessionRuntimeBase &
+  (
+    | { kind: "local-tmux"; isolation: "trusted-shared-host" }
+    | { kind: "daytona"; isolation: "isolated-hosted" }
+  );
 
 export interface TeamSessionResponsibilities {
   assignee?: TeamSessionIdentity;

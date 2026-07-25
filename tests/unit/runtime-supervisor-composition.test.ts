@@ -253,7 +253,7 @@ describe("Runtime supervisor production composition", () => {
           networkPolicyDigest: "c".repeat(64),
           credentialPolicyRef: "test-credential-policy:v1",
           credentialPolicyDigest: "d".repeat(64),
-          effectEnforcerSetDigest: "e".repeat(64),
+          effectEnforcerPolicyDigest: "e".repeat(64),
         }),
       },
       runtimeEnforcementProofVerifier: () => true,

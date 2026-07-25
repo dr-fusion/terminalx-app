@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import Database from "better-sqlite3";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   TEAM_SESSION_SCHEMA_VERSION,
   TeamSessionError,
@@ -27,6 +27,9 @@ import {
   type TeamSessionHttpDependencies,
 } from "@/lib/team-sessions/http";
 import type { RequestActor } from "@/lib/request-actor";
+import type { TeamSessionKernel } from "@/lib/team-sessions/module";
+import { installTeamSessionKernel } from "@/lib/team-sessions/service";
+import { markMultiplayerTransportAvailable } from "@/lib/team-sessions/feature";
 
 const ALICE: RequestActor = {
   kind: "human",
@@ -217,6 +220,97 @@ describe("Team Session HTTP adapter", () => {
     ).resolves.toEqual([]);
   });
 
+  it("fails closed before dispatch when custom-server mutation availability is withdrawn", async () => {
+    const dispatch = vi.fn();
+    const response = await handleTeamSessionCommand(
+      commandRequest({ type: "team.create", name: "Blocked" }, "transport-unavailable"),
+      {
+        teamSessions: { dispatch } as unknown as TeamSessions,
+        resolveActor: actorResolver(ALICE),
+        isMutationAvailable: () => false,
+      }
+    );
+
+    expect(response.status).toBe(503);
+    expect(await responseBody(response)).toEqual({
+      error: {
+        code: "multiplayer-unavailable",
+        message: "Multiplayer service is unavailable",
+      },
+    });
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+
+  it("rechecks readiness immediately before dispatch and rejects a stale admission", async () => {
+    const dispatch = vi.fn();
+    let checks = 0;
+    const response = await handleTeamSessionCommand(
+      commandRequest({ type: "team.create", name: "Raced" }, "transport-race"),
+      {
+        teamSessions: { dispatch } as unknown as TeamSessions,
+        resolveActor: actorResolver(ALICE),
+        isMutationAvailable: () => {
+          checks += 1;
+          return checks === 1;
+        },
+      }
+    );
+
+    expect(checks).toBe(2);
+    expect(response.status).toBe(503);
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+
+  it("never lazily constructs a LocalTmux kernel for an uninstalled HTTP route", async () => {
+    const service = await import("@/lib/team-sessions/service");
+    expect(service.getRegisteredTeamSessionKernel()).toBeNull();
+
+    const response = await handleTeamSessionCommand(
+      commandRequest({ type: "team.create", name: "No fallback" }, "no-fallback"),
+      {
+        resolveActor: actorResolver(ALICE),
+        isMutationAvailable: () => true,
+      }
+    );
+
+    expect(response.status).toBe(503);
+    expect(service.getRegisteredTeamSessionKernel()).toBeNull();
+  });
+
+  it("dispatches through the exact explicitly installed hosted kernel", async () => {
+    const dispatch = vi.fn(async (command: SessionCommand) => ({
+      accepted: true,
+      acceptedSequence: 1,
+      commandType: command.type,
+      replayed: false,
+      data: { teamId: CALLER_TEAM_ID },
+      events: [],
+    }));
+    const kernel = {
+      teamSessions: { dispatch, close: vi.fn() },
+    } as unknown as TeamSessionKernel;
+    const uninstall = installTeamSessionKernel(kernel);
+    const runtime = {
+      kind: "daytona" as const,
+      isolation: "isolated-hosted" as const,
+      yoloEligible: false as const,
+    };
+    markMultiplayerTransportAvailable(true, runtime);
+    try {
+      const response = await handleTeamSessionCommand(
+        commandRequest({ type: "team.create", name: "Hosted" }, "hosted-kernel"),
+        { resolveActor: actorResolver(ALICE) }
+      );
+
+      expect(response.status).toBe(200);
+      expect(dispatch).toHaveBeenCalledTimes(1);
+      expect((dispatch.mock.calls[0]?.[0] as SessionCommand).type).toBe("team.create");
+    } finally {
+      markMultiplayerTransportAvailable(false, runtime);
+      uninstall();
+    }
+  });
+
   it("keeps actor, schema, and idempotency envelope fields server-owned", async () => {
     for (const reserved of ["actor", "schemaVersion", "idempotency"]) {
       const response = await post(
@@ -312,6 +406,16 @@ describe("Team Session HTTP adapter", () => {
           tmuxName: "caller-selected-tmux",
         },
         key: "caller-tmux-name",
+      },
+      {
+        body: {
+          type: "session.start",
+          teamId: CALLER_TEAM_ID,
+          projectId: CALLER_PROJECT_ID,
+          name: "Caller Runtime profile",
+          runtimeProfile: { kind: "daytona" },
+        },
+        key: "caller-runtime-profile",
       },
     ];
 

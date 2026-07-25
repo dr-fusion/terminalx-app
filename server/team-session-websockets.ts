@@ -1,6 +1,6 @@
 import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
-import { TextDecoder } from "node:util";
+import { TextDecoder, types as nodeTypes } from "node:util";
 import { WebSocket, WebSocketServer, type RawData } from "ws";
 import {
   resolveRequestActor,
@@ -8,6 +8,15 @@ import {
   type RequestHeaders,
 } from "../src/lib/request-actor";
 import { getPublicUrl, trustProxyHeaders } from "../src/lib/security-config";
+import { snapshotRuntimeSupervisorPortableData } from "../src/lib/runtime/runtime-supervisor-snapshot";
+import type {
+  HostedTerminalAdapter,
+  HostedTerminalConnection,
+} from "../src/lib/runtime/hosted-terminal";
+import type {
+  HostedTeamSessionTerminalBinding,
+  TeamSessionTerminalBinding,
+} from "../src/lib/team-session-terminal-gateway";
 import { projectPublicSessionEvent } from "../src/lib/team-sessions/public-event";
 import {
   TEAM_SESSION_SCHEMA_VERSION,
@@ -22,8 +31,11 @@ const MAX_WEBSOCKET_PAYLOAD_BYTES = 64 * 1024;
 const MAX_TERMINAL_INPUT_BYTES = 16 * 1024;
 const MAX_BUFFERED_OUTPUT_BYTES = 4 * 1024 * 1024;
 const MAX_QUEUED_TERMINAL_MESSAGES = 16;
+const MAX_QUEUED_HOSTED_MUTATIONS = 8;
+const MAX_QUEUED_HOSTED_MUTATION_BYTES = 128 * 1024;
 const DEFAULT_CREDENTIAL_CHECK_INTERVAL_MS = 1_000;
 const DEFAULT_EVENT_POLL_INTERVAL_MS = 100;
+const SHUTDOWN_SETTLEMENT_TIMEOUT_MS = 250;
 const CONNECTION_LIMITS = Object.freeze({
   terminal: { perUser: 2, perSession: 8, global: 16 },
   events: { perUser: 4, perSession: 32, global: 256 },
@@ -33,10 +45,28 @@ const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
 
 type TerminalMutationAction = "input" | "resize" | "interrupt";
 type HumanActorContext = ActorContext & { kind: "human" };
+type AnyFunction = (...args: unknown[]) => unknown;
+
+interface CapturedHostedTerminalAdapter {
+  readonly receiver: object;
+  readonly connect: AnyFunction;
+}
+
+interface CapturedHostedTerminalConnection {
+  readonly receiver: object;
+  readonly binding: HostedTeamSessionTerminalBinding;
+  readonly onData: AnyFunction;
+  readonly onExit: AnyFunction;
+  readonly input: AnyFunction;
+  readonly resize: AnyFunction;
+  readonly interrupt: AnyFunction;
+  readonly destroy: AnyFunction;
+}
 
 export interface CanonicalTerminalConnection {
   readonly sessionId: string;
-  readonly tmuxName: string;
+  readonly binding: TeamSessionTerminalBinding;
+  readonly tmuxName?: string;
   readonly controlEpoch: number;
   readonly runtimeAuthorizationGeneration: number;
 
@@ -83,6 +113,11 @@ export interface CanonicalTerminalPtyAdapter {
   destroy(pty: CanonicalTerminalPty): void;
 }
 
+export type CanonicalHostedTerminalConnection = HostedTerminalConnection;
+
+/** Compatibility name for the provider-neutral asynchronous terminal port. */
+export type CanonicalHostedTerminalAdapter = HostedTerminalAdapter;
+
 export interface TeamSessionEventKernel {
   inspect(query: SessionGetQuery): Promise<SessionView | null>;
   follow(options: FollowSessionOptions): AsyncIterable<SessionEvent>;
@@ -92,6 +127,7 @@ export interface CreateTeamSessionWebSocketsOptions {
   teamSessions: TeamSessionEventKernel;
   terminalGateway: CanonicalTerminalGateway;
   pty: CanonicalTerminalPtyAdapter;
+  hostedTerminal?: CanonicalHostedTerminalAdapter;
   /** Resolve the isolated tmux server for one canonical Team Session. */
   resolveTmuxSocketName: (sessionId: string) => string;
   /** Resolve the admitted generation to an immutable session-incarnation/`$id` pair. */
@@ -115,6 +151,14 @@ export interface TeamSessionWebSockets {
   /** Returns false without touching the socket when the path is not canonical. */
   handleUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer): Promise<boolean>;
   close(): Promise<void>;
+}
+
+/** Stable shutdown failure; dependency details are never interpolated. */
+export class TeamSessionWebSocketShutdownError extends Error {
+  constructor() {
+    super("Team Session WebSocket shutdown did not settle");
+    this.name = "TeamSessionWebSocketShutdownError";
+  }
 }
 
 interface CredentialSnapshot extends RequestHeaders {
@@ -152,6 +196,9 @@ export function createTeamSessionWebSockets(
 ): TeamSessionWebSockets {
   assertFactoryOptions(options);
 
+  const hostedTerminalAdapter = options.hostedTerminal
+    ? captureHostedTerminalAdapter(options.hostedTerminal)
+    : undefined;
   const resolveActor = options.resolveActor ?? resolveRequestActor;
   const credentialCheckIntervalMs =
     options.credentialCheckIntervalMs ?? DEFAULT_CREDENTIAL_CHECK_INTERVAL_MS;
@@ -165,8 +212,42 @@ export function createTeamSessionWebSockets(
     maxPayload: MAX_WEBSOCKET_PAYLOAD_BYTES,
   });
   const mutationQueues = new Map<string, Promise<void>>();
+  const hostedDestroySettlements = new Set<Promise<void>>();
+  const terminalServeSettlements = new Set<Promise<void>>();
+  const eventServeSettlements = new Set<Promise<void>>();
   const connectionQuota = createConnectionQuota();
   let closed = false;
+  let closePromise: Promise<void> | null = null;
+  let hostedDestroyFailed = false;
+
+  const destroyHostedTerminal = (terminal: CapturedHostedTerminalConnection): Promise<void> => {
+    const settlement = invokeCapturedPromise(terminal.receiver, terminal.destroy, []).then(
+      (result) => {
+        if (result !== undefined) throw new TypeError();
+      }
+    );
+    hostedDestroySettlements.add(settlement);
+    void settlement.then(
+      () => hostedDestroySettlements.delete(settlement),
+      (error) => {
+        hostedDestroySettlements.delete(settlement);
+        hostedDestroyFailed = true;
+        reportError(error, options.reportInternalError);
+      }
+    );
+    return settlement;
+  };
+
+  const trackServe = (settlements: Set<Promise<void>>, settlement: Promise<void>): void => {
+    settlements.add(settlement);
+    void settlement.then(
+      () => settlements.delete(settlement),
+      (error) => {
+        settlements.delete(settlement);
+        reportError(error, options.reportInternalError);
+      }
+    );
+  };
 
   const enqueueMutation = (sessionId: string, mutation: () => Promise<void>): Promise<void> => {
     const previous = mutationQueues.get(sessionId) ?? Promise.resolve();
@@ -237,19 +318,24 @@ export function createTeamSessionWebSockets(
 
         try {
           terminalWebSocketServer.handleUpgrade(request, socket, head, (webSocket) => {
-            void serveTerminal(
-              webSocket,
-              {
-                actor,
-                credentials,
-                route,
-                connection,
-              },
-              options,
-              resolveActor,
-              credentialCheckIntervalMs,
-              enqueueMutation,
-              releaseQuota
+            trackServe(
+              terminalServeSettlements,
+              serveTerminal(
+                webSocket,
+                {
+                  actor,
+                  credentials,
+                  route,
+                  connection,
+                },
+                options,
+                hostedTerminalAdapter,
+                destroyHostedTerminal,
+                resolveActor,
+                credentialCheckIntervalMs,
+                enqueueMutation,
+                releaseQuota
+              )
             );
           });
         } catch (error) {
@@ -284,14 +370,17 @@ export function createTeamSessionWebSockets(
 
       try {
         eventWebSocketServer.handleUpgrade(request, socket, head, (webSocket) => {
-          void serveEvents(
-            webSocket,
-            { actor, credentials, route, session },
-            options,
-            resolveActor,
-            credentialCheckIntervalMs,
-            eventPollIntervalMs,
-            releaseQuota
+          trackServe(
+            eventServeSettlements,
+            serveEvents(
+              webSocket,
+              { actor, credentials, route, session },
+              options,
+              resolveActor,
+              credentialCheckIntervalMs,
+              eventPollIntervalMs,
+              releaseQuota
+            )
           );
         });
       } catch (error) {
@@ -302,15 +391,35 @@ export function createTeamSessionWebSockets(
       return true;
     },
 
-    async close(): Promise<void> {
-      if (closed) return;
+    close(): Promise<void> {
+      if (closePromise) return closePromise;
       closed = true;
-      for (const webSocket of terminalWebSocketServer.clients) webSocket.terminate();
-      for (const webSocket of eventWebSocketServer.clients) webSocket.terminate();
-      await Promise.all([
-        closeWebSocketServer(terminalWebSocketServer),
-        closeWebSocketServer(eventWebSocketServer),
-      ]);
+      const close = (async () => {
+        for (const webSocket of terminalWebSocketServer.clients) webSocket.terminate();
+        for (const webSocket of eventWebSocketServer.clients) webSocket.terminate();
+        await Promise.all([
+          closeWebSocketServer(terminalWebSocketServer),
+          closeWebSocketServer(eventWebSocketServer),
+        ]);
+        const serveSettled = await settleWithin(
+          [...terminalServeSettlements, ...eventServeSettlements],
+          SHUTDOWN_SETTLEMENT_TIMEOUT_MS
+        );
+        if (!serveSettled) {
+          reportError(new Error("WebSocket serve shutdown timed out"), options.reportInternalError);
+        }
+        const destroySettlementsSettled = await settleWithin(
+          [...hostedDestroySettlements],
+          SHUTDOWN_SETTLEMENT_TIMEOUT_MS
+        );
+        const destroySettled = destroySettlementsSettled && !hostedDestroyFailed;
+        if (!destroySettled) {
+          reportError(new Error("Hosted terminal destroy timed out"), options.reportInternalError);
+        }
+        if (!serveSettled || !destroySettled) throw new TeamSessionWebSocketShutdownError();
+      })();
+      closePromise = close;
+      return close;
     },
   };
 }
@@ -319,6 +428,8 @@ async function serveTerminal(
   webSocket: WebSocket,
   admission: TerminalAdmission,
   options: CreateTeamSessionWebSocketsOptions,
+  hostedTerminalAdapter: CapturedHostedTerminalAdapter | undefined,
+  destroyHostedTerminal: (terminal: CapturedHostedTerminalConnection) => Promise<void>,
   resolveActor: (headers: RequestHeaders) => Promise<RequestActor | null>,
   credentialCheckIntervalMs: number,
   enqueueMutation: (sessionId: string, mutation: () => Promise<void>) => Promise<void>,
@@ -326,8 +437,14 @@ async function serveTerminal(
 ): Promise<void> {
   const abortController = new AbortController();
   let pty: CanonicalTerminalPty | undefined;
+  let hostedTerminal: CapturedHostedTerminalConnection | undefined;
+  let hostedMutationQueue: HostedTerminalMutationQueue | undefined;
   let dataSubscription: { dispose(): void } | undefined;
   let exitSubscription: { dispose(): void } | undefined;
+  const pendingTerminalOutput: string[] = [];
+  let pendingTerminalOutputBytes = 0;
+  let terminalReady = false;
+  let terminalExitPending = false;
   let cleanedUp = false;
   let credentialCheckActive = false;
 
@@ -337,9 +454,25 @@ async function serveTerminal(
     abortController.abort();
     clearInterval(credentialTimer);
     releaseQuota();
-    dataSubscription?.dispose();
-    exitSubscription?.dispose();
+    try {
+      dataSubscription?.dispose();
+    } catch (error) {
+      reportError(error, options.reportInternalError);
+    }
+    try {
+      exitSubscription?.dispose();
+    } catch (error) {
+      reportError(error, options.reportInternalError);
+    }
     if (pty) options.pty.destroy(pty);
+    hostedMutationQueue?.close();
+    pendingTerminalOutput.length = 0;
+    pendingTerminalOutputBytes = 0;
+    if (hostedTerminal) {
+      const terminal = hostedTerminal;
+      hostedTerminal = undefined;
+      void destroyHostedTerminal(terminal).catch(() => undefined);
+    }
   };
   const closeUnavailable = (): void => {
     cleanup();
@@ -386,14 +519,14 @@ async function serveTerminal(
 
     // Admission happened before the HTTP upgrade. Re-open at the last moment
     // so a revocation during the handshake cannot briefly receive PTY output.
-    const connection = await options.terminalGateway.open({
+    let connection = await options.terminalGateway.open({
       sessionId: admission.route.sessionId,
       actor: admission.actor,
     });
     if (
       connection.sessionId !== admission.route.sessionId ||
       connection.sessionId !== admission.connection.sessionId ||
-      connection.tmuxName !== admission.connection.tmuxName ||
+      !sameTerminalBinding(connection.binding, admission.connection.binding) ||
       connection.controlEpoch !== admission.connection.controlEpoch ||
       connection.runtimeAuthorizationGeneration !==
         admission.connection.runtimeAuthorizationGeneration
@@ -404,55 +537,114 @@ async function serveTerminal(
 
     // This is a display-mode projection only. Every later PTY mutation still
     // passes through the connection's synchronous, transaction-held `perform`.
-    const readOnly = !(await connection.canPerform("input"));
+    let readOnly = !(await connection.canPerform("input"));
 
     if (!(await credentialsAreCurrent())) {
       closeUnavailable();
       return;
     }
 
-    const tmuxSocketName = options.resolveTmuxSocketName(connection.sessionId);
-    if (!isValidTmuxSocketName(tmuxSocketName)) {
-      closeUnavailable();
-      return;
-    }
-    let tmuxSessionRef: string;
-    let tmuxSessionIncarnation: string;
-    try {
-      const resolvedBinding = options.resolveTmuxSessionRef({
-        sessionId: connection.sessionId,
-        tmuxName: connection.tmuxName,
-        runtimeAuthorizationGeneration: connection.runtimeAuthorizationGeneration,
-        tmuxSocketName,
-      });
-      tmuxSessionRef = resolvedBinding.tmuxSessionRef;
-      tmuxSessionIncarnation = resolvedBinding.tmuxSessionIncarnation;
-    } catch {
-      closeUnavailable();
-      return;
-    }
-    if (
-      !isImmutableTmuxSessionRef(tmuxSessionRef) ||
-      !isTmuxSessionIncarnation(tmuxSessionIncarnation)
-    ) {
-      closeUnavailable();
-      return;
-    }
+    if (connection.binding.kind === "local-tmux") {
+      const tmuxName = connection.binding.tmuxName;
+      if (connection.tmuxName !== undefined && connection.tmuxName !== tmuxName) {
+        closeUnavailable();
+        return;
+      }
+      const tmuxSocketName = options.resolveTmuxSocketName(connection.sessionId);
+      if (!isValidTmuxSocketName(tmuxSocketName)) {
+        closeUnavailable();
+        return;
+      }
+      let tmuxSessionRef: string;
+      let tmuxSessionIncarnation: string;
+      try {
+        const resolvedBinding = options.resolveTmuxSessionRef({
+          sessionId: connection.sessionId,
+          tmuxName,
+          runtimeAuthorizationGeneration: connection.runtimeAuthorizationGeneration,
+          tmuxSocketName,
+        });
+        tmuxSessionRef = resolvedBinding.tmuxSessionRef;
+        tmuxSessionIncarnation = resolvedBinding.tmuxSessionIncarnation;
+      } catch {
+        closeUnavailable();
+        return;
+      }
+      if (
+        !isImmutableTmuxSessionRef(tmuxSessionRef) ||
+        !isTmuxSessionIncarnation(tmuxSessionIncarnation)
+      ) {
+        closeUnavailable();
+        return;
+      }
 
-    pty = options.pty.create({
-      tmuxName: connection.tmuxName,
-      shell: options.shell,
-      cols: admission.route.cols,
-      rows: admission.route.rows,
-      binding: {
-        teamSessionId: admission.route.sessionId,
-        runtimeAuthorizationGeneration: connection.runtimeAuthorizationGeneration,
-        tmuxSocketName,
-        tmuxSessionRef,
-        tmuxSessionIncarnation,
-        readOnly,
-      },
-    });
+      pty = options.pty.create({
+        tmuxName,
+        shell: options.shell,
+        cols: admission.route.cols,
+        rows: admission.route.rows,
+        binding: {
+          teamSessionId: admission.route.sessionId,
+          runtimeAuthorizationGeneration: connection.runtimeAuthorizationGeneration,
+          tmuxSocketName,
+          tmuxSessionRef,
+          tmuxSessionIncarnation,
+          readOnly,
+        },
+      });
+    } else {
+      if (!hostedTerminalAdapter) {
+        closeUnavailable();
+        return;
+      }
+      const attached = captureHostedTerminalConnection(
+        await invokeCapturedPromise(hostedTerminalAdapter.receiver, hostedTerminalAdapter.connect, [
+          Object.freeze({
+            binding: connection.binding,
+            cols: admission.route.cols,
+            rows: admission.route.rows,
+            signal: abortController.signal,
+          }),
+        ])
+      );
+      if (
+        abortController.signal.aborted ||
+        !sameTerminalBinding(attached.binding, connection.binding)
+      ) {
+        void destroyHostedTerminal(attached);
+        closeUnavailable();
+        return;
+      }
+      // From this point cleanup owns exactly-once destruction, including when
+      // any post-connect authorization read throws.
+      hostedTerminal = attached;
+
+      // A hosted connect can take materially longer than the local PTY attach.
+      // Re-read both credential and exact Session/plan authorization after it
+      // completes, before registering output or announcing readiness.
+      if (!(await credentialsAreCurrent())) {
+        closeUnavailable();
+        return;
+      }
+      const refreshed = await options.terminalGateway.open({
+        sessionId: admission.route.sessionId,
+        actor: admission.actor,
+      });
+      if (!sameTerminalConnection(refreshed, connection)) {
+        closeUnavailable();
+        return;
+      }
+      connection = refreshed;
+      readOnly = !(await connection.canPerform("input"));
+      hostedMutationQueue = new HostedTerminalMutationQueue(
+        attached,
+        abortController.signal,
+        (error) => {
+          reportError(error, options.reportInternalError);
+          closeUnavailable();
+        }
+      );
+    }
 
     // Start the durable authorization monitor before registering any PTY
     // output forwarding callback.
@@ -464,6 +656,63 @@ async function serveTerminal(
       .catch(() => {
         if (!abortController.signal.aborted) closeUnavailable();
       });
+
+    const onTerminalData = (data: unknown): void => {
+      if (typeof data !== "string") {
+        closeUnavailable();
+        return;
+      }
+      const bytes = Buffer.byteLength(data, "utf8");
+      if (bytes > MAX_WEBSOCKET_PAYLOAD_BYTES) {
+        closeUnavailable();
+        return;
+      }
+      if (!terminalReady) {
+        if (bytes > MAX_BUFFERED_OUTPUT_BYTES - pendingTerminalOutputBytes) {
+          closeUnavailable();
+          return;
+        }
+        pendingTerminalOutput.push(data);
+        pendingTerminalOutputBytes += bytes;
+        return;
+      }
+      sendJson(webSocket, { type: "terminal.output", data }, closeUnavailable);
+    };
+    const endTerminal = (): void => {
+      sendJson(
+        webSocket,
+        { type: "terminal.ended", sessionId: admission.route.sessionId },
+        closeUnavailable
+      );
+      cleanup();
+      closeWebSocket(webSocket, 4000, "Terminal ended");
+    };
+    const onTerminalExit = (): void => {
+      if (!terminalReady) {
+        terminalExitPending = true;
+        return;
+      }
+      endTerminal();
+    };
+    if (pty) {
+      dataSubscription = pty.onData(onTerminalData);
+      exitSubscription = pty.onExit(onTerminalExit);
+    } else if (hostedTerminal) {
+      dataSubscription = captureSubscription(
+        Reflect.apply(hostedTerminal.onData, hostedTerminal.receiver, [onTerminalData])
+      );
+      exitSubscription = captureSubscription(
+        Reflect.apply(hostedTerminal.onExit, hostedTerminal.receiver, [onTerminalExit])
+      );
+    } else {
+      closeUnavailable();
+      return;
+    }
+    if (abortController.signal.aborted) {
+      dataSubscription?.dispose();
+      exitSubscription?.dispose();
+      return;
+    }
 
     if (
       !sendJson(
@@ -480,19 +729,16 @@ async function serveTerminal(
     ) {
       return;
     }
-
-    dataSubscription = pty.onData((data) => {
-      sendJson(webSocket, { type: "terminal.output", data }, closeUnavailable);
-    });
-    exitSubscription = pty.onExit(() => {
-      sendJson(
-        webSocket,
-        { type: "terminal.ended", sessionId: admission.route.sessionId },
-        closeUnavailable
-      );
-      cleanup();
-      closeWebSocket(webSocket, 4000, "Terminal ended");
-    });
+    terminalReady = true;
+    for (const data of pendingTerminalOutput.splice(0)) {
+      if (abortController.signal.aborted) return;
+      pendingTerminalOutputBytes -= Buffer.byteLength(data, "utf8");
+      if (!sendJson(webSocket, { type: "terminal.output", data }, closeUnavailable)) return;
+    }
+    if (terminalExitPending) {
+      endTerminal();
+      return;
+    }
 
     let messageQueue = Promise.resolve();
     let queuedMessages = 0;
@@ -505,7 +751,7 @@ async function serveTerminal(
       messageQueue = messageQueue
         .then(() =>
           enqueueMutation(admission.route.sessionId, async () => {
-            if (!pty || abortController.signal.aborted) return;
+            if ((!pty && !hostedTerminal) || abortController.signal.aborted) return;
             const message = parseTerminalMessage(rawData, isBinary);
             if (!message) {
               closeInvalidMessage();
@@ -526,21 +772,47 @@ async function serveTerminal(
             }
 
             const currentPty = pty;
-            if (!currentPty) return;
+            if (currentPty) {
+              switch (message.type) {
+                case "input":
+                  connection.perform("input", () => {
+                    options.pty.write(currentPty, message.data);
+                  });
+                  break;
+                case "resize":
+                  connection.perform("resize", () => {
+                    options.pty.resize(currentPty, message.cols, message.rows);
+                  });
+                  break;
+                case "interrupt":
+                  connection.perform("interrupt", () => {
+                    options.pty.interrupt(currentPty);
+                  });
+                  break;
+              }
+              return;
+            }
+
+            const currentHostedQueue = hostedMutationQueue;
+            if (!currentHostedQueue) return;
             switch (message.type) {
               case "input":
                 connection.perform("input", () => {
-                  options.pty.write(currentPty, message.data);
+                  currentHostedQueue.enqueue({ type: "input", data: message.data });
                 });
                 break;
               case "resize":
                 connection.perform("resize", () => {
-                  options.pty.resize(currentPty, message.cols, message.rows);
+                  currentHostedQueue.enqueue({
+                    type: "resize",
+                    cols: message.cols,
+                    rows: message.rows,
+                  });
                 });
                 break;
               case "interrupt":
                 connection.perform("interrupt", () => {
-                  options.pty.interrupt(currentPty);
+                  currentHostedQueue.enqueue({ type: "interrupt" });
                 });
                 break;
             }
@@ -646,32 +918,55 @@ async function serveEvents(
       return;
     }
     let latestSequence = currentSession.latestSequence;
-    for await (const event of options.teamSessions.follow({
+    const events = options.teamSessions.follow({
       sessionId: admission.route.sessionId,
       afterSequence: latestSequence,
       actor: admission.actor,
       signal: abortController.signal,
       pollIntervalMs: eventPollIntervalMs,
-    })) {
-      if (abortController.signal.aborted) return;
-      if (
-        event.sessionId !== admission.route.sessionId ||
-        !Number.isSafeInteger(event.sequence) ||
-        event.sequence <= latestSequence
-      ) {
-        closeUnavailable();
-        return;
+    });
+    const iterator = events[Symbol.asyncIterator]();
+    let returnRequested = false;
+    const requestFollowerReturn = (): void => {
+      if (returnRequested || typeof iterator.return !== "function") return;
+      returnRequested = true;
+      try {
+        void Promise.resolve(iterator.return()).catch((error) =>
+          reportError(error, options.reportInternalError)
+        );
+      } catch (error) {
+        reportError(error, options.reportInternalError);
       }
-      latestSequence = event.sequence;
-      if (
-        !sendJson(
-          webSocket,
-          { type: "session.event", event: projectPublicSessionEvent(event) },
-          closeUnavailable
-        )
-      ) {
-        return;
+    };
+    abortController.signal.addEventListener("abort", requestFollowerReturn, { once: true });
+    try {
+      while (true) {
+        const result = await iterator.next();
+        if (result.done) break;
+        const event = result.value;
+        if (abortController.signal.aborted) return;
+        if (
+          event.sessionId !== admission.route.sessionId ||
+          !Number.isSafeInteger(event.sequence) ||
+          event.sequence <= latestSequence
+        ) {
+          closeUnavailable();
+          return;
+        }
+        latestSequence = event.sequence;
+        if (
+          !sendJson(
+            webSocket,
+            { type: "session.event", event: projectPublicSessionEvent(event) },
+            closeUnavailable
+          )
+        ) {
+          return;
+        }
       }
+    } finally {
+      abortController.signal.removeEventListener("abort", requestFollowerReturn);
+      if (abortController.signal.aborted) requestFollowerReturn();
     }
 
     if (!abortController.signal.aborted) closeUnavailable();
@@ -702,6 +997,102 @@ type TerminalMessage =
       controlEpoch: number;
       runtimeAuthorizationGeneration: number;
     };
+
+type HostedTerminalMutation =
+  | { readonly type: "input"; readonly data: string }
+  | { readonly type: "resize"; readonly cols: number; readonly rows: number }
+  | { readonly type: "interrupt" };
+
+/**
+ * The authorization callback may only synchronously enqueue. Adapter I/O is
+ * deferred to a microtask and serialized outside the kernel transaction.
+ */
+class HostedTerminalMutationQueue {
+  private readonly queued: Array<{
+    readonly mutation: HostedTerminalMutation;
+    readonly bytes: number;
+  }> = [];
+  private queuedBytes = 0;
+  private draining = false;
+  private closed = false;
+
+  constructor(
+    private readonly terminal: CapturedHostedTerminalConnection,
+    private readonly signal: AbortSignal,
+    private readonly onFailure: (error: unknown) => void
+  ) {}
+
+  enqueue(mutation: HostedTerminalMutation): void {
+    const bytes = hostedMutationBytes(mutation);
+    if (
+      this.closed ||
+      this.signal.aborted ||
+      this.queued.length >= MAX_QUEUED_HOSTED_MUTATIONS ||
+      bytes > MAX_QUEUED_HOSTED_MUTATION_BYTES - this.queuedBytes
+    ) {
+      throw new Error("Hosted terminal mutation queue unavailable");
+    }
+    this.queued.push({ mutation: Object.freeze({ ...mutation }), bytes });
+    this.queuedBytes += bytes;
+    if (this.draining) return;
+    this.draining = true;
+    queueMicrotask(() => void this.drain());
+  }
+
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.queued.length = 0;
+    this.queuedBytes = 0;
+  }
+
+  private async drain(): Promise<void> {
+    try {
+      while (!this.closed && !this.signal.aborted) {
+        const entry = this.queued.shift();
+        if (!entry) break;
+        this.queuedBytes -= entry.bytes;
+        await this.dispatch(entry.mutation);
+      }
+    } catch (error) {
+      this.close();
+      this.onFailure(error);
+    } finally {
+      this.draining = false;
+    }
+  }
+
+  private dispatch(mutation: HostedTerminalMutation): Promise<void> {
+    switch (mutation.type) {
+      case "input":
+        return invokeCapturedVoidPromise(this.terminal.receiver, this.terminal.input, [
+          mutation.data,
+          this.signal,
+        ]);
+      case "resize":
+        return invokeCapturedVoidPromise(this.terminal.receiver, this.terminal.resize, [
+          mutation.cols,
+          mutation.rows,
+          this.signal,
+        ]);
+      case "interrupt":
+        return invokeCapturedVoidPromise(this.terminal.receiver, this.terminal.interrupt, [
+          this.signal,
+        ]);
+    }
+  }
+}
+
+function hostedMutationBytes(mutation: HostedTerminalMutation): number {
+  switch (mutation.type) {
+    case "input":
+      return Buffer.byteLength(mutation.data, "utf8");
+    case "resize":
+      return 16;
+    case "interrupt":
+      return 1;
+  }
+}
 
 function parseTerminalMessage(rawData: RawData, isBinary: boolean): TerminalMessage | null {
   if (isBinary) return null;
@@ -994,6 +1385,147 @@ function closeWebSocketServer(server: WebSocketServer): Promise<void> {
   });
 }
 
+function settleWithin(
+  settlements: readonly Promise<unknown>[],
+  timeoutMs: number
+): Promise<boolean> {
+  if (settlements.length === 0) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(false), timeoutMs);
+    timer.unref();
+    void Promise.allSettled(settlements).then((results) => {
+      clearTimeout(timer);
+      resolve(results.every((result) => result.status === "fulfilled"));
+    });
+  });
+}
+
+function captureHostedTerminalAdapter(
+  value: CanonicalHostedTerminalAdapter
+): CapturedHostedTerminalAdapter {
+  const receiver = safeObject(value);
+  return Object.freeze({ receiver, connect: captureDataMethod(receiver, "connect") });
+}
+
+function captureHostedTerminalConnection(value: unknown): CapturedHostedTerminalConnection {
+  const receiver = safeObject(value);
+  return Object.freeze({
+    receiver,
+    binding: snapshotHostedTerminalBinding(captureDataProperty(receiver, "binding")),
+    onData: captureDataMethod(receiver, "onData"),
+    onExit: captureDataMethod(receiver, "onExit"),
+    input: captureDataMethod(receiver, "input"),
+    resize: captureDataMethod(receiver, "resize"),
+    interrupt: captureDataMethod(receiver, "interrupt"),
+    destroy: captureDataMethod(receiver, "destroy"),
+  });
+}
+
+function captureSubscription(value: unknown): { dispose(): void } {
+  const receiver = safeObject(value);
+  const dispose = captureDataMethod(receiver, "dispose");
+  return Object.freeze({
+    dispose(): void {
+      const result = Reflect.apply(dispose, receiver, []);
+      if (result !== undefined) throw new TypeError();
+    },
+  });
+}
+
+function captureDataMethod(receiver: object, name: string): AnyFunction {
+  const value = captureDataProperty(receiver, name);
+  if (typeof value !== "function") throw new TypeError();
+  return value as AnyFunction;
+}
+
+function captureDataProperty(receiver: object, name: string): unknown {
+  const visited = new Set<object>();
+  let current: object | null = receiver;
+  for (let depth = 0; current !== null && depth < 32; depth += 1) {
+    if (visited.has(current) || nodeTypes.isProxy(current)) throw new TypeError();
+    visited.add(current);
+    const descriptor = Object.getOwnPropertyDescriptor(current, name);
+    if (descriptor !== undefined) {
+      if (!("value" in descriptor)) throw new TypeError();
+      return descriptor.value;
+    }
+    current = Object.getPrototypeOf(current) as object | null;
+  }
+  throw new TypeError();
+}
+
+function safeObject(value: unknown): object {
+  if ((typeof value !== "object" && typeof value !== "function") || value === null) {
+    throw new TypeError();
+  }
+  if (nodeTypes.isProxy(value)) throw new TypeError();
+  return value;
+}
+
+function snapshotHostedTerminalBinding(value: unknown): HostedTeamSessionTerminalBinding {
+  const snapshot = snapshotRuntimeSupervisorPortableData(value);
+  if (
+    !isRecord(snapshot) ||
+    !hasExactKeys(snapshot, [
+      "kind",
+      "binding",
+      "runtimeAuthorizationGeneration",
+      "assignmentPlanDigest",
+      "incarnation",
+      "specificationDigest",
+    ]) ||
+    snapshot.kind !== "hosted" ||
+    !isRecord(snapshot.binding) ||
+    !hasExactKeys(snapshot.binding, [
+      "teamId",
+      "projectId",
+      "sessionId",
+      "runtimeAssignmentId",
+      "runtimeAssignmentGeneration",
+      "sandboxId",
+      "sandboxGeneration",
+      "runtimePrincipalId",
+    ]) ||
+    !isSafeReference(snapshot.binding.teamId) ||
+    !isSafeReference(snapshot.binding.projectId) ||
+    !isSafeReference(snapshot.binding.sessionId) ||
+    !isSafeReference(snapshot.binding.runtimeAssignmentId) ||
+    !isPositiveFence(snapshot.binding.runtimeAssignmentGeneration) ||
+    !isSafeReference(snapshot.binding.sandboxId) ||
+    !isPositiveFence(snapshot.binding.sandboxGeneration) ||
+    !isSafeReference(snapshot.binding.runtimePrincipalId) ||
+    !isPositiveFence(snapshot.runtimeAuthorizationGeneration) ||
+    !isSha256(snapshot.assignmentPlanDigest) ||
+    !isSha256(snapshot.incarnation) ||
+    !isSha256(snapshot.specificationDigest)
+  ) {
+    throw new TypeError();
+  }
+  return snapshot as unknown as HostedTeamSessionTerminalBinding;
+}
+
+function invokeCapturedPromise(
+  receiver: object,
+  method: AnyFunction,
+  args: readonly unknown[]
+): Promise<unknown> {
+  try {
+    return Promise.resolve(Reflect.apply(method, receiver, [...args]));
+  } catch (error) {
+    return Promise.reject(error);
+  }
+}
+
+function invokeCapturedVoidPromise(
+  receiver: object,
+  method: AnyFunction,
+  args: readonly unknown[]
+): Promise<void> {
+  return invokeCapturedPromise(receiver, method, args).then((result) => {
+    if (result !== undefined) throw new TypeError();
+  });
+}
+
 function reportError(_error: unknown, reporter: ((errorName: string) => void) | undefined): void {
   if (!reporter) return;
   reporter("InternalError");
@@ -1031,6 +1563,61 @@ function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): 
 
 function isFence(value: unknown): value is number {
   return Number.isSafeInteger(value) && (value as number) >= 0;
+}
+
+function sameTerminalBinding(
+  left: TeamSessionTerminalBinding,
+  right: TeamSessionTerminalBinding
+): boolean {
+  if (left.kind !== right.kind) return false;
+  if (left.kind === "local-tmux") {
+    return right.kind === "local-tmux" && left.tmuxName === right.tmuxName;
+  }
+  return (
+    right.kind === "hosted" &&
+    left.runtimeAuthorizationGeneration === right.runtimeAuthorizationGeneration &&
+    left.assignmentPlanDigest === right.assignmentPlanDigest &&
+    left.incarnation === right.incarnation &&
+    left.specificationDigest === right.specificationDigest &&
+    left.binding.teamId === right.binding.teamId &&
+    left.binding.projectId === right.binding.projectId &&
+    left.binding.sessionId === right.binding.sessionId &&
+    left.binding.runtimeAssignmentId === right.binding.runtimeAssignmentId &&
+    left.binding.runtimeAssignmentGeneration === right.binding.runtimeAssignmentGeneration &&
+    left.binding.sandboxId === right.binding.sandboxId &&
+    left.binding.sandboxGeneration === right.binding.sandboxGeneration &&
+    left.binding.runtimePrincipalId === right.binding.runtimePrincipalId
+  );
+}
+
+function sameTerminalConnection(
+  left: CanonicalTerminalConnection,
+  right: CanonicalTerminalConnection
+): boolean {
+  return (
+    left.sessionId === right.sessionId &&
+    left.controlEpoch === right.controlEpoch &&
+    left.runtimeAuthorizationGeneration === right.runtimeAuthorizationGeneration &&
+    sameTerminalBinding(left.binding, right.binding)
+  );
+}
+
+function isSafeReference(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= 300 &&
+    value.trim() === value &&
+    !/[\0\r\n\t]/.test(value)
+  );
+}
+
+function isPositiveFence(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) > 0;
+}
+
+function isSha256(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
 }
 
 function boundedDimension(value: string | null, fallback: number, maximum: number): number {

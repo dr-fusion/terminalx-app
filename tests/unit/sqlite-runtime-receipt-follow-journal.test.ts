@@ -91,9 +91,10 @@ describe("SQLite Runtime signed receipt follow journal", () => {
       .prepare(
         `INSERT INTO sessions
            (id, team_id, project_id, name, status, steering_policy,
+            runtime_authorization_generation, runtime_authorization_state,
             runtime_kind, isolation, tmux_name, created_at_ms)
          VALUES (?, ?, ?, 'Follow truth', 'active', 'shared',
-                 'local-tmux', 'trusted-shared-host', 'follow-truth', ?)`
+                 1, 'enforced', 'local-tmux', 'trusted-shared-host', 'follow-truth', ?)`
       )
       .run(SESSION_ID, TEAM_ID, PROJECT_ID, NOW);
     database.db
@@ -109,11 +110,39 @@ describe("SQLite Runtime signed receipt follow journal", () => {
       .prepare(
         `INSERT INTO runtime_authorization_epochs
            (session_id, generation, runtime_assignment_id, runtime_assignment_generation,
-            sandbox_id, sandbox_generation, runtime_principal_id, created_at_ms,
-            effect_enforcer_set_digest)
-         VALUES (?, 1, ?, 1, ?, 1, ?, ?, ?)`
+            sandbox_id, sandbox_generation, runtime_principal_id,
+            effect_enforcer_policy_digest, effect_enforcer_set_digest, created_at_ms)
+         VALUES (?, 1, ?, 1, ?, 1, ?, ?, ?, ?)`
       )
-      .run(SESSION_ID, ASSIGNMENT_ID, SANDBOX_ID, PRINCIPAL_ID, NOW, REQUIRED_ENFORCER_SET_DIGEST);
+      .run(
+        SESSION_ID,
+        ASSIGNMENT_ID,
+        SANDBOX_ID,
+        PRINCIPAL_ID,
+        REQUIRED_ENFORCER_SET_DIGEST,
+        REQUIRED_ENFORCER_SET_DIGEST,
+        NOW
+      );
+    database.db
+      .prepare(
+        `INSERT INTO runtime_effect_enforcer_set_activations
+           (session_id, generation, runtime_assignment_id, runtime_assignment_generation,
+            sandbox_id, sandbox_generation, runtime_principal_id, activation_kind,
+            effect_enforcer_policy_digest, effect_enforcer_set_digest,
+            assignment_plan_digest, provider_identity_commitment, provider_revision,
+            effect_manifest_binding_digest, activated_at_ms)
+         VALUES (?, 1, ?, 1, ?, 1, ?, 'local-static', ?, ?,
+                 NULL, NULL, NULL, NULL, ?)`
+      )
+      .run(
+        SESSION_ID,
+        ASSIGNMENT_ID,
+        SANDBOX_ID,
+        PRINCIPAL_ID,
+        REQUIRED_ENFORCER_SET_DIGEST,
+        REQUIRED_ENFORCER_SET_DIGEST,
+        NOW
+      );
   }
 
   function dropCommandInsertGuardsForIsolatedFixture(): void {
@@ -388,9 +417,17 @@ describe("SQLite Runtime signed receipt follow journal", () => {
 
   it("does not grant migrated v5 rows a trusted follow stream", () => {
     database.db.exec("DROP TRIGGER runtime_authorization_epochs_immutable_update");
+    database.db.exec("DROP TRIGGER runtime_effect_enforcer_set_activations_immutable_delete");
     database.db
       .prepare(
-        `UPDATE runtime_authorization_epochs SET effect_enforcer_set_digest = NULL
+        `DELETE FROM runtime_effect_enforcer_set_activations
+         WHERE session_id = ? AND generation = 1`
+      )
+      .run(SESSION_ID);
+    database.db
+      .prepare(
+        `UPDATE runtime_authorization_epochs
+         SET effect_enforcer_policy_digest = NULL, effect_enforcer_set_digest = NULL
          WHERE session_id = ? AND generation = 1`
       )
       .run(SESSION_ID);

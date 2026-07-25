@@ -6,12 +6,14 @@ import { digestRuntimeCompensationIncident } from "../runtime/runtime-compensati
 import { RUNTIME_RECEIPT_OBSERVATION_MAX_CURSOR_CODE_POINTS } from "../runtime/runtime-receipt-observation-contract";
 import { isValidTmuxSessionName } from "../tmux";
 
-const SCHEMA_VERSION = 8;
+const SCHEMA_VERSION = 10;
 const PRE_RUNTIME_START_SCHEMA_VERSION = 4;
 const RUNTIME_START_SCHEMA_VERSION = 5;
 const RUNTIME_RECEIPT_FOLLOW_SCHEMA_VERSION = 6;
 const RUNTIME_COMPENSATION_SCHEMA_VERSION = 7;
 const RUNTIME_ASSIGNMENT_OUTBOX_INTERLOCK_SCHEMA_VERSION = 8;
+const HOSTED_RUNTIME_ASSIGNMENT_SCHEMA_VERSION = 9;
+const PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION = 10;
 const APPLICATION_ID = 0x54585331; // "TXS1"
 
 const CONVERSATION_SCHEMA = `
@@ -177,7 +179,8 @@ END;
 
 CREATE UNIQUE INDEX one_current_runtime_assignment_per_session
   ON runtime_assignments(session_id)
-  WHERE status IN ('provisioning', 'ready', 'checkpointing', 'recovering', 'quarantined');
+  WHERE status IN ('provisioning', 'ready', 'checkpointing', 'recovering', 'quarantined')
+    AND NOT (runtime_kind = 'daytona' AND status = 'recovering');
 
 CREATE TABLE runtime_authorization_epochs (
   session_id TEXT NOT NULL,
@@ -3439,6 +3442,23 @@ BEGIN
   SELECT RAISE(ABORT, 'Runtime principal observation keys are immutable');
 END;
 
+CREATE TRIGGER hosted_runtime_observation_identity_unique_insert
+BEFORE INSERT ON runtime_principal_observation_keys
+WHEN EXISTS (
+  SELECT 1
+  FROM runtime_assignments desired
+  JOIN runtime_principal_observation_keys existing
+    ON existing.runtime_assignment_id <> NEW.runtime_assignment_id
+   AND (
+     existing.issuer_key_id = NEW.issuer_key_id OR
+     existing.public_key_spki_digest = NEW.public_key_spki_digest
+   )
+  WHERE desired.id = NEW.runtime_assignment_id AND desired.runtime_kind = 'daytona'
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Hosted Runtime observation identity is already assigned');
+END;
+
 CREATE TABLE runtime_receipt_follow_streams (
   runtime_assignment_id TEXT NOT NULL,
   session_id TEXT NOT NULL,
@@ -5526,6 +5546,283 @@ function runtimeOutboxBoundedTextSql(valueSql: string): string {
   )`;
 }
 
+function hostedRuntimeBindingJsonSql(payloadSql: string, bindingPath = "$.binding"): string {
+  const binding = `${payloadSql}, '${bindingPath}'`;
+  const textFields = [
+    "teamId",
+    "projectId",
+    "sessionId",
+    "runtimeAssignmentId",
+    "sandboxId",
+    "runtimePrincipalId",
+  ];
+  const texts = textFields
+    .map((field) =>
+      runtimeOutboxBoundedTextSql(`json_extract(${payloadSql}, '${bindingPath}.${field}')`)
+    )
+    .join(" AND ");
+  return `(
+    json_type(${payloadSql}, '${bindingPath}') = 'object' AND
+    (SELECT count(*) = 8 AND count(*) = count(DISTINCT key) FROM json_each(${binding})) AND
+    NOT EXISTS (
+      SELECT 1 FROM json_each(${binding}) WHERE key NOT IN (
+        'teamId', 'projectId', 'sessionId', 'runtimeAssignmentId',
+        'runtimeAssignmentGeneration', 'sandboxId', 'sandboxGeneration', 'runtimePrincipalId'
+      )
+    ) AND
+    ${texts} AND
+    json_type(${payloadSql}, '${bindingPath}.runtimeAssignmentGeneration') = 'integer' AND
+    json_extract(${payloadSql}, '${bindingPath}.runtimeAssignmentGeneration')
+      BETWEEN 1 AND 9007199254740991 AND
+    json_type(${payloadSql}, '${bindingPath}.sandboxGeneration') = 'integer' AND
+    json_extract(${payloadSql}, '${bindingPath}.sandboxGeneration') BETWEEN 1 AND 9007199254740991
+  )`;
+}
+
+function hostedRuntimePlanReferenceJsonSql(payloadSql: string): string {
+  return `(
+    json_type(${payloadSql}, '$.runtimeKind') = 'text' AND
+    json_extract(${payloadSql}, '$.runtimeKind') = 'daytona' AND
+    ${runtimeOutboxBoundedTextSql(`json_extract(${payloadSql}, '$.assignmentPlanRef')`)} AND
+    json_type(${payloadSql}, '$.assignmentPlanDigest') = 'text' AND
+    length(json_extract(${payloadSql}, '$.assignmentPlanDigest')) = 64 AND
+    json_extract(${payloadSql}, '$.assignmentPlanDigest') NOT GLOB '*[^0-9a-f]*' AND
+    ${hostedRuntimeBindingJsonSql(payloadSql)}
+  )`;
+}
+
+function hostedRuntimeTransitionPlanReferenceJsonSql(payloadSql: string): string {
+  return `(
+    ${hostedRuntimePlanReferenceJsonSql(payloadSql)} AND
+    json_type(${payloadSql}, '$.assignmentPlanRuntimeAuthorizationGeneration') = 'integer' AND
+    json_extract(${payloadSql}, '$.assignmentPlanRuntimeAuthorizationGeneration')
+      BETWEEN 1 AND 9007199254740991 AND
+    json_extract(${payloadSql}, '$.assignmentPlanRuntimeAuthorizationGeneration') <
+      json_extract(${payloadSql}, '$.runtimeAuthorizationGeneration')
+  )`;
+}
+
+function hostedRuntimeRecoveryEnsureJsonSql(payloadSql: string): string {
+  return `(
+    ${runtimeOutboxBoundedTextSql(`json_extract(${payloadSql}, '$.recoveryId')`)} AND
+    ${runtimeOutboxBoundedTextSql(`json_extract(${payloadSql}, '$.agentRunId')`)} AND
+    ${runtimeOutboxBoundedTextSql(`json_extract(${payloadSql}, '$.fenceOutboxId')`)} AND
+    json_type(${payloadSql}, '$.previousRuntimeAuthorizationGeneration') = 'integer' AND
+    json_extract(${payloadSql}, '$.previousRuntimeAuthorizationGeneration')
+      BETWEEN 1 AND 9007199254740991 AND
+    json_extract(${payloadSql}, '$.previousRuntimeAuthorizationGeneration') + 1 =
+      json_extract(${payloadSql}, '$.runtimeAuthorizationGeneration') AND
+    ${hostedRuntimeBindingJsonSql(payloadSql, "$.previousBinding")} AND
+    ${runtimeOutboxBoundedTextSql(`json_extract(${payloadSql}, '$.previousAssignmentPlanRef')`)} AND
+    json_type(${payloadSql}, '$.previousAssignmentPlanDigest') = 'text' AND
+    length(json_extract(${payloadSql}, '$.previousAssignmentPlanDigest')) = 64 AND
+    json_extract(${payloadSql}, '$.previousAssignmentPlanDigest') NOT GLOB '*[^0-9a-f]*' AND
+    json_type(
+      ${payloadSql}, '$.previousAssignmentPlanRuntimeAuthorizationGeneration'
+    ) = 'integer' AND
+    json_extract(
+      ${payloadSql}, '$.previousAssignmentPlanRuntimeAuthorizationGeneration'
+    ) BETWEEN 1 AND 9007199254740991 AND
+    json_extract(
+      ${payloadSql}, '$.previousAssignmentPlanRuntimeAuthorizationGeneration'
+    ) < json_extract(${payloadSql}, '$.previousRuntimeAuthorizationGeneration') AND
+    json_extract(${payloadSql}, '$.previousBinding.sessionId') =
+      json_extract(${payloadSql}, '$.binding.sessionId') AND
+    json_extract(${payloadSql}, '$.previousBinding.runtimeAssignmentId') <>
+      json_extract(${payloadSql}, '$.binding.runtimeAssignmentId')
+  )`;
+}
+
+function hostedRuntimeRecoveryRetireJsonSql(payloadSql: string): string {
+  return `(
+    ${runtimeOutboxBoundedTextSql(`json_extract(${payloadSql}, '$.recoveryId')`)} AND
+    ${runtimeOutboxBoundedTextSql(`json_extract(${payloadSql}, '$.fenceOutboxId')`)} AND
+    json_type(${payloadSql}, '$.previousRuntimeAuthorizationGeneration') = 'integer' AND
+    json_extract(${payloadSql}, '$.previousRuntimeAuthorizationGeneration')
+      BETWEEN 1 AND 9007199254740991 AND
+    json_extract(${payloadSql}, '$.previousRuntimeAuthorizationGeneration') + 1 =
+      json_extract(${payloadSql}, '$.runtimeAuthorizationGeneration') AND
+    ${hostedRuntimeBindingJsonSql(payloadSql, "$.replacementBinding")} AND
+    ${runtimeOutboxBoundedTextSql(
+      `json_extract(${payloadSql}, '$.replacementAssignmentPlanRef')`
+    )} AND
+    json_type(${payloadSql}, '$.replacementAssignmentPlanDigest') = 'text' AND
+    length(json_extract(${payloadSql}, '$.replacementAssignmentPlanDigest')) = 64 AND
+    json_extract(${payloadSql}, '$.replacementAssignmentPlanDigest') NOT GLOB '*[^0-9a-f]*' AND
+    json_extract(${payloadSql}, '$.replacementBinding.sessionId') =
+      json_extract(${payloadSql}, '$.binding.sessionId') AND
+    json_extract(${payloadSql}, '$.replacementBinding.runtimeAssignmentId') <>
+      json_extract(${payloadSql}, '$.binding.runtimeAssignmentId')
+  )`;
+}
+
+function hostedRuntimeRecoverySourceEventSql(): string {
+  const previousBindingField = (field: string) => `CASE NEW.kind
+    WHEN 'runtime.session.ensure' THEN
+      json_extract(NEW.payload_json, '$.previousBinding.${field}')
+    ELSE json_extract(NEW.payload_json, '$.binding.${field}') END`;
+  const replacementBindingField = (field: string) => `CASE NEW.kind
+    WHEN 'runtime.session.ensure' THEN
+      json_extract(NEW.payload_json, '$.binding.${field}')
+    ELSE json_extract(NEW.payload_json, '$.replacementBinding.${field}') END`;
+  const previousAssignmentId = `CASE NEW.kind
+    WHEN 'runtime.session.ensure' THEN
+      json_extract(NEW.payload_json, '$.previousBinding.runtimeAssignmentId')
+    ELSE json_extract(NEW.payload_json, '$.binding.runtimeAssignmentId') END`;
+  const replacementAssignmentId = `CASE NEW.kind
+    WHEN 'runtime.session.ensure' THEN
+      json_extract(NEW.payload_json, '$.binding.runtimeAssignmentId')
+    ELSE json_extract(NEW.payload_json, '$.replacementBinding.runtimeAssignmentId') END`;
+  const previousPlanRef = `CASE NEW.kind
+    WHEN 'runtime.session.ensure' THEN
+      json_extract(NEW.payload_json, '$.previousAssignmentPlanRef')
+    ELSE json_extract(NEW.payload_json, '$.assignmentPlanRef') END`;
+  const previousPlanDigest = `CASE NEW.kind
+    WHEN 'runtime.session.ensure' THEN
+      json_extract(NEW.payload_json, '$.previousAssignmentPlanDigest')
+    ELSE json_extract(NEW.payload_json, '$.assignmentPlanDigest') END`;
+  const previousPlanGeneration = `CASE NEW.kind
+    WHEN 'runtime.session.ensure' THEN json_extract(
+      NEW.payload_json, '$.previousAssignmentPlanRuntimeAuthorizationGeneration'
+    ) ELSE json_extract(
+      NEW.payload_json, '$.assignmentPlanRuntimeAuthorizationGeneration'
+    ) END`;
+  const replacementPlanRef = `CASE NEW.kind
+    WHEN 'runtime.session.ensure' THEN json_extract(NEW.payload_json, '$.assignmentPlanRef')
+    ELSE json_extract(NEW.payload_json, '$.replacementAssignmentPlanRef') END`;
+  const replacementPlanDigest = `CASE NEW.kind
+    WHEN 'runtime.session.ensure' THEN json_extract(NEW.payload_json, '$.assignmentPlanDigest')
+    ELSE json_extract(NEW.payload_json, '$.replacementAssignmentPlanDigest') END`;
+  const bindingFields = [
+    "teamId",
+    "projectId",
+    "sessionId",
+    "runtimeAssignmentId",
+    "runtimeAssignmentGeneration",
+    "sandboxId",
+    "sandboxGeneration",
+    "runtimePrincipalId",
+  ];
+  const previousEventBindingMatches = bindingFields
+    .map(
+      (field) => `json_extract(event.payload_json, '$.previousBinding.${field}') =
+      ${previousBindingField(field)}`
+    )
+    .join(" AND\n    ");
+  const replacementEventBindingMatches = bindingFields
+    .map(
+      (field) => `json_extract(event.payload_json, '$.replacementBinding.${field}') =
+      ${replacementBindingField(field)}`
+    )
+    .join(" AND\n    ");
+  return `(
+    (
+      NEW.kind = 'runtime.session.ensure' OR
+      (NEW.kind = 'runtime.session.retire' AND
+       json_extract(NEW.payload_json, '$.reason') = 'assignee-replacement')
+    ) AND
+    event.type = 'session.hosted-runtime.recovery.requested' AND
+    (SELECT count(*) = 12 AND count(*) = count(DISTINCT key)
+     FROM json_each(event.payload_json)) AND
+    NOT EXISTS (
+      SELECT 1 FROM json_each(event.payload_json) WHERE key NOT IN (
+        'recoveryId', 'agentRunId', 'fenceOutboxId',
+        'previousRuntimeAuthorizationGeneration', 'runtimeAuthorizationGeneration',
+        'previousBinding', 'previousAssignmentPlanRef', 'previousAssignmentPlanDigest',
+        'previousAssignmentPlanRuntimeAuthorizationGeneration', 'replacementBinding',
+        'replacementAssignmentPlanRef', 'replacementAssignmentPlanDigest'
+      )
+    ) AND
+    ${hostedRuntimeBindingJsonSql("event.payload_json", "$.previousBinding")} AND
+    ${hostedRuntimeBindingJsonSql("event.payload_json", "$.replacementBinding")} AND
+    json_extract(event.payload_json, '$.recoveryId') =
+      json_extract(NEW.payload_json, '$.recoveryId') AND
+    json_extract(event.payload_json, '$.agentRunId') =
+      json_extract(NEW.payload_json, '$.agentRunId') AND
+    json_extract(event.payload_json, '$.fenceOutboxId') =
+      json_extract(NEW.payload_json, '$.fenceOutboxId') AND
+    json_extract(event.payload_json, '$.previousRuntimeAuthorizationGeneration') =
+      json_extract(NEW.payload_json, '$.previousRuntimeAuthorizationGeneration') AND
+    json_extract(event.payload_json, '$.runtimeAuthorizationGeneration') =
+      json_extract(NEW.payload_json, '$.runtimeAuthorizationGeneration') AND
+    ${previousEventBindingMatches} AND
+    ${replacementEventBindingMatches} AND
+    json_extract(event.payload_json, '$.previousAssignmentPlanRef') =
+      ${previousPlanRef} AND
+    json_extract(event.payload_json, '$.previousAssignmentPlanDigest') =
+      ${previousPlanDigest} AND
+    json_extract(event.payload_json, '$.replacementAssignmentPlanRef') =
+      ${replacementPlanRef} AND
+    json_extract(event.payload_json, '$.replacementAssignmentPlanDigest') =
+      ${replacementPlanDigest} AND
+    json_extract(
+      event.payload_json, '$.previousAssignmentPlanRuntimeAuthorizationGeneration'
+    ) = ${previousPlanGeneration} AND
+    EXISTS (
+      SELECT 1 FROM sessions session
+      JOIN runtime_assignments previous
+        ON previous.id = ${previousAssignmentId} AND previous.session_id = session.id
+      JOIN hosted_runtime_assignment_plans previous_plan
+        ON previous_plan.plan_ref = ${previousPlanRef}
+       AND previous_plan.plan_digest = ${previousPlanDigest}
+       AND previous_plan.runtime_assignment_id = previous.id
+       AND previous_plan.runtime_authorization_generation = ${previousPlanGeneration}
+       AND previous_plan.team_id = ${previousBindingField("teamId")}
+       AND previous_plan.project_id = ${previousBindingField("projectId")}
+       AND previous_plan.session_id = ${previousBindingField("sessionId")}
+       AND previous_plan.runtime_assignment_generation =
+         ${previousBindingField("runtimeAssignmentGeneration")}
+       AND previous_plan.sandbox_id = ${previousBindingField("sandboxId")}
+       AND previous_plan.sandbox_generation = ${previousBindingField("sandboxGeneration")}
+       AND previous_plan.runtime_principal_id = ${previousBindingField("runtimePrincipalId")}
+      JOIN runtime_assignments replacement
+        ON replacement.id = ${replacementAssignmentId}
+       AND replacement.session_id = session.id
+      JOIN hosted_runtime_assignment_plans replacement_plan
+        ON replacement_plan.plan_ref = ${replacementPlanRef}
+       AND replacement_plan.plan_digest = ${replacementPlanDigest}
+       AND replacement_plan.runtime_assignment_id = replacement.id
+       AND replacement_plan.runtime_authorization_generation =
+         json_extract(NEW.payload_json, '$.runtimeAuthorizationGeneration')
+       AND replacement_plan.team_id = ${replacementBindingField("teamId")}
+       AND replacement_plan.project_id = ${replacementBindingField("projectId")}
+       AND replacement_plan.session_id = ${replacementBindingField("sessionId")}
+       AND replacement_plan.runtime_assignment_generation =
+         ${replacementBindingField("runtimeAssignmentGeneration")}
+       AND replacement_plan.sandbox_id = ${replacementBindingField("sandboxId")}
+       AND replacement_plan.sandbox_generation =
+         ${replacementBindingField("sandboxGeneration")}
+       AND replacement_plan.runtime_principal_id =
+         ${replacementBindingField("runtimePrincipalId")}
+      JOIN agent_runs run
+        ON run.id = json_extract(NEW.payload_json, '$.agentRunId')
+       AND run.session_id = session.id AND run.runtime_assignment_id = previous.id
+      JOIN runtime_outbox fence
+        ON fence.id = json_extract(NEW.payload_json, '$.fenceOutboxId')
+       AND fence.session_id = session.id
+      WHERE session.id = NEW.session_id AND session.status = 'active'
+        AND session.runtime_kind = 'daytona'
+        AND session.runtime_authorization_generation =
+          json_extract(NEW.payload_json, '$.runtimeAuthorizationGeneration')
+        AND session.runtime_authorization_state = 'pending'
+        AND previous.runtime_authorization_generation =
+          json_extract(NEW.payload_json, '$.previousRuntimeAuthorizationGeneration')
+        AND previous.status = 'recovering'
+        AND replacement.runtime_authorization_generation =
+          json_extract(NEW.payload_json, '$.runtimeAuthorizationGeneration')
+        AND replacement.status = 'provisioning'
+        AND run.runtime_authorization_generation =
+          json_extract(NEW.payload_json, '$.previousRuntimeAuthorizationGeneration')
+        AND run.lifecycle IN ('paused', 'agent-work-finished')
+        AND fence.kind = 'runtime.authorization.fence' AND fence.status = 'delivered'
+        AND json_extract(fence.payload_json, '$.reason') = 'assignee-loss'
+        AND json_extract(fence.payload_json, '$.runtimeAuthorizationGeneration') =
+          json_extract(NEW.payload_json, '$.previousRuntimeAuthorizationGeneration')
+        AND json_extract(fence.payload_json, '$.binding.runtimeAssignmentId') = previous.id
+    )
+  )`;
+}
+
 const RUNTIME_OUTBOX_EVIDENCE_TABLES_SCHEMA_V8 = `
 CREATE INDEX runtime_outbox_created_at_idx ON runtime_outbox(created_at_ms);
 CREATE INDEX runtime_outbox_dispatch_interlock_acquired_at_idx
@@ -6732,7 +7029,9 @@ export function openTeamSessionDatabase(
         migratedVersion !== RUNTIME_START_SCHEMA_VERSION &&
         migratedVersion !== RUNTIME_RECEIPT_FOLLOW_SCHEMA_VERSION &&
         migratedVersion !== RUNTIME_COMPENSATION_SCHEMA_VERSION &&
-        migratedVersion !== RUNTIME_ASSIGNMENT_OUTBOX_INTERLOCK_SCHEMA_VERSION
+        migratedVersion !== RUNTIME_ASSIGNMENT_OUTBOX_INTERLOCK_SCHEMA_VERSION &&
+        migratedVersion !== HOSTED_RUNTIME_ASSIGNMENT_SCHEMA_VERSION &&
+        migratedVersion !== PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION
       ) {
         throw new Error(
           `Unsupported Team Session database schema ${currentVersion}; expected ${SCHEMA_VERSION}`
@@ -6760,6 +7059,14 @@ export function openTeamSessionDatabase(
     }) as number;
     if (assignmentInterlockPreparedVersion === RUNTIME_COMPENSATION_SCHEMA_VERSION) {
       migrateRuntimeAssignmentOutboxInterlockSchemaV8(db);
+    }
+    const hostedRuntimePreparedVersion = db.pragma("user_version", { simple: true }) as number;
+    if (hostedRuntimePreparedVersion === RUNTIME_ASSIGNMENT_OUTBOX_INTERLOCK_SCHEMA_VERSION) {
+      migrateHostedRuntimeAssignmentSchemaV9(db);
+    }
+    const effectActivationPreparedVersion = db.pragma("user_version", { simple: true }) as number;
+    if (effectActivationPreparedVersion === HOSTED_RUNTIME_ASSIGNMENT_SCHEMA_VERSION) {
+      migrateProviderBoundEffectActivationSchemaV10(db);
     }
 
     const applicationId = db.pragma("application_id", { simple: true }) as number;
@@ -6838,7 +7145,9 @@ function migrateRuntimeStartSchemaV5(db: Database.Database): void {
         currentVersion === RUNTIME_START_SCHEMA_VERSION ||
         currentVersion === RUNTIME_RECEIPT_FOLLOW_SCHEMA_VERSION ||
         currentVersion === RUNTIME_COMPENSATION_SCHEMA_VERSION ||
-        currentVersion === RUNTIME_ASSIGNMENT_OUTBOX_INTERLOCK_SCHEMA_VERSION
+        currentVersion === RUNTIME_ASSIGNMENT_OUTBOX_INTERLOCK_SCHEMA_VERSION ||
+        currentVersion === HOSTED_RUNTIME_ASSIGNMENT_SCHEMA_VERSION ||
+        currentVersion === PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION
       ) {
         return;
       }
@@ -6875,7 +7184,9 @@ function migrateRuntimeReceiptFollowSchemaV6(db: Database.Database): void {
     if (
       currentVersion === RUNTIME_RECEIPT_FOLLOW_SCHEMA_VERSION ||
       currentVersion === RUNTIME_COMPENSATION_SCHEMA_VERSION ||
-      currentVersion === RUNTIME_ASSIGNMENT_OUTBOX_INTERLOCK_SCHEMA_VERSION
+      currentVersion === RUNTIME_ASSIGNMENT_OUTBOX_INTERLOCK_SCHEMA_VERSION ||
+      currentVersion === HOSTED_RUNTIME_ASSIGNMENT_SCHEMA_VERSION ||
+      currentVersion === PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION
     ) {
       return;
     }
@@ -6905,7 +7216,9 @@ function migrateRuntimeCompensationSchemaV7(db: Database.Database): void {
     }
     if (
       currentVersion === RUNTIME_COMPENSATION_SCHEMA_VERSION ||
-      currentVersion === RUNTIME_ASSIGNMENT_OUTBOX_INTERLOCK_SCHEMA_VERSION
+      currentVersion === RUNTIME_ASSIGNMENT_OUTBOX_INTERLOCK_SCHEMA_VERSION ||
+      currentVersion === HOSTED_RUNTIME_ASSIGNMENT_SCHEMA_VERSION ||
+      currentVersion === PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION
     ) {
       return;
     }
@@ -6937,7 +7250,12 @@ function migrateRuntimeAssignmentOutboxInterlockSchemaV8(db: Database.Database):
     if (applicationId !== APPLICATION_ID) {
       throw new Error("File is not a recognized Team Session database");
     }
-    if (currentVersion === RUNTIME_ASSIGNMENT_OUTBOX_INTERLOCK_SCHEMA_VERSION) return;
+    if (
+      currentVersion === RUNTIME_ASSIGNMENT_OUTBOX_INTERLOCK_SCHEMA_VERSION ||
+      currentVersion === HOSTED_RUNTIME_ASSIGNMENT_SCHEMA_VERSION ||
+      currentVersion === PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION
+    )
+      return;
     if (currentVersion !== RUNTIME_COMPENSATION_SCHEMA_VERSION) {
       throw new Error(
         `Unsupported Team Session database schema ${currentVersion}; expected ${RUNTIME_ASSIGNMENT_OUTBOX_INTERLOCK_SCHEMA_VERSION}`
@@ -6956,6 +7274,932 @@ function migrateRuntimeAssignmentOutboxInterlockSchemaV8(db: Database.Database):
   });
   migrate.immediate();
 }
+
+interface SqliteSchemaArtifactV9 {
+  readonly type: "index" | "trigger";
+  readonly name: string;
+  readonly sql: string;
+}
+
+function migrateHostedRuntimeAssignmentSchemaV9(db: Database.Database): void {
+  // Both tables are parents of durable lifecycle state. As in v5, replacement
+  // is isolated on this unopened connection and followed by a complete FK audit.
+  db.pragma("foreign_keys = OFF");
+  try {
+    const migrate = db.transaction(() => {
+      const currentVersion = db.pragma("user_version", { simple: true }) as number;
+      const applicationId = db.pragma("application_id", { simple: true }) as number;
+      if (applicationId !== APPLICATION_ID) {
+        throw new Error("File is not a recognized Team Session database");
+      }
+      if (
+        currentVersion === HOSTED_RUNTIME_ASSIGNMENT_SCHEMA_VERSION ||
+        currentVersion === PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION
+      )
+        return;
+      if (currentVersion !== RUNTIME_ASSIGNMENT_OUTBOX_INTERLOCK_SCHEMA_VERSION) {
+        throw new Error(
+          `Unsupported Team Session database schema ${currentVersion}; expected ${HOSTED_RUNTIME_ASSIGNMENT_SCHEMA_VERSION}`
+        );
+      }
+
+      assertHostedRuntimeParentRowsAreSafeForV9(db);
+      assertRuntimeOutboxPayloadsAreSafeForV8(db);
+      assertRuntimeOutboxStatesAreSafeForV8(db);
+      assertRuntimeOutboxSourcesAreSafeForV8(db);
+      const artifacts = db
+        .prepare(
+          `SELECT type, name, sql FROM sqlite_schema
+           WHERE tbl_name IN ('sessions', 'runtime_assignments')
+             AND type IN ('index', 'trigger') AND sql IS NOT NULL
+           ORDER BY type, name`
+        )
+        .all() as SqliteSchemaArtifactV9[];
+
+      db.exec(HOSTED_RUNTIME_PARENT_TABLES_SCHEMA_V9);
+      db.pragma("legacy_alter_table = ON");
+      db.exec(`
+        INSERT INTO sessions_hosted_v9 (
+          id, team_id, project_id, name, status, steering_policy,
+          access_revision, assignee_revision, supervision_revision, steering_revision,
+          control_revision, control_epoch, runtime_authorization_generation,
+          runtime_authorization_state, run_state_revision, next_sequence,
+          runtime_kind, isolation, tmux_name, yolo_eligible, created_at_ms
+        )
+        SELECT
+          id, team_id, project_id, name, status, steering_policy,
+          access_revision, assignee_revision, supervision_revision, steering_revision,
+          control_revision, control_epoch, runtime_authorization_generation,
+          runtime_authorization_state, run_state_revision, next_sequence,
+          runtime_kind, isolation, tmux_name, yolo_eligible, created_at_ms
+        FROM sessions;
+        INSERT INTO runtime_assignments_hosted_v9 (
+          id, session_id, team_id, project_id, generation, runtime_kind,
+          sandbox_id, sandbox_generation, runtime_principal_id,
+          runtime_authorization_generation, status, created_at_ms, retired_at_ms
+        )
+        SELECT
+          id, session_id, team_id, project_id, generation, runtime_kind,
+          sandbox_id, sandbox_generation, runtime_principal_id,
+          runtime_authorization_generation, status, created_at_ms, retired_at_ms
+        FROM runtime_assignments;
+        ALTER TABLE runtime_assignments RENAME TO runtime_assignments_v8;
+        ALTER TABLE sessions RENAME TO sessions_v8;
+        ALTER TABLE sessions_hosted_v9 RENAME TO sessions;
+        ALTER TABLE runtime_assignments_hosted_v9 RENAME TO runtime_assignments;
+        DROP TABLE runtime_assignments_v8;
+        DROP TABLE sessions_v8;
+      `);
+      db.pragma("legacy_alter_table = OFF");
+      for (const artifact of artifacts) db.exec(artifact.sql);
+      db.exec(`
+        DROP INDEX one_current_runtime_assignment_per_session;
+        CREATE UNIQUE INDEX one_current_runtime_assignment_per_session
+          ON runtime_assignments(session_id)
+          WHERE status IN (
+            'provisioning', 'ready', 'checkpointing', 'recovering', 'quarantined'
+          ) AND NOT (runtime_kind = 'daytona' AND status = 'recovering');
+      `);
+
+      db.exec(HOSTED_RUNTIME_ASSIGNMENT_PLANS_SCHEMA_V9);
+      db.exec(`
+        DROP TRIGGER runtime_outbox_payload_valid_insert;
+        DROP TRIGGER runtime_outbox_source_event_valid_insert;
+      `);
+      db.exec(HOSTED_RUNTIME_OUTBOX_INSERT_TRIGGERS_SCHEMA_V9);
+      const violations = db.pragma("foreign_key_check") as unknown[];
+      if (violations.length > 0) {
+        throw new Error("Team Session v9 migration failed its foreign key check");
+      }
+      db.pragma(`user_version = ${HOSTED_RUNTIME_ASSIGNMENT_SCHEMA_VERSION}`);
+    });
+    migrate.exclusive();
+  } finally {
+    db.pragma("legacy_alter_table = OFF");
+    db.pragma("foreign_keys = ON");
+  }
+  if ((db.pragma("foreign_keys", { simple: true }) as number) !== 1) {
+    throw new Error("Team Session database requires SQLite foreign key enforcement");
+  }
+}
+
+function migrateProviderBoundEffectActivationSchemaV10(db: Database.Database): void {
+  const migrate = db.transaction(() => {
+    const currentVersion = db.pragma("user_version", { simple: true }) as number;
+    if (currentVersion === PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION) return;
+    if (currentVersion !== HOSTED_RUNTIME_ASSIGNMENT_SCHEMA_VERSION) {
+      throw new Error(
+        `Unsupported Team Session database schema ${currentVersion}; expected ${HOSTED_RUNTIME_ASSIGNMENT_SCHEMA_VERSION}`
+      );
+    }
+
+    const legacyHostedPlan = db
+      .prepare(
+        `SELECT 1
+         FROM hosted_runtime_assignment_plans
+         LIMIT 1`
+      )
+      .get();
+    if (legacyHostedPlan) {
+      throw new Error(
+        "Cannot migrate a legacy hosted Runtime Assignment Plan without provider-bound effect policy; retire and reprovision it first"
+      );
+    }
+
+    // The v9 trigger's exact JSON contract cannot admit the provider-bound
+    // policy field. No legacy row can be translated without inventing that
+    // security decision, so an empty table is rebuilt under the v10 contract.
+    db.exec("DROP TABLE hosted_runtime_assignment_plans");
+    db.exec(HOSTED_RUNTIME_ASSIGNMENT_PLANS_SCHEMA_V9);
+
+    addColumnIfMissing(
+      db,
+      "runtime_authorization_epochs",
+      "effect_enforcer_policy_digest",
+      `ALTER TABLE runtime_authorization_epochs
+         ADD COLUMN effect_enforcer_policy_digest TEXT CHECK (
+           effect_enforcer_policy_digest IS NULL OR (
+             length(effect_enforcer_policy_digest) = 64 AND
+             effect_enforcer_policy_digest = lower(effect_enforcer_policy_digest) AND
+             effect_enforcer_policy_digest NOT GLOB '*[^0-9a-f]*'
+           )
+         )`
+    );
+    db.exec("DROP TRIGGER runtime_authorization_epochs_immutable_update");
+    db.prepare(
+      `UPDATE runtime_authorization_epochs
+       SET effect_enforcer_policy_digest = effect_enforcer_set_digest
+       WHERE effect_enforcer_policy_digest IS NULL`
+    ).run();
+    db.exec(`
+      CREATE TRIGGER runtime_authorization_epochs_immutable_update
+      BEFORE UPDATE ON runtime_authorization_epochs
+      BEGIN
+        SELECT RAISE(ABORT, 'Runtime authorization epochs are immutable');
+      END;
+    `);
+
+    db.exec(`
+      CREATE TABLE runtime_effect_enforcer_set_activations (
+        session_id TEXT NOT NULL,
+        generation INTEGER NOT NULL CHECK (generation >= 1),
+        runtime_assignment_id TEXT NOT NULL,
+        runtime_assignment_generation INTEGER NOT NULL CHECK (runtime_assignment_generation >= 1),
+        sandbox_id TEXT NOT NULL,
+        sandbox_generation INTEGER NOT NULL CHECK (sandbox_generation >= 1),
+        runtime_principal_id TEXT NOT NULL,
+        activation_kind TEXT NOT NULL CHECK (activation_kind IN ('local-static', 'daytona-provider')),
+        effect_enforcer_policy_digest TEXT NOT NULL CHECK (
+          length(effect_enforcer_policy_digest) = 64 AND
+          effect_enforcer_policy_digest NOT GLOB '*[^0-9a-f]*'
+        ),
+        effect_enforcer_set_digest TEXT NOT NULL CHECK (
+          length(effect_enforcer_set_digest) = 64 AND
+          effect_enforcer_set_digest NOT GLOB '*[^0-9a-f]*'
+        ),
+        assignment_plan_digest TEXT,
+        provider_identity_commitment TEXT,
+        provider_revision INTEGER CHECK (provider_revision IS NULL OR provider_revision >= 1),
+        effect_manifest_binding_digest TEXT,
+        activated_at_ms INTEGER NOT NULL CHECK (activated_at_ms >= 0),
+        PRIMARY KEY (session_id, generation),
+        UNIQUE (
+          session_id, generation, runtime_assignment_id, runtime_assignment_generation,
+          sandbox_id, sandbox_generation, runtime_principal_id,
+          effect_enforcer_policy_digest, effect_enforcer_set_digest
+        ),
+        CHECK (
+          (activation_kind = 'local-static' AND
+            effect_enforcer_policy_digest = effect_enforcer_set_digest AND
+            assignment_plan_digest IS NULL AND provider_identity_commitment IS NULL AND
+            provider_revision IS NULL AND effect_manifest_binding_digest IS NULL) OR
+          (activation_kind = 'daytona-provider' AND
+            assignment_plan_digest IS NOT NULL AND length(assignment_plan_digest) = 64 AND
+            assignment_plan_digest NOT GLOB '*[^0-9a-f]*' AND
+            provider_identity_commitment IS NOT NULL AND
+            length(provider_identity_commitment) = 64 AND
+            provider_identity_commitment NOT GLOB '*[^0-9a-f]*' AND
+            provider_revision IS NOT NULL AND
+            effect_manifest_binding_digest IS NOT NULL AND
+            length(effect_manifest_binding_digest) = 64 AND
+            effect_manifest_binding_digest NOT GLOB '*[^0-9a-f]*')
+        ),
+        FOREIGN KEY (
+          session_id, generation, runtime_assignment_id, runtime_assignment_generation,
+          sandbox_id, sandbox_generation, runtime_principal_id
+        ) REFERENCES runtime_authorization_epochs(
+          session_id, generation, runtime_assignment_id, runtime_assignment_generation,
+          sandbox_id, sandbox_generation, runtime_principal_id
+        ) ON DELETE RESTRICT
+      ) STRICT;
+
+      CREATE TRIGGER runtime_effect_enforcer_set_activations_immutable_update
+      BEFORE UPDATE ON runtime_effect_enforcer_set_activations
+      BEGIN
+        SELECT RAISE(ABORT, 'Runtime effect-enforcer activations are immutable');
+      END;
+
+      CREATE TRIGGER runtime_effect_enforcer_set_activations_immutable_delete
+      BEFORE DELETE ON runtime_effect_enforcer_set_activations
+      BEGIN
+        SELECT RAISE(ABORT, 'Runtime effect-enforcer activations are immutable');
+      END;
+    `);
+
+    db.prepare(
+      `INSERT INTO runtime_effect_enforcer_set_activations (
+         session_id, generation, runtime_assignment_id, runtime_assignment_generation,
+         sandbox_id, sandbox_generation, runtime_principal_id, activation_kind,
+         effect_enforcer_policy_digest, effect_enforcer_set_digest,
+         assignment_plan_digest, provider_identity_commitment, provider_revision,
+         effect_manifest_binding_digest, activated_at_ms
+       )
+       SELECT epoch.session_id, epoch.generation, epoch.runtime_assignment_id,
+              epoch.runtime_assignment_generation, epoch.sandbox_id,
+              epoch.sandbox_generation, epoch.runtime_principal_id, 'local-static',
+              epoch.effect_enforcer_policy_digest, epoch.effect_enforcer_set_digest,
+              NULL, NULL, NULL, NULL, epoch.created_at_ms
+       FROM runtime_authorization_epochs epoch
+       JOIN runtime_assignments assignment ON assignment.id = epoch.runtime_assignment_id
+       WHERE assignment.runtime_kind = 'local-tmux'
+         AND epoch.effect_enforcer_policy_digest IS NOT NULL
+         AND epoch.effect_enforcer_set_digest IS NOT NULL`
+    ).run();
+
+    db.exec(`
+      DROP TRIGGER run_policy_revisions_enforcer_set_binding;
+      CREATE TRIGGER run_policy_revisions_enforcer_set_binding
+      BEFORE INSERT ON run_policy_revisions
+      WHEN NEW.required_effect_enforcer_set_digest IS NULL OR NOT EXISTS (
+        SELECT 1
+        FROM runtime_authorization_epochs epoch
+        JOIN runtime_effect_enforcer_set_activations activation
+          ON activation.session_id = epoch.session_id
+         AND activation.generation = epoch.generation
+         AND activation.runtime_assignment_id = epoch.runtime_assignment_id
+         AND activation.runtime_assignment_generation = epoch.runtime_assignment_generation
+         AND activation.sandbox_id = epoch.sandbox_id
+         AND activation.sandbox_generation = epoch.sandbox_generation
+         AND activation.runtime_principal_id = epoch.runtime_principal_id
+         AND activation.effect_enforcer_policy_digest = epoch.effect_enforcer_policy_digest
+        WHERE epoch.session_id = NEW.session_id
+          AND epoch.generation = NEW.runtime_authorization_generation
+          AND epoch.runtime_assignment_id = NEW.runtime_assignment_id
+          AND epoch.runtime_assignment_generation = NEW.runtime_assignment_generation
+          AND epoch.sandbox_id = NEW.sandbox_id
+          AND epoch.sandbox_generation = NEW.sandbox_generation
+          AND epoch.runtime_principal_id = NEW.runtime_principal_id
+          AND activation.effect_enforcer_set_digest = NEW.required_effect_enforcer_set_digest
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'Run policy effect-enforcer set does not match its authorization epoch');
+      END;
+
+      DROP TRIGGER runtime_run_commands_enforcer_set_binding;
+      CREATE TRIGGER runtime_run_commands_enforcer_set_binding
+      BEFORE INSERT ON runtime_run_commands
+      WHEN NEW.required_effect_enforcer_set_digest IS NULL OR
+        COALESCE(
+          json_extract(NEW.command_json, '$.requiredEffectEnforcerSetDigest') =
+            NEW.required_effect_enforcer_set_digest,
+          0
+        ) = 0 OR
+        (NEW.operation = 'run.start' AND COALESCE(
+          json_extract(NEW.command_json, '$.policy.requiredEffectEnforcerSetDigest') =
+            NEW.required_effect_enforcer_set_digest,
+          0
+        ) = 0) OR NOT EXISTS (
+          SELECT 1
+          FROM run_policy_revisions policy
+          JOIN runtime_authorization_epochs epoch
+            ON epoch.session_id = policy.session_id
+           AND epoch.generation = policy.runtime_authorization_generation
+           AND epoch.runtime_assignment_id = policy.runtime_assignment_id
+           AND epoch.runtime_assignment_generation = policy.runtime_assignment_generation
+           AND epoch.sandbox_id = policy.sandbox_id
+           AND epoch.sandbox_generation = policy.sandbox_generation
+           AND epoch.runtime_principal_id = policy.runtime_principal_id
+          JOIN runtime_effect_enforcer_set_activations activation
+            ON activation.session_id = epoch.session_id
+           AND activation.generation = epoch.generation
+           AND activation.runtime_assignment_id = epoch.runtime_assignment_id
+           AND activation.runtime_assignment_generation = epoch.runtime_assignment_generation
+           AND activation.sandbox_id = epoch.sandbox_id
+           AND activation.sandbox_generation = epoch.sandbox_generation
+           AND activation.runtime_principal_id = epoch.runtime_principal_id
+           AND activation.effect_enforcer_policy_digest = epoch.effect_enforcer_policy_digest
+          WHERE policy.agent_run_id = NEW.agent_run_id
+            AND policy.session_id = NEW.session_id
+            AND policy.revision = NEW.run_policy_revision
+            AND policy.runtime_assignment_id = NEW.runtime_assignment_id
+            AND policy.runtime_assignment_generation = NEW.runtime_assignment_generation
+            AND policy.sandbox_id = NEW.sandbox_id
+            AND policy.sandbox_generation = NEW.sandbox_generation
+            AND policy.runtime_principal_id = NEW.runtime_principal_id
+            AND policy.runtime_authorization_generation = NEW.runtime_authorization_generation
+            AND policy.required_effect_enforcer_set_digest =
+              NEW.required_effect_enforcer_set_digest
+            AND activation.effect_enforcer_set_digest = NEW.required_effect_enforcer_set_digest
+        )
+      BEGIN
+        SELECT RAISE(ABORT, 'Runtime command effect-enforcer set does not match policy and epoch');
+      END;
+    `);
+
+    db.pragma(`user_version = ${PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION}`);
+  });
+  migrate.exclusive();
+}
+
+function assertHostedRuntimeParentRowsAreSafeForV9(db: Database.Database): void {
+  const invalidSession = db
+    .prepare(
+      `SELECT id FROM sessions
+       WHERE runtime_kind <> 'local-tmux'
+          OR isolation <> 'trusted-shared-host'
+          OR tmux_name IS NULL OR length(tmux_name) NOT BETWEEN 1 AND 128
+          OR yolo_eligible <> 0
+       LIMIT 1`
+    )
+    .get();
+  const invalidAssignment = db
+    .prepare(
+      `SELECT id FROM runtime_assignments
+       WHERE runtime_kind <> 'local-tmux'
+       LIMIT 1`
+    )
+    .get();
+  if (invalidSession || invalidAssignment) {
+    throw new Error("Team Session v9 migration found poisoned Runtime parent state");
+  }
+}
+
+const HOSTED_RUNTIME_PARENT_TABLES_SCHEMA_V9 = `
+CREATE TABLE sessions_hosted_v9 (
+  id TEXT PRIMARY KEY,
+  team_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  name TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 160),
+  status TEXT NOT NULL CHECK (status IN ('active', 'awaiting_assignee', 'ended')),
+  steering_policy TEXT NOT NULL CHECK (steering_policy IN ('single', 'shared')),
+  access_revision INTEGER NOT NULL DEFAULT 1 CHECK (access_revision >= 1),
+  assignee_revision INTEGER NOT NULL DEFAULT 1 CHECK (assignee_revision >= 1),
+  supervision_revision INTEGER NOT NULL DEFAULT 1 CHECK (supervision_revision >= 1),
+  steering_revision INTEGER NOT NULL DEFAULT 1 CHECK (steering_revision >= 1),
+  control_revision INTEGER NOT NULL DEFAULT 1 CHECK (control_revision >= 1),
+  control_epoch INTEGER NOT NULL DEFAULT 1 CHECK (control_epoch >= 1),
+  runtime_authorization_generation INTEGER NOT NULL DEFAULT 1
+    CHECK (runtime_authorization_generation >= 1),
+  runtime_authorization_state TEXT NOT NULL DEFAULT 'enforced'
+    CHECK (runtime_authorization_state IN ('enforced', 'pending', 'quarantined')),
+  run_state_revision INTEGER NOT NULL DEFAULT 1 CHECK (run_state_revision >= 1),
+  next_sequence INTEGER NOT NULL DEFAULT 1 CHECK (next_sequence >= 1),
+  runtime_kind TEXT NOT NULL CHECK (runtime_kind IN ('local-tmux', 'daytona')),
+  isolation TEXT NOT NULL CHECK (isolation IN ('trusted-shared-host', 'isolated-hosted')),
+  tmux_name TEXT CHECK (tmux_name IS NULL OR length(tmux_name) BETWEEN 1 AND 128),
+  yolo_eligible INTEGER NOT NULL DEFAULT 0 CHECK (yolo_eligible = 0),
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  UNIQUE (team_id, name),
+  UNIQUE (tmux_name),
+  UNIQUE (id, team_id, project_id),
+  CHECK (
+    (runtime_kind = 'local-tmux' AND isolation = 'trusted-shared-host' AND tmux_name IS NOT NULL) OR
+    (runtime_kind = 'daytona' AND isolation = 'isolated-hosted' AND tmux_name IS NULL)
+  ),
+  FOREIGN KEY (project_id, team_id) REFERENCES projects(id, team_id) ON DELETE RESTRICT
+) STRICT;
+
+CREATE TABLE runtime_assignments_hosted_v9 (
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  team_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  generation INTEGER NOT NULL CHECK (generation >= 1),
+  runtime_kind TEXT NOT NULL CHECK (runtime_kind IN ('local-tmux', 'daytona')),
+  sandbox_id TEXT NOT NULL CHECK (length(sandbox_id) BETWEEN 1 AND 300),
+  sandbox_generation INTEGER NOT NULL CHECK (sandbox_generation >= 1),
+  runtime_principal_id TEXT NOT NULL CHECK (length(runtime_principal_id) BETWEEN 1 AND 300),
+  runtime_authorization_generation INTEGER NOT NULL CHECK (runtime_authorization_generation >= 1),
+  status TEXT NOT NULL CHECK (status IN (
+    'provisioning', 'ready', 'checkpointing', 'recovering',
+    'quarantined', 'retired', 'failed'
+  )),
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  retired_at_ms INTEGER,
+  CHECK (
+    (status = 'retired' AND retired_at_ms IS NOT NULL) OR
+    (status <> 'retired' AND retired_at_ms IS NULL)
+  ),
+  UNIQUE (session_id, generation),
+  UNIQUE (id, session_id),
+  UNIQUE (id, generation, sandbox_id, sandbox_generation, runtime_principal_id),
+  UNIQUE (id, session_id, generation, sandbox_id, sandbox_generation, runtime_principal_id),
+  FOREIGN KEY (session_id, team_id, project_id)
+    REFERENCES sessions(id, team_id, project_id) ON DELETE RESTRICT
+) STRICT;
+`;
+
+const HOSTED_RUNTIME_ASSIGNMENT_PLANS_SCHEMA_V9 = `
+DROP TRIGGER IF EXISTS hosted_runtime_observation_identity_unique_insert;
+CREATE TRIGGER hosted_runtime_observation_identity_unique_insert
+BEFORE INSERT ON runtime_principal_observation_keys
+WHEN EXISTS (
+  SELECT 1
+  FROM runtime_assignments desired
+  JOIN runtime_principal_observation_keys existing
+    ON existing.runtime_assignment_id <> NEW.runtime_assignment_id
+   AND (
+     existing.issuer_key_id = NEW.issuer_key_id OR
+     existing.public_key_spki_digest = NEW.public_key_spki_digest
+   )
+  WHERE desired.id = NEW.runtime_assignment_id AND desired.runtime_kind = 'daytona'
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Hosted Runtime observation identity is already assigned');
+END;
+
+CREATE TABLE hosted_runtime_assignment_plans (
+  plan_ref TEXT PRIMARY KEY CHECK (length(plan_ref) BETWEEN 1 AND 300),
+  plan_digest TEXT NOT NULL UNIQUE CHECK (
+    length(plan_digest) = 64 AND plan_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  specification_digest TEXT NOT NULL CHECK (
+    length(specification_digest) = 64 AND specification_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  team_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  runtime_assignment_id TEXT NOT NULL,
+  runtime_assignment_generation INTEGER NOT NULL CHECK (runtime_assignment_generation >= 1),
+  sandbox_id TEXT NOT NULL,
+  sandbox_generation INTEGER NOT NULL CHECK (sandbox_generation >= 1),
+  runtime_principal_id TEXT NOT NULL,
+  runtime_authorization_generation INTEGER NOT NULL CHECK (runtime_authorization_generation >= 1),
+  plan_json TEXT NOT NULL CHECK (json_valid(plan_json) AND json_type(plan_json) = 'object'),
+  spec_json TEXT NOT NULL CHECK (json_valid(spec_json) AND json_type(spec_json) = 'object'),
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  UNIQUE (runtime_assignment_id, runtime_authorization_generation),
+  UNIQUE (
+    runtime_assignment_id, session_id, runtime_assignment_generation,
+    sandbox_id, sandbox_generation, runtime_principal_id,
+    runtime_authorization_generation
+  ),
+  FOREIGN KEY (
+    runtime_assignment_id, session_id, runtime_assignment_generation,
+    sandbox_id, sandbox_generation, runtime_principal_id
+  ) REFERENCES runtime_assignments(
+    id, session_id, generation, sandbox_id, sandbox_generation, runtime_principal_id
+  ) ON DELETE RESTRICT
+) STRICT;
+
+CREATE TRIGGER hosted_runtime_assignment_plans_valid_insert
+BEFORE INSERT ON hosted_runtime_assignment_plans
+WHEN NOT EXISTS (
+  SELECT 1 FROM runtime_assignments assignment
+  JOIN sessions session ON session.id = assignment.session_id
+  WHERE assignment.id = NEW.runtime_assignment_id
+    AND assignment.session_id = NEW.session_id
+    AND assignment.team_id = NEW.team_id
+    AND assignment.project_id = NEW.project_id
+    AND assignment.generation = NEW.runtime_assignment_generation
+    AND assignment.sandbox_id = NEW.sandbox_id
+    AND assignment.sandbox_generation = NEW.sandbox_generation
+    AND assignment.runtime_principal_id = NEW.runtime_principal_id
+    AND assignment.runtime_authorization_generation = NEW.runtime_authorization_generation
+    AND assignment.runtime_kind = 'daytona' AND assignment.status IN (
+      'provisioning', 'ready', 'checkpointing', 'recovering', 'quarantined'
+    )
+    AND session.runtime_kind = 'daytona' AND session.isolation = 'isolated-hosted'
+    AND session.tmux_name IS NULL AND session.yolo_eligible = 0
+    AND (SELECT count(*) = 9 AND count(*) = count(DISTINCT key)
+         FROM json_each(NEW.plan_json))
+    AND NOT EXISTS (
+      SELECT 1 FROM json_each(NEW.plan_json) WHERE key NOT IN (
+        'binding', 'runtimeAuthorizationGeneration', 'incarnation',
+        'specificationDigest', 'effectEnforcerPolicyDigest',
+        'adapterConfigurationRef', 'observation',
+        'isolation', 'capabilities'
+      )
+    )
+    AND (SELECT count(*) = 7 AND count(*) = count(DISTINCT key)
+         FROM json_each(NEW.spec_json))
+    AND NOT EXISTS (
+      SELECT 1 FROM json_each(NEW.spec_json) WHERE key NOT IN (
+        'binding', 'source', 'harnessRef', 'projectCeiling', 'authorization',
+        'checkpointPolicyRef', 'adapterConfigurationRef'
+      )
+    )
+    AND json_extract(NEW.plan_json, '$.binding.teamId') = NEW.team_id
+    AND json_extract(NEW.plan_json, '$.binding.projectId') = NEW.project_id
+    AND json_extract(NEW.plan_json, '$.binding.sessionId') = NEW.session_id
+    AND json_extract(NEW.plan_json, '$.binding.runtimeAssignmentId') = NEW.runtime_assignment_id
+    AND json_extract(NEW.plan_json, '$.binding.runtimeAssignmentGeneration') = NEW.runtime_assignment_generation
+    AND json_extract(NEW.plan_json, '$.binding.sandboxId') = NEW.sandbox_id
+    AND json_extract(NEW.plan_json, '$.binding.sandboxGeneration') = NEW.sandbox_generation
+    AND json_extract(NEW.plan_json, '$.binding.runtimePrincipalId') = NEW.runtime_principal_id
+    AND json_extract(NEW.plan_json, '$.runtimeAuthorizationGeneration') = NEW.runtime_authorization_generation
+    AND json_extract(NEW.plan_json, '$.specificationDigest') = NEW.specification_digest
+    AND json_type(NEW.plan_json, '$.effectEnforcerPolicyDigest') = 'text'
+    AND length(json_extract(NEW.plan_json, '$.effectEnforcerPolicyDigest')) = 64
+    AND json_extract(NEW.plan_json, '$.effectEnforcerPolicyDigest')
+          NOT GLOB '*[^0-9a-f]*'
+    AND json_extract(NEW.plan_json, '$.effectEnforcerPolicyDigest') =
+          json_extract(NEW.spec_json, '$.authorization.effectEnforcerPolicyDigest')
+    AND EXISTS (
+      SELECT 1 FROM runtime_authorization_epochs epoch
+      WHERE epoch.session_id = NEW.session_id
+        AND epoch.generation = NEW.runtime_authorization_generation
+        AND epoch.runtime_assignment_id = NEW.runtime_assignment_id
+        AND epoch.runtime_assignment_generation = NEW.runtime_assignment_generation
+        AND epoch.sandbox_id = NEW.sandbox_id
+        AND epoch.sandbox_generation = NEW.sandbox_generation
+        AND epoch.runtime_principal_id = NEW.runtime_principal_id
+        AND epoch.effect_enforcer_policy_digest =
+          json_extract(NEW.plan_json, '$.effectEnforcerPolicyDigest')
+    )
+    AND (SELECT count(*) = 3 AND count(*) = count(DISTINCT key)
+         FROM json_each(NEW.plan_json, '$.observation'))
+    AND NOT EXISTS (
+      SELECT 1 FROM json_each(NEW.plan_json, '$.observation') WHERE key NOT IN (
+        'keyProvisioningRef', 'issuerKeyId', 'publicKeySpkiPem'
+      )
+    )
+    AND json_type(NEW.plan_json, '$.observation.keyProvisioningRef') = 'text'
+    AND length(json_extract(NEW.plan_json, '$.observation.keyProvisioningRef')) BETWEEN 1 AND 300
+    AND json_type(NEW.plan_json, '$.observation.issuerKeyId') = 'text'
+    AND length(json_extract(NEW.plan_json, '$.observation.issuerKeyId')) BETWEEN 1 AND 300
+    AND json_type(NEW.plan_json, '$.observation.publicKeySpkiPem') = 'text'
+    AND EXISTS (
+      SELECT 1 FROM runtime_principal_observation_keys observation_key
+      WHERE observation_key.runtime_assignment_id = NEW.runtime_assignment_id
+        AND observation_key.runtime_authorization_generation =
+          NEW.runtime_authorization_generation
+        AND observation_key.issuer_key_id =
+          json_extract(NEW.plan_json, '$.observation.issuerKeyId')
+        AND observation_key.public_key_spki_pem =
+          json_extract(NEW.plan_json, '$.observation.publicKeySpkiPem')
+    )
+    AND NOT EXISTS (
+      SELECT 1 FROM hosted_runtime_assignment_plans existing_plan
+      WHERE json_extract(
+        existing_plan.plan_json, '$.observation.keyProvisioningRef'
+      ) = json_extract(NEW.plan_json, '$.observation.keyProvisioningRef')
+        AND (
+          existing_plan.runtime_assignment_id <> NEW.runtime_assignment_id OR
+          existing_plan.runtime_authorization_generation <>
+            NEW.runtime_authorization_generation
+        )
+    )
+    AND json_extract(NEW.spec_json, '$.binding.runtimeAssignmentId') = NEW.runtime_assignment_id
+    AND json_extract(NEW.spec_json, '$.binding.teamId') = NEW.team_id
+    AND json_extract(NEW.spec_json, '$.binding.projectId') = NEW.project_id
+    AND json_extract(NEW.spec_json, '$.binding.sessionId') = NEW.session_id
+    AND json_extract(NEW.spec_json, '$.binding.runtimeAssignmentGeneration') = NEW.runtime_assignment_generation
+    AND json_extract(NEW.spec_json, '$.binding.sandboxId') = NEW.sandbox_id
+    AND json_extract(NEW.spec_json, '$.binding.sandboxGeneration') = NEW.sandbox_generation
+    AND json_extract(NEW.spec_json, '$.binding.runtimePrincipalId') = NEW.runtime_principal_id
+    AND json_extract(NEW.spec_json, '$.authorization.generation') = NEW.runtime_authorization_generation
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Hosted Runtime Assignment Plan binding is invalid');
+END;
+
+CREATE TRIGGER hosted_runtime_assignment_plans_immutable_update
+BEFORE UPDATE ON hosted_runtime_assignment_plans
+BEGIN
+  SELECT RAISE(ABORT, 'Hosted Runtime Assignment Plans are immutable');
+END;
+
+CREATE TRIGGER hosted_runtime_assignment_plans_immutable_delete
+BEFORE DELETE ON hosted_runtime_assignment_plans
+BEGIN
+  SELECT RAISE(ABORT, 'Hosted Runtime Assignment Plans are immutable');
+END;
+`;
+
+const HOSTED_RUNTIME_OUTBOX_INSERT_TRIGGERS_SCHEMA_V9 = `
+CREATE TRIGGER runtime_outbox_payload_valid_insert
+BEFORE INSERT ON runtime_outbox
+WHEN CASE
+  WHEN json_valid(NEW.payload_json) = 0 THEN 1
+  ELSE COALESCE((
+    json_type(NEW.payload_json) = 'object' AND
+    (SELECT count(*) = count(DISTINCT key) FROM json_each(NEW.payload_json)) AND
+    json_type(NEW.payload_json, '$.sessionId') = 'text' AND
+    json_extract(NEW.payload_json, '$.sessionId') = NEW.session_id AND
+    json_type(NEW.payload_json, '$.runtimeAuthorizationGeneration') = 'integer' AND
+    json_extract(NEW.payload_json, '$.runtimeAuthorizationGeneration')
+      BETWEEN 1 AND 9007199254740991 AND
+    (
+      (
+        NEW.kind = 'runtime.session.ensure' AND
+        (
+          (
+            (SELECT count(*) FROM json_each(NEW.payload_json)) = 4 AND
+            NOT EXISTS (
+              SELECT 1 FROM json_each(NEW.payload_json) WHERE key NOT IN (
+                'sessionId', 'runtimeKind', 'tmuxName', 'runtimeAuthorizationGeneration'
+              )
+            ) AND
+            json_extract(NEW.payload_json, '$.runtimeKind') = 'local-tmux' AND
+            json_type(NEW.payload_json, '$.tmuxName') = 'text' AND
+            length(json_extract(NEW.payload_json, '$.tmuxName')) BETWEEN 1 AND 128 AND
+            json_extract(NEW.payload_json, '$.tmuxName') NOT GLOB '*[^a-zA-Z0-9_.-]*'
+          ) OR (
+            ${hostedRuntimePlanReferenceJsonSql("NEW.payload_json")} AND (
+              (
+                (SELECT count(*) FROM json_each(NEW.payload_json)) = 6 AND
+                NOT EXISTS (
+                  SELECT 1 FROM json_each(NEW.payload_json) WHERE key NOT IN (
+                    'sessionId', 'runtimeKind', 'runtimeAuthorizationGeneration', 'binding',
+                    'assignmentPlanRef', 'assignmentPlanDigest'
+                  )
+                )
+              ) OR (
+                (SELECT count(*) FROM json_each(NEW.payload_json)) = 14 AND
+                NOT EXISTS (
+                  SELECT 1 FROM json_each(NEW.payload_json) WHERE key NOT IN (
+                    'sessionId', 'runtimeKind', 'runtimeAuthorizationGeneration', 'binding',
+                    'assignmentPlanRef', 'assignmentPlanDigest', 'recoveryId', 'agentRunId',
+                    'fenceOutboxId', 'previousRuntimeAuthorizationGeneration',
+                    'previousBinding', 'previousAssignmentPlanRef',
+                    'previousAssignmentPlanDigest',
+                    'previousAssignmentPlanRuntimeAuthorizationGeneration'
+                  )
+                ) AND ${hostedRuntimeRecoveryEnsureJsonSql("NEW.payload_json")}
+              )
+            )
+          )
+        )
+      ) OR (
+        NEW.kind = 'runtime.authorization.fence' AND
+        json_extract(NEW.payload_json, '$.reason') IN ('assignee-loss', 'emergency-stop') AND
+        (
+          (
+            (SELECT count(*) FROM json_each(NEW.payload_json)) = 3 AND
+            NOT EXISTS (
+              SELECT 1 FROM json_each(NEW.payload_json)
+              WHERE key NOT IN ('sessionId', 'reason', 'runtimeAuthorizationGeneration')
+            )
+          ) OR (
+            (SELECT count(*) FROM json_each(NEW.payload_json)) = 8 AND
+            NOT EXISTS (
+              SELECT 1 FROM json_each(NEW.payload_json) WHERE key NOT IN (
+                'sessionId', 'reason', 'runtimeAuthorizationGeneration', 'runtimeKind',
+                'binding', 'assignmentPlanRef', 'assignmentPlanDigest',
+                'assignmentPlanRuntimeAuthorizationGeneration'
+              )
+            ) AND ${hostedRuntimeTransitionPlanReferenceJsonSql("NEW.payload_json")}
+          )
+        )
+      ) OR (
+        NEW.kind = 'runtime.session.retire' AND
+        json_extract(NEW.payload_json, '$.reason') IN (
+          'emergency-stop', 'assignee-replacement'
+        ) AND
+        ${runtimeOutboxBoundedTextSql("json_extract(NEW.payload_json, '$.agentRunId')")} AND
+        ${runtimeOutboxBoundedTextSql(
+          "json_extract(NEW.payload_json, '$.runtimeAssignmentId')"
+        )} AND
+        json_type(NEW.payload_json, '$.runtimeAssignmentGeneration') = 'integer' AND
+        json_extract(NEW.payload_json, '$.runtimeAssignmentGeneration')
+          BETWEEN 1 AND 9007199254740991 AND
+        ${runtimeOutboxBoundedTextSql("json_extract(NEW.payload_json, '$.sandboxId')")} AND
+        json_type(NEW.payload_json, '$.sandboxGeneration') = 'integer' AND
+        json_extract(NEW.payload_json, '$.sandboxGeneration') BETWEEN 1 AND 9007199254740991 AND
+        (
+          (
+            (SELECT count(*) FROM json_each(NEW.payload_json)) = 8 AND
+            json_extract(NEW.payload_json, '$.reason') = 'emergency-stop' AND
+            NOT EXISTS (
+              SELECT 1 FROM json_each(NEW.payload_json) WHERE key NOT IN (
+                'sessionId', 'runtimeAuthorizationGeneration', 'reason', 'agentRunId',
+                'runtimeAssignmentId', 'runtimeAssignmentGeneration', 'sandboxId',
+                'sandboxGeneration'
+              )
+            )
+          ) OR (
+            (SELECT count(*) FROM json_each(NEW.payload_json)) = 13 AND
+            json_extract(NEW.payload_json, '$.reason') = 'emergency-stop' AND
+            NOT EXISTS (
+              SELECT 1 FROM json_each(NEW.payload_json) WHERE key NOT IN (
+                'sessionId', 'runtimeAuthorizationGeneration', 'reason', 'agentRunId',
+                'runtimeAssignmentId', 'runtimeAssignmentGeneration', 'sandboxId',
+                'sandboxGeneration', 'runtimeKind', 'binding', 'assignmentPlanRef',
+                'assignmentPlanDigest', 'assignmentPlanRuntimeAuthorizationGeneration'
+              )
+            ) AND ${hostedRuntimeTransitionPlanReferenceJsonSql("NEW.payload_json")} AND
+            json_extract(NEW.payload_json, '$.runtimeAssignmentId') =
+              json_extract(NEW.payload_json, '$.binding.runtimeAssignmentId') AND
+            json_extract(NEW.payload_json, '$.runtimeAssignmentGeneration') =
+              json_extract(NEW.payload_json, '$.binding.runtimeAssignmentGeneration') AND
+            json_extract(NEW.payload_json, '$.sandboxId') =
+              json_extract(NEW.payload_json, '$.binding.sandboxId') AND
+            json_extract(NEW.payload_json, '$.sandboxGeneration') =
+              json_extract(NEW.payload_json, '$.binding.sandboxGeneration')
+          ) OR (
+            (SELECT count(*) FROM json_each(NEW.payload_json)) = 19 AND
+            json_extract(NEW.payload_json, '$.reason') = 'assignee-replacement' AND
+            NOT EXISTS (
+              SELECT 1 FROM json_each(NEW.payload_json) WHERE key NOT IN (
+                'sessionId', 'runtimeAuthorizationGeneration', 'reason', 'agentRunId',
+                'runtimeAssignmentId', 'runtimeAssignmentGeneration', 'sandboxId',
+                'sandboxGeneration', 'runtimeKind', 'binding', 'assignmentPlanRef',
+                'assignmentPlanDigest', 'assignmentPlanRuntimeAuthorizationGeneration',
+                'recoveryId', 'fenceOutboxId', 'previousRuntimeAuthorizationGeneration',
+                'replacementBinding', 'replacementAssignmentPlanRef',
+                'replacementAssignmentPlanDigest'
+              )
+            ) AND ${hostedRuntimeTransitionPlanReferenceJsonSql("NEW.payload_json")} AND
+            ${hostedRuntimeRecoveryRetireJsonSql("NEW.payload_json")} AND
+            json_extract(NEW.payload_json, '$.runtimeAssignmentId') =
+              json_extract(NEW.payload_json, '$.binding.runtimeAssignmentId') AND
+            json_extract(NEW.payload_json, '$.runtimeAssignmentGeneration') =
+              json_extract(NEW.payload_json, '$.binding.runtimeAssignmentGeneration') AND
+            json_extract(NEW.payload_json, '$.sandboxId') =
+              json_extract(NEW.payload_json, '$.binding.sandboxId') AND
+            json_extract(NEW.payload_json, '$.sandboxGeneration') =
+              json_extract(NEW.payload_json, '$.binding.sandboxGeneration')
+          )
+        )
+      )
+    )
+  ), 0) = 0
+END
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime outbox payload contract is invalid');
+END;
+
+CREATE TRIGGER runtime_outbox_source_event_valid_insert
+BEFORE INSERT ON runtime_outbox
+WHEN NOT EXISTS (
+  SELECT 1 FROM session_events event
+  WHERE event.session_id = NEW.session_id
+    AND event.sequence = NEW.session_sequence
+    AND event.occurred_at_ms = NEW.created_at_ms
+    AND json_type(event.payload_json) = 'object'
+    AND (SELECT count(*) = count(DISTINCT key) FROM json_each(event.payload_json))
+    AND (
+      (
+        NEW.kind = 'runtime.session.ensure' AND event.type = 'session.started' AND
+        json_extract(event.payload_json, '$.sessionId') = NEW.session_id AND
+        json_extract(event.payload_json, '$.runtimeKind') =
+          json_extract(NEW.payload_json, '$.runtimeKind') AND
+        json_extract(event.payload_json, '$.runtimeAuthorizationGeneration') =
+          json_extract(NEW.payload_json, '$.runtimeAuthorizationGeneration') AND
+        EXISTS (
+          SELECT 1 FROM sessions session
+          WHERE session.id = NEW.session_id
+            AND session.runtime_kind = json_extract(NEW.payload_json, '$.runtimeKind')
+            AND session.runtime_authorization_generation =
+              json_extract(NEW.payload_json, '$.runtimeAuthorizationGeneration')
+            AND session.runtime_authorization_state = 'pending'
+            AND (
+              (session.runtime_kind = 'local-tmux' AND session.tmux_name =
+                json_extract(NEW.payload_json, '$.tmuxName')) OR
+              (session.runtime_kind = 'daytona' AND session.tmux_name IS NULL AND
+                EXISTS (
+                  SELECT 1 FROM hosted_runtime_assignment_plans plan
+                  WHERE plan.plan_ref = json_extract(NEW.payload_json, '$.assignmentPlanRef')
+                    AND plan.plan_digest = json_extract(NEW.payload_json, '$.assignmentPlanDigest')
+                    AND plan.session_id = NEW.session_id
+                    AND plan.runtime_assignment_id =
+                      json_extract(NEW.payload_json, '$.binding.runtimeAssignmentId')
+                    AND plan.runtime_assignment_generation =
+                      json_extract(NEW.payload_json, '$.binding.runtimeAssignmentGeneration')
+                    AND plan.sandbox_id = json_extract(NEW.payload_json, '$.binding.sandboxId')
+                    AND plan.sandbox_generation =
+                      json_extract(NEW.payload_json, '$.binding.sandboxGeneration')
+                    AND plan.runtime_principal_id =
+                      json_extract(NEW.payload_json, '$.binding.runtimePrincipalId')
+                ))
+            )
+        )
+      ) OR ${hostedRuntimeRecoverySourceEventSql()} OR (
+        NEW.kind = 'runtime.authorization.fence' AND
+        event.type = 'session.runtime-authorization.advanced' AND
+        json_extract(event.payload_json, '$.reason') = json_extract(NEW.payload_json, '$.reason') AND
+        json_extract(event.payload_json, '$.runtimeAuthorizationGeneration') =
+          json_extract(NEW.payload_json, '$.runtimeAuthorizationGeneration') AND
+        EXISTS (
+          SELECT 1 FROM sessions session
+          WHERE session.id = NEW.session_id
+            AND session.runtime_authorization_generation =
+              json_extract(NEW.payload_json, '$.runtimeAuthorizationGeneration')
+            AND session.runtime_authorization_state IN ('pending', 'quarantined')
+            AND json_extract(event.payload_json, '$.enforcementState') =
+              session.runtime_authorization_state
+            AND (
+              json_type(NEW.payload_json, '$.runtimeKind') IS NULL OR
+              (session.runtime_kind = 'daytona' AND EXISTS (
+                SELECT 1 FROM hosted_runtime_assignment_plans plan
+                JOIN runtime_assignments assignment
+                  ON assignment.id = plan.runtime_assignment_id
+                WHERE plan.plan_ref = json_extract(NEW.payload_json, '$.assignmentPlanRef')
+                  AND plan.plan_digest = json_extract(NEW.payload_json, '$.assignmentPlanDigest')
+                  AND plan.team_id = json_extract(NEW.payload_json, '$.binding.teamId')
+                  AND plan.project_id = json_extract(NEW.payload_json, '$.binding.projectId')
+                  AND plan.session_id = NEW.session_id
+                  AND plan.runtime_assignment_id =
+                    json_extract(NEW.payload_json, '$.binding.runtimeAssignmentId')
+                  AND plan.runtime_assignment_generation =
+                    json_extract(NEW.payload_json, '$.binding.runtimeAssignmentGeneration')
+                  AND plan.sandbox_id = json_extract(NEW.payload_json, '$.binding.sandboxId')
+                  AND plan.sandbox_generation =
+                    json_extract(NEW.payload_json, '$.binding.sandboxGeneration')
+                  AND plan.runtime_principal_id =
+                    json_extract(NEW.payload_json, '$.binding.runtimePrincipalId')
+                  AND plan.runtime_authorization_generation = json_extract(
+                    NEW.payload_json, '$.assignmentPlanRuntimeAuthorizationGeneration'
+                  )
+                  AND assignment.runtime_authorization_generation =
+                    json_extract(NEW.payload_json, '$.runtimeAuthorizationGeneration')
+                  AND assignment.status IN (
+                    'provisioning', 'ready', 'checkpointing', 'recovering', 'quarantined'
+                  )
+                  AND assignment.runtime_kind = 'daytona'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM hosted_runtime_assignment_plans newer
+                    WHERE newer.runtime_assignment_id = plan.runtime_assignment_id
+                      AND newer.runtime_authorization_generation >
+                        plan.runtime_authorization_generation
+                      AND newer.runtime_authorization_generation < json_extract(
+                        NEW.payload_json, '$.runtimeAuthorizationGeneration'
+                      )
+                  )
+              ))
+            )
+        )
+      ) OR (
+        NEW.kind = 'runtime.session.retire' AND
+        event.type = 'run.emergency-stop.requested' AND
+        json_extract(event.payload_json, '$.agentRunId') =
+          json_extract(NEW.payload_json, '$.agentRunId') AND
+        json_extract(event.payload_json, '$.runtimeAuthorizationGeneration') =
+          json_extract(NEW.payload_json, '$.runtimeAuthorizationGeneration') AND
+        json_type(event.payload_json, '$.revokeAllRunGrants') = 'true' AND
+        json_extract(event.payload_json, '$.revokeAllRunGrants') = 1 AND
+        EXISTS (
+          SELECT 1 FROM sessions session
+          JOIN runtime_assignments assignment ON assignment.session_id = session.id
+          JOIN agent_runs run ON run.session_id = session.id
+            AND run.runtime_assignment_id = assignment.id
+          WHERE session.id = NEW.session_id
+            AND session.runtime_authorization_generation =
+              json_extract(NEW.payload_json, '$.runtimeAuthorizationGeneration')
+            AND session.runtime_authorization_state = 'quarantined'
+            AND assignment.id = json_extract(NEW.payload_json, '$.runtimeAssignmentId')
+            AND assignment.generation =
+              json_extract(NEW.payload_json, '$.runtimeAssignmentGeneration')
+            AND assignment.sandbox_id = json_extract(NEW.payload_json, '$.sandboxId')
+            AND assignment.sandbox_generation =
+              json_extract(NEW.payload_json, '$.sandboxGeneration')
+            AND assignment.runtime_authorization_generation =
+              json_extract(NEW.payload_json, '$.runtimeAuthorizationGeneration')
+            AND assignment.status = 'quarantined'
+            AND run.id = json_extract(NEW.payload_json, '$.agentRunId')
+            AND run.runtime_authorization_generation =
+              json_extract(NEW.payload_json, '$.runtimeAuthorizationGeneration')
+            AND run.lifecycle = 'pausing'
+            AND (
+              json_type(NEW.payload_json, '$.runtimeKind') IS NULL OR
+              (assignment.runtime_kind = 'daytona' AND EXISTS (
+                SELECT 1 FROM hosted_runtime_assignment_plans plan
+                WHERE plan.plan_ref = json_extract(NEW.payload_json, '$.assignmentPlanRef')
+                  AND plan.plan_digest = json_extract(NEW.payload_json, '$.assignmentPlanDigest')
+                  AND plan.runtime_assignment_id = assignment.id
+                  AND plan.team_id = json_extract(NEW.payload_json, '$.binding.teamId')
+                  AND plan.project_id = json_extract(NEW.payload_json, '$.binding.projectId')
+                  AND plan.session_id = NEW.session_id
+                  AND plan.runtime_assignment_generation =
+                    json_extract(NEW.payload_json, '$.binding.runtimeAssignmentGeneration')
+                  AND plan.sandbox_id = json_extract(NEW.payload_json, '$.binding.sandboxId')
+                  AND plan.sandbox_generation =
+                    json_extract(NEW.payload_json, '$.binding.sandboxGeneration')
+                  AND plan.runtime_principal_id =
+                    json_extract(NEW.payload_json, '$.binding.runtimePrincipalId')
+                  AND plan.runtime_authorization_generation = json_extract(
+                    NEW.payload_json, '$.assignmentPlanRuntimeAuthorizationGeneration'
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM hosted_runtime_assignment_plans newer
+                    WHERE newer.runtime_assignment_id = plan.runtime_assignment_id
+                      AND newer.runtime_authorization_generation >
+                        plan.runtime_authorization_generation
+                      AND newer.runtime_authorization_generation < json_extract(
+                        NEW.payload_json, '$.runtimeAuthorizationGeneration'
+                      )
+                  )
+              ))
+            )
+        )
+      )
+    )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Runtime outbox source event does not match');
+END;
+`;
 
 function ensureAcceptedCommandLedgerV8(db: Database.Database): void {
   const acceptedCommands = db

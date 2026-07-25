@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "kind": "terminalx.daytona-production-source",
+  "forkRepository": "https://github.com/procyon-labs-io/daytona",
+  "productionForkCommit": "ad3bc03a3c0e7eb7f9d2ce57e0f41565fe31d388",
+  "upstreamRepository": "https://github.com/daytonaio/daytona",
+  "upstreamBaseCommit": "b5a5d9e78d76c8bcf351f2049620250e0f34eea4"
+}

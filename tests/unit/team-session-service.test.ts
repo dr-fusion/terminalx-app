@@ -12,7 +12,9 @@ vi.mock("@/lib/team-sessions/module", () => ({
 const REGISTRY_KEYS = [
   "__terminalxTeamSessionKernel",
   "__terminalxTeamSessionKernelClose",
+  "__terminalxTeamSessionKernelInstallation",
   "__terminalxTeamSessionKernelPhase",
+  "__terminalxHostedMultiplayerServiceFactory",
 ] as const;
 
 function fakeKernel(close: () => void = vi.fn()): TeamSessionKernel {
@@ -127,5 +129,100 @@ describe("Team Session process service", () => {
     expect(service.getTeamSessionKernel()).toBe(recovered);
 
     service.closeTeamSessions(recovered);
+  });
+
+  it("keeps the explicit hosted factory absent without constructing a local kernel", async () => {
+    const service = await import("@/lib/team-sessions/service");
+
+    expect(service.getHostedMultiplayerServiceFactory()).toBeNull();
+    expect(mocks.createTeamSessionKernel).not.toHaveBeenCalled();
+  });
+
+  it("registers a hosted one-call factory with owner-scoped removal", async () => {
+    const service = await import("@/lib/team-sessions/service");
+    const hosted = {} as never;
+    const factory = vi.fn(async () => hosted);
+    const remove = service.installHostedMultiplayerServiceFactory(factory);
+
+    expect(service.getHostedMultiplayerServiceFactory()).toBe(factory);
+    expect(() => service.installHostedMultiplayerServiceFactory(vi.fn(async () => hosted))).toThrow(
+      "Hosted multiplayer factory conflicts"
+    );
+
+    remove();
+    expect(service.getHostedMultiplayerServiceFactory()).toBeNull();
+    expect(mocks.createTeamSessionKernel).not.toHaveBeenCalled();
+  });
+
+  it("installs one deployment-owned kernel without constructing or closing a fallback", async () => {
+    const service = await import("@/lib/team-sessions/service");
+    const close = vi.fn();
+    const hosted = fakeKernel(close);
+    const dispose = service.installTeamSessionKernel(hosted);
+
+    expect(service.getRegisteredTeamSessionKernel()).toBe(hosted);
+    expect(service.getRegisteredTeamSessions()).toBe(hosted.teamSessions);
+    expect(service.getTeamSessionKernel()).toBe(hosted);
+    expect(mocks.createTeamSessionKernel).not.toHaveBeenCalled();
+    expect(() => service.closeTeamSessions()).toThrow(
+      "Installed Team Session kernel is externally owned"
+    );
+
+    dispose();
+    dispose();
+    expect(service.getRegisteredTeamSessionKernel()).toBeNull();
+    expect(close).not.toHaveBeenCalled();
+  });
+
+  it("rejects a hosted install over a lazy LocalTmux owner without replacing either identity", async () => {
+    const localClose = vi.fn();
+    const hostedClose = vi.fn();
+    const local = fakeKernel(localClose);
+    const hosted = fakeKernel(hostedClose);
+    mocks.createTeamSessionKernel.mockReturnValue(local);
+    const service = await import("@/lib/team-sessions/service");
+
+    expect(service.getTeamSessionKernel()).toBe(local);
+    expect(() => service.installTeamSessionKernel(hosted)).toThrow(
+      "Team Session kernel installation conflicts"
+    );
+    expect(service.getRegisteredTeamSessionKernel()).toBe(local);
+    expect(hostedClose).not.toHaveBeenCalled();
+
+    service.closeTeamSessions(local);
+    expect(localClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not let a stale installation disposer remove its replacement", async () => {
+    const service = await import("@/lib/team-sessions/service");
+    const first = fakeKernel();
+    const second = fakeKernel();
+    const disposeFirst = service.installTeamSessionKernel(first);
+    disposeFirst();
+    const disposeSecond = service.installTeamSessionKernel(second);
+
+    disposeFirst();
+    expect(service.getRegisteredTeamSessionKernel()).toBe(second);
+    disposeSecond();
+    expect(service.getRegisteredTeamSessionKernel()).toBeNull();
+  });
+
+  it("fails closed on a partial registry instead of serving or overwriting it", async () => {
+    const service = await import("@/lib/team-sessions/service");
+    const stranded = fakeKernel();
+    Object.defineProperty(globalThis, "__terminalxTeamSessionKernelClose", {
+      configurable: true,
+      enumerable: false,
+      value: Object.freeze({ kernel: stranded, close: vi.fn() }),
+      writable: true,
+    });
+
+    expect(() => service.getRegisteredTeamSessionKernel()).toThrow(
+      "Invalid Team Session kernel registry"
+    );
+    expect(() => service.installTeamSessionKernel(fakeKernel())).toThrow(
+      "Team Session kernel installation conflicts"
+    );
+    expect(mocks.createTeamSessionKernel).not.toHaveBeenCalled();
   });
 });

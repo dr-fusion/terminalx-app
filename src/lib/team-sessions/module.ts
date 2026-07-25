@@ -1,10 +1,28 @@
 import * as crypto from "crypto";
 import * as path from "path";
+import { isIP } from "node:net";
+import { types as nodeTypes } from "node:util";
 import type Database from "better-sqlite3";
 import { openTeamSessionDatabase } from "./sqlite";
 import { isValidTmuxSessionName } from "../tmux";
 import { projectPublicSessionRunState } from "./public-run-state";
-import type { RuntimeAuthorizationSnapshot, RuntimeLifecycleCommand } from "../runtime/contracts";
+import type {
+  ProjectRuntimeCeiling,
+  RuntimeAuthorizationSnapshot,
+  RuntimeLifecycleCommand,
+  RuntimeSpec,
+} from "../runtime/contracts";
+import { canonicalRuntimeJson } from "../runtime/runtime-command-canonical";
+import { snapshotHostedRuntimeActivation } from "../runtime/hosted-runtime-activation";
+import { digestHostedRuntimeAssignmentPlan } from "../runtime/hosted-runtime-adapter";
+import type {
+  HostedAssignmentLookup,
+  HostedAssignmentPlanSource,
+  HostedRuntimeActivation,
+  HostedRuntimeActivationSource,
+  HostedRuntimeAssignmentPlan,
+  HostedRuntimeIsolationControls,
+} from "../runtime/hosted-runtime-control-plane";
 import type { RuntimeCommandAuthorityIssuer } from "../runtime/runtime-command-authority";
 import {
   createRuntimeCompensationMaterializer,
@@ -107,6 +125,24 @@ export interface CreateTeamSessionsOptions {
   clock?: () => number;
   idGenerator?: () => string;
   invitationTokenGenerator?: () => string;
+  /** Test seam; production defaults to a fresh cryptographic 256-bit assignment incarnation. */
+  runtimeIncarnationGenerator?: () => string;
+  /**
+   * Root-private, synchronous key registry seam. It must be a pure in-memory
+   * derivation or lookup over key material loaded before this kernel opens:
+   * this callback runs inside the SQLite command transaction and therefore
+   * MUST NOT perform filesystem, vault, network, or other external effects.
+   * It provisions one stable identity for an exact hosted Assignment and
+   * returns public registration material only. Private bytes never cross it.
+   */
+  hostedRuntimeObservationProvisioner?: HostedRuntimeObservationProvisioner;
+  /**
+   * Process-private pure in-memory activation lookup. It is invoked inside the
+   * outbox settlement transaction and therefore MUST NOT perform any I/O.
+   */
+  hostedRuntimeActivationSource?: HostedRuntimeActivationSource;
+  /** Selected by trusted deployment composition; never accepted from a Session command. */
+  runtimeProfile?: RuntimeDeploymentProfile;
   /** Required before any ordinary Runtime-backed Run lifecycle intent is accepted. */
   runtimeCommandAuthorityIssuer?: RuntimeCommandAuthorityIssuer;
   /**
@@ -130,6 +166,41 @@ export interface CreateTeamSessionsOptions {
   runtimeCompensationEnforcementProofVerifier?: SynchronousRuntimeCompensationEnforcementProofVerifier;
 }
 
+export interface HostedRuntimeObservationProvisioningRequest {
+  readonly binding: RuntimeBinding;
+  readonly runtimeAuthorizationGeneration: number;
+  readonly incarnation: string;
+  readonly adapterConfigurationRef: string;
+}
+
+export interface HostedRuntimeObservationRegistration {
+  /** Opaque handle resolved only by the root-private hosted supervisor. */
+  readonly keyProvisioningRef: string;
+  readonly issuerKeyId: string;
+  readonly publicKeySpkiPem: string;
+}
+
+/**
+ * Must be idempotent for the exact immutable request, return synchronously,
+ * and perform no filesystem, vault, network, or other external effects.
+ */
+export type HostedRuntimeObservationProvisioner = (
+  request: HostedRuntimeObservationProvisioningRequest
+) => HostedRuntimeObservationRegistration;
+
+export type RuntimeDeploymentProfile =
+  | { readonly kind: "local-tmux" }
+  | {
+      readonly kind: "daytona";
+      readonly source: RuntimeSpec["source"];
+      readonly harnessRef: string;
+      readonly projectCeiling: ProjectRuntimeCeiling;
+      readonly checkpointPolicyRef: string;
+      readonly adapterConfigurationRef: string;
+      readonly isolation: HostedRuntimeIsolationControls;
+      readonly capabilities: HostedRuntimeAssignmentPlan["capabilities"];
+    };
+
 export interface RuntimeAuthorizationSnapshotQuery {
   readonly binding: RuntimeBinding;
   readonly runtimeAuthorizationGeneration: number;
@@ -150,6 +221,8 @@ export interface TeamSessionKernel {
   readonly runtimeLifecycleJournal: RuntimeLifecycleJournal;
   /** Private worker seam; never project this journal through HTTP or browser state. */
   readonly runtimeReceiptFollowJournal: SqliteRuntimeReceiptFollowJournal;
+  /** Private restart-safe source of immutable provider-independent hosted plans. */
+  readonly hostedAssignmentPlanSource: HostedAssignmentPlanSource;
   /** Private platform-security worker seam; absent unless its complete trust group is configured. */
   readonly runtimeCompensationJournal?: RuntimeCompensationJournal;
   /** Private signer worker seam; absent unless its complete trust group is configured. */
@@ -183,7 +256,7 @@ const SHA256_DIGEST = /^[0-9a-f]{64}$/;
 const RUNTIME_AUTHORIZATION_SNAPSHOT_FIELDS = [
   "credentialPolicyDigest",
   "credentialPolicyRef",
-  "effectEnforcerSetDigest",
+  "effectEnforcerPolicyDigest",
   "generation",
   "networkPolicyDigest",
   "networkPolicyRef",
@@ -214,6 +287,34 @@ interface AssigneeLossRunTransition {
   runStateRevision: number;
 }
 
+interface HostedAssigneeRecoveryCandidate {
+  run: SqlRow;
+  previousAssignment: SqlRow;
+  fenceOutboxId: string;
+  previousTarget: {
+    binding: RuntimeBinding;
+    assignmentPlanRef: string;
+    assignmentPlanDigest: string;
+    assignmentPlanRuntimeAuthorizationGeneration: number;
+  };
+}
+
+interface PreparedHostedAssigneeRecovery {
+  recoveryId: string;
+  agentRunId: string;
+  fenceOutboxId: string;
+  previousRuntimeAuthorizationGeneration: number;
+  runtimeAuthorizationGeneration: number;
+  previousTarget: HostedAssigneeRecoveryCandidate["previousTarget"];
+  replacementBinding: RuntimeBinding;
+  replacementAssignmentPlanRef: string;
+  replacementAssignmentPlanDigest: string;
+  ensureOutboxId: string;
+  retireOutboxId: string;
+  ensurePayload: RuntimeOutboxPayload<"runtime.session.ensure">;
+  retirePayload: RuntimeOutboxPayload<"runtime.session.retire">;
+}
+
 type RuntimeOutboxPayload<K extends RuntimeOutboxKind> = Extract<
   RuntimeOutboxDelivery,
   { kind: K }
@@ -235,6 +336,7 @@ export function createTeamSessionKernel(
     runtimeWriteStateSnapshotSource: teamSessions.runtimeWriteStateSnapshotSourceForKernel(),
     runtimeLifecycleJournal: teamSessions.runtimeJournalForSupervisor(),
     runtimeReceiptFollowJournal: teamSessions.runtimeReceiptFollowJournalForSupervisor(),
+    hostedAssignmentPlanSource: teamSessions.hostedAssignmentPlanSourceForKernel(),
     ...(runtimeCompensationJournal === undefined ? {} : { runtimeCompensationJournal }),
     ...(runtimeCompensationMaterializer === undefined ? {} : { runtimeCompensationMaterializer }),
   });
@@ -246,6 +348,13 @@ class SqliteTeamSessions implements TeamSessions {
   private readonly clock: () => number;
   private readonly idGenerator: () => string;
   private readonly invitationTokenGenerator: () => string;
+  private readonly runtimeIncarnationGenerator: () => string;
+  private readonly hostedRuntimeObservationProvisioner?: HostedRuntimeObservationProvisioner;
+  private readonly hostedRuntimeActivationResolve?: (
+    query: Parameters<HostedRuntimeActivationSource["resolve"]>[0]
+  ) => HostedRuntimeActivation | null;
+  private readonly runtimeProfile: RuntimeDeploymentProfile;
+  private readonly hostedAssignmentPlanSource: HostedAssignmentPlanSource;
   private readonly runtimeCommandAuthorityIssuer?: RuntimeCommandAuthorityIssuer;
   private readonly runtimeAuthorizationSnapshotSource?: RuntimeAuthorizationSnapshotSource;
   private readonly runtimeEnforcementProofVerifier?: SynchronousRuntimeEnforcementProofVerifier;
@@ -299,6 +408,29 @@ class SqliteTeamSessions implements TeamSessions {
     ) {
       throw new TypeError("Runtime enforcement proof verifier is invalid");
     }
+    const runtimeProfile = snapshotRuntimeDeploymentProfile(
+      options.runtimeProfile ?? Object.freeze({ kind: "local-tmux" as const })
+    );
+    if (runtimeProfile.kind === "daytona" && runtimeSecurityComponentCount !== 3) {
+      throw new TypeError(
+        "Hosted Runtime requires the complete Runtime lifecycle security configuration"
+      );
+    }
+    if (
+      runtimeProfile.kind === "daytona" &&
+      typeof options.hostedRuntimeObservationProvisioner !== "function"
+    ) {
+      throw new TypeError("Hosted Runtime requires observation key provisioning");
+    }
+    if (runtimeProfile.kind === "daytona" && options.hostedRuntimeActivationSource === undefined) {
+      throw new TypeError("Hosted Runtime requires provider-bound activation settlement");
+    }
+    const runtimeLifecycleCommandTtlMs = boundedIntegerOption(
+      options.runtimeLifecycleCommandTtlMs ?? DEFAULT_RUNTIME_LIFECYCLE_COMMAND_TTL_MS,
+      1,
+      MAX_RUNTIME_LIFECYCLE_COMMAND_TTL_MS,
+      "Runtime lifecycle command TTL"
+    );
     this.database = openTeamSessionDatabase({
       filename:
         options.filename ??
@@ -310,17 +442,23 @@ class SqliteTeamSessions implements TeamSessions {
     this.idGenerator = options.idGenerator ?? crypto.randomUUID;
     this.invitationTokenGenerator =
       options.invitationTokenGenerator ?? (() => crypto.randomBytes(32).toString("base64url"));
+    this.runtimeIncarnationGenerator =
+      options.runtimeIncarnationGenerator ?? (() => crypto.randomBytes(32).toString("hex"));
+    this.hostedRuntimeObservationProvisioner = options.hostedRuntimeObservationProvisioner;
+    this.hostedRuntimeActivationResolve = captureHostedRuntimeActivationSource(
+      options.hostedRuntimeActivationSource
+    );
+    this.runtimeProfile = runtimeProfile;
     this.runtimeCommandAuthorityIssuer = options.runtimeCommandAuthorityIssuer;
     this.runtimeAuthorizationSnapshotSource = options.runtimeAuthorizationSnapshotSource;
     this.runtimeEnforcementProofVerifier = options.runtimeEnforcementProofVerifier;
-    this.runtimeLifecycleCommandTtlMs = boundedIntegerOption(
-      options.runtimeLifecycleCommandTtlMs ?? DEFAULT_RUNTIME_LIFECYCLE_COMMAND_TTL_MS,
-      1,
-      MAX_RUNTIME_LIFECYCLE_COMMAND_TTL_MS,
-      "Runtime lifecycle command TTL"
-    );
+    this.runtimeLifecycleCommandTtlMs = runtimeLifecycleCommandTtlMs;
     this.runtimeWriteStateSnapshotSource = createSqliteRuntimeWriteStateSnapshotSource({
       db: this.db,
+    });
+    this.hostedAssignmentPlanSource = Object.freeze({
+      resolve: (lookup: HostedAssignmentLookup) => this.resolveHostedAssignmentPlan(lookup),
+      isCurrent: (lookup: HostedAssignmentLookup) => this.isHostedAssignmentLookupCurrent(lookup),
     });
     this.runtimeLifecycle = createSqliteRuntimeLifecycleJournal({
       db: this.db,
@@ -375,6 +513,10 @@ class SqliteTeamSessions implements TeamSessions {
 
   runtimeReceiptFollowJournalForSupervisor(): SqliteRuntimeReceiptFollowJournal {
     return this.runtimeReceiptFollow;
+  }
+
+  hostedAssignmentPlanSourceForKernel(): HostedAssignmentPlanSource {
+    return this.hostedAssignmentPlanSource;
   }
 
   runtimeCompensationJournalForSupervisor(): SqliteRuntimeCompensationJournal | undefined {
@@ -1314,7 +1456,10 @@ class SqliteTeamSessions implements TeamSessions {
       "Session id"
     );
     const name = requiredText(command.name, "Session name", 160);
-    const tmuxName = command.tmuxName;
+    const tmuxName =
+      this.runtimeProfile.kind === "local-tmux" ? requiredLocalTmuxName(command.tmuxName) : null;
+    const runtimeKind = this.runtimeProfile.kind;
+    const isolation = runtimeKind === "local-tmux" ? "trusted-shared-host" : "isolated-hosted";
     const policy = command.steeringPolicy ?? "single";
     this.db
       .prepare(
@@ -1326,9 +1471,19 @@ class SqliteTeamSessions implements TeamSessions {
            next_sequence, runtime_kind,
            isolation, tmux_name, yolo_eligible, created_at_ms
          ) VALUES (?, ?, ?, ?, 'active', ?, 1, 1, 1, 1, 1, 1, 1, 'pending', 1,
-                   'local-tmux', 'trusted-shared-host', ?, 0, ?)`
+                   ?, ?, ?, 0, ?)`
       )
-      .run(sessionId, command.teamId, command.projectId, name, policy, tmuxName, now);
+      .run(
+        sessionId,
+        command.teamId,
+        command.projectId,
+        name,
+        policy,
+        runtimeKind,
+        isolation,
+        tmuxName,
+        now
+      );
     this.upsertParticipant(sessionId, command.actor.userId, now);
     for (const responsibility of RESPONSIBILITY_ORDER) {
       this.upsertResponsibility(sessionId, command.actor.userId, responsibility, now);
@@ -1339,19 +1494,22 @@ class SqliteTeamSessions implements TeamSessions {
       projectId: command.projectId,
       starterUserId: command.actor.userId,
       steeringPolicy: policy,
-      runtimeKind: "local-tmux",
-      isolation: "trusted-shared-host",
+      runtimeKind,
+      isolation,
       yoloEligible: false,
       runtimeAuthorizationGeneration: 1,
       runtimeAuthorizationState: "pending",
     });
     const outboxId = this.nextId("outbox");
-    const runtimeEnsurePayload: RuntimeOutboxPayload<"runtime.session.ensure"> = {
-      sessionId,
-      runtimeKind: "local-tmux",
-      tmuxName,
-      runtimeAuthorizationGeneration: 1,
-    };
+    const runtimeEnsurePayload: RuntimeOutboxPayload<"runtime.session.ensure"> =
+      this.runtimeProfile.kind === "local-tmux"
+        ? {
+            sessionId,
+            runtimeKind: "local-tmux",
+            tmuxName: tmuxName as string,
+            runtimeAuthorizationGeneration: 1,
+          }
+        : this.createHostedSessionAssignmentPlan(sessionId, command.teamId, command.projectId, now);
     this.db
       .prepare(
         `INSERT INTO runtime_outbox
@@ -1360,6 +1518,905 @@ class SqliteTeamSessions implements TeamSessions {
       )
       .run(outboxId, sessionId, event.sequence, JSON.stringify(runtimeEnsurePayload), now);
     return result(command, { sessionId, runtimeOutboxId: outboxId }, [event]);
+  }
+
+  private createHostedSessionAssignmentPlan(
+    sessionId: string,
+    teamId: string,
+    projectId: string,
+    now: number
+  ): Extract<RuntimeOutboxPayload<"runtime.session.ensure">, { runtimeKind: "daytona" }> {
+    if (this.runtimeProfile.kind !== "daytona") {
+      throw new TeamSessionError("conflict", "Hosted Runtime profile is unavailable");
+    }
+    const runtimeAssignmentId = this.nextId("runtime-assignment");
+    const sandboxId = this.nextId("sandbox");
+    const runtimePrincipalId = this.nextId("runtime-principal");
+    const binding: RuntimeBinding = Object.freeze({
+      teamId,
+      projectId,
+      sessionId,
+      runtimeAssignmentId,
+      runtimeAssignmentGeneration: 1,
+      sandboxId,
+      sandboxGeneration: 1,
+      runtimePrincipalId,
+    });
+    this.db
+      .prepare(
+        `INSERT INTO runtime_assignments (
+           id, session_id, team_id, project_id, generation, runtime_kind,
+           sandbox_id, sandbox_generation, runtime_principal_id,
+           runtime_authorization_generation, status, created_at_ms, retired_at_ms
+         ) VALUES (?, ?, ?, ?, 1, 'daytona', ?, 1, ?, 1, 'provisioning', ?, NULL)`
+      )
+      .run(runtimeAssignmentId, sessionId, teamId, projectId, sandboxId, runtimePrincipalId, now);
+    const assignment = this.requireRuntimeAssignment(runtimeAssignmentId);
+    return {
+      sessionId,
+      runtimeKind: "daytona",
+      runtimeAuthorizationGeneration: 1,
+      binding,
+      ...this.persistHostedAssignmentPlan(assignment, 1, now),
+    };
+  }
+
+  private persistHostedAssignmentPlan(
+    assignment: SqlRow,
+    runtimeAuthorizationGeneration: number,
+    now: number
+  ): { assignmentPlanRef: string; assignmentPlanDigest: string } {
+    if (this.runtimeProfile.kind !== "daytona" || assignment.runtime_kind !== "daytona") {
+      throw new TeamSessionError("conflict", "Hosted Runtime profile is unavailable");
+    }
+    const binding: RuntimeBinding = Object.freeze({
+      teamId: assignment.team_id as string,
+      projectId: assignment.project_id as string,
+      sessionId: assignment.session_id as string,
+      runtimeAssignmentId: assignment.id as string,
+      runtimeAssignmentGeneration: assignment.generation as number,
+      sandboxId: assignment.sandbox_id as string,
+      sandboxGeneration: assignment.sandbox_generation as number,
+      runtimePrincipalId: assignment.runtime_principal_id as string,
+    });
+    const incarnation = this.hostedAssignmentIncarnation(assignment.id as string);
+    const observation = this.provisionHostedObservationIdentity(
+      binding,
+      runtimeAuthorizationGeneration,
+      incarnation
+    );
+    const authorization = this.resolveRuntimeAuthorizationSnapshot(
+      binding.sessionId,
+      assignment,
+      runtimeAuthorizationGeneration
+    );
+    if (!authorization) {
+      throw new TeamSessionError(
+        "conflict",
+        "Trusted Runtime Authorization snapshot is unavailable"
+      );
+    }
+    if (
+      this.runtimeProfile.projectCeiling.networkPolicyDigest !==
+        authorization.networkPolicyDigest ||
+      this.runtimeProfile.projectCeiling.credentialPolicyDigest !==
+        authorization.credentialPolicyDigest ||
+      this.runtimeProfile.projectCeiling.isolationPolicyDigest !==
+        this.runtimeProfile.isolation.isolationPolicyDigest
+    ) {
+      throw new TeamSessionError(
+        "conflict",
+        "Hosted Runtime Project ceiling does not match enforced authorization"
+      );
+    }
+    this.db
+      .prepare(
+        `INSERT INTO runtime_authorization_epochs (
+           session_id, generation, runtime_assignment_id, runtime_assignment_generation,
+           sandbox_id, sandbox_generation, runtime_principal_id,
+           effect_enforcer_policy_digest, effect_enforcer_set_digest, created_at_ms
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+         ON CONFLICT(session_id, generation) DO NOTHING`
+      )
+      .run(
+        binding.sessionId,
+        runtimeAuthorizationGeneration,
+        binding.runtimeAssignmentId,
+        binding.runtimeAssignmentGeneration,
+        binding.sandboxId,
+        binding.sandboxGeneration,
+        binding.runtimePrincipalId,
+        authorization.effectEnforcerPolicyDigest,
+        now
+      );
+    this.runtimeReceiptFollow.register({
+      binding,
+      runtimeAuthorizationGeneration,
+      issuerKeyId: observation.issuerKeyId,
+      publicKeySpkiPem: observation.publicKeySpkiPem,
+      createdAtMs: now,
+    });
+    const spec: RuntimeSpec = Object.freeze({
+      binding,
+      source: this.runtimeProfile.source,
+      harnessRef: this.runtimeProfile.harnessRef,
+      projectCeiling: this.runtimeProfile.projectCeiling,
+      authorization,
+      checkpointPolicyRef: this.runtimeProfile.checkpointPolicyRef,
+      adapterConfigurationRef: this.runtimeProfile.adapterConfigurationRef,
+    });
+    const specJson = canonicalRuntimeJson(spec);
+    const specificationDigest = hostedRuntimeDigest("terminalx/hosted-runtime-spec/v1\0", specJson);
+    const plan: HostedRuntimeAssignmentPlan = Object.freeze({
+      binding,
+      runtimeAuthorizationGeneration,
+      incarnation,
+      specificationDigest,
+      effectEnforcerPolicyDigest: authorization.effectEnforcerPolicyDigest,
+      adapterConfigurationRef: this.runtimeProfile.adapterConfigurationRef,
+      observation,
+      isolation: this.runtimeProfile.isolation,
+      capabilities: this.runtimeProfile.capabilities,
+    });
+    const planJson = canonicalRuntimeJson(plan);
+    const assignmentPlanRef = this.nextId("runtime-plan");
+    const assignmentPlanDigest = hostedRuntimeDigest(
+      "terminalx/hosted-runtime-assignment-plan/v1\0",
+      planJson
+    );
+    this.db
+      .prepare(
+        `INSERT INTO hosted_runtime_assignment_plans (
+           plan_ref, plan_digest, specification_digest, team_id, project_id, session_id,
+           runtime_assignment_id, runtime_assignment_generation, sandbox_id,
+           sandbox_generation, runtime_principal_id, runtime_authorization_generation,
+           plan_json, spec_json, created_at_ms
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        assignmentPlanRef,
+        assignmentPlanDigest,
+        specificationDigest,
+        binding.teamId,
+        binding.projectId,
+        binding.sessionId,
+        binding.runtimeAssignmentId,
+        binding.runtimeAssignmentGeneration,
+        binding.sandboxId,
+        binding.sandboxGeneration,
+        binding.runtimePrincipalId,
+        runtimeAuthorizationGeneration,
+        planJson,
+        specJson,
+        now
+      );
+    return { assignmentPlanRef, assignmentPlanDigest };
+  }
+
+  private provisionHostedObservationIdentity(
+    binding: RuntimeBinding,
+    runtimeAuthorizationGeneration: number,
+    incarnation: string
+  ): HostedRuntimeAssignmentPlan["observation"] {
+    if (this.runtimeProfile.kind !== "daytona" || !this.hostedRuntimeObservationProvisioner) {
+      throw new TeamSessionError(
+        "conflict",
+        "Hosted Runtime observation key provisioning is unavailable"
+      );
+    }
+    let unsafeRegistration: unknown;
+    try {
+      unsafeRegistration = this.hostedRuntimeObservationProvisioner(
+        Object.freeze({
+          binding,
+          runtimeAuthorizationGeneration,
+          incarnation,
+          adapterConfigurationRef: this.runtimeProfile.adapterConfigurationRef,
+        })
+      );
+    } catch {
+      throw new TeamSessionError("conflict", "Hosted Runtime observation key provisioning failed");
+    }
+    const fields = ["issuerKeyId", "keyProvisioningRef", "publicKeySpkiPem"] as const;
+    if (
+      typeof unsafeRegistration !== "object" ||
+      unsafeRegistration === null ||
+      Array.isArray(unsafeRegistration) ||
+      nodeTypes.isProxy(unsafeRegistration) ||
+      (Object.getPrototypeOf(unsafeRegistration) !== Object.prototype &&
+        Object.getPrototypeOf(unsafeRegistration) !== null) ||
+      Object.getOwnPropertySymbols(unsafeRegistration).length !== 0
+    ) {
+      throw new TeamSessionError(
+        "conflict",
+        "Hosted Runtime observation key registration is invalid"
+      );
+    }
+    const descriptors = Object.getOwnPropertyDescriptors(unsafeRegistration);
+    const names = Object.getOwnPropertyNames(unsafeRegistration).sort();
+    if (
+      names.length !== fields.length ||
+      names.some((name, index) => name !== [...fields].sort()[index]) ||
+      fields.some((field) => {
+        const descriptor = descriptors[field];
+        return !descriptor || !("value" in descriptor) || descriptor.enumerable !== true;
+      })
+    ) {
+      throw new TeamSessionError(
+        "conflict",
+        "Hosted Runtime observation key registration is invalid"
+      );
+    }
+    const keyProvisioningRef = descriptors.keyProvisioningRef!.value;
+    const issuerKeyId = descriptors.issuerKeyId!.value;
+    const publicKeySpkiPem = descriptors.publicKeySpkiPem!.value;
+    if (
+      !isSafeRuntimeAuthorizationRef(keyProvisioningRef) ||
+      !isSafeRuntimeAuthorizationRef(issuerKeyId) ||
+      !isValidHostedObservationPublicKey(publicKeySpkiPem)
+    ) {
+      throw new TeamSessionError(
+        "conflict",
+        "Hosted Runtime observation key registration is invalid"
+      );
+    }
+    const publicKeySpkiDigest = crypto
+      .createHash("sha256")
+      .update(crypto.createPublicKey(publicKeySpkiPem).export({ format: "der", type: "spki" }))
+      .digest("hex");
+    const reused = this.db
+      .prepare(
+        `SELECT 1
+         FROM runtime_principal_observation_keys key
+         WHERE key.runtime_assignment_id <> ? AND (
+           key.issuer_key_id = ? OR key.public_key_spki_digest = ?
+         )
+         UNION ALL
+         SELECT 1
+         FROM hosted_runtime_assignment_plans plan
+         WHERE plan.runtime_assignment_id <> ?
+           AND json_extract(plan.plan_json, '$.observation.keyProvisioningRef') = ?
+         LIMIT 1`
+      )
+      .get(
+        binding.runtimeAssignmentId,
+        issuerKeyId,
+        publicKeySpkiDigest,
+        binding.runtimeAssignmentId,
+        keyProvisioningRef
+      );
+    if (reused) {
+      throw new TeamSessionError(
+        "conflict",
+        "Hosted Runtime observation identity was already assigned"
+      );
+    }
+    return Object.freeze({ keyProvisioningRef, issuerKeyId, publicKeySpkiPem });
+  }
+
+  private hostedAssignmentIncarnation(runtimeAssignmentId: string): string {
+    const existing = this.db
+      .prepare(
+        `SELECT json_extract(plan_json, '$.incarnation') AS incarnation
+         FROM hosted_runtime_assignment_plans
+         WHERE runtime_assignment_id = ?
+         ORDER BY runtime_authorization_generation ASC LIMIT 1`
+      )
+      .get(runtimeAssignmentId) as SqlRow | undefined;
+    return requiredHostedIncarnation(existing?.incarnation ?? this.runtimeIncarnationGenerator());
+  }
+
+  private prepareHostedFenceAssignment(
+    sessionId: string,
+    runtimeAuthorizationGeneration: number,
+    runtimeAuthorizationState: "pending" | "quarantined",
+    now: number
+  ): {
+    runtimeKind: "daytona";
+    binding: RuntimeBinding;
+    assignmentPlanRef: string;
+    assignmentPlanDigest: string;
+    assignmentPlanRuntimeAuthorizationGeneration: number;
+  } {
+    const assignment = this.db
+      .prepare(
+        `SELECT * FROM runtime_assignments
+         WHERE session_id = ? AND status IN (
+           'provisioning', 'ready', 'checkpointing', 'recovering', 'quarantined'
+         ) ORDER BY generation DESC LIMIT 1`
+      )
+      .get(sessionId) as SqlRow | undefined;
+    if (!assignment || assignment.runtime_kind !== "daytona") {
+      throw new TeamSessionError("conflict", "Hosted Runtime Assignment is unavailable");
+    }
+    const target = this.hostedAssignmentTransitionTarget(
+      assignment,
+      runtimeAuthorizationGeneration
+    );
+    if (assignment.runtime_authorization_generation !== runtimeAuthorizationGeneration) {
+      const updated = this.db
+        .prepare(
+          `UPDATE runtime_assignments
+           SET runtime_authorization_generation = ?,
+               status = CASE
+                 WHEN status IN ('provisioning', 'quarantined') OR ? = 'quarantined'
+                   THEN 'quarantined'
+                 ELSE 'recovering'
+               END
+           WHERE id = ? AND runtime_authorization_generation < ?
+             AND status IN (
+               'provisioning', 'ready', 'checkpointing', 'recovering', 'quarantined'
+             )`
+        )
+        .run(
+          runtimeAuthorizationGeneration,
+          runtimeAuthorizationState,
+          assignment.id,
+          runtimeAuthorizationGeneration
+        );
+      if (updated.changes !== 1) {
+        throw new TeamSessionError("stale-revision", "Hosted Runtime Assignment changed");
+      }
+      this.recordRuntimeAuthorizationEpoch(
+        sessionId,
+        this.requireRuntimeAssignment(assignment.id as string),
+        runtimeAuthorizationGeneration,
+        now
+      );
+    }
+    return {
+      runtimeKind: "daytona",
+      ...target,
+    };
+  }
+
+  private hostedAssignmentTransitionTarget(
+    assignment: SqlRow,
+    runtimeAuthorizationGeneration: number
+  ): {
+    binding: RuntimeBinding;
+    assignmentPlanRef: string;
+    assignmentPlanDigest: string;
+    assignmentPlanRuntimeAuthorizationGeneration: number;
+  } {
+    if (this.runtimeProfile.kind !== "daytona" || assignment.runtime_kind !== "daytona") {
+      throw new TeamSessionError("conflict", "Hosted Runtime profile is unavailable");
+    }
+    const binding = runtimeBindingFromAssignment(assignment);
+    const row = this.db
+      .prepare(
+        `SELECT plan_ref, plan_digest, runtime_authorization_generation
+         FROM hosted_runtime_assignment_plans
+         WHERE runtime_assignment_id = ? AND runtime_authorization_generation < ?
+         ORDER BY runtime_authorization_generation DESC LIMIT 1`
+      )
+      .get(binding.runtimeAssignmentId, runtimeAuthorizationGeneration) as SqlRow | undefined;
+    if (!row) {
+      throw new TeamSessionError(
+        "conflict",
+        "Hosted Runtime provider Assignment Plan is unavailable"
+      );
+    }
+    const assignmentPlanRuntimeAuthorizationGeneration = positiveHostedInteger(
+      row.runtime_authorization_generation
+    );
+    const plan = this.resolveHostedAssignmentPlan({
+      kind: "binding",
+      binding,
+      runtimeAuthorizationGeneration: assignmentPlanRuntimeAuthorizationGeneration,
+    });
+    if (!plan || !isSafeRuntimeAuthorizationRef(row.plan_ref) || !isSha256Digest(row.plan_digest)) {
+      throw new TeamSessionError("conflict", "Hosted Runtime provider Assignment Plan is invalid");
+    }
+    return {
+      binding,
+      assignmentPlanRef: row.plan_ref,
+      assignmentPlanDigest: row.plan_digest,
+      assignmentPlanRuntimeAuthorizationGeneration,
+    };
+  }
+
+  private resolveHostedAssignmentPlan(
+    lookup: HostedAssignmentLookup
+  ): HostedRuntimeAssignmentPlan | null {
+    try {
+      let row: SqlRow | undefined;
+      let expectedBinding: RuntimeBinding;
+      let expectedGeneration: number;
+      if (lookup.kind === "binding") {
+        expectedBinding = lookup.binding;
+        expectedGeneration = lookup.runtimeAuthorizationGeneration;
+        row = this.db
+          .prepare(
+            `SELECT * FROM hosted_runtime_assignment_plans
+             WHERE team_id = ? AND project_id = ? AND session_id = ?
+               AND runtime_assignment_id = ? AND runtime_assignment_generation = ?
+               AND sandbox_id = ? AND sandbox_generation = ? AND runtime_principal_id = ?
+               AND runtime_authorization_generation = ?`
+          )
+          .get(
+            expectedBinding.teamId,
+            expectedBinding.projectId,
+            expectedBinding.sessionId,
+            expectedBinding.runtimeAssignmentId,
+            expectedBinding.runtimeAssignmentGeneration,
+            expectedBinding.sandboxId,
+            expectedBinding.sandboxGeneration,
+            expectedBinding.runtimePrincipalId,
+            expectedGeneration
+          ) as SqlRow | undefined;
+      } else if (lookup.kind === "session") {
+        expectedGeneration = positiveHostedInteger(lookup.runtimeAuthorizationGeneration);
+        row = this.db
+          .prepare(
+            `SELECT plan.* FROM hosted_runtime_assignment_plans plan
+             JOIN runtime_assignments assignment ON assignment.id = plan.runtime_assignment_id
+             JOIN sessions session ON session.id = plan.session_id
+             WHERE plan.session_id = ? AND plan.runtime_authorization_generation = ?
+               AND assignment.runtime_authorization_generation =
+                 plan.runtime_authorization_generation
+               AND assignment.status = 'ready' AND assignment.runtime_kind = 'daytona'
+               AND session.runtime_authorization_generation =
+                 plan.runtime_authorization_generation
+               AND session.runtime_authorization_state = 'enforced'
+               AND session.runtime_kind = 'daytona' AND session.status = 'active'`
+          )
+          .get(lookup.sessionId, expectedGeneration) as SqlRow | undefined;
+        if (!row) return null;
+        expectedBinding = snapshotHostedRuntimeBinding({
+          teamId: row.team_id,
+          projectId: row.project_id,
+          sessionId: row.session_id,
+          runtimeAssignmentId: row.runtime_assignment_id,
+          runtimeAssignmentGeneration: row.runtime_assignment_generation,
+          sandboxId: row.sandbox_id,
+          sandboxGeneration: row.sandbox_generation,
+          runtimePrincipalId: row.runtime_principal_id,
+        });
+      } else {
+        const payload = hostedPayloadRecord(lookup.delivery.payload);
+        if (
+          payload.runtimeKind !== "daytona" ||
+          typeof payload.assignmentPlanRef !== "string" ||
+          typeof payload.assignmentPlanDigest !== "string"
+        ) {
+          return null;
+        }
+        expectedBinding = snapshotHostedRuntimeBinding(payload.binding);
+        expectedGeneration = positiveHostedInteger(
+          lookup.delivery.kind === "runtime.session.ensure"
+            ? payload.runtimeAuthorizationGeneration
+            : payload.assignmentPlanRuntimeAuthorizationGeneration
+        );
+        row = this.db
+          .prepare(
+            `SELECT * FROM hosted_runtime_assignment_plans
+             WHERE plan_ref = ? AND plan_digest = ?`
+          )
+          .get(payload.assignmentPlanRef, payload.assignmentPlanDigest) as SqlRow | undefined;
+      }
+      if (!row || !hostedPlanRowMatches(row, expectedBinding, expectedGeneration)) return null;
+      const planJson = row.plan_json as string;
+      const specJson = row.spec_json as string;
+      if (
+        hostedRuntimeDigest("terminalx/hosted-runtime-assignment-plan/v1\0", planJson) !==
+          row.plan_digest ||
+        hostedRuntimeDigest("terminalx/hosted-runtime-spec/v1\0", specJson) !==
+          row.specification_digest
+      ) {
+        return null;
+      }
+      const plan = JSON.parse(planJson) as unknown;
+      const spec = JSON.parse(specJson) as unknown;
+      if (canonicalRuntimeJson(plan) !== planJson || canonicalRuntimeJson(spec) !== specJson) {
+        return null;
+      }
+      const planRecord = hostedPayloadRecord(plan);
+      const specRecord = hostedPayloadRecord(spec);
+      const planBinding = snapshotHostedRuntimeBinding(planRecord.binding);
+      const specBinding = snapshotHostedRuntimeBinding(specRecord.binding);
+      if (
+        !sameHostedRuntimeBinding(planBinding, expectedBinding) ||
+        !sameHostedRuntimeBinding(specBinding, expectedBinding) ||
+        planRecord.runtimeAuthorizationGeneration !== expectedGeneration ||
+        planRecord.specificationDigest !== row.specification_digest
+      ) {
+        return null;
+      }
+      return deepFreezeHostedValue(plan) as HostedRuntimeAssignmentPlan;
+    } catch {
+      return null;
+    }
+  }
+
+  private hostedOutboxBindingIsCurrent(
+    payload: Record<string, unknown>,
+    sessionId: string,
+    generation: number,
+    kind: RuntimeOutboxKind
+  ): boolean {
+    try {
+      if (
+        payload.runtimeKind !== "daytona" ||
+        typeof payload.assignmentPlanRef !== "string" ||
+        typeof payload.assignmentPlanDigest !== "string"
+      ) {
+        return false;
+      }
+      const binding = snapshotHostedRuntimeBinding(payload.binding);
+      if (binding.sessionId !== sessionId) return false;
+      if (positiveHostedInteger(payload.runtimeAuthorizationGeneration) !== generation)
+        return false;
+      if (kind === "runtime.session.retire" && payload.reason === "assignee-replacement") {
+        return this.hostedRecoveryRetireIsCurrent(payload, binding, sessionId, generation);
+      }
+      if (
+        kind === "runtime.session.ensure" &&
+        payload.recoveryId !== undefined &&
+        !this.hostedRecoveryEnsureIsCurrent(payload, binding, sessionId, generation)
+      ) {
+        return false;
+      }
+      const assignmentPlanRuntimeAuthorizationGeneration =
+        kind === "runtime.session.ensure"
+          ? generation
+          : positiveHostedInteger(payload.assignmentPlanRuntimeAuthorizationGeneration);
+      if (
+        (kind === "runtime.session.ensure" &&
+          assignmentPlanRuntimeAuthorizationGeneration !== generation) ||
+        (kind !== "runtime.session.ensure" &&
+          assignmentPlanRuntimeAuthorizationGeneration >= generation)
+      ) {
+        return false;
+      }
+      const allowedStatuses =
+        kind === "runtime.session.ensure"
+          ? new Set(["provisioning", "ready"])
+          : kind === "runtime.session.retire"
+            ? new Set(["quarantined"])
+            : null;
+      const row = this.db
+        .prepare(
+          `SELECT assignment.status FROM hosted_runtime_assignment_plans plan
+           JOIN runtime_assignments assignment ON assignment.id = plan.runtime_assignment_id
+           JOIN sessions session ON session.id = plan.session_id
+           WHERE plan.plan_ref = ? AND plan.plan_digest = ?
+             AND plan.team_id = ? AND plan.project_id = ? AND plan.session_id = ?
+             AND plan.runtime_assignment_id = ? AND plan.runtime_assignment_generation = ?
+             AND plan.sandbox_id = ? AND plan.sandbox_generation = ?
+             AND plan.runtime_principal_id = ?
+             AND plan.runtime_authorization_generation = ?
+             AND assignment.runtime_authorization_generation = ?
+             AND session.runtime_authorization_generation = ?
+             AND (? = 'runtime.session.ensure' OR NOT EXISTS (
+               SELECT 1 FROM hosted_runtime_assignment_plans newer
+               WHERE newer.runtime_assignment_id = plan.runtime_assignment_id
+                 AND newer.runtime_authorization_generation >
+                   plan.runtime_authorization_generation
+                 AND newer.runtime_authorization_generation < ?
+             ))
+             AND assignment.status IN (
+               'provisioning', 'ready', 'checkpointing', 'recovering', 'quarantined'
+             )
+             AND assignment.runtime_kind = 'daytona'
+             AND session.runtime_kind = 'daytona' AND session.tmux_name IS NULL
+             AND session.status <> 'ended'`
+        )
+        .get(
+          payload.assignmentPlanRef,
+          payload.assignmentPlanDigest,
+          binding.teamId,
+          binding.projectId,
+          binding.sessionId,
+          binding.runtimeAssignmentId,
+          binding.runtimeAssignmentGeneration,
+          binding.sandboxId,
+          binding.sandboxGeneration,
+          binding.runtimePrincipalId,
+          assignmentPlanRuntimeAuthorizationGeneration,
+          generation,
+          generation,
+          kind,
+          generation
+        ) as SqlRow | undefined;
+      return (
+        row !== undefined && (allowedStatuses === null || allowedStatuses.has(row.status as string))
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  private hostedRecoveryEnsureIsCurrent(
+    payload: Record<string, unknown>,
+    replacementBinding: RuntimeBinding,
+    sessionId: string,
+    generation: number
+  ): boolean {
+    try {
+      const recoveryId = requiredHostedOutboxIdentifier(payload.recoveryId);
+      const agentRunId = requiredHostedOutboxIdentifier(payload.agentRunId);
+      const fenceOutboxId = requiredHostedOutboxIdentifier(payload.fenceOutboxId);
+      const previousGeneration = positiveHostedInteger(
+        payload.previousRuntimeAuthorizationGeneration
+      );
+      const previousPlanGeneration = positiveHostedInteger(
+        payload.previousAssignmentPlanRuntimeAuthorizationGeneration
+      );
+      const previousBinding = snapshotHostedRuntimeBinding(payload.previousBinding);
+      if (
+        previousGeneration + 1 !== generation ||
+        previousPlanGeneration >= previousGeneration ||
+        previousBinding.sessionId !== sessionId ||
+        sameHostedRuntimeBinding(previousBinding, replacementBinding) ||
+        !isSafeRuntimeAuthorizationRef(payload.previousAssignmentPlanRef) ||
+        !isSha256Digest(payload.previousAssignmentPlanDigest) ||
+        !isSafeRuntimeAuthorizationRef(payload.assignmentPlanRef) ||
+        !isSha256Digest(payload.assignmentPlanDigest)
+      ) {
+        return false;
+      }
+      return Boolean(
+        this.db
+          .prepare(
+            `SELECT 1
+             FROM sessions session
+             JOIN runtime_assignments replacement
+               ON replacement.id = ? AND replacement.session_id = session.id
+             JOIN hosted_runtime_assignment_plans replacement_plan
+               ON replacement_plan.plan_ref = ? AND replacement_plan.plan_digest = ?
+              AND replacement_plan.runtime_assignment_id = replacement.id
+              AND replacement_plan.runtime_authorization_generation = ?
+             JOIN runtime_assignments previous
+               ON previous.id = ? AND previous.session_id = session.id
+             JOIN hosted_runtime_assignment_plans previous_plan
+               ON previous_plan.plan_ref = ? AND previous_plan.plan_digest = ?
+              AND previous_plan.runtime_assignment_id = previous.id
+              AND previous_plan.runtime_authorization_generation = ?
+             JOIN agent_runs run ON run.id = ? AND run.session_id = session.id
+             JOIN runtime_outbox fence ON fence.id = ? AND fence.session_id = session.id
+             JOIN session_events recovery_event
+               ON recovery_event.session_id = session.id
+              AND recovery_event.type = 'session.hosted-runtime.recovery.requested'
+              AND json_extract(recovery_event.payload_json, '$.recoveryId') = ?
+             WHERE session.id = ? AND session.status = 'active'
+               AND session.runtime_kind = 'daytona'
+               AND session.runtime_authorization_generation = ?
+               AND session.runtime_authorization_state = 'pending'
+               AND replacement.generation = ? AND replacement.sandbox_id = ?
+               AND replacement.sandbox_generation = ?
+               AND replacement.runtime_principal_id = ?
+               AND replacement.runtime_authorization_generation = ?
+               AND replacement.status IN ('provisioning', 'ready')
+               AND previous.generation = ? AND previous.sandbox_id = ?
+               AND previous.sandbox_generation = ? AND previous.runtime_principal_id = ?
+               AND previous.runtime_authorization_generation = ?
+               AND previous.status IN ('recovering', 'retired')
+               AND run.runtime_assignment_id = previous.id
+               AND run.runtime_authorization_generation = ?
+               AND run.lifecycle IN ('paused', 'agent-work-finished')
+               AND fence.kind = 'runtime.authorization.fence' AND fence.status = 'delivered'
+               AND json_extract(fence.payload_json, '$.reason') = 'assignee-loss'
+               AND json_extract(fence.payload_json, '$.runtimeAuthorizationGeneration') = ?
+               AND json_extract(fence.payload_json, '$.binding.runtimeAssignmentId') = previous.id
+               AND json_extract(
+                 recovery_event.payload_json, '$.replacementBinding.runtimeAssignmentId'
+               ) = replacement.id
+               AND json_extract(
+                 recovery_event.payload_json, '$.previousBinding.runtimeAssignmentId'
+               ) = previous.id`
+          )
+          .get(
+            replacementBinding.runtimeAssignmentId,
+            payload.assignmentPlanRef,
+            payload.assignmentPlanDigest,
+            generation,
+            previousBinding.runtimeAssignmentId,
+            payload.previousAssignmentPlanRef,
+            payload.previousAssignmentPlanDigest,
+            previousPlanGeneration,
+            agentRunId,
+            fenceOutboxId,
+            recoveryId,
+            sessionId,
+            generation,
+            replacementBinding.runtimeAssignmentGeneration,
+            replacementBinding.sandboxId,
+            replacementBinding.sandboxGeneration,
+            replacementBinding.runtimePrincipalId,
+            generation,
+            previousBinding.runtimeAssignmentGeneration,
+            previousBinding.sandboxId,
+            previousBinding.sandboxGeneration,
+            previousBinding.runtimePrincipalId,
+            previousGeneration,
+            previousGeneration,
+            previousGeneration
+          )
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  private hostedRecoveryRetireIsCurrent(
+    payload: Record<string, unknown>,
+    previousBinding: RuntimeBinding,
+    sessionId: string,
+    generation: number
+  ): boolean {
+    try {
+      const recoveryId = requiredHostedOutboxIdentifier(payload.recoveryId);
+      const agentRunId = requiredHostedOutboxIdentifier(payload.agentRunId);
+      const fenceOutboxId = requiredHostedOutboxIdentifier(payload.fenceOutboxId);
+      const previousGeneration = positiveHostedInteger(
+        payload.previousRuntimeAuthorizationGeneration
+      );
+      const previousPlanGeneration = positiveHostedInteger(
+        payload.assignmentPlanRuntimeAuthorizationGeneration
+      );
+      const replacementBinding = snapshotHostedRuntimeBinding(payload.replacementBinding);
+      if (
+        previousGeneration + 1 !== generation ||
+        previousPlanGeneration >= previousGeneration ||
+        replacementBinding.sessionId !== sessionId ||
+        sameHostedRuntimeBinding(previousBinding, replacementBinding) ||
+        !isSafeRuntimeAuthorizationRef(payload.assignmentPlanRef) ||
+        !isSha256Digest(payload.assignmentPlanDigest) ||
+        !isSafeRuntimeAuthorizationRef(payload.replacementAssignmentPlanRef) ||
+        !isSha256Digest(payload.replacementAssignmentPlanDigest)
+      ) {
+        return false;
+      }
+      return Boolean(
+        this.db
+          .prepare(
+            `SELECT 1
+             FROM sessions session
+             JOIN runtime_assignments previous
+               ON previous.id = ? AND previous.session_id = session.id
+             JOIN hosted_runtime_assignment_plans previous_plan
+               ON previous_plan.plan_ref = ? AND previous_plan.plan_digest = ?
+              AND previous_plan.runtime_assignment_id = previous.id
+              AND previous_plan.runtime_authorization_generation = ?
+             JOIN runtime_assignments replacement
+               ON replacement.id = ? AND replacement.session_id = session.id
+             JOIN hosted_runtime_assignment_plans replacement_plan
+               ON replacement_plan.plan_ref = ? AND replacement_plan.plan_digest = ?
+              AND replacement_plan.runtime_assignment_id = replacement.id
+              AND replacement_plan.runtime_authorization_generation = ?
+             JOIN agent_runs run ON run.id = ? AND run.session_id = session.id
+             JOIN runtime_outbox fence ON fence.id = ? AND fence.session_id = session.id
+             JOIN session_events recovery_event
+               ON recovery_event.session_id = session.id
+              AND recovery_event.type = 'session.hosted-runtime.recovery.requested'
+              AND json_extract(recovery_event.payload_json, '$.recoveryId') = ?
+             WHERE session.id = ?
+               AND session.runtime_kind = 'daytona'
+               AND session.runtime_authorization_generation >= ?
+               AND session.runtime_authorization_state IN ('pending', 'enforced', 'quarantined')
+               AND previous.generation = ? AND previous.sandbox_id = ?
+               AND previous.sandbox_generation = ? AND previous.runtime_principal_id = ?
+               AND previous.runtime_authorization_generation = ?
+               AND previous.status = 'recovering'
+               AND replacement.generation = ? AND replacement.sandbox_id = ?
+               AND replacement.sandbox_generation = ?
+               AND replacement.runtime_principal_id = ?
+               AND replacement.runtime_authorization_generation >= ?
+               AND replacement.status IN (
+                 'provisioning', 'ready', 'checkpointing', 'recovering',
+                 'quarantined', 'retired'
+               )
+               AND fence.kind = 'runtime.authorization.fence' AND fence.status = 'delivered'
+               AND json_extract(fence.payload_json, '$.reason') = 'assignee-loss'
+               AND json_extract(fence.payload_json, '$.runtimeAuthorizationGeneration') = ?
+               AND json_extract(fence.payload_json, '$.binding.runtimeAssignmentId') = previous.id
+               AND json_extract(
+                 recovery_event.payload_json, '$.replacementBinding.runtimeAssignmentId'
+               ) = replacement.id
+               AND json_extract(
+                 recovery_event.payload_json, '$.previousBinding.runtimeAssignmentId'
+               ) = previous.id`
+          )
+          .get(
+            previousBinding.runtimeAssignmentId,
+            payload.assignmentPlanRef,
+            payload.assignmentPlanDigest,
+            previousPlanGeneration,
+            replacementBinding.runtimeAssignmentId,
+            payload.replacementAssignmentPlanRef,
+            payload.replacementAssignmentPlanDigest,
+            generation,
+            agentRunId,
+            fenceOutboxId,
+            recoveryId,
+            sessionId,
+            generation,
+            previousBinding.runtimeAssignmentGeneration,
+            previousBinding.sandboxId,
+            previousBinding.sandboxGeneration,
+            previousBinding.runtimePrincipalId,
+            previousGeneration,
+            replacementBinding.runtimeAssignmentGeneration,
+            replacementBinding.sandboxId,
+            replacementBinding.sandboxGeneration,
+            replacementBinding.runtimePrincipalId,
+            generation,
+            previousGeneration
+          )
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  private isHostedAssignmentLookupCurrent(lookup: HostedAssignmentLookup): boolean {
+    try {
+      const plan = this.resolveHostedAssignmentPlan(lookup);
+      if (!plan) return false;
+      if (lookup.kind === "delivery") {
+        const payload = hostedPayloadRecord(lookup.delivery.payload);
+        return this.hostedOutboxBindingIsCurrent(
+          payload,
+          lookup.delivery.sessionId,
+          positiveHostedInteger(payload.runtimeAuthorizationGeneration),
+          lookup.delivery.kind
+        );
+      }
+      if (lookup.kind === "session") {
+        return Boolean(
+          this.db
+            .prepare(
+              `SELECT 1 FROM hosted_runtime_assignment_plans plan
+               JOIN runtime_assignments assignment ON assignment.id = plan.runtime_assignment_id
+               JOIN sessions session ON session.id = plan.session_id
+               WHERE plan.session_id = ? AND plan.runtime_authorization_generation = ?
+                 AND assignment.runtime_authorization_generation =
+                   plan.runtime_authorization_generation
+                 AND assignment.status = 'ready' AND assignment.runtime_kind = 'daytona'
+                 AND session.runtime_authorization_generation =
+                   plan.runtime_authorization_generation
+                 AND session.runtime_authorization_state = 'enforced'
+                 AND session.runtime_kind = 'daytona' AND session.status = 'active'`
+            )
+            .get(lookup.sessionId, lookup.runtimeAuthorizationGeneration)
+        );
+      }
+      const binding = plan.binding;
+      return Boolean(
+        this.db
+          .prepare(
+            `SELECT 1 FROM hosted_runtime_assignment_plans plan
+             JOIN runtime_assignments assignment ON assignment.id = plan.runtime_assignment_id
+             JOIN sessions session ON session.id = plan.session_id
+             WHERE plan.team_id = ? AND plan.project_id = ? AND plan.session_id = ?
+               AND plan.runtime_assignment_id = ? AND plan.runtime_assignment_generation = ?
+               AND plan.sandbox_id = ? AND plan.sandbox_generation = ?
+               AND plan.runtime_principal_id = ?
+               AND plan.runtime_authorization_generation = ?
+               AND assignment.runtime_authorization_generation =
+                 plan.runtime_authorization_generation
+               AND session.runtime_authorization_generation =
+                 plan.runtime_authorization_generation
+               AND assignment.status IN (
+                 'provisioning', 'ready', 'checkpointing', 'recovering', 'quarantined'
+               ) AND session.status <> 'ended'`
+          )
+          .get(
+            binding.teamId,
+            binding.projectId,
+            binding.sessionId,
+            binding.runtimeAssignmentId,
+            binding.runtimeAssignmentGeneration,
+            binding.sandboxId,
+            binding.sandboxGeneration,
+            binding.runtimePrincipalId,
+            plan.runtimeAuthorizationGeneration
+          )
+      );
+    } catch {
+      return false;
+    }
   }
 
   private createInvitation(
@@ -2252,6 +3309,7 @@ class SqliteTeamSessions implements TeamSessions {
     if (this.activeResponsibilityHolder(command.sessionId, "assignee")) {
       throw new TeamSessionError("conflict", "Session already has an Assignee");
     }
+    const hostedRecoveryCandidate = this.hostedAssigneeRecoveryCandidate(session);
 
     const wasSupervisor = this.hasResponsibility(
       command.sessionId,
@@ -2266,7 +3324,12 @@ class SqliteTeamSessions implements TeamSessions {
     const supervisionRevision = wasSupervisor
       ? (session.supervision_revision as number)
       : this.advanceSupervisionRevision(command.sessionId);
-    this.db.prepare("UPDATE sessions SET status = 'active' WHERE id = ?").run(command.sessionId);
+    const hostedRecovery = hostedRecoveryCandidate
+      ? this.prepareHostedAssigneeRecovery(session, hostedRecoveryCandidate, now)
+      : undefined;
+    if (!hostedRecovery) {
+      this.db.prepare("UPDATE sessions SET status = 'active' WHERE id = ?").run(command.sessionId);
+    }
     const cancelled = this.cancelOfferedHandoffs(
       command.sessionId,
       now,
@@ -2296,10 +3359,59 @@ class SqliteTeamSessions implements TeamSessions {
         participantId: participant.id,
         assigneeRevision,
         supervisionRevision,
-        runtimeAuthorizationGeneration: session.runtime_authorization_generation,
-        runtimeAuthorizationState: session.runtime_authorization_state,
+        runtimeAuthorizationGeneration:
+          hostedRecovery?.runtimeAuthorizationGeneration ??
+          session.runtime_authorization_generation,
+        runtimeAuthorizationState:
+          hostedRecovery === undefined ? session.runtime_authorization_state : "pending",
       })
     );
+    if (hostedRecovery) {
+      const recoveryEvent = this.appendEvent(
+        command.sessionId,
+        command,
+        now,
+        "session.hosted-runtime.recovery.requested",
+        {
+          recoveryId: hostedRecovery.recoveryId,
+          agentRunId: hostedRecovery.agentRunId,
+          fenceOutboxId: hostedRecovery.fenceOutboxId,
+          previousRuntimeAuthorizationGeneration:
+            hostedRecovery.previousRuntimeAuthorizationGeneration,
+          runtimeAuthorizationGeneration: hostedRecovery.runtimeAuthorizationGeneration,
+          previousBinding: hostedRecovery.previousTarget.binding,
+          previousAssignmentPlanRef: hostedRecovery.previousTarget.assignmentPlanRef,
+          previousAssignmentPlanDigest: hostedRecovery.previousTarget.assignmentPlanDigest,
+          previousAssignmentPlanRuntimeAuthorizationGeneration:
+            hostedRecovery.previousTarget.assignmentPlanRuntimeAuthorizationGeneration,
+          replacementBinding: hostedRecovery.replacementBinding,
+          replacementAssignmentPlanRef: hostedRecovery.replacementAssignmentPlanRef,
+          replacementAssignmentPlanDigest: hostedRecovery.replacementAssignmentPlanDigest,
+        }
+      );
+      const insertOutbox = this.db.prepare(
+        `INSERT INTO runtime_outbox
+           (id, session_id, session_sequence, kind, payload_json, status, attempts, created_at_ms)
+         VALUES (?, ?, ?, ?, ?, 'pending', 0, ?)`
+      );
+      insertOutbox.run(
+        hostedRecovery.ensureOutboxId,
+        command.sessionId,
+        recoveryEvent.sequence,
+        "runtime.session.ensure",
+        JSON.stringify(hostedRecovery.ensurePayload),
+        now
+      );
+      insertOutbox.run(
+        hostedRecovery.retireOutboxId,
+        command.sessionId,
+        recoveryEvent.sequence,
+        "runtime.session.retire",
+        JSON.stringify(hostedRecovery.retirePayload),
+        now
+      );
+      events.push(recoveryEvent);
+    }
     return result(
       command,
       {
@@ -2307,11 +3419,226 @@ class SqliteTeamSessions implements TeamSessions {
         assigneeUserId: command.actor.userId,
         assigneeRevision,
         supervisionRevision,
-        runtimeAuthorizationGeneration: session.runtime_authorization_generation,
-        runtimeAuthorizationState: session.runtime_authorization_state,
+        runtimeAuthorizationGeneration:
+          hostedRecovery?.runtimeAuthorizationGeneration ??
+          session.runtime_authorization_generation,
+        runtimeAuthorizationState:
+          hostedRecovery === undefined ? session.runtime_authorization_state : "pending",
+        ...(hostedRecovery === undefined
+          ? {}
+          : {
+              recoveryId: hostedRecovery.recoveryId,
+              runtimeEnsureOutboxId: hostedRecovery.ensureOutboxId,
+              runtimeRetireOutboxId: hostedRecovery.retireOutboxId,
+            }),
       },
       events
     );
+  }
+
+  private hostedAssigneeRecoveryCandidate(
+    session: SqlRow
+  ): HostedAssigneeRecoveryCandidate | undefined {
+    if (session.runtime_kind !== "daytona") return undefined;
+    if (session.runtime_authorization_state !== "pending") {
+      throw new TeamSessionError(
+        "conflict",
+        "A quarantined hosted Runtime cannot be reassigned without emergency recovery"
+      );
+    }
+    const sessionId = session.id as string;
+    const generation = session.runtime_authorization_generation as number;
+    const run = this.mutableAgentRun(sessionId);
+    if (!run || (run.lifecycle !== "paused" && run.lifecycle !== "agent-work-finished")) {
+      throw new TeamSessionError(
+        "conflict",
+        "Hosted Runtime reassignment requires the fenced Run to be durably paused"
+      );
+    }
+    if (this.hasUnresolvedRuntimeLifecycle(run.id as string)) {
+      throw new TeamSessionError(
+        "conflict",
+        "Hosted Runtime reassignment is waiting for lifecycle truth"
+      );
+    }
+    const previousAssignment = this.requireRuntimeAssignment(run.runtime_assignment_id as string);
+    if (
+      previousAssignment.runtime_kind !== "daytona" ||
+      previousAssignment.session_id !== sessionId ||
+      previousAssignment.status !== "recovering" ||
+      previousAssignment.runtime_authorization_generation !== generation ||
+      run.runtime_authorization_generation !== generation
+    ) {
+      throw new TeamSessionError("conflict", "Hosted Runtime reassignment binding is unavailable");
+    }
+    const fence = this.db
+      .prepare(
+        `SELECT id, payload_json FROM runtime_outbox
+         WHERE session_id = ? AND kind = 'runtime.authorization.fence'
+           AND status = 'delivered'
+           AND json_extract(payload_json, '$.reason') = 'assignee-loss'
+           AND json_extract(payload_json, '$.runtimeAuthorizationGeneration') = ?
+         ORDER BY session_sequence DESC, id DESC LIMIT 1`
+      )
+      .get(sessionId, generation) as SqlRow | undefined;
+    if (!fence) {
+      throw new TeamSessionError(
+        "conflict",
+        "Hosted Runtime reassignment is waiting for fence acknowledgement"
+      );
+    }
+    const payload = JSON.parse(fence.payload_json as string) as Record<string, unknown>;
+    const previousTarget = this.hostedAssignmentTransitionTarget(previousAssignment, generation);
+    let payloadBinding: RuntimeBinding;
+    try {
+      payloadBinding = snapshotHostedRuntimeBinding(payload.binding);
+    } catch {
+      throw new TeamSessionError("conflict", "Hosted Runtime fence binding is invalid");
+    }
+    if (
+      payload.runtimeKind !== "daytona" ||
+      payload.reason !== "assignee-loss" ||
+      !sameHostedRuntimeBinding(payloadBinding, previousTarget.binding) ||
+      payload.assignmentPlanRef !== previousTarget.assignmentPlanRef ||
+      payload.assignmentPlanDigest !== previousTarget.assignmentPlanDigest ||
+      payload.assignmentPlanRuntimeAuthorizationGeneration !==
+        previousTarget.assignmentPlanRuntimeAuthorizationGeneration ||
+      !this.hostedOutboxBindingIsCurrent(
+        payload,
+        sessionId,
+        generation,
+        "runtime.authorization.fence"
+      )
+    ) {
+      throw new TeamSessionError("conflict", "Hosted Runtime fence binding is stale");
+    }
+    return {
+      run,
+      previousAssignment,
+      fenceOutboxId: fence.id as string,
+      previousTarget,
+    };
+  }
+
+  private prepareHostedAssigneeRecovery(
+    session: SqlRow,
+    candidate: HostedAssigneeRecoveryCandidate,
+    now: number
+  ): PreparedHostedAssigneeRecovery {
+    if (this.runtimeProfile.kind !== "daytona") {
+      throw new TeamSessionError("conflict", "Hosted Runtime profile is unavailable");
+    }
+    const previousGeneration = session.runtime_authorization_generation as number;
+    const runtimeAuthorizationGeneration = previousGeneration + 1;
+    if (!Number.isSafeInteger(runtimeAuthorizationGeneration)) {
+      throw new TeamSessionError("conflict", "Hosted Runtime generation is exhausted");
+    }
+    const sessionAdvanced = this.db
+      .prepare(
+        `UPDATE sessions
+         SET status = 'active', runtime_authorization_generation = ?,
+             runtime_authorization_state = 'pending'
+         WHERE id = ? AND status = 'awaiting_assignee'
+           AND runtime_authorization_generation = ?
+           AND runtime_authorization_state = 'pending'
+         RETURNING runtime_authorization_generation`
+      )
+      .get(runtimeAuthorizationGeneration, session.id, previousGeneration) as SqlRow | undefined;
+    if (!sessionAdvanced) {
+      throw new TeamSessionError("stale-revision", "Hosted Runtime recovery changed concurrently");
+    }
+    const generationRow = this.db
+      .prepare(
+        `SELECT COALESCE(MAX(generation), 0) + 1 AS generation
+         FROM runtime_assignments WHERE session_id = ?`
+      )
+      .get(session.id) as SqlRow;
+    const runtimeAssignmentGeneration = positiveHostedInteger(generationRow.generation);
+    const sandboxGeneration = positiveHostedInteger(
+      (candidate.previousAssignment.sandbox_generation as number) + 1
+    );
+    const runtimeAssignmentId = this.nextId("runtime-assignment");
+    const sandboxId = this.nextId("sandbox");
+    const runtimePrincipalId = this.nextId("runtime-principal");
+    this.db
+      .prepare(
+        `INSERT INTO runtime_assignments (
+           id, session_id, team_id, project_id, generation, runtime_kind,
+           sandbox_id, sandbox_generation, runtime_principal_id,
+           runtime_authorization_generation, status, created_at_ms, retired_at_ms
+         ) VALUES (?, ?, ?, ?, ?, 'daytona', ?, ?, ?, ?, 'provisioning', ?, NULL)`
+      )
+      .run(
+        runtimeAssignmentId,
+        session.id,
+        session.team_id,
+        session.project_id,
+        runtimeAssignmentGeneration,
+        sandboxId,
+        sandboxGeneration,
+        runtimePrincipalId,
+        runtimeAuthorizationGeneration,
+        now
+      );
+    const replacement = this.requireRuntimeAssignment(runtimeAssignmentId);
+    const replacementBinding = runtimeBindingFromAssignment(replacement);
+    const replacementPlan = this.persistHostedAssignmentPlan(
+      replacement,
+      runtimeAuthorizationGeneration,
+      now
+    );
+    const recoveryId = this.nextId("runtime-recovery");
+    const ensureOutboxId = this.nextId("outbox");
+    const retireOutboxId = this.nextId("outbox");
+    const ensurePayload: RuntimeOutboxPayload<"runtime.session.ensure"> = {
+      sessionId: session.id as string,
+      runtimeKind: "daytona",
+      runtimeAuthorizationGeneration,
+      binding: replacementBinding,
+      ...replacementPlan,
+      recoveryId,
+      agentRunId: candidate.run.id as string,
+      fenceOutboxId: candidate.fenceOutboxId,
+      previousRuntimeAuthorizationGeneration: previousGeneration,
+      previousBinding: candidate.previousTarget.binding,
+      previousAssignmentPlanRef: candidate.previousTarget.assignmentPlanRef,
+      previousAssignmentPlanDigest: candidate.previousTarget.assignmentPlanDigest,
+      previousAssignmentPlanRuntimeAuthorizationGeneration:
+        candidate.previousTarget.assignmentPlanRuntimeAuthorizationGeneration,
+    };
+    const retirePayload: RuntimeOutboxPayload<"runtime.session.retire"> = {
+      sessionId: session.id as string,
+      runtimeAuthorizationGeneration,
+      reason: "assignee-replacement",
+      agentRunId: candidate.run.id as string,
+      runtimeAssignmentId: candidate.previousTarget.binding.runtimeAssignmentId,
+      runtimeAssignmentGeneration: candidate.previousTarget.binding.runtimeAssignmentGeneration,
+      sandboxId: candidate.previousTarget.binding.sandboxId,
+      sandboxGeneration: candidate.previousTarget.binding.sandboxGeneration,
+      runtimeKind: "daytona",
+      ...candidate.previousTarget,
+      recoveryId,
+      fenceOutboxId: candidate.fenceOutboxId,
+      previousRuntimeAuthorizationGeneration: previousGeneration,
+      replacementBinding,
+      replacementAssignmentPlanRef: replacementPlan.assignmentPlanRef,
+      replacementAssignmentPlanDigest: replacementPlan.assignmentPlanDigest,
+    };
+    return {
+      recoveryId,
+      agentRunId: candidate.run.id as string,
+      fenceOutboxId: candidate.fenceOutboxId,
+      previousRuntimeAuthorizationGeneration: previousGeneration,
+      runtimeAuthorizationGeneration,
+      previousTarget: candidate.previousTarget,
+      replacementBinding,
+      replacementAssignmentPlanRef: replacementPlan.assignmentPlanRef,
+      replacementAssignmentPlanDigest: replacementPlan.assignmentPlanDigest,
+      ensureOutboxId,
+      retireOutboxId,
+      ensurePayload,
+      retirePayload,
+    };
   }
 
   private offerHandoff(
@@ -3382,6 +4709,17 @@ class SqliteTeamSessions implements TeamSessions {
       }
     );
     const retireOutboxId = this.nextId("outbox");
+    const currentAssignment = this.requireRuntimeAssignment(assignment.id as string);
+    const hostedRetire =
+      session.runtime_kind === "daytona"
+        ? {
+            runtimeKind: "daytona" as const,
+            ...this.hostedAssignmentTransitionTarget(
+              currentAssignment,
+              authorization.runtime_authorization_generation as number
+            ),
+          }
+        : {};
     const retirePayload: RuntimeOutboxPayload<"runtime.session.retire"> = {
       sessionId: command.sessionId,
       runtimeAuthorizationGeneration: authorization.runtime_authorization_generation as number,
@@ -3391,6 +4729,7 @@ class SqliteTeamSessions implements TeamSessions {
       runtimeAssignmentGeneration: assignment.generation as number,
       sandboxId: assignment.sandbox_id as string,
       sandboxGeneration: assignment.sandbox_generation as number,
+      ...hostedRetire,
     };
     this.db
       .prepare(
@@ -4028,7 +5367,28 @@ class SqliteTeamSessions implements TeamSessions {
       throw new TeamSessionError("conflict", "Runtime outbox generation is ahead of Session state");
     }
     const emergencyStopEnforcement = payload.reason === "emergency-stop";
-    const superseded = !emergencyStopEnforcement && generation < currentGeneration;
+    const replacementRetireEnforcement = payload.reason === "assignee-replacement";
+    const superseded =
+      !emergencyStopEnforcement && !replacementRetireEnforcement && generation < currentGeneration;
+    let hostedPlan: HostedRuntimeAssignmentPlan | null = null;
+    if (payload.runtimeKind === "daytona") {
+      const exactHistoricalDelivery = projectRuntimeOutboxDelivery(
+        outbox,
+        command.expectedAttempt,
+        command.workerId,
+        command.expectedLeaseExpiresAtMs
+      );
+      hostedPlan = this.resolveHostedAssignmentPlan({
+        kind: "delivery",
+        delivery: exactHistoricalDelivery,
+      });
+      if (hostedPlan === null) {
+        throw new TeamSessionError("conflict", "Hosted Runtime outbox plan is invalid");
+      }
+      if (!superseded && !this.hostedOutboxBindingIsCurrent(payload, sessionId, generation, kind)) {
+        throw new TeamSessionError("conflict", "Hosted Runtime outbox binding is stale");
+      }
+    }
     this.recordRuntimeOutboxSettlement(command, outbox, "acknowledged", undefined, now);
     if (emergencyStopEnforcement) {
       this.recordRetiredBindingSupersessionEvidence(command, outbox, now);
@@ -4056,29 +5416,95 @@ class SqliteTeamSessions implements TeamSessions {
       throw new TeamSessionError("stale-revision", "Runtime outbox lease changed");
     }
     let enforced = false;
+    let hostedRunRebind:
+      | {
+          agentRunId: string;
+          lifecycle: "paused" | "agent-work-finished";
+          stateVersion: number;
+          previousRunPolicyRevision: number;
+          runPolicyRevision: number;
+          invalidatedGrantCount: number;
+          runStateRevision: number;
+          previousBinding: RuntimeBinding;
+          replacementBinding: RuntimeBinding;
+        }
+      | undefined;
+    const hostedAssigneeLossFence =
+      kind === "runtime.authorization.fence" &&
+      payload.runtimeKind === "daytona" &&
+      payload.reason === "assignee-loss";
     if (
       !superseded &&
       (kind === "runtime.session.ensure" || kind === "runtime.authorization.fence") &&
-      generation === session.runtime_authorization_generation
+      generation === session.runtime_authorization_generation &&
+      !hostedAssigneeLossFence
     ) {
-      const updated =
-        kind === "runtime.session.ensure"
-          ? this.db
-              .prepare(
-                `UPDATE sessions SET runtime_authorization_state = 'enforced'
-                 WHERE id = ? AND runtime_authorization_generation = ?
-                   AND runtime_authorization_state = 'pending'
-                   AND status = 'active' AND runtime_kind = 'local-tmux'
-                   AND isolation = 'trusted-shared-host' AND tmux_name = ?`
-              )
-              .run(sessionId, generation, payload.tmuxName)
-          : this.db
-              .prepare(
-                `UPDATE sessions SET runtime_authorization_state = 'enforced'
+      let updated: Database.RunResult;
+      if (kind === "runtime.session.ensure" && payload.runtimeKind === "daytona") {
+        const binding = snapshotHostedRuntimeBinding(payload.binding);
+        if (hostedPlan === null) {
+          throw new TeamSessionError("conflict", "Hosted Runtime outbox plan is invalid");
+        }
+        const assignment = this.requireRuntimeAssignment(binding.runtimeAssignmentId);
+        this.insertHostedProviderEffectActivation(
+          sessionId,
+          assignment,
+          generation,
+          hostedPlan,
+          now
+        );
+        const assignmentReady = this.db
+          .prepare(
+            `UPDATE runtime_assignments SET status = 'ready'
+             WHERE id = ? AND session_id = ? AND generation = ? AND sandbox_id = ?
+               AND sandbox_generation = ? AND runtime_principal_id = ?
+               AND runtime_authorization_generation = ? AND runtime_kind = 'daytona'
+               AND status = 'provisioning'`
+          )
+          .run(
+            binding.runtimeAssignmentId,
+            sessionId,
+            binding.runtimeAssignmentGeneration,
+            binding.sandboxId,
+            binding.sandboxGeneration,
+            binding.runtimePrincipalId,
+            generation
+          );
+        if (assignmentReady.changes !== 1) {
+          throw new TeamSessionError("conflict", "Hosted Runtime Assignment is stale");
+        }
+        if (payload.recoveryId !== undefined) {
+          hostedRunRebind = this.rebindHostedRecoveredRun(payload, generation, now);
+        }
+        updated = this.db
+          .prepare(
+            `UPDATE sessions SET runtime_authorization_state = 'enforced'
+             WHERE id = ? AND runtime_authorization_generation = ?
+               AND runtime_authorization_state = 'pending' AND status = 'active'
+               AND runtime_kind = 'daytona' AND isolation = 'isolated-hosted'
+               AND tmux_name IS NULL AND yolo_eligible = 0`
+          )
+          .run(sessionId, generation);
+      } else {
+        updated =
+          kind === "runtime.session.ensure"
+            ? this.db
+                .prepare(
+                  `UPDATE sessions SET runtime_authorization_state = 'enforced'
+                   WHERE id = ? AND runtime_authorization_generation = ?
+                     AND runtime_authorization_state = 'pending'
+                     AND status = 'active' AND runtime_kind = 'local-tmux'
+                     AND isolation = 'trusted-shared-host' AND tmux_name = ?`
+                )
+                .run(sessionId, generation, payload.tmuxName)
+            : this.db
+                .prepare(
+                  `UPDATE sessions SET runtime_authorization_state = 'enforced'
                  WHERE id = ? AND runtime_authorization_generation = ?
                    AND runtime_authorization_state = 'pending'`
-              )
-              .run(sessionId, generation);
+                )
+                .run(sessionId, generation);
+      }
       enforced = updated.changes === 1;
     }
     let emergencyStopStateVersion: number | undefined;
@@ -4088,14 +5514,14 @@ class SqliteTeamSessions implements TeamSessions {
           agentRunId: string;
           lifecycle: "paused" | "agent-work-finished";
           stateVersion: number;
-          sandboxState: "ready";
+          sandboxState: "ready" | "recovering";
         }
       | undefined;
     if (
       !superseded &&
       kind === "runtime.authorization.fence" &&
       payload.reason === "assignee-loss" &&
-      enforced
+      (enforced || hostedAssigneeLossFence)
     ) {
       const recovery = this.db
         .prepare(
@@ -4112,18 +5538,20 @@ class SqliteTeamSessions implements TeamSessions {
         )
         .get(sessionId, generation, generation) as SqlRow | undefined;
       if (recovery) {
-        const assignmentReady = this.db
-          .prepare(
-            `UPDATE runtime_assignments SET status = 'ready'
-             WHERE id = ? AND session_id = ?
-               AND runtime_authorization_generation = ? AND status = 'recovering'`
-          )
-          .run(recovery.assignment_id, sessionId, generation);
-        if (assignmentReady.changes !== 1) {
-          throw new TeamSessionError(
-            "stale-revision",
-            "Run Runtime Assignment recovery changed concurrently"
-          );
+        if (!hostedAssigneeLossFence) {
+          const assignmentReady = this.db
+            .prepare(
+              `UPDATE runtime_assignments SET status = 'ready'
+               WHERE id = ? AND session_id = ?
+                 AND runtime_authorization_generation = ? AND status = 'recovering'`
+            )
+            .run(recovery.assignment_id, sessionId, generation);
+          if (assignmentReady.changes !== 1) {
+            throw new TeamSessionError(
+              "stale-revision",
+              "Run Runtime Assignment recovery changed concurrently"
+            );
+          }
         }
         let lifecycle = recovery.lifecycle as "paused" | "agent-work-finished";
         let stateVersion = recovery.state_version as number;
@@ -4150,7 +5578,7 @@ class SqliteTeamSessions implements TeamSessions {
           agentRunId: recovery.id as string,
           lifecycle,
           stateVersion,
-          sandboxState: "ready",
+          sandboxState: hostedAssigneeLossFence ? "recovering" : "ready",
         };
       }
     }
@@ -4191,6 +5619,38 @@ class SqliteTeamSessions implements TeamSessions {
       emergencyStopStateVersion = stopped.state_version as number;
       runStateRevision = this.advanceRunStateRevision(sessionId);
     }
+    if (
+      !superseded &&
+      kind === "runtime.session.retire" &&
+      payload.reason === "assignee-replacement"
+    ) {
+      const previousBinding = snapshotHostedRuntimeBinding(payload.binding);
+      const previousGeneration = positiveHostedInteger(
+        payload.previousRuntimeAuthorizationGeneration
+      );
+      const retired = this.db
+        .prepare(
+          `UPDATE runtime_assignments
+           SET status = 'retired', retired_at_ms = ?
+           WHERE id = ? AND session_id = ? AND generation = ? AND sandbox_id = ?
+             AND sandbox_generation = ? AND runtime_principal_id = ?
+             AND runtime_authorization_generation = ? AND runtime_kind = 'daytona'
+             AND status = 'recovering'`
+        )
+        .run(
+          now,
+          previousBinding.runtimeAssignmentId,
+          sessionId,
+          previousBinding.runtimeAssignmentGeneration,
+          previousBinding.sandboxId,
+          previousBinding.sandboxGeneration,
+          previousBinding.runtimePrincipalId,
+          previousGeneration
+        );
+      if (retired.changes !== 1) {
+        throw new TeamSessionError("conflict", "Hosted Runtime retirement target is stale");
+      }
+    }
     const eventType =
       emergencyStopStateVersion !== undefined
         ? "run.emergency-stopped"
@@ -4220,6 +5680,16 @@ class SqliteTeamSessions implements TeamSessions {
           }),
     });
     const events = [event];
+    if (hostedRunRebind) {
+      events.push(
+        this.appendEvent(sessionId, command, now, "run.runtime-rebound", {
+          ...hostedRunRebind,
+          recoveryId: payload.recoveryId,
+          runtimeAuthorizationGeneration: generation,
+          sandboxState: "ready",
+        })
+      );
+    }
     if (recoveredRun) {
       events.push(
         this.appendEvent(
@@ -4254,9 +5724,138 @@ class SqliteTeamSessions implements TeamSessions {
               stateVersion: emergencyStopStateVersion,
               runStateRevision,
             }),
+        ...(hostedRunRebind === undefined ? {} : hostedRunRebind),
       },
       events
     );
+  }
+
+  private rebindHostedRecoveredRun(
+    payload: Record<string, unknown>,
+    runtimeAuthorizationGeneration: number,
+    now: number
+  ): {
+    agentRunId: string;
+    lifecycle: "paused" | "agent-work-finished";
+    stateVersion: number;
+    previousRunPolicyRevision: number;
+    runPolicyRevision: number;
+    invalidatedGrantCount: number;
+    runStateRevision: number;
+    previousBinding: RuntimeBinding;
+    replacementBinding: RuntimeBinding;
+  } {
+    const agentRunId = requiredHostedOutboxIdentifier(payload.agentRunId);
+    const previousGeneration = positiveHostedInteger(
+      payload.previousRuntimeAuthorizationGeneration
+    );
+    if (previousGeneration + 1 !== runtimeAuthorizationGeneration) {
+      throw new TeamSessionError("conflict", "Hosted Runtime recovery generation is invalid");
+    }
+    const previousBinding = snapshotHostedRuntimeBinding(payload.previousBinding);
+    const replacementBinding = snapshotHostedRuntimeBinding(payload.binding);
+    if (
+      previousBinding.sessionId !== replacementBinding.sessionId ||
+      sameHostedRuntimeBinding(previousBinding, replacementBinding)
+    ) {
+      throw new TeamSessionError("conflict", "Hosted Runtime recovery binding is invalid");
+    }
+    const replacement = this.requireRuntimeAssignment(replacementBinding.runtimeAssignmentId);
+    if (
+      replacement.status !== "ready" ||
+      replacement.runtime_kind !== "daytona" ||
+      replacement.runtime_authorization_generation !== runtimeAuthorizationGeneration ||
+      !sameHostedRuntimeBinding(runtimeBindingFromAssignment(replacement), replacementBinding)
+    ) {
+      throw new TeamSessionError("conflict", "Hosted Runtime replacement is not ready");
+    }
+    const run = this.db
+      .prepare(
+        `SELECT * FROM agent_runs
+         WHERE id = ? AND session_id = ? AND runtime_assignment_id = ?
+           AND runtime_authorization_generation = ?
+           AND lifecycle IN ('paused', 'agent-work-finished')`
+      )
+      .get(
+        agentRunId,
+        previousBinding.sessionId,
+        previousBinding.runtimeAssignmentId,
+        previousGeneration
+      ) as SqlRow | undefined;
+    if (!run || this.hasUnresolvedRuntimeLifecycle(agentRunId)) {
+      throw new TeamSessionError("conflict", "Hosted Runtime Run rebind is unavailable");
+    }
+    const previousRunPolicyRevision = run.current_policy_revision as number;
+    const policyRow = this.db
+      .prepare(
+        `SELECT policy_body_digest, yolo_confirmation_ref
+         FROM run_policy_revisions WHERE agent_run_id = ? AND revision = ?`
+      )
+      .get(agentRunId, previousRunPolicyRevision) as SqlRow | undefined;
+    if (!policyRow || !isSha256Digest(policyRow.policy_body_digest)) {
+      throw new TeamSessionError("conflict", "Current Run policy is unavailable");
+    }
+    const runPolicyRevision = previousRunPolicyRevision + 1;
+    const goalSet = this.currentGoalSetSnapshot(run);
+    this.insertRunPolicyRevision({
+      agentRunId,
+      sessionId: previousBinding.sessionId,
+      revision: runPolicyRevision,
+      previousRevision: previousRunPolicyRevision,
+      policy: this.readRunPolicyDraft(agentRunId, previousRunPolicyRevision),
+      policyDigest: policyRow.policy_body_digest as string,
+      goalSetId: goalSet.goalSetId,
+      goalSetRevision: goalSet.revision,
+      goalSetDigest: goalSet.digest,
+      goals: goalSet.goals,
+      assignment: replacement,
+      ...(typeof policyRow.yolo_confirmation_ref === "string"
+        ? { yoloConfirmationRef: policyRow.yolo_confirmation_ref }
+        : {}),
+      now,
+    });
+    const updated = this.db
+      .prepare(
+        `UPDATE agent_runs
+         SET runtime_assignment_id = ?, runtime_authorization_generation = ?,
+             current_policy_revision = ?, state_version = state_version + 1,
+             updated_at_ms = ?
+         WHERE id = ? AND session_id = ? AND runtime_assignment_id = ?
+           AND runtime_authorization_generation = ? AND current_policy_revision = ?
+           AND state_version = ? AND lifecycle IN ('paused', 'agent-work-finished')
+         RETURNING lifecycle, state_version`
+      )
+      .get(
+        replacementBinding.runtimeAssignmentId,
+        runtimeAuthorizationGeneration,
+        runPolicyRevision,
+        now,
+        agentRunId,
+        previousBinding.sessionId,
+        previousBinding.runtimeAssignmentId,
+        previousGeneration,
+        previousRunPolicyRevision,
+        run.state_version
+      ) as SqlRow | undefined;
+    if (!updated) {
+      throw new TeamSessionError("stale-revision", "Hosted Runtime Run rebind changed");
+    }
+    const invalidatedGrantCount = this.invalidateMutableRunGrants(
+      agentRunId,
+      now,
+      "runtime-assignment"
+    );
+    return {
+      agentRunId,
+      lifecycle: updated.lifecycle as "paused" | "agent-work-finished",
+      stateVersion: updated.state_version as number,
+      previousRunPolicyRevision,
+      runPolicyRevision,
+      invalidatedGrantCount,
+      runStateRevision: this.advanceRunStateRevision(previousBinding.sessionId),
+      previousBinding,
+      replacementBinding,
+    };
   }
 
   private failRuntimeOutbox(
@@ -4326,6 +5925,34 @@ class SqliteTeamSessions implements TeamSessions {
         )
         .run(sessionId, generation);
       quarantined = updated.changes === 1;
+    }
+    if (
+      quarantined &&
+      !command.retryable &&
+      kind === "runtime.session.ensure" &&
+      payload.runtimeKind === "daytona"
+    ) {
+      const binding = snapshotHostedRuntimeBinding(payload.binding);
+      const assignmentQuarantined = this.db
+        .prepare(
+          `UPDATE runtime_assignments SET status = 'quarantined'
+           WHERE id = ? AND session_id = ? AND generation = ? AND sandbox_id = ?
+             AND sandbox_generation = ? AND runtime_principal_id = ?
+             AND runtime_authorization_generation = ? AND runtime_kind = 'daytona'
+             AND status = 'provisioning'`
+        )
+        .run(
+          binding.runtimeAssignmentId,
+          sessionId,
+          binding.runtimeAssignmentGeneration,
+          binding.sandboxId,
+          binding.sandboxGeneration,
+          binding.runtimePrincipalId,
+          generation
+        );
+      if (assignmentQuarantined.changes !== 1) {
+        throw new TeamSessionError("conflict", "Hosted Runtime Assignment quarantine is stale");
+      }
     }
     const event = this.appendEvent(
       sessionId,
@@ -4742,6 +6369,14 @@ class SqliteTeamSessions implements TeamSessions {
         sessionId,
         reason: "assignee-loss",
         runtimeAuthorizationGeneration,
+        ...(this.requireSession(sessionId).runtime_kind === "daytona"
+          ? this.prepareHostedFenceAssignment(
+              sessionId,
+              runtimeAuthorizationGeneration,
+              runtimeAuthorizationState,
+              now
+            )
+          : {}),
       };
       this.db
         .prepare(
@@ -5136,14 +6771,7 @@ class SqliteTeamSessions implements TeamSessions {
       name: session.name as string,
       status: session.status as SessionInboxItemView["status"],
       steeringPolicy: session.steering_policy as SessionInboxItemView["steeringPolicy"],
-      runtime: {
-        kind: "local-tmux",
-        isolation: "trusted-shared-host",
-        yoloEligible: false,
-        authorizationGeneration: session.runtime_authorization_generation as number,
-        authorizationState:
-          session.runtime_authorization_state as SessionInboxItemView["runtime"]["authorizationState"],
-      },
+      runtime: projectPublicRuntime(session),
       responsibilities,
       viewer,
       latestSequence,
@@ -5790,15 +7418,7 @@ class SqliteTeamSessions implements TeamSessions {
       controlRevision: session.control_revision as number,
       controlEpoch: session.control_epoch as number,
       runStateRevision: session.run_state_revision as number,
-      runtime: {
-        kind: "local-tmux",
-        isolation: "trusted-shared-host",
-        tmuxName: session.tmux_name as string,
-        yoloEligible: false,
-        authorizationGeneration: session.runtime_authorization_generation as number,
-        authorizationState:
-          session.runtime_authorization_state as SessionView["runtime"]["authorizationState"],
-      },
+      runtime: projectPrivateRuntime(session),
       participants,
       shares,
       invitations,
@@ -6045,8 +7665,8 @@ class SqliteTeamSessions implements TeamSessions {
         `INSERT INTO runtime_authorization_epochs
            (session_id, generation, runtime_assignment_id, runtime_assignment_generation,
             sandbox_id, sandbox_generation, runtime_principal_id,
-            effect_enforcer_set_digest, created_at_ms)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            effect_enforcer_policy_digest, effect_enforcer_set_digest, created_at_ms)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(session_id, generation) DO NOTHING`
       )
       .run(
@@ -6057,7 +7677,10 @@ class SqliteTeamSessions implements TeamSessions {
         assignment.sandbox_id,
         assignment.sandbox_generation,
         assignment.runtime_principal_id,
-        authorization?.effectEnforcerSetDigest ?? null,
+        authorization?.effectEnforcerPolicyDigest ?? null,
+        assignment.runtime_kind === "daytona"
+          ? null
+          : (authorization?.effectEnforcerPolicyDigest ?? null),
         now
       );
     const exact = this.db
@@ -6066,7 +7689,7 @@ class SqliteTeamSessions implements TeamSessions {
          WHERE session_id = ? AND generation = ? AND runtime_assignment_id = ?
            AND runtime_assignment_generation = ? AND sandbox_id = ?
            AND sandbox_generation = ? AND runtime_principal_id = ?
-           AND effect_enforcer_set_digest IS ?`
+           AND effect_enforcer_policy_digest IS ? AND effect_enforcer_set_digest IS ?`
       )
       .get(
         sessionId,
@@ -6076,10 +7699,26 @@ class SqliteTeamSessions implements TeamSessions {
         assignment.sandbox_id,
         assignment.sandbox_generation,
         assignment.runtime_principal_id,
-        authorization?.effectEnforcerSetDigest ?? null
+        authorization?.effectEnforcerPolicyDigest ?? null,
+        assignment.runtime_kind === "daytona"
+          ? null
+          : (authorization?.effectEnforcerPolicyDigest ?? null)
       );
     if (!exact) {
       throw new TeamSessionError("conflict", "Runtime Authorization epoch binding is immutable");
+    }
+    if (
+      assignment.runtime_kind !== "daytona" &&
+      authorization !== undefined &&
+      isSha256Digest(authorization.effectEnforcerPolicyDigest)
+    ) {
+      this.insertLocalStaticEffectActivation(
+        sessionId,
+        assignment,
+        generation,
+        authorization.effectEnforcerPolicyDigest,
+        now
+      );
     }
   }
 
@@ -6122,6 +7761,165 @@ class SqliteTeamSessions implements TeamSessions {
     }
   }
 
+  private insertLocalStaticEffectActivation(
+    sessionId: string,
+    assignment: SqlRow,
+    generation: number,
+    digest: string,
+    now: number
+  ): void {
+    this.db
+      .prepare(
+        `INSERT INTO runtime_effect_enforcer_set_activations (
+           session_id, generation, runtime_assignment_id, runtime_assignment_generation,
+           sandbox_id, sandbox_generation, runtime_principal_id, activation_kind,
+           effect_enforcer_policy_digest, effect_enforcer_set_digest,
+           assignment_plan_digest, provider_identity_commitment, provider_revision,
+           effect_manifest_binding_digest, activated_at_ms
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, 'local-static', ?, ?, NULL, NULL, NULL, NULL, ?)
+         ON CONFLICT(session_id, generation) DO NOTHING`
+      )
+      .run(
+        sessionId,
+        generation,
+        assignment.id,
+        assignment.generation,
+        assignment.sandbox_id,
+        assignment.sandbox_generation,
+        assignment.runtime_principal_id,
+        digest,
+        digest,
+        now
+      );
+  }
+
+  private insertHostedProviderEffectActivation(
+    sessionId: string,
+    assignment: SqlRow,
+    generation: number,
+    plan: HostedRuntimeAssignmentPlan,
+    now: number
+  ): void {
+    if (
+      assignment.runtime_kind !== "daytona" ||
+      assignment.session_id !== sessionId ||
+      assignment.runtime_authorization_generation !== generation ||
+      !sameHostedRuntimeBinding(runtimeBindingFromAssignment(assignment), plan.binding) ||
+      plan.runtimeAuthorizationGeneration !== generation ||
+      this.hostedRuntimeActivationResolve === undefined
+    ) {
+      throw new TeamSessionError("conflict", "Hosted Runtime activation binding is invalid");
+    }
+    const assignmentPlanDigest = digestHostedRuntimeAssignmentPlan(plan);
+    let activation: HostedRuntimeActivation | null;
+    try {
+      activation = this.hostedRuntimeActivationResolve(
+        Object.freeze({
+          binding: plan.binding,
+          runtimeAuthorizationGeneration: generation,
+          assignmentPlanDigest,
+          effectEnforcerPolicyDigest: plan.effectEnforcerPolicyDigest,
+        })
+      );
+    } catch {
+      throw new TeamSessionError(
+        "conflict",
+        "Hosted Runtime provider-bound effect activation is unavailable"
+      );
+    }
+    if (
+      activation === null ||
+      !sameHostedRuntimeBinding(activation.binding, plan.binding) ||
+      activation.runtimeAuthorizationGeneration !== generation ||
+      activation.assignmentPlanDigest !== assignmentPlanDigest ||
+      activation.effectEnforcerPolicyDigest !== plan.effectEnforcerPolicyDigest ||
+      activation.providerRevision !== 1
+    ) {
+      throw new TeamSessionError("conflict", "Hosted Runtime activation binding is invalid");
+    }
+    const epoch = this.db
+      .prepare(
+        `SELECT effect_enforcer_policy_digest, effect_enforcer_set_digest
+         FROM runtime_authorization_epochs
+         WHERE session_id = ? AND generation = ? AND runtime_assignment_id = ?
+           AND runtime_assignment_generation = ? AND sandbox_id = ?
+           AND sandbox_generation = ? AND runtime_principal_id = ?`
+      )
+      .get(
+        sessionId,
+        generation,
+        plan.binding.runtimeAssignmentId,
+        plan.binding.runtimeAssignmentGeneration,
+        plan.binding.sandboxId,
+        plan.binding.sandboxGeneration,
+        plan.binding.runtimePrincipalId
+      ) as SqlRow | undefined;
+    if (
+      !epoch ||
+      epoch.effect_enforcer_set_digest !== null ||
+      !isSha256Digest(epoch.effect_enforcer_policy_digest) ||
+      epoch.effect_enforcer_policy_digest !== activation.effectEnforcerPolicyDigest
+    ) {
+      throw new TeamSessionError("conflict", "Hosted Runtime Authorization epoch is invalid");
+    }
+    this.db
+      .prepare(
+        `INSERT INTO runtime_effect_enforcer_set_activations (
+           session_id, generation, runtime_assignment_id, runtime_assignment_generation,
+           sandbox_id, sandbox_generation, runtime_principal_id, activation_kind,
+           effect_enforcer_policy_digest, effect_enforcer_set_digest,
+           assignment_plan_digest, provider_identity_commitment, provider_revision,
+           effect_manifest_binding_digest, activated_at_ms
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, 'daytona-provider', ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(session_id, generation) DO NOTHING`
+      )
+      .run(
+        sessionId,
+        generation,
+        plan.binding.runtimeAssignmentId,
+        plan.binding.runtimeAssignmentGeneration,
+        plan.binding.sandboxId,
+        plan.binding.sandboxGeneration,
+        plan.binding.runtimePrincipalId,
+        activation.effectEnforcerPolicyDigest,
+        activation.effectEnforcerSetDigest,
+        activation.assignmentPlanDigest,
+        activation.providerIdentityCommitment,
+        activation.providerRevision,
+        activation.effectManifestBindingDigest,
+        now
+      );
+    const exact = this.db
+      .prepare(
+        `SELECT 1 FROM runtime_effect_enforcer_set_activations
+         WHERE session_id = ? AND generation = ? AND runtime_assignment_id = ?
+           AND runtime_assignment_generation = ? AND sandbox_id = ?
+           AND sandbox_generation = ? AND runtime_principal_id = ?
+           AND activation_kind = 'daytona-provider'
+           AND effect_enforcer_policy_digest = ? AND effect_enforcer_set_digest = ?
+           AND assignment_plan_digest = ? AND provider_identity_commitment = ?
+           AND provider_revision = ? AND effect_manifest_binding_digest = ?`
+      )
+      .get(
+        sessionId,
+        generation,
+        plan.binding.runtimeAssignmentId,
+        plan.binding.runtimeAssignmentGeneration,
+        plan.binding.sandboxId,
+        plan.binding.sandboxGeneration,
+        plan.binding.runtimePrincipalId,
+        activation.effectEnforcerPolicyDigest,
+        activation.effectEnforcerSetDigest,
+        activation.assignmentPlanDigest,
+        activation.providerIdentityCommitment,
+        activation.providerRevision,
+        activation.effectManifestBindingDigest
+      );
+    if (!exact) {
+      throw new TeamSessionError("conflict", "Hosted Runtime activation binding is immutable");
+    }
+  }
+
   private requireRuntimeAuthorizationEpochDigest(
     sessionId: string,
     assignment: SqlRow,
@@ -6144,10 +7942,20 @@ class SqliteTeamSessions implements TeamSessions {
   ): string | undefined {
     const epoch = this.db
       .prepare(
-        `SELECT effect_enforcer_set_digest FROM runtime_authorization_epochs
-         WHERE session_id = ? AND generation = ? AND runtime_assignment_id = ?
-           AND runtime_assignment_generation = ? AND sandbox_id = ?
-           AND sandbox_generation = ? AND runtime_principal_id = ?`
+        `SELECT activation.effect_enforcer_set_digest
+         FROM runtime_authorization_epochs epoch
+         JOIN runtime_effect_enforcer_set_activations activation
+           ON activation.session_id = epoch.session_id
+          AND activation.generation = epoch.generation
+          AND activation.runtime_assignment_id = epoch.runtime_assignment_id
+          AND activation.runtime_assignment_generation = epoch.runtime_assignment_generation
+          AND activation.sandbox_id = epoch.sandbox_id
+          AND activation.sandbox_generation = epoch.sandbox_generation
+          AND activation.runtime_principal_id = epoch.runtime_principal_id
+          AND activation.effect_enforcer_policy_digest = epoch.effect_enforcer_policy_digest
+         WHERE epoch.session_id = ? AND epoch.generation = ? AND epoch.runtime_assignment_id = ?
+           AND epoch.runtime_assignment_generation = ? AND epoch.sandbox_id = ?
+           AND epoch.sandbox_generation = ? AND epoch.runtime_principal_id = ?`
       )
       .get(
         sessionId,
@@ -6169,11 +7977,12 @@ class SqliteTeamSessions implements TeamSessions {
     session: SqlRow,
     assignment: SqlRow
   ): void {
+    const projectCeiling = this.projectCeilingIdentity(assignment);
     try {
       assertValidRunPolicyCommit(commit, {
         sessionName: session.name as string,
         yoloEligible: session.yolo_eligible === 1,
-        projectCeilingRevision: LOCAL_TMUX_PROJECT_CEILING_REVISION,
+        projectCeilingRevision: projectCeiling.revision,
         runtimeAssignmentGeneration: assignment.generation as number,
         sandboxId: assignment.sandbox_id as string,
         sandboxGeneration: assignment.sandbox_generation as number,
@@ -6202,6 +8011,7 @@ class SqliteTeamSessions implements TeamSessions {
     yoloConfirmationRef?: string;
     now: number;
   }): AgentRunPolicySnapshot {
+    const projectCeiling = this.projectCeilingIdentity(input.assignment);
     const requiredEffectEnforcerSetDigest = this.requireRuntimeAuthorizationEpochDigest(
       input.sessionId,
       input.assignment,
@@ -6227,8 +8037,8 @@ class SqliteTeamSessions implements TeamSessions {
       policyBodyDigest: input.policyDigest,
       initialGoalSet,
       scopedExternalRules: [],
-      projectCeilingRevision: LOCAL_TMUX_PROJECT_CEILING_REVISION,
-      projectCeilingDigest: LOCAL_TMUX_PROJECT_CEILING_DIGEST,
+      projectCeilingRevision: projectCeiling.revision,
+      projectCeilingDigest: projectCeiling.digest,
       binding: {
         teamId: input.assignment.team_id as string,
         projectId: input.assignment.project_id as string,
@@ -6277,8 +8087,8 @@ class SqliteTeamSessions implements TeamSessions {
         JSON.stringify(input.policy.limits),
         input.goalSetId,
         input.goalSetRevision,
-        LOCAL_TMUX_PROJECT_CEILING_REVISION,
-        LOCAL_TMUX_PROJECT_CEILING_DIGEST,
+        projectCeiling.revision,
+        projectCeiling.digest,
         input.assignment.id,
         input.assignment.generation,
         input.assignment.sandbox_id,
@@ -6290,6 +8100,25 @@ class SqliteTeamSessions implements TeamSessions {
         input.now
       );
     return snapshot;
+  }
+
+  private projectCeilingIdentity(assignment: SqlRow): {
+    revision: string;
+    digest: string;
+  } {
+    if (assignment.runtime_kind === "local-tmux") {
+      return {
+        revision: LOCAL_TMUX_PROJECT_CEILING_REVISION,
+        digest: LOCAL_TMUX_PROJECT_CEILING_DIGEST,
+      };
+    }
+    if (assignment.runtime_kind !== "daytona" || this.runtimeProfile.kind !== "daytona") {
+      throw new TeamSessionError("conflict", "Runtime Project ceiling is unavailable");
+    }
+    return {
+      revision: this.runtimeProfile.projectCeiling.revision,
+      digest: this.runtimeProfile.projectCeiling.digest,
+    };
   }
 
   private readRunPolicyDraft(agentRunId: string, revision: number): RunPolicyDraft {
@@ -7458,7 +9287,7 @@ function validateCommandPayload(command: SessionCommand): void {
         requiredCanonicalSessionId(command.sessionId, "Session id");
       }
       requiredText(command.name, "Session name", 160);
-      if (!isValidTmuxSessionName(command.tmuxName)) {
+      if (command.tmuxName !== undefined && !isValidTmuxSessionName(command.tmuxName)) {
         throw new TeamSessionError("invalid-command", "tmux name is invalid");
       }
       if (command.steeringPolicy !== undefined) {
@@ -7981,6 +9810,28 @@ function projectRuntimeOutboxDelivery(
   };
   switch (row.kind as RuntimeOutboxKind) {
     case "runtime.session.ensure": {
+      if (payload.runtimeKind === "daytona") {
+        const hostedAssignment = projectHostedOutboxAssignment(payload, sessionId);
+        const recovery =
+          payload.recoveryId === undefined
+            ? undefined
+            : projectHostedRecoveryEnsure(
+                payload,
+                sessionId,
+                runtimeAuthorizationGeneration,
+                hostedAssignment
+              );
+        return {
+          ...base,
+          kind: "runtime.session.ensure",
+          payload: {
+            sessionId,
+            runtimeAuthorizationGeneration,
+            ...hostedAssignment,
+            ...(recovery ?? {}),
+          },
+        };
+      }
       if (payload.runtimeKind !== "local-tmux" || !isValidTmuxSessionName(payload.tmuxName)) {
         throw new TeamSessionError("conflict", "Runtime ensure payload is invalid");
       }
@@ -8002,15 +9853,23 @@ function projectRuntimeOutboxDelivery(
       return {
         ...base,
         kind: "runtime.authorization.fence",
-        payload: {
-          sessionId,
-          reason: payload.reason,
-          runtimeAuthorizationGeneration,
-        },
+        payload:
+          payload.runtimeKind === "daytona"
+            ? {
+                sessionId,
+                reason: payload.reason,
+                runtimeAuthorizationGeneration,
+                ...projectHostedOutboxTransitionTarget(
+                  payload,
+                  sessionId,
+                  runtimeAuthorizationGeneration
+                ),
+              }
+            : { sessionId, reason: payload.reason, runtimeAuthorizationGeneration },
       };
     case "runtime.session.retire": {
       if (
-        payload.reason !== "emergency-stop" ||
+        (payload.reason !== "emergency-stop" && payload.reason !== "assignee-replacement") ||
         typeof payload.agentRunId !== "string" ||
         typeof payload.runtimeAssignmentId !== "string" ||
         !Number.isSafeInteger(payload.runtimeAssignmentGeneration) ||
@@ -8019,24 +9878,213 @@ function projectRuntimeOutboxDelivery(
       ) {
         throw new TeamSessionError("conflict", "Runtime retire payload is invalid");
       }
+      if (payload.reason === "assignee-replacement" && payload.runtimeKind !== "daytona") {
+        throw new TeamSessionError("conflict", "Runtime replacement retire payload is invalid");
+      }
+      const hostedAssignment =
+        payload.runtimeKind === "daytona"
+          ? projectHostedOutboxTransitionTarget(payload, sessionId, runtimeAuthorizationGeneration)
+          : undefined;
+      if (
+        hostedAssignment !== undefined &&
+        (payload.runtimeAssignmentId !== hostedAssignment.binding.runtimeAssignmentId ||
+          payload.runtimeAssignmentGeneration !==
+            hostedAssignment.binding.runtimeAssignmentGeneration ||
+          payload.sandboxId !== hostedAssignment.binding.sandboxId ||
+          payload.sandboxGeneration !== hostedAssignment.binding.sandboxGeneration)
+      ) {
+        throw new TeamSessionError("conflict", "Hosted Runtime retire binding is invalid");
+      }
       return {
         ...base,
         kind: "runtime.session.retire",
-        payload: {
-          sessionId,
-          runtimeAuthorizationGeneration,
-          reason: "emergency-stop",
-          agentRunId: payload.agentRunId,
-          runtimeAssignmentId: payload.runtimeAssignmentId,
-          runtimeAssignmentGeneration: payload.runtimeAssignmentGeneration as number,
-          sandboxId: payload.sandboxId,
-          sandboxGeneration: payload.sandboxGeneration as number,
-        },
+        payload:
+          hostedAssignment !== undefined
+            ? payload.reason === "assignee-replacement"
+              ? {
+                  sessionId,
+                  runtimeAuthorizationGeneration,
+                  reason: "assignee-replacement",
+                  agentRunId: payload.agentRunId,
+                  runtimeAssignmentId: payload.runtimeAssignmentId,
+                  runtimeAssignmentGeneration: payload.runtimeAssignmentGeneration as number,
+                  sandboxId: payload.sandboxId,
+                  sandboxGeneration: payload.sandboxGeneration as number,
+                  ...hostedAssignment,
+                  ...projectHostedRecoveryRetire(
+                    payload,
+                    sessionId,
+                    runtimeAuthorizationGeneration,
+                    hostedAssignment.binding
+                  ),
+                }
+              : {
+                  sessionId,
+                  runtimeAuthorizationGeneration,
+                  reason: "emergency-stop",
+                  agentRunId: payload.agentRunId,
+                  runtimeAssignmentId: payload.runtimeAssignmentId,
+                  runtimeAssignmentGeneration: payload.runtimeAssignmentGeneration as number,
+                  sandboxId: payload.sandboxId,
+                  sandboxGeneration: payload.sandboxGeneration as number,
+                  ...hostedAssignment,
+                }
+            : {
+                sessionId,
+                runtimeAuthorizationGeneration,
+                reason: "emergency-stop",
+                agentRunId: payload.agentRunId,
+                runtimeAssignmentId: payload.runtimeAssignmentId,
+                runtimeAssignmentGeneration: payload.runtimeAssignmentGeneration as number,
+                sandboxId: payload.sandboxId,
+                sandboxGeneration: payload.sandboxGeneration as number,
+              },
       };
     }
     default:
       throw new TeamSessionError("conflict", "Runtime outbox kind is invalid");
   }
+}
+
+function projectHostedRecoveryEnsure(
+  payload: Record<string, unknown>,
+  sessionId: string,
+  runtimeAuthorizationGeneration: number,
+  replacement: ReturnType<typeof projectHostedOutboxAssignment>
+): {
+  recoveryId: string;
+  agentRunId: string;
+  fenceOutboxId: string;
+  previousRuntimeAuthorizationGeneration: number;
+  previousBinding: RuntimeBinding;
+  previousAssignmentPlanRef: string;
+  previousAssignmentPlanDigest: string;
+  previousAssignmentPlanRuntimeAuthorizationGeneration: number;
+} {
+  const recoveryId = requiredHostedOutboxIdentifier(payload.recoveryId);
+  const agentRunId = requiredHostedOutboxIdentifier(payload.agentRunId);
+  const fenceOutboxId = requiredHostedOutboxIdentifier(payload.fenceOutboxId);
+  const previousRuntimeAuthorizationGeneration = positiveHostedInteger(
+    payload.previousRuntimeAuthorizationGeneration
+  );
+  const previousAssignmentPlanRuntimeAuthorizationGeneration = positiveHostedInteger(
+    payload.previousAssignmentPlanRuntimeAuthorizationGeneration
+  );
+  const previousBinding = snapshotHostedRuntimeBinding(payload.previousBinding);
+  if (
+    previousBinding.sessionId !== sessionId ||
+    sameHostedRuntimeBinding(previousBinding, replacement.binding) ||
+    previousRuntimeAuthorizationGeneration >= runtimeAuthorizationGeneration ||
+    previousAssignmentPlanRuntimeAuthorizationGeneration >=
+      previousRuntimeAuthorizationGeneration ||
+    !isSafeRuntimeAuthorizationRef(payload.previousAssignmentPlanRef) ||
+    !isSha256Digest(payload.previousAssignmentPlanDigest)
+  ) {
+    throw new TeamSessionError("conflict", "Hosted Runtime recovery ensure is invalid");
+  }
+  return {
+    recoveryId,
+    agentRunId,
+    fenceOutboxId,
+    previousRuntimeAuthorizationGeneration,
+    previousBinding,
+    previousAssignmentPlanRef: payload.previousAssignmentPlanRef,
+    previousAssignmentPlanDigest: payload.previousAssignmentPlanDigest,
+    previousAssignmentPlanRuntimeAuthorizationGeneration,
+  };
+}
+
+function projectHostedRecoveryRetire(
+  payload: Record<string, unknown>,
+  sessionId: string,
+  runtimeAuthorizationGeneration: number,
+  previousBinding: RuntimeBinding
+): {
+  recoveryId: string;
+  fenceOutboxId: string;
+  previousRuntimeAuthorizationGeneration: number;
+  replacementBinding: RuntimeBinding;
+  replacementAssignmentPlanRef: string;
+  replacementAssignmentPlanDigest: string;
+} {
+  const recoveryId = requiredHostedOutboxIdentifier(payload.recoveryId);
+  const fenceOutboxId = requiredHostedOutboxIdentifier(payload.fenceOutboxId);
+  const previousRuntimeAuthorizationGeneration = positiveHostedInteger(
+    payload.previousRuntimeAuthorizationGeneration
+  );
+  const replacementBinding = snapshotHostedRuntimeBinding(payload.replacementBinding);
+  if (
+    replacementBinding.sessionId !== sessionId ||
+    sameHostedRuntimeBinding(previousBinding, replacementBinding) ||
+    previousRuntimeAuthorizationGeneration >= runtimeAuthorizationGeneration ||
+    !isSafeRuntimeAuthorizationRef(payload.replacementAssignmentPlanRef) ||
+    !isSha256Digest(payload.replacementAssignmentPlanDigest) ||
+    positiveHostedInteger(payload.assignmentPlanRuntimeAuthorizationGeneration) >=
+      runtimeAuthorizationGeneration
+  ) {
+    throw new TeamSessionError("conflict", "Hosted Runtime recovery retire is invalid");
+  }
+  return {
+    recoveryId,
+    fenceOutboxId,
+    previousRuntimeAuthorizationGeneration,
+    replacementBinding,
+    replacementAssignmentPlanRef: payload.replacementAssignmentPlanRef,
+    replacementAssignmentPlanDigest: payload.replacementAssignmentPlanDigest,
+  };
+}
+
+function requiredHostedOutboxIdentifier(value: unknown): string {
+  if (!isSafeRuntimeAuthorizationRef(value)) {
+    throw new TeamSessionError("conflict", "Hosted Runtime recovery identity is invalid");
+  }
+  return value;
+}
+
+function projectHostedOutboxAssignment(
+  payload: Record<string, unknown>,
+  sessionId: string
+): {
+  runtimeKind: "daytona";
+  binding: RuntimeBinding;
+  assignmentPlanRef: string;
+  assignmentPlanDigest: string;
+} {
+  const binding = snapshotHostedRuntimeBinding(payload.binding);
+  if (
+    payload.runtimeKind !== "daytona" ||
+    binding.sessionId !== sessionId ||
+    !isSafeRuntimeAuthorizationRef(payload.assignmentPlanRef) ||
+    !isSha256Digest(payload.assignmentPlanDigest)
+  ) {
+    throw new TeamSessionError("conflict", "Hosted Runtime outbox payload is invalid");
+  }
+  return {
+    runtimeKind: "daytona",
+    binding,
+    assignmentPlanRef: payload.assignmentPlanRef,
+    assignmentPlanDigest: payload.assignmentPlanDigest,
+  };
+}
+
+function projectHostedOutboxTransitionTarget(
+  payload: Record<string, unknown>,
+  sessionId: string,
+  runtimeAuthorizationGeneration: number
+): ReturnType<typeof projectHostedOutboxAssignment> & {
+  assignmentPlanRuntimeAuthorizationGeneration: number;
+} {
+  const assignment = projectHostedOutboxAssignment(payload, sessionId);
+  const assignmentPlanRuntimeAuthorizationGeneration = positiveHostedInteger(
+    payload.assignmentPlanRuntimeAuthorizationGeneration
+  );
+  if (assignmentPlanRuntimeAuthorizationGeneration >= runtimeAuthorizationGeneration) {
+    throw new TeamSessionError(
+      "conflict",
+      "Hosted Runtime transition target generation is invalid"
+    );
+  }
+  return { ...assignment, assignmentPlanRuntimeAuthorizationGeneration };
 }
 
 function runtimeGenerationFromPayload(payload: Record<string, unknown>): number {
@@ -8176,6 +10224,423 @@ function runtimeLifecycleProjectionStatus(
   }
 }
 
+function projectPublicRuntime(session: SqlRow): SessionInboxItemView["runtime"] {
+  const common = {
+    yoloEligible: false as const,
+    authorizationGeneration: session.runtime_authorization_generation as number,
+    authorizationState: session.runtime_authorization_state as
+      | "enforced"
+      | "pending"
+      | "quarantined",
+  };
+  if (session.runtime_kind === "daytona") {
+    if (session.isolation !== "isolated-hosted" || session.tmux_name !== null) {
+      throw new TeamSessionError("conflict", "Hosted Runtime projection is invalid");
+    }
+    return { ...common, kind: "daytona", isolation: "isolated-hosted" };
+  }
+  if (
+    session.runtime_kind !== "local-tmux" ||
+    session.isolation !== "trusted-shared-host" ||
+    typeof session.tmux_name !== "string"
+  ) {
+    throw new TeamSessionError("conflict", "Local Runtime projection is invalid");
+  }
+  return { ...common, kind: "local-tmux", isolation: "trusted-shared-host" };
+}
+
+function projectPrivateRuntime(session: SqlRow): SessionView["runtime"] {
+  const publicRuntime = projectPublicRuntime(session);
+  return publicRuntime.kind === "daytona"
+    ? publicRuntime
+    : { ...publicRuntime, tmuxName: session.tmux_name as string };
+}
+
+function requiredLocalTmuxName(value: unknown): string {
+  if (typeof value !== "string" || !isValidTmuxSessionName(value)) {
+    throw new TeamSessionError("invalid-command", "tmux name is invalid");
+  }
+  return value;
+}
+
+function snapshotRuntimeDeploymentProfile(
+  value: RuntimeDeploymentProfile
+): RuntimeDeploymentProfile {
+  let snapshot: unknown;
+  try {
+    snapshot = JSON.parse(canonicalRuntimeJson(value));
+  } catch {
+    throw new TypeError("Runtime deployment profile is invalid");
+  }
+  const profile = hostedPayloadRecord(snapshot);
+  if (profile.kind === "local-tmux") {
+    if (!hasExactHostedFields(profile, ["kind"])) {
+      throw new TypeError("Runtime deployment profile is invalid");
+    }
+    return Object.freeze({ kind: "local-tmux" });
+  }
+  const fields = [
+    "kind",
+    "source",
+    "harnessRef",
+    "projectCeiling",
+    "checkpointPolicyRef",
+    "adapterConfigurationRef",
+    "isolation",
+    "capabilities",
+  ];
+  if (profile.kind !== "daytona" || !hasExactHostedFields(profile, fields)) {
+    throw new TypeError("Runtime deployment profile is invalid");
+  }
+  const source = hostedPayloadRecord(profile.source);
+  const isolation = hostedPayloadRecord(profile.isolation);
+  const network = hostedPayloadRecord(isolation.network);
+  const resources = hostedPayloadRecord(isolation.resources);
+  const capabilities = hostedPayloadRecord(profile.capabilities);
+  if (
+    !hasExactHostedFields(source, ["sourceRevision", "expectedCommitSha", "setupRef"]) ||
+    !Object.values(source).every(isSafeRuntimeAuthorizationRef) ||
+    !isSafeRuntimeAuthorizationRef(profile.harnessRef) ||
+    !isSafeRuntimeAuthorizationRef(profile.checkpointPolicyRef) ||
+    !isSafeRuntimeAuthorizationRef(profile.adapterConfigurationRef) ||
+    !isValidHostedProjectCeiling(profile.projectCeiling, isolation) ||
+    !hasExactHostedFields(isolation, [
+      "isolationPolicyDigest",
+      "publicAccess",
+      "hostMounts",
+      "linkedSandbox",
+      "rootIdentity",
+      "network",
+      "resources",
+    ]) ||
+    !isSha256Digest(isolation.isolationPolicyDigest) ||
+    isolation.publicAccess !== false ||
+    isolation.hostMounts !== false ||
+    isolation.linkedSandbox !== false ||
+    isolation.rootIdentity !== false ||
+    !hasExactHostedFields(network, ["mode", "policyDigest", "allowedDestinations"]) ||
+    (network.mode !== "blocked" && network.mode !== "allowlist") ||
+    !isSha256Digest(network.policyDigest) ||
+    !Array.isArray(network.allowedDestinations) ||
+    network.allowedDestinations.length > 256 ||
+    !network.allowedDestinations.every(isValidDaytonaNetworkDestination) ||
+    new Set(network.allowedDestinations.map(canonicalDaytonaNetworkDestination)).size !==
+      network.allowedDestinations.length ||
+    (network.mode === "blocked" && network.allowedDestinations.length !== 0) ||
+    (network.mode === "allowlist" && network.allowedDestinations.length === 0) ||
+    !hasExactHostedFields(resources, ["cpu", "memoryGiB", "diskGiB", "pids"]) ||
+    !isBoundedHostedInteger(resources.cpu, 1, 64) ||
+    !isBoundedHostedInteger(resources.memoryGiB, 1, 512) ||
+    !isBoundedHostedInteger(resources.diskGiB, 1, 4_096) ||
+    !isBoundedHostedInteger(resources.pids, 1, 1_000_000) ||
+    !hasExactHostedFields(capabilities, [
+      "isolatedExecution",
+      "brokeredCredentials",
+      "proxyOnlyEgress",
+      "checkpoints",
+      "yoloEligible",
+    ]) ||
+    capabilities.isolatedExecution !== true ||
+    capabilities.brokeredCredentials !== false ||
+    capabilities.proxyOnlyEgress !== false ||
+    typeof capabilities.checkpoints !== "boolean" ||
+    capabilities.yoloEligible !== false
+  ) {
+    throw new TypeError("Runtime deployment profile is invalid");
+  }
+  // The canonical snapshot owns all nested input and prevents later deployment
+  // object mutation from changing a Session's chosen plan.
+  return deepFreezeHostedValue(snapshot) as RuntimeDeploymentProfile;
+}
+
+function hostedRuntimeDigest(domain: string, canonicalJsonValue: string): string {
+  return crypto
+    .createHash("sha256")
+    .update(domain, "utf8")
+    .update(canonicalJsonValue, "utf8")
+    .digest("hex");
+}
+
+function requiredHostedIncarnation(value: unknown): string {
+  if (!isSha256Digest(value)) {
+    throw new TeamSessionError("conflict", "Hosted Runtime incarnation generator is invalid");
+  }
+  return value;
+}
+
+function isValidHostedObservationPublicKey(value: unknown): value is string {
+  if (
+    typeof value !== "string" ||
+    Buffer.byteLength(value, "utf8") > 4_000 ||
+    !value.startsWith("-----BEGIN PUBLIC KEY-----\n") ||
+    !value.endsWith("-----END PUBLIC KEY-----\n") ||
+    value.includes("PRIVATE KEY")
+  )
+    return false;
+  try {
+    const key = crypto.createPublicKey(value);
+    return (
+      key.type === "public" &&
+      key.asymmetricKeyType === "ed25519" &&
+      key.export({ format: "pem", type: "spki" }).toString() === value
+    );
+  } catch {
+    return false;
+  }
+}
+
+function isValidHostedProjectCeiling(
+  value: unknown,
+  isolation: Record<string, unknown>
+): value is ProjectRuntimeCeiling {
+  try {
+    const ceiling = hostedPayloadRecord(value);
+    const resource = hostedPayloadRecord(ceiling.finiteResourceProfile);
+    const limits = hostedPayloadRecord(ceiling.maximumRunLimits);
+    const actionCounts = hostedPayloadRecord(limits.actionCounts);
+    if (
+      !hasExactHostedFields(ceiling, [
+        "revision",
+        "digest",
+        "allowedModes",
+        "yoloEnabled",
+        "finiteResourceProfile",
+        "maximumRunLimits",
+        "scopedExternalRulesDigest",
+        "isolationPolicyDigest",
+        "networkPolicyDigest",
+        "credentialPolicyDigest",
+      ]) ||
+      !isSafeRuntimeAuthorizationRef(ceiling.revision) ||
+      !isSha256Digest(ceiling.digest) ||
+      !Array.isArray(ceiling.allowedModes) ||
+      ceiling.allowedModes.length < 1 ||
+      new Set(ceiling.allowedModes).size !== ceiling.allowedModes.length ||
+      ceiling.allowedModes.some((mode) => mode !== "supervised" && mode !== "autonomous") ||
+      ceiling.yoloEnabled !== false ||
+      !hasExactHostedFields(resource, ["cpu", "memoryGiB", "diskGiB"]) ||
+      !isBoundedHostedInteger(resource.cpu, 1, 64) ||
+      !isBoundedHostedInteger(resource.memoryGiB, 1, 512) ||
+      !isBoundedHostedInteger(resource.diskGiB, 1, 4_096) ||
+      !hasExactHostedFields(limits, [
+        "wallClock",
+        "modelTokens",
+        "modelSpend",
+        "outboundBytes",
+        "actionCounts",
+      ]) ||
+      !isValidHostedLimit(limits.wallClock, "duration") ||
+      !isValidHostedLimit(limits.modelTokens, "integer") ||
+      !isValidHostedLimit(limits.modelSpend, "money") ||
+      !isValidHostedLimit(limits.outboundBytes, "integer") ||
+      !hasExactHostedFields(actionCounts, ["local", "scoped-external", "protected", "forbidden"]) ||
+      !Object.values(actionCounts).every((limit) => isValidHostedLimit(limit, "integer")) ||
+      !isSha256Digest(ceiling.scopedExternalRulesDigest) ||
+      !isSha256Digest(ceiling.isolationPolicyDigest) ||
+      ceiling.isolationPolicyDigest !== isolation.isolationPolicyDigest ||
+      !isSha256Digest(ceiling.networkPolicyDigest) ||
+      !isSha256Digest(ceiling.credentialPolicyDigest)
+    ) {
+      return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isPositiveHostedSafeInteger(value: unknown): boolean {
+  return Number.isSafeInteger(value) && (value as number) > 0;
+}
+
+function isBoundedHostedInteger(value: unknown, minimum: number, maximum: number): boolean {
+  return (
+    Number.isSafeInteger(value) && (value as number) >= minimum && (value as number) <= maximum
+  );
+}
+
+function isValidHostedLimit(value: unknown, kind: "integer" | "duration" | "money"): boolean {
+  try {
+    const limit = hostedPayloadRecord(value);
+    if (limit.kind === "unconfigured") return hasExactHostedFields(limit, ["kind"]);
+    if (!hasExactHostedFields(limit, ["kind", "value"]) || limit.kind !== "capped") return false;
+    if (kind === "integer") return isPositiveHostedSafeInteger(limit.value);
+    const nested = hostedPayloadRecord(limit.value);
+    if (kind === "duration") {
+      return (
+        hasExactHostedFields(nested, ["milliseconds"]) &&
+        isPositiveHostedSafeInteger(nested.milliseconds)
+      );
+    }
+    return (
+      hasExactHostedFields(nested, ["currency", "minorUnits"]) &&
+      typeof nested.currency === "string" &&
+      /^[A-Z]{3}$/.test(nested.currency) &&
+      isPositiveHostedSafeInteger(nested.minorUnits)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function isValidDaytonaNetworkDestination(value: unknown): value is string {
+  if (
+    typeof value !== "string" ||
+    value.length < 1 ||
+    value.length > 253 ||
+    value.trim() !== value ||
+    /\s/.test(value) ||
+    /[\u0000-\u001f\u007f]/.test(value)
+  ) {
+    return false;
+  }
+  if (value.startsWith("cidr:")) return isValidDaytonaCidr(value.slice(5));
+  if (value.startsWith("domain:")) return isValidDaytonaDomain(value.slice(7));
+  return false;
+}
+
+function isValidDaytonaCidr(value: string): boolean {
+  const separator = value.lastIndexOf("/");
+  if (separator < 1 || value.indexOf("/") !== separator) return false;
+  const address = value.slice(0, separator);
+  const prefixText = value.slice(separator + 1);
+  if (!/^[0-9a-f:.]+$/i.test(address)) return false;
+  if (!/^(?:0|[1-9][0-9]{0,2})$/.test(prefixText)) return false;
+  const version = isIP(address);
+  const prefix = Number(prefixText);
+  return (version === 4 && prefix <= 32) || (version === 6 && prefix <= 128);
+}
+
+function isValidDaytonaDomain(value: string): boolean {
+  const domain = (value.startsWith("*.") ? value.slice(2) : value).toLowerCase();
+  if (domain.length < 1 || domain.length > 253 || domain.endsWith(".")) return false;
+  return domain
+    .split(".")
+    .every(
+      (label) =>
+        label.length >= 1 && label.length <= 63 && /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(label)
+    );
+}
+
+function canonicalDaytonaNetworkDestination(value: string): string {
+  return value.startsWith("domain:") ? `domain:${value.slice(7).toLowerCase()}` : value;
+}
+
+function hostedPayloadRecord(value: unknown): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new TypeError("Hosted Runtime value is invalid");
+  }
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new TypeError("Hosted Runtime value is invalid");
+  }
+  return value as Record<string, unknown>;
+}
+
+function hasExactHostedFields(
+  value: Record<string, unknown>,
+  expected: readonly string[]
+): boolean {
+  const actual = Object.keys(value);
+  return (
+    actual.length === expected.length && expected.every((field) => Object.hasOwn(value, field))
+  );
+}
+
+function positiveHostedInteger(value: unknown): number {
+  if (!Number.isSafeInteger(value) || (value as number) < 1) {
+    throw new TypeError("Hosted Runtime generation is invalid");
+  }
+  return value as number;
+}
+
+function snapshotHostedRuntimeBinding(value: unknown): RuntimeBinding {
+  const binding = hostedPayloadRecord(value);
+  const fields = [
+    "teamId",
+    "projectId",
+    "sessionId",
+    "runtimeAssignmentId",
+    "runtimeAssignmentGeneration",
+    "sandboxId",
+    "sandboxGeneration",
+    "runtimePrincipalId",
+  ];
+  if (
+    !hasExactHostedFields(binding, fields) ||
+    !isSafeRuntimeAuthorizationRef(binding.teamId) ||
+    !isSafeRuntimeAuthorizationRef(binding.projectId) ||
+    !isSafeRuntimeAuthorizationRef(binding.sessionId) ||
+    !isSafeRuntimeAuthorizationRef(binding.runtimeAssignmentId) ||
+    !isSafeRuntimeAuthorizationRef(binding.sandboxId) ||
+    !isSafeRuntimeAuthorizationRef(binding.runtimePrincipalId)
+  ) {
+    throw new TypeError("Hosted Runtime binding is invalid");
+  }
+  return Object.freeze({
+    teamId: binding.teamId,
+    projectId: binding.projectId,
+    sessionId: binding.sessionId,
+    runtimeAssignmentId: binding.runtimeAssignmentId,
+    runtimeAssignmentGeneration: positiveHostedInteger(binding.runtimeAssignmentGeneration),
+    sandboxId: binding.sandboxId,
+    sandboxGeneration: positiveHostedInteger(binding.sandboxGeneration),
+    runtimePrincipalId: binding.runtimePrincipalId,
+  });
+}
+
+function runtimeBindingFromAssignment(assignment: SqlRow): RuntimeBinding {
+  return snapshotHostedRuntimeBinding({
+    teamId: assignment.team_id,
+    projectId: assignment.project_id,
+    sessionId: assignment.session_id,
+    runtimeAssignmentId: assignment.id,
+    runtimeAssignmentGeneration: assignment.generation,
+    sandboxId: assignment.sandbox_id,
+    sandboxGeneration: assignment.sandbox_generation,
+    runtimePrincipalId: assignment.runtime_principal_id,
+  });
+}
+
+function sameHostedRuntimeBinding(left: RuntimeBinding, right: RuntimeBinding): boolean {
+  return (
+    left.teamId === right.teamId &&
+    left.projectId === right.projectId &&
+    left.sessionId === right.sessionId &&
+    left.runtimeAssignmentId === right.runtimeAssignmentId &&
+    left.runtimeAssignmentGeneration === right.runtimeAssignmentGeneration &&
+    left.sandboxId === right.sandboxId &&
+    left.sandboxGeneration === right.sandboxGeneration &&
+    left.runtimePrincipalId === right.runtimePrincipalId
+  );
+}
+
+function hostedPlanRowMatches(row: SqlRow, binding: RuntimeBinding, generation: number): boolean {
+  return (
+    row.team_id === binding.teamId &&
+    row.project_id === binding.projectId &&
+    row.session_id === binding.sessionId &&
+    row.runtime_assignment_id === binding.runtimeAssignmentId &&
+    row.runtime_assignment_generation === binding.runtimeAssignmentGeneration &&
+    row.sandbox_id === binding.sandboxId &&
+    row.sandbox_generation === binding.sandboxGeneration &&
+    row.runtime_principal_id === binding.runtimePrincipalId &&
+    row.runtime_authorization_generation === generation &&
+    typeof row.plan_digest === "string" &&
+    isSha256Digest(row.plan_digest) &&
+    typeof row.specification_digest === "string" &&
+    isSha256Digest(row.specification_digest)
+  );
+}
+
+function deepFreezeHostedValue<T>(value: T): T {
+  if (typeof value !== "object" || value === null || Object.isFrozen(value)) return value;
+  for (const nested of Object.values(value as Record<string, unknown>)) {
+    deepFreezeHostedValue(nested);
+  }
+  return Object.freeze(value);
+}
+
 function snapshotTrustedRuntimeAuthorization(
   value: RuntimeAuthorizationSnapshot | undefined,
   expectedGeneration: number
@@ -8213,7 +10678,7 @@ function snapshotTrustedRuntimeAuthorization(
     !isSha256Digest(snapshot.networkPolicyDigest) ||
     !isSafeRuntimeAuthorizationRef(snapshot.credentialPolicyRef) ||
     !isSha256Digest(snapshot.credentialPolicyDigest) ||
-    !isSha256Digest(snapshot.effectEnforcerSetDigest)
+    !isSha256Digest(snapshot.effectEnforcerPolicyDigest)
   ) {
     throw new TypeError("Runtime Authorization snapshot is invalid");
   }
@@ -8232,6 +10697,40 @@ function isSafeRuntimeAuthorizationRef(value: unknown): value is string {
 
 function isSha256Digest(value: unknown): value is string {
   return typeof value === "string" && SHA256_DIGEST.test(value);
+}
+
+function captureHostedRuntimeActivationSource(
+  value: HostedRuntimeActivationSource | undefined
+):
+  | ((
+      query: Parameters<HostedRuntimeActivationSource["resolve"]>[0]
+    ) => HostedRuntimeActivation | null)
+  | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "object" || value === null || nodeTypes.isProxy(value)) {
+    throw new TypeError("Hosted Runtime activation source is invalid");
+  }
+  const receiver = value as object;
+  let current: object | null = receiver;
+  let resolve: ((...args: unknown[]) => unknown) | undefined;
+  for (let depth = 0; current !== null && depth < 32; depth += 1) {
+    if (nodeTypes.isProxy(current))
+      throw new TypeError("Hosted Runtime activation source is invalid");
+    const descriptor = Object.getOwnPropertyDescriptor(current, "resolve");
+    if (descriptor) {
+      if (!("value" in descriptor) || typeof descriptor.value !== "function") {
+        throw new TypeError("Hosted Runtime activation source is invalid");
+      }
+      resolve = descriptor.value as (...args: unknown[]) => unknown;
+      break;
+    }
+    current = Object.getPrototypeOf(current) as object | null;
+  }
+  if (!resolve) throw new TypeError("Hosted Runtime activation source is invalid");
+  return (query) => {
+    const result = Reflect.apply(resolve!, receiver, [query]);
+    return result === null ? null : snapshotHostedRuntimeActivation(result);
+  };
 }
 
 function commandDigest(command: SessionCommand): string {
