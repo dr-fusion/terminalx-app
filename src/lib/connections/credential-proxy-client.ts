@@ -6,6 +6,7 @@ import {
   snapshotProxyResult,
   type CredentialProxyMethod,
   type ProxyAuthoritySnapshot,
+  type ProxyCallerFence,
   type ProxyResult,
 } from "../../../packages/secret-broker/src/proxy/proxy-protocol";
 
@@ -23,6 +24,8 @@ export class CredentialProxyClientError extends Error {
 export interface CredentialProxyExecuteInput {
   readonly operation: string;
   readonly authority: ProxyAuthoritySnapshot;
+  /** Slice 8F caller fence. Hosted Runs pass a `hosted-assignment` fence. */
+  readonly caller?: ProxyCallerFence;
   readonly params: unknown;
 }
 
@@ -67,6 +70,7 @@ export function createCredentialProxyClient(
           bindingId: input.authority.bindingId,
           bindingRevision: input.authority.bindingRevision,
         },
+        ...(input.caller ? { caller: input.caller } : {}),
         params: input.params,
       };
       const result = await request(socketPath, timeoutMs, "proxy.execute", params);

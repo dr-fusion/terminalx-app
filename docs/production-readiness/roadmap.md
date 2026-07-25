@@ -61,12 +61,22 @@ Close the hosted evidence boundary of release Gate 1 and release Gate 2.
 
 Close release Gate 3 and complete the Slack/Telegram/credential connection model.
 
-Status: in progress. The canonical authentication identity foundation and Slice 8B schema-v13 local
-connection authority are complete. Provider adapters, Secret Broker and Credential Proxy
-enforcement, and hosted exfiltration evidence remain closed. Release Gate 3 is open, and
-`brokeredCredentials` and `proxyOnlyEgress` must remain `false`. The exact scope and remaining
-closed boundaries are tracked in
-[Phase 8 brokered secrets and connections](../multiplayer/phase-8-brokered-connections.md).
+Status: in progress. Slices 8A–8G are landed: the canonical authentication identity foundation, the
+Slice 8B connection authority, the Slice 8C Secret Broker, the Slice 8D Credential Proxy, the Slice
+8E Telegram/Slack provider adapters and end-to-end flow, and the Slice 8F/8G hosted enforcement
+machinery — Runtime-Assignment-scoped credential eligibility, measured capability activation, and
+the adversarial canary evidence suite.
+
+Gate 3: **mechanism + hermetic evidence complete; real-runtime evidence pending Phase 12.** Every
+enforcement mechanism and its verification run against the hermetic hosted-runtime harness and the
+real broker/proxy modules. Capability activation is per-deployment **measured evidence**, never a
+config assertion: nothing in the codebase or configuration statically flips `brokeredCredentials`
+or `proxyOnlyEgress` to `true`, and both remain `false` until a valid signed measurement matches the
+exact Runtime Assignment. Gate 3 CLOSES only when Phase 12's real hosted Daytona Runtime produces
+the same measured evidence through this exact machinery and reruns the canary suite unchanged. The
+exact scope and remaining closed boundaries are tracked in
+[Phase 8 brokered secrets and connections](../multiplayer/phase-8-brokered-connections.md) and
+[ADR 0005](../adr/0005-assignment-scoped-credential-policy-and-measured-capability-activation.md).
 
 The completed Slice 8B hardening binds pairing and Link Challenges to the exact source-JWT expiry, rejects
 source-less legacy pairing upgrades, revalidates after local verifier boundaries, and makes logout

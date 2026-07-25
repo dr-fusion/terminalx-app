@@ -27,6 +27,10 @@ export const SECRET_BROKER_METHODS = Object.freeze([
   "exchange.slack-oauth",
   "exchange.telegram-bot-token",
   "webhook.verify-slack",
+  // Sign in with Slack (OIDC) identity-link verification. Verifies the id_token
+  // inside the broker (JWKS + iss/aud/exp/nonce bound to the Link Challenge
+  // digest) and returns only the verified non-secret identity.
+  "exchange.slack-oidc",
 ] as const);
 
 export type SecretBrokerMethod = (typeof SECRET_BROKER_METHODS)[number];
@@ -184,7 +188,18 @@ export const RESPONSE_SCHEMAS: Readonly<Record<SecretBrokerMethod, readonly stri
     "exchange.slack-oauth": ["receipt", "installation"],
     "exchange.telegram-bot-token": ["receipt", "botIdentity", "webhookAuthDigest"],
     "webhook.verify-slack": ["valid", "withinReplayWindow"],
+    "exchange.slack-oidc": ["identity"],
   });
+
+/** Non-secret verified Slack OIDC identity returned by `exchange.slack-oidc`. */
+export const SLACK_OIDC_IDENTITY_FIELDS = Object.freeze([
+  "provider",
+  "externalTenantId",
+  "externalAppId",
+  "externalSubject",
+  "challenge",
+  "replayId",
+] as const);
 
 /** Non-secret Slack installation identity returned by `exchange.slack-oauth`. */
 export const SLACK_INSTALLATION_FIELDS = Object.freeze([
@@ -265,6 +280,10 @@ export function assertClosedResponse(method: SecretBrokerMethod, response: unkno
       ) {
         throw new TypeError();
       }
+    }
+    if (method === "exchange.slack-oidc") {
+      const identity = exactRecord(field(record, "identity"), SLACK_OIDC_IDENTITY_FIELDS);
+      if (field(identity, "provider") !== "slack") throw new TypeError();
     }
   } catch {
     throw new SecretBrokerProtocolError("internal");

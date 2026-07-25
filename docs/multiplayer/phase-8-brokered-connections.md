@@ -1,10 +1,15 @@
 # Phase 8 brokered secrets and connections
 
 Status: in progress. The canonical authentication identity foundation, the Slice 8B local connection
-authority, the Slice 8C Secret Broker process, the Slice 8D Credential Proxy, and the Slice 8E
-Telegram/Slack provider adapters and end-to-end connection flow are complete. Hosted exfiltration
-evidence remains closed. Release Gate 3 is open, and hosted Runtimes must continue to advertise
-`brokeredCredentials: false` and `proxyOnlyEgress: false`.
+authority, the Slice 8C Secret Broker process, the Slice 8D Credential Proxy, the Slice 8E
+Telegram/Slack provider adapters and end-to-end connection flow, and the Slice 8F/8G hosted
+enforcement machinery are complete. **Mechanism complete and hermetic evidence complete; Gate 3
+closes only when Phase 12's real hosted Runtime produces the same measured evidence through this
+exact machinery.** Capability activation is per-deployment measured evidence, never a config
+assertion: no code path or configuration statically flips `brokeredCredentials`/`proxyOnlyEgress`
+to `true`, and a hosted Runtime advertises them `true` only when a valid, trust-group-signed
+measurement binds to its exact Runtime Assignment. Absent that, both stay `false` and hosted
+credential operations fail closed.
 
 ## Authority boundaries
 
@@ -346,6 +351,74 @@ parent-rename race) and fences it behind the `TERMINALX_LEGACY_TELEGRAM` flag wi
 startup warning; hosted Runtimes never get the legacy path because hosted enforcement composes only
 the brokered path.
 
+Slice 8E2 completes the Sign in with Slack (OIDC) identity-link path: a broker `exchange.slack-oidc`
+operation verifies the id_token entirely inside the broker (JWKS retrieval through the broker's
+injectable exchange client, keys cached with a bounded TTL and one refresh on an unknown `kid`) and
+checks `iss`/`aud`/`exp`/`iat` plus a `nonce` bound to the Link Challenge digest, returning only the
+verified non-secret identity for `verifySlackOidcProof`. The `POST /api/connections/identity-connections/slack/callback`
+route verifies the id_token through the broker, builds the `VerifiedSlackOidcProof`, and completes
+the Link Challenge through the connection authority — mirroring the Telegram deep-link route
+discipline (Telegram linking is already route-complete through the webhook).
+
+## Slice 8F — hosted enforcement
+
+Status: mechanism complete; hermetic evidence complete; real-runtime evidence pending Phase 12. The
+design and its rationale are recorded in
+[`ADR 0005`](../adr/0005-assignment-scoped-credential-policy-and-measured-capability-activation.md).
+
+- **Runtime-Assignment-scoped broker/proxy policy.** Every Credential Proxy send carries an explicit
+  caller class. A hosted Run is `hosted-assignment` and must present the exact Runtime Assignment
+  identity — assignment id, generation, and the Sandbox identity digest from the Phase 7 trust chain.
+  A broker-private, durable eligibility store records which assignment a handle is pinned to and
+  applies the generation-fence discipline: a mismatched assignment or Sandbox identity, or a stale
+  (superseded) generation, is denied with an audited `authority-mismatch`; observing a newer
+  generation advances the fence and revokes in-flight eligibility for the superseded generation. A
+  hosted caller with no eligibility store composed fails closed. The two caller classes are explicit:
+  local non-hosted callers (the 8E HTTP flows) are `human-session` — human-session-fenced at the
+  route boundary — and are never assignment-fenced; legacy frames without a caller are treated as
+  unfenced human-session, preserving 8D/8E behavior.
+- **Measured capability activation.** The hard `false` capability pins are replaced with
+  evidence-derived values. `brokeredCredentials: true` requires a signed enforcement proof that the
+  runtime image (a) carries no ambient provider credentials (env/filesystem sweep attestation),
+  (b) reaches the broker only via the supervisor-mediated channel, and (c) has a measured egress
+  lockdown — the deny-by-default network namespace with only broker/supervisor endpoints allowlisted
+  that `proxyOnlyEgress` denotes. Evidence is a domain-separated, Ed25519-signed record verified
+  against the Phase 7 trust group keys and bound to the exact binding, authorization generation,
+  assignment-plan digest, effect-enforcer policy and set digests, and Sandbox boot epoch. Absence,
+  staleness (boot epoch or generation), tampering, a foreign signing key, an assignment mismatch, or
+  any verification failure derives the capability `false`, and hosted credential operations fail
+  closed. The in-memory control plane can produce valid, tampered, foreign-key, stale, and partial
+  evidence for tests. No code path or configuration statically flips a capability to `true`.
+- **Legacy Telegram retirement decision (completed here).** A hosted Runtime deployment
+  (`TERMINALX_HOSTED_RUNTIME` selected) can never compose the legacy host-global adapter, even when
+  `TERMINALX_LEGACY_TELEGRAM` is on: `legacyTelegramIntegrationEnabled()` returns `false` under a
+  hosted selector, so `startTelegramBot()` no-ops, and the hosted composition path never imports the
+  legacy bot. The flag still backs the LocalTmux deployment with its 8E-hardened download path;
+  retirement-to-zero is blocked on operator migration to connection-based Telegram (a Phase 11 ops
+  note), not on code.
+
+## Slice 8G — adversarial evidence
+
+Status: mechanism complete; hermetic evidence complete; real-runtime evidence pending Phase 12.
+
+A canary secret is seeded into the broker as real material through the real 8C at-rest path, and
+hostile scenarios in `tests/adversarial/` attempt to exfiltrate it through every observable surface:
+the handle/registration API, the encrypted-at-rest broker files, proxy result projections, denied
+and provider-error classifications (including a hostile upstream that echoes the token), transport
+errors, outbound accounting rows, audit events and captured logs, the outbound-request boundary (the
+canary reaches ONLY the authorized credential path and no projection/header/body/row/log), the
+accounted request-byte exclusion, and the environment/argv/`/proc` of a spawned harness process.
+Each channel is its own test, and every assertion covers the canary's common encodings
+(base64/base64url/hex/percent/utf16le) and ordered split-chunk smuggling, not just the literal. The
+scanner is a reusable helper (`tests/adversarial/canary-scanner.ts`) so Phase 12 reruns these
+scenarios against the real hosted Daytona Runtime unchanged.
+
+**Honest evidence boundary.** Real-Daytona execution evidence is a Phase 12 deliverable. This slice
+proves the machinery and its verification against the hermetic hosted-runtime harness and the real
+broker/proxy modules. It does not, and does not claim to, close Gate 3: closure requires the real
+hosted Runtime to produce the same measured activation evidence and pass the same canary suite
+through this exact machinery.
+
 ## Remaining implementation slices
 
 - **8C — Secret Broker:** complete; see the Slice 8C section above.
@@ -356,11 +429,12 @@ the brokered path.
   linking, rotation, revocation, webhook verification, replay protection, and least-privilege scopes,
   with credential acquisition inside the broker and no legacy plaintext provider state in the
   authority model.
-- **8F — hosted enforcement:** bind broker and proxy policy to the exact Runtime Assignment and make
-  capability activation depend on measured enforcement evidence.
-- **8G — adversarial evidence:** seed canaries and prove they cannot escape through files,
-  environment variables, `/proc`, terminal output, encodings, artifacts, logs, model output, or
-  outbound requests.
+- **8F — hosted enforcement:** complete; see the Slice 8F section above. Binds broker/proxy policy to
+  the exact Runtime Assignment and makes capability activation depend on measured enforcement
+  evidence; mechanism and hermetic evidence complete.
+- **8G — adversarial evidence:** complete; see the Slice 8G section above. Seeds canaries and proves
+  they cannot escape through files, environment variables, `/proc`, terminal output, encodings,
+  artifacts, logs, model output, or outbound requests; mechanism and hermetic evidence complete.
 
 ## Acceptance boundary
 
@@ -369,3 +443,9 @@ are unavailable to Users, agents, shells, events, logs, evidence, artifacts, and
 connection revocation and rotation are generation-fenced end to end; and proxy-only egress cannot
 be bypassed. Schema coverage, mocked provider tests, warnings, or feature flags are not substitutes
 for that evidence.
+
+Slices 8F and 8G build and prove the exact machinery that closure depends on, but the closing
+evidence — a real hosted Daytona Runtime producing valid measured activation evidence and passing
+the seeded-canary suite through this same machinery — is a Phase 12 deliverable. Until then, hosted
+Runtimes continue to advertise `brokeredCredentials: false` and `proxyOnlyEgress: false` in every
+deployment, because no measured evidence is produced by the hermetic harness in production.

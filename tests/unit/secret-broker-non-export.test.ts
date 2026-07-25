@@ -81,6 +81,16 @@ const VALID_RESPONSES: Readonly<Record<SecretBrokerMethod, unknown>> = {
     webhookAuthDigest: "d".repeat(64),
   },
   "webhook.verify-slack": { valid: true, withinReplayWindow: true },
+  "exchange.slack-oidc": {
+    identity: {
+      provider: "slack",
+      externalTenantId: "T1",
+      externalAppId: "A1",
+      externalSubject: "U-alice",
+      challenge: "link-challenge-nonce",
+      replayId: "jti-1",
+    },
+  },
 };
 
 const FORBIDDEN =

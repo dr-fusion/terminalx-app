@@ -158,16 +158,37 @@ export function telegramConfigFingerprint(): string {
 }
 
 /**
+ * Whether a hosted Daytona Runtime is selected for this deployment.
+ *
+ * Phase 7 gates hosted execution on `TERMINALX_HOSTED_RUNTIME=daytona`. A hosted
+ * deployment composes only the brokered connection path, so it must never
+ * compose the legacy host-global Telegram adapter (Slice 8F). Any non-empty
+ * value signals hosted intent; an invalid value fails hosted startup elsewhere,
+ * but it must still keep the legacy adapter out of the hosted composition path.
+ */
+export function hostedRuntimeSelected(): boolean {
+  const raw = process.env.TERMINALX_HOSTED_RUNTIME;
+  return typeof raw === "string" && raw.trim().length > 0;
+}
+
+/**
  * Whether the legacy host-global Telegram integration is enabled.
  *
  * The legacy integration is deprecated: it is a single host-global bot token and
  * username allowlist that predates the Phase 8 connection authority and never
- * feeds it. It backs a live production deployment, so it defaults to today's
+ * feeds it. It backs a live LocalTmux deployment, so it defaults to today's
  * behavior (enabled). Set `TERMINALX_LEGACY_TELEGRAM=false` (or `0`/`off`/`no`)
- * to disable it entirely. Its full retirement lands with Slice 8F hosted
- * enforcement; hosted Runtimes never get this path.
+ * to disable it entirely.
+ *
+ * Slice 8F completes the re-scoped retirement decision: a hosted Runtime
+ * deployment ({@link hostedRuntimeSelected}) can never compose the legacy
+ * adapter, even when `TERMINALX_LEGACY_TELEGRAM` is on — hosted enforcement
+ * composes only the brokered path. Full retirement-to-zero for the LocalTmux
+ * deployment is blocked on operator migration to connection-based Telegram
+ * (Phase 11 ops note), not on code.
  */
 export function legacyTelegramIntegrationEnabled(): boolean {
+  if (hostedRuntimeSelected()) return false;
   const raw = process.env.TERMINALX_LEGACY_TELEGRAM;
   if (raw === undefined) return true;
   const normalized = raw.trim().toLowerCase();

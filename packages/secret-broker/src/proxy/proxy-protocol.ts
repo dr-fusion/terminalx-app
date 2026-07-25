@@ -198,11 +198,33 @@ export interface ProxyAuthoritySnapshot {
   readonly bindingRevision: number | null;
 }
 
+/**
+ * The two explicit caller classes (Slice 8F). Local non-hosted callers — the 8E
+ * HTTP flows — are `human-session`: they are human-session-fenced at the route
+ * boundary and carry no assignment fence. A hosted Run is `hosted-assignment`
+ * and must carry the exact Runtime Assignment identity (assignment id +
+ * generation + Sandbox identity digest from the Phase 7 trust chain), which the
+ * broker durably records and generation-fences.
+ */
+export type ProxyCallerFence =
+  | {
+      readonly class: "human-session";
+      readonly humanSessionFenceId: string;
+    }
+  | {
+      readonly class: "hosted-assignment";
+      readonly runtimeAssignmentId: string;
+      readonly runtimeAssignmentGeneration: number;
+      readonly sandboxIdentityDigest: string;
+    };
+
 export interface ProxyExecuteRequest {
   /** A fresh per-call nonce; the accounting key that makes a duplicate frame converge. */
   readonly operationId: string;
   readonly operation: string;
   readonly authority: ProxyAuthoritySnapshot;
+  /** Absent on legacy frames (treated as human-session, unfenced). */
+  readonly caller: ProxyCallerFence | null;
   readonly params: unknown;
 }
 
@@ -213,7 +235,8 @@ export interface ProxyExecuteRequest {
  */
 export function snapshotProxyExecuteRequest(params: unknown): ProxyExecuteRequest {
   try {
-    const record = exactRecord(params, ["operationId", "operation", "authority", "params"]);
+    const record = recordWithOptionalCaller(params);
+    const caller = snapshotCallerFence("caller" in record ? record.caller : undefined);
     const authorityRecord = exactRecord(field(record, "authority"), [
       "provider",
       "handleId",
@@ -244,12 +267,55 @@ export function snapshotProxyExecuteRequest(params: unknown): ProxyExecuteReques
       operationId: boundedIdentifier(field(record, "operationId")),
       operation: boundedIdentifier(field(record, "operation")),
       authority,
+      caller,
       params: field(record, "params"),
     });
   } catch (error) {
     if (error instanceof SecretBrokerProtocolError) throw error;
     throw new SecretBrokerProtocolError("invalid-request");
   }
+}
+
+function recordWithOptionalCaller(value: unknown): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new TypeError();
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) throw new TypeError();
+  const record = value as Record<string, unknown>;
+  const required = ["operationId", "operation", "authority", "params"];
+  const allowed = new Set([...required, "caller"]);
+  for (const key of Object.keys(record)) {
+    if (!allowed.has(key)) throw new TypeError();
+  }
+  for (const key of required) field(record, key);
+  return record;
+}
+
+function snapshotCallerFence(value: unknown): ProxyCallerFence | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "object" || Array.isArray(value)) throw new TypeError();
+  const callerClass = (value as Record<string, unknown>).class;
+  if (callerClass === "human-session") {
+    const record = exactRecord(value, ["class", "humanSessionFenceId"]);
+    return Object.freeze({
+      class: "human-session",
+      humanSessionFenceId: boundedIdentifier(field(record, "humanSessionFenceId")),
+    });
+  }
+  if (callerClass === "hosted-assignment") {
+    const record = exactRecord(value, [
+      "class",
+      "runtimeAssignmentId",
+      "runtimeAssignmentGeneration",
+      "sandboxIdentityDigest",
+    ]);
+    return Object.freeze({
+      class: "hosted-assignment",
+      runtimeAssignmentId: boundedIdentifier(field(record, "runtimeAssignmentId")),
+      runtimeAssignmentGeneration: positiveInteger(field(record, "runtimeAssignmentGeneration")),
+      sandboxIdentityDigest: digestField(field(record, "sandboxIdentityDigest")),
+    });
+  }
+  throw new TypeError();
 }
 
 export { safeTimestamp };
