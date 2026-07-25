@@ -4,13 +4,20 @@ import WebSocket from "ws";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createTeamSessionWebSockets,
+  type CanonicalHostedTerminalAdapter,
+  type CanonicalHostedTerminalConnection,
   type CanonicalTerminalConnection,
   type CanonicalTerminalGateway,
   type CanonicalTerminalPty,
   type CanonicalTerminalPtyAdapter,
   type TeamSessionEventKernel,
+  TeamSessionWebSocketShutdownError,
   type TeamSessionWebSockets,
 } from "../../server/team-session-websockets";
+import type {
+  HostedTeamSessionTerminalBinding,
+  TeamSessionTerminalBinding,
+} from "@/lib/team-session-terminal-gateway";
 import {
   TEAM_SESSION_SCHEMA_VERSION,
   type FollowSessionOptions,
@@ -22,6 +29,27 @@ import type { RequestActor, RequestHeaders } from "@/lib/request-actor";
 
 const SESSION_ID = "33333333-3333-4333-8333-333333333333";
 const TMUX_SESSION_INCARNATION = "a".repeat(64);
+const LOCAL_TERMINAL_BINDING = Object.freeze({
+  kind: "local-tmux" as const,
+  tmuxName: "team-session-runtime",
+});
+const HOSTED_TERMINAL_BINDING: HostedTeamSessionTerminalBinding = Object.freeze({
+  kind: "hosted",
+  binding: Object.freeze({
+    teamId: "team-1",
+    projectId: "project-1",
+    sessionId: SESSION_ID,
+    runtimeAssignmentId: "assignment-1",
+    runtimeAssignmentGeneration: 1,
+    sandboxId: "sandbox-1",
+    sandboxGeneration: 1,
+    runtimePrincipalId: "principal-1",
+  }),
+  runtimeAuthorizationGeneration: 11,
+  assignmentPlanDigest: "b".repeat(64),
+  incarnation: "c".repeat(64),
+  specificationDigest: "d".repeat(64),
+});
 const ACTOR: RequestActor = {
   kind: "human",
   userId: "user-alice",
@@ -109,6 +137,297 @@ describe("canonical Team Session WebSockets", () => {
       tmuxSessionRef: "$7",
       tmuxSessionIncarnation: TMUX_SESSION_INCARNATION,
     });
+  });
+
+  it("attaches a provider-blind hosted terminal without touching the local tmux path", async () => {
+    const connection = new FakeTerminalConnection(SESSION_ID, HOSTED_TERMINAL_BINDING);
+    const hostedTerminal = new FakeHostedTerminalAdapter();
+    const resolveTmuxSocketName = vi.fn(() => "must-not-run");
+    const resolveTmuxSessionRef = vi.fn(() => ({
+      tmuxSessionRef: "$9",
+      tmuxSessionIncarnation: TMUX_SESSION_INCARNATION,
+    }));
+    const harness = await createHarness({
+      connection,
+      hostedTerminal,
+      resolveTmuxSocketName,
+      resolveTmuxSessionRef,
+    });
+    const client = await harness.connect("terminal", bearerHeaders());
+
+    const ready = await client.nextJson();
+    expect(ready).toMatchObject({
+      type: "terminal.ready",
+      sessionId: SESSION_ID,
+      canInput: true,
+      controlEpoch: 7,
+      runtimeAuthorizationGeneration: 11,
+    });
+    expect(JSON.stringify(ready)).not.toContain("assignment-1");
+    expect(JSON.stringify(ready)).not.toContain(HOSTED_TERMINAL_BINDING.assignmentPlanDigest);
+    expect(JSON.stringify(ready)).not.toContain("sandbox-1");
+    expect(resolveTmuxSocketName).not.toHaveBeenCalled();
+    expect(resolveTmuxSessionRef).not.toHaveBeenCalled();
+    expect(harness.pty.created).toEqual([]);
+    expect(hostedTerminal.connectCalls).toHaveLength(1);
+    expect(hostedTerminal.connectCalls[0]).toMatchObject({
+      binding: HOSTED_TERMINAL_BINDING,
+      cols: 80,
+      rows: 24,
+    });
+
+    hostedTerminal.terminal.emitData("hosted output");
+    await expect(client.nextJson()).resolves.toEqual({
+      type: "terminal.output",
+      data: "hosted output",
+    });
+  });
+
+  it("re-checks exact authorization after a slow hosted connect before sending readiness", async () => {
+    const connection = new FakeTerminalConnection(SESSION_ID, HOSTED_TERMINAL_BINDING);
+    const hostedTerminal = new FakeHostedTerminalAdapter();
+    const connectGate = deferred<void>();
+    hostedTerminal.onConnect = async () => connectGate.promise;
+    let opens = 0;
+    const terminalGateway: CanonicalTerminalGateway = {
+      async open() {
+        opens += 1;
+        if (opens === 3) throw new Error("private revocation during hosted connect");
+        return connection;
+      },
+    };
+    const harness = await createHarness({ connection, terminalGateway, hostedTerminal });
+    const client = await harness.connect("terminal", bearerHeaders());
+    await waitFor(() => hostedTerminal.connectCalls.length === 1);
+
+    connectGate.resolve();
+    await expect(client.closed).resolves.toEqual({ code: 1008, reason: "Terminal unavailable" });
+    expect(opens).toBe(3);
+    expect(client.messages).toEqual([]);
+    expect(hostedTerminal.terminal.destroyed).toBe(1);
+  });
+
+  it("subscribes before readiness, preserves protocol order, and bounds provider output chunks", async () => {
+    const connection = new FakeTerminalConnection(SESSION_ID, HOSTED_TERMINAL_BINDING);
+    const hostedTerminal = new FakeHostedTerminalAdapter();
+    hostedTerminal.terminal.dataOnSubscribe = "bootstrap output";
+    const harness = await createHarness({ connection, hostedTerminal });
+    const client = await harness.connect("terminal", bearerHeaders());
+
+    await expect(client.nextJson()).resolves.toMatchObject({ type: "terminal.ready" });
+    await expect(client.nextJson()).resolves.toEqual({
+      type: "terminal.output",
+      data: "bootstrap output",
+    });
+    hostedTerminal.terminal.emitData("x".repeat(64 * 1024 + 1));
+    await expect(client.closed).resolves.toEqual({ code: 1008, reason: "Terminal unavailable" });
+    expect(hostedTerminal.terminal.destroyed).toBe(1);
+  });
+
+  it("captures hosted adapter and connection methods as stable data capabilities", async () => {
+    const connection = new FakeTerminalConnection(SESSION_ID, HOSTED_TERMINAL_BINDING);
+    const hostedTerminal = new FakeHostedTerminalAdapter();
+    const harness = await createHarness({ connection, hostedTerminal });
+    Object.defineProperty(hostedTerminal, "connect", {
+      configurable: true,
+      value: async () => {
+        throw new Error("substituted provider connect");
+      },
+    });
+    const client = await harness.connect("terminal", bearerHeaders());
+    await expect(client.nextJson()).resolves.toMatchObject({ type: "terminal.ready" });
+
+    Object.defineProperty(hostedTerminal.terminal, "input", {
+      configurable: true,
+      value: async () => {
+        throw new Error("substituted provider input");
+      },
+    });
+    client.webSocket.send(terminalInput("stable-method"));
+    await waitFor(() => hostedTerminal.terminal.operations.length === 1);
+    expect(hostedTerminal.terminal.operations).toEqual(["input:stable-method"]);
+  });
+
+  it("synchronously enqueues hosted mutations under the fence and dispatches them serially", async () => {
+    const order: string[] = [];
+    const connection = new FakeTerminalConnection(SESSION_ID, HOSTED_TERMINAL_BINDING);
+    const hostedTerminal = new FakeHostedTerminalAdapter();
+    const firstInput = deferred<void>();
+    hostedTerminal.terminal.onInput = async (data) => {
+      order.push(`adapter:input:${data}`);
+      if (data === "first") await firstInput.promise;
+    };
+    hostedTerminal.terminal.onResize = async (cols, rows) => {
+      order.push(`adapter:resize:${cols}x${rows}`);
+    };
+    hostedTerminal.terminal.onInterrupt = async () => {
+      order.push("adapter:interrupt");
+    };
+    connection.onPerform = (action, effect) => {
+      order.push(`perform:${action}:start`);
+      effect();
+      order.push(`perform:${action}:end`);
+    };
+    const harness = await createHarness({ connection, hostedTerminal });
+    const client = await harness.connect("terminal", bearerHeaders());
+    await client.nextJson();
+
+    client.webSocket.send(terminalInput("first"));
+    client.webSocket.send(terminalResize(120, 40));
+    client.webSocket.send(terminalInterrupt());
+
+    await waitFor(() => hostedTerminal.terminal.operations.length === 1);
+    expect(order.slice(0, 3)).toEqual([
+      "perform:input:start",
+      "perform:input:end",
+      "adapter:input:first",
+    ]);
+    expect(hostedTerminal.terminal.operations).toEqual(["input:first"]);
+
+    firstInput.resolve();
+    await waitFor(() => hostedTerminal.terminal.operations.length === 3);
+    expect(hostedTerminal.terminal.operations).toEqual([
+      "input:first",
+      "resize:120x40",
+      "interrupt",
+    ]);
+    expect(order).toEqual([
+      "perform:input:start",
+      "perform:input:end",
+      "adapter:input:first",
+      "perform:resize:start",
+      "perform:resize:end",
+      "perform:interrupt:start",
+      "perform:interrupt:end",
+      "adapter:resize:120x40",
+      "adapter:interrupt",
+    ]);
+  });
+
+  it("fails a hosted terminal closed on queue overflow without leaking transport details", async () => {
+    const connection = new FakeTerminalConnection(SESSION_ID, HOSTED_TERMINAL_BINDING);
+    const hostedTerminal = new FakeHostedTerminalAdapter();
+    const blocked = deferred<void>();
+    hostedTerminal.terminal.onInput = async () => blocked.promise;
+    const harness = await createHarness({ connection, hostedTerminal });
+    const client = await harness.connect("terminal", bearerHeaders());
+    await client.nextJson();
+
+    for (let index = 0; index < 12; index += 1) {
+      client.webSocket.send(terminalInput(`queued-${index}`));
+    }
+
+    await expect(client.closed).resolves.toEqual({ code: 1008, reason: "Terminal unavailable" });
+    expect(hostedTerminal.terminal.destroyed).toBe(1);
+    blocked.resolve();
+  });
+
+  it("normalizes hosted transport failure and rejects a mismatched plan binding", async () => {
+    const reportInternalError = vi.fn();
+    const connection = new FakeTerminalConnection(SESSION_ID, HOSTED_TERMINAL_BINDING);
+    const failingTerminal = new FakeHostedTerminalAdapter();
+    failingTerminal.terminal.onInput = async () => {
+      throw new Error("provider sandbox private-provider-id failed with /secret/path");
+    };
+    const failingHarness = await createHarness({
+      connection,
+      hostedTerminal: failingTerminal,
+      reportInternalError,
+    });
+    const failingClient = await failingHarness.connect("terminal", bearerHeaders());
+    await failingClient.nextJson();
+    failingClient.webSocket.send(terminalInput("fail"));
+
+    await expect(failingClient.closed).resolves.toEqual({
+      code: 1008,
+      reason: "Terminal unavailable",
+    });
+    expect(reportInternalError).toHaveBeenCalledWith("InternalError");
+
+    const mismatchedBinding = Object.freeze({
+      ...HOSTED_TERMINAL_BINDING,
+      assignmentPlanDigest: "e".repeat(64),
+    });
+    const mismatchedTerminal = new FakeHostedTerminalAdapter(
+      new FakeHostedTerminal(mismatchedBinding)
+    );
+    const mismatchedHarness = await createHarness({
+      connection: new FakeTerminalConnection(SESSION_ID, HOSTED_TERMINAL_BINDING),
+      hostedTerminal: mismatchedTerminal,
+    });
+    const mismatchedClient = await mismatchedHarness.connect("terminal", bearerHeaders());
+    await expect(mismatchedClient.closed).resolves.toEqual({
+      code: 1008,
+      reason: "Terminal unavailable",
+    });
+    expect(mismatchedTerminal.terminal.destroyed).toBe(1);
+    expect(mismatchedHarness.pty.created).toEqual([]);
+  });
+
+  it("aborts and destroys hosted transport on authorization invalidation", async () => {
+    const connection = new FakeTerminalConnection(SESSION_ID, HOSTED_TERMINAL_BINDING);
+    const hostedTerminal = new FakeHostedTerminalAdapter();
+    const blocked = deferred<void>();
+    hostedTerminal.terminal.onInput = async () => blocked.promise;
+    const harness = await createHarness({ connection, hostedTerminal });
+    const client = await harness.connect("terminal", bearerHeaders());
+    await client.nextJson();
+    client.webSocket.send(terminalInput("in-flight"));
+    client.webSocket.send(terminalInput("must-not-dispatch"));
+    await waitFor(() => hostedTerminal.terminal.operations.length === 1);
+
+    connection.invalidate();
+    await expect(client.closed).resolves.toEqual({ code: 1008, reason: "Terminal unavailable" });
+    expect(hostedTerminal.terminal.destroyed).toBe(1);
+    blocked.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(hostedTerminal.terminal.operations).toEqual(["input:in-flight"]);
+  });
+
+  it("settles hosted destroy before server shutdown completes", async () => {
+    const connection = new FakeTerminalConnection(SESSION_ID, HOSTED_TERMINAL_BINDING);
+    const hostedTerminal = new FakeHostedTerminalAdapter();
+    const destroyGate = deferred<void>();
+    hostedTerminal.terminal.onDestroy = async () => destroyGate.promise;
+    const harness = await createHarness({ connection, hostedTerminal });
+    const client = await harness.connect("terminal", bearerHeaders());
+    await client.nextJson();
+
+    let closed = false;
+    const closing = harness.close().then(() => {
+      closed = true;
+    });
+    await waitFor(() => hostedTerminal.terminal.destroyed === 1);
+    expect(closed).toBe(false);
+    destroyGate.resolve();
+    await closing;
+    expect(closed).toBe(true);
+  });
+
+  it("rejects bounded shutdown when a hosted destroy ignores abort", async () => {
+    const connection = new FakeTerminalConnection(SESSION_ID, HOSTED_TERMINAL_BINDING);
+    const hostedTerminal = new FakeHostedTerminalAdapter();
+    hostedTerminal.terminal.onDestroy = () => new Promise<void>(() => undefined);
+    const harness = await createHarness({ connection, hostedTerminal });
+    const client = await harness.connect("terminal", bearerHeaders());
+    await client.nextJson();
+
+    await expect(harness.close()).rejects.toBeInstanceOf(TeamSessionWebSocketShutdownError);
+  });
+
+  it("rejects shutdown when a hosted destroy settles as a failure", async () => {
+    const reportInternalError = vi.fn();
+    const connection = new FakeTerminalConnection(SESSION_ID, HOSTED_TERMINAL_BINDING);
+    const hostedTerminal = new FakeHostedTerminalAdapter();
+    hostedTerminal.terminal.onDestroy = async () => {
+      throw new Error("private provider destroy failure");
+    };
+    const harness = await createHarness({ connection, hostedTerminal, reportInternalError });
+    const client = await harness.connect("terminal", bearerHeaders());
+    await client.nextJson();
+
+    await expect(harness.close()).rejects.toBeInstanceOf(TeamSessionWebSocketShutdownError);
+    expect(reportInternalError).toHaveBeenCalledWith("InternalError");
   });
 
   it("fails closed when a canonical Session socket cannot be resolved safely", async () => {
@@ -406,7 +725,7 @@ describe("canonical Team Session WebSockets", () => {
 
   it("streams a minimized snapshot and allowlisted conversation events from latestSequence", async () => {
     const kernel = new FakeEventKernel();
-    kernel.followImplementation = async function* () {
+    kernel.followImplementation = async function* (options) {
       yield {
         ...makeEvent(24, {
           commentId: "comment-24",
@@ -421,7 +740,7 @@ describe("canonical Team Session WebSockets", () => {
         }),
         type: "comment.added",
       };
-      await new Promise<void>(() => undefined);
+      yield* waitForAbort(options.signal);
     };
     const harness = await createHarness({ kernel });
     const client = await harness.connect("events", bearerHeaders());
@@ -499,7 +818,7 @@ describe("canonical Team Session WebSockets", () => {
       displayName: "Pending Guest Private Name",
     };
     const kernel = new FakeEventKernel();
-    kernel.followImplementation = async function* () {
+    kernel.followImplementation = async function* (options) {
       yield {
         ...makeEvent(24, {
           invitationId: "private-invitation-id",
@@ -533,7 +852,7 @@ describe("canonical Team Session WebSockets", () => {
         type: "session.participant.joined",
         actor: pendingGuest,
       };
-      await new Promise<void>(() => undefined);
+      yield* waitForAbort(options.signal);
     };
     const harness = await createHarness({ kernel });
     const client = await harness.connect("events", bearerHeaders());
@@ -573,12 +892,12 @@ describe("canonical Team Session WebSockets", () => {
   it("keeps the event stream available for historical Comments after a Session ends", async () => {
     const kernel = new FakeEventKernel();
     kernel.session = { ...makeSession(), status: "ended" };
-    kernel.followImplementation = async function* () {
+    kernel.followImplementation = async function* (options) {
       yield {
         ...makeEvent(24, { commentId: "comment-after-end", body: "Postmortem note" }),
         type: "comment.added",
       };
-      await new Promise<void>(() => undefined);
+      yield* waitForAbort(options.signal);
     };
     const harness = await createHarness({ kernel });
     const client = await harness.connect("events", bearerHeaders());
@@ -612,12 +931,52 @@ describe("canonical Team Session WebSockets", () => {
     await client.nextJson();
     await expect(client.closed).resolves.toMatchObject({ code: 1008 });
   });
+
+  it("settles an active event follower before server shutdown completes", async () => {
+    const kernel = new FakeEventKernel();
+    const followerSettlement = deferred<void>();
+    kernel.followImplementation = async function* (options) {
+      try {
+        yield* waitForAbort(options.signal);
+      } finally {
+        await followerSettlement.promise;
+      }
+    };
+    const harness = await createHarness({ kernel });
+    const client = await harness.connect("events", bearerHeaders());
+    await client.nextJson();
+
+    let closed = false;
+    const closing = harness.close().then(() => {
+      closed = true;
+    });
+    await client.closed;
+    expect(closed).toBe(false);
+    followerSettlement.resolve();
+    await closing;
+    expect(closed).toBe(true);
+  });
+
+  it("rejects bounded shutdown when an event follower ignores abort and return", async () => {
+    const kernel = new FakeEventKernel();
+    kernel.followImplementation = async function* () {
+      await new Promise<void>(() => undefined);
+    };
+    const harness = await createHarness({ kernel });
+    const client = await harness.connect("events", bearerHeaders());
+    await client.nextJson();
+
+    await expect(harness.close()).rejects.toBeInstanceOf(TeamSessionWebSocketShutdownError);
+  });
 });
 
 class FakeTerminalConnection implements CanonicalTerminalConnection {
-  constructor(readonly sessionId = SESSION_ID) {}
+  constructor(
+    readonly sessionId = SESSION_ID,
+    readonly binding: TeamSessionTerminalBinding = LOCAL_TERMINAL_BINDING
+  ) {}
 
-  readonly tmuxName = "team-session-runtime";
+  readonly tmuxName = this.binding.kind === "local-tmux" ? this.binding.tmuxName : undefined;
   readonly controlEpoch = 7;
   readonly runtimeAuthorizationGeneration = 11;
   canWrite = true;
@@ -648,6 +1007,72 @@ class FakeTerminalConnection implements CanonicalTerminalConnection {
 
   invalidate(): void {
     this.monitorResolution.resolve({ kind: "terminal-authorization-changed" });
+  }
+}
+
+class FakeHostedTerminal implements CanonicalHostedTerminalConnection {
+  constructor(readonly binding: HostedTeamSessionTerminalBinding = HOSTED_TERMINAL_BINDING) {}
+
+  readonly dataListeners = new Set<(data: string) => void>();
+  readonly exitListeners = new Set<() => void>();
+  readonly operations: string[] = [];
+  destroyed = 0;
+  dataOnSubscribe: string | undefined;
+  onInput: ((data: string, signal: AbortSignal) => Promise<void>) | undefined;
+  onResize: ((cols: number, rows: number, signal: AbortSignal) => Promise<void>) | undefined;
+  onInterrupt: ((signal: AbortSignal) => Promise<void>) | undefined;
+  onDestroy: (() => Promise<void>) | undefined;
+
+  onData(listener: (data: string) => void): { dispose(): void } {
+    this.dataListeners.add(listener);
+    if (this.dataOnSubscribe !== undefined) listener(this.dataOnSubscribe);
+    return { dispose: () => this.dataListeners.delete(listener) };
+  }
+
+  onExit(listener: () => void): { dispose(): void } {
+    this.exitListeners.add(listener);
+    return { dispose: () => this.exitListeners.delete(listener) };
+  }
+
+  async input(data: string, signal: AbortSignal): Promise<void> {
+    this.operations.push(`input:${data}`);
+    await this.onInput?.(data, signal);
+  }
+
+  async resize(cols: number, rows: number, signal: AbortSignal): Promise<void> {
+    this.operations.push(`resize:${cols}x${rows}`);
+    await this.onResize?.(cols, rows, signal);
+  }
+
+  async interrupt(signal: AbortSignal): Promise<void> {
+    this.operations.push("interrupt");
+    await this.onInterrupt?.(signal);
+  }
+
+  async destroy(): Promise<void> {
+    this.destroyed += 1;
+    await this.onDestroy?.();
+  }
+
+  emitData(data: string): void {
+    for (const listener of this.dataListeners) listener(data);
+  }
+}
+
+class FakeHostedTerminalAdapter implements CanonicalHostedTerminalAdapter {
+  readonly connectCalls: Array<Parameters<CanonicalHostedTerminalAdapter["connect"]>[0]> = [];
+
+  constructor(readonly terminal = new FakeHostedTerminal()) {}
+  onConnect:
+    | ((options: Parameters<CanonicalHostedTerminalAdapter["connect"]>[0]) => Promise<void>)
+    | undefined;
+
+  async connect(
+    options: Parameters<CanonicalHostedTerminalAdapter["connect"]>[0]
+  ): Promise<CanonicalHostedTerminalConnection> {
+    this.connectCalls.push(options);
+    await this.onConnect?.(options);
+    return this.terminal;
   }
 }
 
@@ -725,6 +1150,7 @@ interface HarnessOptions {
   terminalGateway?: CanonicalTerminalGateway;
   kernel?: FakeEventKernel;
   pty?: FakePtyAdapter;
+  hostedTerminal?: FakeHostedTerminalAdapter;
   resolveActor?: (headers: RequestHeaders) => Promise<RequestActor | null>;
   credentialCheckIntervalMs?: number;
   resolveTmuxSocketName?: (sessionId: string) => string;
@@ -734,6 +1160,7 @@ interface HarnessOptions {
     runtimeAuthorizationGeneration: number;
     tmuxSocketName: string;
   }) => { tmuxSessionRef: string; tmuxSessionIncarnation: string };
+  reportInternalError?: (errorName: string) => void;
 }
 
 interface TestHarness {
@@ -743,6 +1170,7 @@ interface TestHarness {
   connection: FakeTerminalConnection;
   kernel: FakeEventKernel;
   pty: FakePtyAdapter;
+  hostedTerminal: FakeHostedTerminalAdapter | undefined;
   connect(kind: "terminal" | "events", headers: Record<string, string>): Promise<TestClient>;
   close(): Promise<void>;
 }
@@ -760,6 +1188,7 @@ async function createHarness(options: HarnessOptions = {}): Promise<TestHarness>
     teamSessions: kernel,
     terminalGateway,
     pty,
+    ...(options.hostedTerminal ? { hostedTerminal: options.hostedTerminal } : {}),
     shell: "/bin/bash",
     resolveTmuxSocketName:
       options.resolveTmuxSocketName ?? ((sessionId) => `terminalx-${sessionId.slice(0, 8)}`),
@@ -772,6 +1201,7 @@ async function createHarness(options: HarnessOptions = {}): Promise<TestHarness>
     resolveActor: options.resolveActor ?? defaultActorResolver,
     credentialCheckIntervalMs: options.credentialCheckIntervalMs ?? 1_000,
     eventPollIntervalMs: 20,
+    ...(options.reportInternalError ? { reportInternalError: options.reportInternalError } : {}),
   });
   const server = createServer((_request, response) => {
     response.writeHead(404).end();
@@ -796,12 +1226,19 @@ async function createHarness(options: HarnessOptions = {}): Promise<TestHarness>
     connection,
     kernel,
     pty,
+    hostedTerminal: options.hostedTerminal,
     connect: (kind, headers) => connectClient(`${wsUrl}/${kind}`, headers),
     async close() {
       if (closed) return;
       closed = true;
-      await transport.close();
+      let failure: unknown;
+      try {
+        await transport.close();
+      } catch (error) {
+        failure = error;
+      }
       await new Promise<void>((resolve) => server.close(() => resolve()));
+      if (failure !== undefined) throw failure;
     },
   };
   openHarnesses.add(harness);
@@ -881,6 +1318,24 @@ function terminalInput(data: string): string {
   return JSON.stringify({
     type: "input",
     data,
+    controlEpoch: 7,
+    runtimeAuthorizationGeneration: 11,
+  });
+}
+
+function terminalResize(cols: number, rows: number): string {
+  return JSON.stringify({
+    type: "resize",
+    cols,
+    rows,
+    controlEpoch: 7,
+    runtimeAuthorizationGeneration: 11,
+  });
+}
+
+function terminalInterrupt(): string {
+  return JSON.stringify({
+    type: "interrupt",
     controlEpoch: 7,
     runtimeAuthorizationGeneration: 11,
   });

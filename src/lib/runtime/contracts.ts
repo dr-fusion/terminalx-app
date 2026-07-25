@@ -38,7 +38,12 @@ export interface RuntimeAuthorizationSnapshot {
   readonly networkPolicyDigest: string;
   readonly credentialPolicyRef: string;
   readonly credentialPolicyDigest: string;
-  readonly effectEnforcerSetDigest: string;
+  /**
+   * Key-independent contract for required enforcer kinds, purposes, and
+   * quorum. A concrete provider-bound enforcer-set digest is admitted only by
+   * the later hosted activation record and never participates in RuntimeSpec.
+   */
+  readonly effectEnforcerPolicyDigest: string;
 }
 
 export interface RuntimeSpec {

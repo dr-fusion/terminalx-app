@@ -32,6 +32,22 @@ jobs:
       - name: Production dependency audit
         run: npm audit --omit=dev --audit-level=high
 
+      - name: Verify hardened Sandbox native helpers
+        run: >-
+          cc -std=c17 -O2 -Wall -Wextra -Werror -Wformat=2 -Wconversion
+          -Wsign-conversion -Wshadow -Wstrict-prototypes -fsyntax-only
+          packages/daytona-sandbox-image/root-tools/terminalx-sandbox-init.c
+          packages/daytona-sandbox-image/root-tools/terminalx-peercred.c
+          packages/daytona-sandbox-image/root-tools/terminalx-isolation-probe.c
+
+      - name: Verify release script syntax
+        run: |
+          bash -n scripts/build-pinned-daytona-sdk.sh scripts/build-pinned-daytona-supervisor.sh packages/daytona-sandbox-image/build-image.sh
+          node --check scripts/write-daytona-sdk-artifact.mjs
+          node --check scripts/write-daytona-supervisor-artifact.mjs
+          node --check packages/daytona-sandbox-image/root-tools/terminalx-deployment-binding-install.mjs
+          for script in packages/daytona-sandbox-image/scripts/*.mjs; do node --check "$script"; done
+
       - name: TypeScript type check
         run: npx tsc --noEmit
 

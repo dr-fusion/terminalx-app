@@ -1,4 +1,10 @@
 import { describe, expect, it } from "vitest";
+import { digestHostedRuntimeAssignmentPlan } from "@/lib/runtime/hosted-runtime-adapter";
+import type {
+  HostedAssignmentLookup,
+  HostedAssignmentPlanSource,
+  HostedRuntimeAssignmentPlan,
+} from "@/lib/runtime/hosted-runtime-control-plane";
 import {
   createTeamSessionTerminalGateway,
   TeamSessionTerminalGatewayError,
@@ -24,6 +30,8 @@ const ACTOR = {
 
 const SESSION_ID = "33333333-3333-4333-8333-333333333333";
 const PARTICIPANT_ID = "participant-alice";
+const PUBLIC_KEY =
+  "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAFf4/tX72aI7ln4nW9XH7z9xWMNJm9Q7A7jTZSlmWyNg=\n-----END PUBLIC KEY-----\n";
 
 type TerminalQuery = SessionGetQuery | SessionTerminalAuthorizationQuery;
 
@@ -64,6 +72,22 @@ class FakeTeamSessionKernel implements TeamSessionTerminalKernel {
   }
 }
 
+class FakeHostedPlanSource implements HostedAssignmentPlanSource {
+  plan: HostedRuntimeAssignmentPlan | null = makeHostedPlan();
+  current = true;
+  readonly lookups: HostedAssignmentLookup[] = [];
+
+  resolve(lookup: HostedAssignmentLookup): HostedRuntimeAssignmentPlan | null {
+    this.lookups.push(lookup);
+    return this.plan;
+  }
+
+  isCurrent(lookup: HostedAssignmentLookup): boolean {
+    this.lookups.push(lookup);
+    return this.current;
+  }
+}
+
 describe("canonical Team Session terminal gateway", () => {
   it("opens an observer connection by canonical Session id and resolves its tmux binding", async () => {
     const kernel = new FakeTeamSessionKernel();
@@ -74,6 +98,7 @@ describe("canonical Team Session terminal gateway", () => {
     expect(connection).toMatchObject({
       sessionId: SESSION_ID,
       tmuxName: "team-session-runtime",
+      binding: { kind: "local-tmux", tmuxName: "team-session-runtime" },
       controlEpoch: 7,
       runtimeAuthorizationGeneration: 11,
     });
@@ -93,6 +118,132 @@ describe("canonical Team Session terminal gateway", () => {
       }),
     ]);
     expect(kernel.queries.some((query) => query.sessionId === "team-session-runtime")).toBe(false);
+  });
+
+  it("opens a hosted terminal only from the current private immutable assignment plan", async () => {
+    const kernel = new FakeTeamSessionKernel();
+    kernel.session = makeHostedSession();
+    const plans = new FakeHostedPlanSource();
+
+    const connection = await createTeamSessionTerminalGateway({
+      teamSessions: kernel,
+      hostedAssignmentPlans: plans,
+    }).open({ sessionId: SESSION_ID, actor: ACTOR });
+
+    const expectedPlan = plans.plan;
+    if (!expectedPlan) throw new Error("Expected hosted plan");
+    expect(connection.tmuxName).toBeUndefined();
+    expect(connection.binding).toEqual({
+      kind: "hosted",
+      binding: expectedPlan.binding,
+      runtimeAuthorizationGeneration: 11,
+      assignmentPlanDigest: digestHostedRuntimeAssignmentPlan(expectedPlan),
+      incarnation: expectedPlan.incarnation,
+      specificationDigest: expectedPlan.specificationDigest,
+    });
+    expect(JSON.stringify(connection.binding)).not.toContain("providerSandboxId");
+    expect(plans.lookups).toEqual([
+      {
+        kind: "session",
+        sessionId: SESSION_ID,
+        runtimeAuthorizationGeneration: 11,
+      },
+      {
+        kind: "session",
+        sessionId: SESSION_ID,
+        runtimeAuthorizationGeneration: 11,
+      },
+    ]);
+  });
+
+  it("captures hosted plan-source methods without invoking accessors or later substitutions", async () => {
+    const kernel = new FakeTeamSessionKernel();
+    kernel.session = makeHostedSession();
+    const plans = new FakeHostedPlanSource();
+    const gateway = createTeamSessionTerminalGateway({
+      teamSessions: kernel,
+      hostedAssignmentPlans: plans,
+    });
+    Object.defineProperty(plans, "resolve", {
+      configurable: true,
+      value: () => {
+        throw new Error("substituted plan resolver");
+      },
+    });
+    await expect(gateway.open({ sessionId: SESSION_ID, actor: ACTOR })).resolves.toMatchObject({
+      binding: { kind: "hosted" },
+    });
+
+    let getterCalls = 0;
+    const accessorSource = Object.create(FakeHostedPlanSource.prototype) as FakeHostedPlanSource;
+    Object.defineProperty(accessorSource, "resolve", {
+      get() {
+        getterCalls += 1;
+        return () => makeHostedPlan();
+      },
+    });
+    expect(() =>
+      createTeamSessionTerminalGateway({
+        teamSessions: kernel,
+        hostedAssignmentPlans: accessorSource,
+      })
+    ).toThrow(TypeError);
+    expect(getterCalls).toBe(0);
+  });
+
+  it("fails hosted admission closed for a missing, stale, mismatched, or non-portable plan", async () => {
+    const makeGateway = (plans?: HostedAssignmentPlanSource) => {
+      const kernel = new FakeTeamSessionKernel();
+      kernel.session = makeHostedSession();
+      return createTeamSessionTerminalGateway({
+        teamSessions: kernel,
+        ...(plans ? { hostedAssignmentPlans: plans } : {}),
+      });
+    };
+
+    await expectUnavailable(makeGateway().open({ sessionId: SESSION_ID, actor: ACTOR }));
+
+    const stale = new FakeHostedPlanSource();
+    stale.current = false;
+    await expectUnavailable(makeGateway(stale).open({ sessionId: SESSION_ID, actor: ACTOR }));
+
+    const mismatched = new FakeHostedPlanSource();
+    mismatched.plan = makeHostedPlan({ sessionId: "different-session" });
+    await expectUnavailable(makeGateway(mismatched).open({ sessionId: SESSION_ID, actor: ACTOR }));
+
+    const providerLeaking = new FakeHostedPlanSource();
+    providerLeaking.plan = {
+      ...makeHostedPlan(),
+      providerSandboxId: "private-provider-id",
+    } as HostedRuntimeAssignmentPlan;
+    await expectUnavailable(
+      makeGateway(providerLeaking).open({ sessionId: SESSION_ID, actor: ACTOR })
+    );
+  });
+
+  it("re-checks the exact hosted plan synchronously inside every mutation transaction", async () => {
+    const kernel = new FakeTeamSessionKernel();
+    kernel.session = makeHostedSession();
+    const plans = new FakeHostedPlanSource();
+    const connection = await createTeamSessionTerminalGateway({
+      teamSessions: kernel,
+      hostedAssignmentPlans: plans,
+    }).open({ sessionId: SESSION_ID, actor: ACTOR });
+    let effects = 0;
+
+    plans.plan = makeHostedPlan({ incarnation: "d".repeat(64) });
+    expect(await connection.canPerform("input")).toBe(false);
+    expect(() => connection.perform("input", () => void (effects += 1))).toThrow(
+      TeamSessionTerminalGatewayError
+    );
+    expect(effects).toBe(0);
+
+    plans.plan = makeHostedPlan();
+    plans.current = false;
+    expect(() => connection.perform("input", () => void (effects += 1))).toThrow(
+      TeamSessionTerminalGatewayError
+    );
+    expect(effects).toBe(0);
   });
 
   it("permits an observer without any steering responsibility", async () => {
@@ -328,6 +479,23 @@ describe("canonical Team Session terminal gateway", () => {
     expect(kernel.follows).toHaveLength(0);
   });
 
+  it("invalidates a hosted connection when its durable plan identity changes", async () => {
+    const kernel = new FakeTeamSessionKernel();
+    kernel.session = makeHostedSession();
+    const plans = new FakeHostedPlanSource();
+    const connection = await createTeamSessionTerminalGateway({
+      teamSessions: kernel,
+      hostedAssignmentPlans: plans,
+    }).open({ sessionId: SESSION_ID, actor: ACTOR });
+    plans.plan = makeHostedPlan({ specificationDigest: "e".repeat(64) });
+
+    await expect(connection.monitor()).resolves.toEqual({
+      kind: "terminal-authorization-changed",
+      publicReason: "Terminal authorization changed",
+    });
+    expect(kernel.follows).toHaveLength(0);
+  });
+
   it("keeps a current connection open across unrelated Session events", async () => {
     const kernel = new FakeTeamSessionKernel();
     const connection = await createTeamSessionTerminalGateway({ teamSessions: kernel }).open({
@@ -443,6 +611,71 @@ function makeSession(
     handoffs: [],
     latestSequence: 23,
     createdAtMs: 1_700_000_000_000,
+  };
+}
+
+function makeHostedSession(): SessionView {
+  const session = makeSession();
+  return {
+    ...session,
+    runtime: {
+      kind: "daytona",
+      isolation: "isolated-hosted",
+      yoloEligible: false,
+      authorizationGeneration: 11,
+      authorizationState: "enforced",
+    },
+  };
+}
+
+function makeHostedPlan(
+  overrides: {
+    sessionId?: string;
+    incarnation?: string;
+    specificationDigest?: string;
+  } = {}
+): HostedRuntimeAssignmentPlan {
+  return {
+    binding: {
+      teamId: "team-1",
+      projectId: "project-1",
+      sessionId: overrides.sessionId ?? SESSION_ID,
+      runtimeAssignmentId: "assignment-1",
+      runtimeAssignmentGeneration: 1,
+      sandboxId: "sandbox-1",
+      sandboxGeneration: 1,
+      runtimePrincipalId: "principal-1",
+    },
+    runtimeAuthorizationGeneration: 11,
+    incarnation: overrides.incarnation ?? "a".repeat(64),
+    specificationDigest: overrides.specificationDigest ?? "b".repeat(64),
+    effectEnforcerPolicyDigest: "c".repeat(64),
+    adapterConfigurationRef: "daytona-adapter-v1",
+    observation: {
+      keyProvisioningRef: "runtime-observation-key-provisioning:test",
+      issuerKeyId: "observation-key-1",
+      publicKeySpkiPem: PUBLIC_KEY,
+    },
+    isolation: {
+      isolationPolicyDigest: "c".repeat(64),
+      publicAccess: false,
+      hostMounts: false,
+      linkedSandbox: false,
+      rootIdentity: false,
+      network: {
+        mode: "blocked",
+        policyDigest: "d".repeat(64),
+        allowedDestinations: [],
+      },
+      resources: { cpu: 2, memoryGiB: 4, diskGiB: 20, pids: 1_024 },
+    },
+    capabilities: {
+      isolatedExecution: true,
+      brokeredCredentials: false,
+      proxyOnlyEgress: false,
+      checkpoints: true,
+      yoloEligible: false,
+    },
   };
 }
 

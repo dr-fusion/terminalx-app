@@ -3,7 +3,8 @@ import { resolveRequestActor, type RequestActor } from "../request-actor";
 import { getPublicUrl, isReadOnlyMode, trustProxyHeaders } from "../security-config";
 import { isValidTmuxSessionName } from "../tmux";
 import { projectPublicSessionEvent } from "./public-event";
-import { getTeamSessions } from "./service";
+import { isMultiplayerTransportAvailable } from "./feature";
+import { getRegisteredTeamSessions } from "./service";
 import {
   TEAM_SESSION_SCHEMA_VERSION,
   TeamSessionError,
@@ -240,6 +241,8 @@ export interface TeamSessionHttpDependencies {
   resolveActor?: (headers: Headers) => Promise<RequestActor | null>;
   maxBodyBytes?: number;
   isReadOnly?: () => boolean;
+  /** Test/composition seam; production defaults to actual custom-server readiness. */
+  isMutationAvailable?: () => boolean;
   reportInternalError?: (errorName: "InternalError") => void;
 }
 
@@ -324,7 +327,33 @@ async function requireActor(
 }
 
 function sessions(dependencies: TeamSessionHttpDependencies): TeamSessions {
-  return dependencies.teamSessions ?? getTeamSessions();
+  if (dependencies.teamSessions !== undefined) return dependencies.teamSessions;
+  let registered: TeamSessions | null;
+  try {
+    registered = getRegisteredTeamSessions();
+  } catch {
+    throw multiplayerUnavailable();
+  }
+  if (registered === null) throw multiplayerUnavailable();
+  return registered;
+}
+
+function requireMutationAvailability(dependencies: TeamSessionHttpDependencies): void {
+  // Explicit injected kernels are isolated adapter tests/compositions. Real
+  // HTTP routes have no injection and must prove custom-server availability.
+  let available = false;
+  try {
+    available =
+      dependencies.isMutationAvailable?.() ??
+      (dependencies.teamSessions !== undefined || isMultiplayerTransportAvailable());
+  } catch {
+    throw multiplayerUnavailable();
+  }
+  if (available !== true) throw multiplayerUnavailable();
+}
+
+function multiplayerUnavailable(): HttpProblem {
+  return new HttpProblem(503, "multiplayer-unavailable", "Multiplayer service is unavailable");
 }
 
 /** A stable namespace that cannot be selected or collided by an HTTP client. */
@@ -755,6 +784,7 @@ export async function handleTeamSessionCommand(
     if ((dependencies.isReadOnly ?? isReadOnlyMode)()) {
       throw new HttpProblem(403, "read-only", "Server is read-only");
     }
+    requireMutationAvailability(dependencies);
     const idempotencyKey = requireIdempotencyKey(request);
     const body = await readLimitedJson(request, dependencies);
     assertHumanCommandShape(body);
@@ -768,7 +798,11 @@ export async function handleTeamSessionCommand(
         key: internalIdempotencyKey,
       },
     } as unknown as SessionCommand;
-    const result = await sessions(dependencies).dispatch(command);
+    const teamSessions = sessions(dependencies);
+    // No await occurs between this second readiness check and dispatch. A
+    // synchronous withdrawal therefore wins before any durable mutation.
+    requireMutationAvailability(dependencies);
+    const result = await teamSessions.dispatch(command);
     const commandType = body.type as HumanCommandType;
     if (result.commandType !== commandType) {
       throw new Error("Team Session kernel returned a mismatched command receipt");

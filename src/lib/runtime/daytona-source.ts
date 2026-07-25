@@ -4,9 +4,9 @@ import { canonicalRuntimeJson } from "./runtime-command-canonical";
 import { suppressNativePromiseRejection } from "./runtime-native-promise";
 
 export const DAYTONA_FORK_REPOSITORY = "https://github.com/procyon-labs-io/daytona";
-export const DAYTONA_FORK_COMMIT = "b5a5d9e78d76c8bcf351f2049620250e0f34eea4";
+export const DAYTONA_PRODUCTION_FORK_COMMIT = "f9b4dfe428d37f3d956acda4403879516aa8d923";
 export const DAYTONA_UPSTREAM_REPOSITORY = "https://github.com/daytonaio/daytona";
-export const DAYTONA_UPSTREAM_BASE_COMMIT = DAYTONA_FORK_COMMIT;
+export const DAYTONA_UPSTREAM_BASE_COMMIT = "b5a5d9e78d76c8bcf351f2049620250e0f34eea4";
 export const DAYTONA_DEPLOYMENT_MANIFEST_CLAIMS_DIGEST_DOMAIN =
   "terminalx/daytona-deployment-manifest-claims/v1\0" as const;
 export const DAYTONA_DEPLOYMENT_MANIFEST_AUTHORITY_SIGNATURE_DOMAIN =
@@ -21,6 +21,7 @@ const SHA256 = /^[0-9a-f]{64}$/;
 const ED25519_SIGNATURE = /^[A-Za-z0-9_-]{86}$/;
 const SAFE_REFERENCE = /^[A-Za-z0-9][A-Za-z0-9._~:/-]{0,299}$/;
 const OCI_IMAGE_REFERENCE = /^[a-z0-9][a-z0-9._:/-]{0,446}@sha256:[0-9a-f]{64}$/;
+const DOCKER_IMAGE_ID = /^sha256:[0-9a-f]{64}$/;
 const DAYTONA_SNAPSHOT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const FLOATING_REFERENCES = new Set([
   "current",
@@ -34,7 +35,7 @@ const FLOATING_REFERENCES = new Set([
 
 const SOURCE_ENVIRONMENT_FIELDS = [
   "TERMINALX_DAYTONA_FORK_REPOSITORY",
-  "TERMINALX_DAYTONA_FORK_COMMIT",
+  "TERMINALX_DAYTONA_PRODUCTION_FORK_COMMIT",
 ] as const;
 const SOURCE_FIELDS = [
   "forkRepository",
@@ -48,7 +49,7 @@ const SUPERVISOR_ARTIFACT_FIELDS = ["kind", "sha256"] as const;
 const SBOM_ARTIFACT_FIELDS = ["kind", "sha256"] as const;
 const PROVENANCE_ARTIFACT_FIELDS = ["kind", "sha256"] as const;
 const IMAGE_FIELDS = ["kind", "reference", "sha256"] as const;
-const SNAPSHOT_FIELDS = ["kind", "snapshotId", "sha256"] as const;
+const SNAPSHOT_FIELDS = ["kind", "snapshotId", "snapshotRef", "imageId", "sha256"] as const;
 const ISOLATION_PROFILE_FIELDS = ["profileRef", "sha256"] as const;
 const MANIFEST_CLAIMS_FIELDS = [
   "version",
@@ -90,14 +91,14 @@ const SIGNATURE_VERIFICATION_FIELDS = [
 
 export interface DaytonaSourcePin {
   readonly forkRepository: typeof DAYTONA_FORK_REPOSITORY;
-  readonly forkCommit: typeof DAYTONA_FORK_COMMIT;
+  readonly forkCommit: typeof DAYTONA_PRODUCTION_FORK_COMMIT;
   readonly upstreamRepository: typeof DAYTONA_UPSTREAM_REPOSITORY;
   readonly upstreamBaseCommit: typeof DAYTONA_UPSTREAM_BASE_COMMIT;
 }
 
 export interface DaytonaSourceEnvironment {
   readonly TERMINALX_DAYTONA_FORK_REPOSITORY?: string;
-  readonly TERMINALX_DAYTONA_FORK_COMMIT?: string;
+  readonly TERMINALX_DAYTONA_PRODUCTION_FORK_COMMIT?: string;
 }
 
 export interface DaytonaDeploymentArtifactPin<Kind extends string> {
@@ -124,7 +125,11 @@ export type DaytonaImmutableSandboxArtifact =
       readonly kind: "daytona-snapshot";
       /** Immutable UUID v4 assigned by the pinned Daytona snapshot service. */
       readonly snapshotId: string;
-      /** Content digest attested by the release provenance, not a mutable name alone. */
+      /** Exact preloaded runner reference resolved from `snapshotId`. */
+      readonly snapshotRef: string;
+      /** Docker-inspected image configuration ID, pinned independently of the reference. */
+      readonly imageId: string;
+      /** Snapshot manifest digest attested by release provenance. */
       readonly sha256: string;
     };
 
@@ -220,14 +225,14 @@ export class DaytonaDeploymentArtifactError extends Error {
 export function resolveDaytonaSourcePin(
   unsafeEnvironment: DaytonaSourceEnvironment = {
     TERMINALX_DAYTONA_FORK_REPOSITORY: process.env.TERMINALX_DAYTONA_FORK_REPOSITORY,
-    TERMINALX_DAYTONA_FORK_COMMIT: process.env.TERMINALX_DAYTONA_FORK_COMMIT,
+    TERMINALX_DAYTONA_PRODUCTION_FORK_COMMIT: process.env.TERMINALX_DAYTONA_PRODUCTION_FORK_COMMIT,
   }
 ): DaytonaSourcePin | null {
   const environment = sourceEnvironment(unsafeEnvironment);
   const repository = optionalField(environment, "TERMINALX_DAYTONA_FORK_REPOSITORY");
-  const commit = optionalField(environment, "TERMINALX_DAYTONA_FORK_COMMIT");
+  const commit = optionalField(environment, "TERMINALX_DAYTONA_PRODUCTION_FORK_COMMIT");
   if (repository === undefined && commit === undefined) return null;
-  if (repository !== DAYTONA_FORK_REPOSITORY || commit !== DAYTONA_FORK_COMMIT) {
+  if (repository !== DAYTONA_FORK_REPOSITORY || commit !== DAYTONA_PRODUCTION_FORK_COMMIT) {
     fail("invalid_source_pin");
   }
   return productionSourcePin();
@@ -338,7 +343,7 @@ function snapshotSource(value: unknown): DaytonaSourcePin {
   const source = exactRecord(value, SOURCE_FIELDS, "invalid_manifest");
   if (
     field(source, "forkRepository", "invalid_manifest") !== DAYTONA_FORK_REPOSITORY ||
-    field(source, "forkCommit", "invalid_manifest") !== DAYTONA_FORK_COMMIT ||
+    field(source, "forkCommit", "invalid_manifest") !== DAYTONA_PRODUCTION_FORK_COMMIT ||
     field(source, "upstreamRepository", "invalid_manifest") !== DAYTONA_UPSTREAM_REPOSITORY ||
     field(source, "upstreamBaseCommit", "invalid_manifest") !== DAYTONA_UPSTREAM_BASE_COMMIT
   ) {
@@ -408,10 +413,26 @@ function snapshotSandboxArtifact(value: unknown): DaytonaImmutableSandboxArtifac
   }
   if (kind === "daytona-snapshot") {
     const snapshot = exactRecord(candidate, SNAPSHOT_FIELDS, "invalid_manifest");
+    const snapshotRef = field(snapshot, "snapshotRef", "invalid_manifest");
+    const imageId = field(snapshot, "imageId", "invalid_manifest");
+    const digest = sha256(field(snapshot, "sha256", "invalid_manifest"));
+    if (
+      typeof snapshotRef !== "string" ||
+      !OCI_IMAGE_REFERENCE.test(snapshotRef) ||
+      snapshotRef.includes("://") ||
+      snapshotRef.includes("//") ||
+      !snapshotRef.endsWith(`@sha256:${digest}`) ||
+      typeof imageId !== "string" ||
+      !DOCKER_IMAGE_ID.test(imageId)
+    ) {
+      fail("invalid_manifest");
+    }
     return Object.freeze({
       kind,
       snapshotId: daytonaSnapshotId(field(snapshot, "snapshotId", "invalid_manifest")),
-      sha256: sha256(field(snapshot, "sha256", "invalid_manifest")),
+      snapshotRef,
+      imageId,
+      sha256: digest,
     });
   }
   fail("invalid_manifest");
@@ -500,7 +521,7 @@ function digestSnapshotClaims(claims: DaytonaDeploymentArtifactManifestClaims): 
 function productionSourcePin(): DaytonaSourcePin {
   return Object.freeze({
     forkRepository: DAYTONA_FORK_REPOSITORY,
-    forkCommit: DAYTONA_FORK_COMMIT,
+    forkCommit: DAYTONA_PRODUCTION_FORK_COMMIT,
     upstreamRepository: DAYTONA_UPSTREAM_REPOSITORY,
     upstreamBaseCommit: DAYTONA_UPSTREAM_BASE_COMMIT,
   });

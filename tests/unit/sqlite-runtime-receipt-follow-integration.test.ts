@@ -120,7 +120,7 @@ describe("signed Runtime late-receipt composition", () => {
           networkPolicyDigest: "c".repeat(64),
           credentialPolicyRef: "test-credential-policy:v1",
           credentialPolicyDigest: "d".repeat(64),
-          effectEnforcerSetDigest: EFFECT_ENFORCER_SET_DIGEST,
+          effectEnforcerPolicyDigest: EFFECT_ENFORCER_SET_DIGEST,
         }),
       },
       runtimeEnforcementProofVerifier: verifyExactTestProof,

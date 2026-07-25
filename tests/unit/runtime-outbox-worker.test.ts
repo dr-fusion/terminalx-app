@@ -118,7 +118,7 @@ function emergencyRetireDelivery(
 }
 
 function hostedDelivery(kind: RuntimeOutboxDelivery["kind"]): RuntimeOutboxDelivery {
-  const generation = 1;
+  const generation = kind === "runtime.session.ensure" ? 1 : 2;
   const binding = {
     teamId: "team-one",
     projectId: "project-one",
@@ -163,6 +163,7 @@ function hostedDelivery(kind: RuntimeOutboxDelivery["kind"]): RuntimeOutboxDeliv
           sessionId: SESSION_ID,
           reason: "assignee-loss",
           runtimeAuthorizationGeneration: generation,
+          assignmentPlanRuntimeAuthorizationGeneration: 1,
           ...hosted,
         },
       };
@@ -179,6 +180,7 @@ function hostedDelivery(kind: RuntimeOutboxDelivery["kind"]): RuntimeOutboxDeliv
           runtimeAssignmentGeneration: binding.runtimeAssignmentGeneration,
           sandboxId: binding.sandboxId,
           sandboxGeneration: binding.sandboxGeneration,
+          assignmentPlanRuntimeAuthorizationGeneration: 1,
           ...hosted,
         },
       };
@@ -1305,10 +1307,11 @@ describe("RuntimeOutboxWorker", () => {
     if (job.kind !== "runtime.session.ensure" || job.payload.runtimeKind !== "daytona") {
       throw new Error("Expected hosted ensure delivery");
     }
-    const originalSandboxId = job.payload.binding.sandboxId;
+    const hostedPayload = job.payload;
+    const originalSandboxId = hostedPayload.binding.sandboxId;
     let applied: RuntimeOutboxDelivery | undefined;
     const kernel = new FakeKernel([[job]], (options) => {
-      (job.payload.binding as { sandboxId: string }).sandboxId = "attacker-selected-sandbox";
+      (hostedPayload.binding as { sandboxId: string }).sandboxId = "attacker-selected-sandbox";
       return {
         leaseExpiresAtMs: Math.max(
           options.expectedLeaseExpiresAtMs,

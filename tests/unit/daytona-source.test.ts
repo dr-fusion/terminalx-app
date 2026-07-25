@@ -1,8 +1,10 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import {
   DAYTONA_DEPLOYMENT_MANIFEST_AUTHORITY_SIGNATURE_DOMAIN,
-  DAYTONA_FORK_COMMIT,
   DAYTONA_FORK_REPOSITORY,
+  DAYTONA_PRODUCTION_FORK_COMMIT,
   DAYTONA_UPSTREAM_BASE_COMMIT,
   DAYTONA_UPSTREAM_REPOSITORY,
   DaytonaDeploymentArtifactError,
@@ -27,18 +29,39 @@ const DIGESTS = Object.freeze({
   snapshot: "7".repeat(64),
 });
 const SIGNATURE = Buffer.alloc(64, 9).toString("base64url");
+const SNAPSHOT_ID = "123e4567-e89b-42d3-a456-426614174000";
+const SNAPSHOT_REF = `registry.example.com/terminalx/sandbox@sha256:${DIGESTS.snapshot}`;
+const SNAPSHOT_IMAGE_ID = `sha256:${"8".repeat(64)}`;
 const SOURCE_ENVIRONMENT: DaytonaSourceEnvironment = Object.freeze({
   TERMINALX_DAYTONA_FORK_REPOSITORY: DAYTONA_FORK_REPOSITORY,
-  TERMINALX_DAYTONA_FORK_COMMIT: DAYTONA_FORK_COMMIT,
+  TERMINALX_DAYTONA_PRODUCTION_FORK_COMMIT: DAYTONA_PRODUCTION_FORK_COMMIT,
 });
 
 describe("Daytona production source pin", () => {
+  it("keeps every release surface on the reviewed hardened merge", () => {
+    expect(DAYTONA_PRODUCTION_FORK_COMMIT).toBe("f9b4dfe428d37f3d956acda4403879516aa8d923");
+    expect(DAYTONA_PRODUCTION_FORK_COMMIT).not.toBe(DAYTONA_UPSTREAM_BASE_COMMIT);
+    for (const relativePath of [
+      ".github/workflows/daytona-sdk-artifact.yml",
+      "scripts/build-pinned-daytona-sdk.sh",
+      "scripts/build-pinned-daytona-supervisor.sh",
+      "scripts/write-daytona-sdk-artifact.mjs",
+      "scripts/write-daytona-supervisor-artifact.mjs",
+      "packages/daytona-sandbox-image/scripts/prepare-build-context.mjs",
+      "packages/daytona-sandbox-image/scripts/write-static-pins.mjs",
+    ]) {
+      expect(readFileSync(resolve(process.cwd(), relativePath), "utf8"), relativePath).toContain(
+        DAYTONA_PRODUCTION_FORK_COMMIT
+      );
+    }
+  });
+
   it("keeps optional development composition disabled when neither pin is present", () => {
     expect(resolveDaytonaSourcePin({})).toBeNull();
     expect(
       resolveDaytonaSourcePin({
         TERMINALX_DAYTONA_FORK_REPOSITORY: undefined,
-        TERMINALX_DAYTONA_FORK_COMMIT: undefined,
+        TERMINALX_DAYTONA_PRODUCTION_FORK_COMMIT: undefined,
       })
     ).toBeNull();
   });
@@ -47,7 +70,7 @@ describe("Daytona production source pin", () => {
     const pin = resolveDaytonaSourcePin(SOURCE_ENVIRONMENT);
     expect(pin).toEqual({
       forkRepository: DAYTONA_FORK_REPOSITORY,
-      forkCommit: DAYTONA_FORK_COMMIT,
+      forkCommit: DAYTONA_PRODUCTION_FORK_COMMIT,
       upstreamRepository: DAYTONA_UPSTREAM_REPOSITORY,
       upstreamBaseCommit: DAYTONA_UPSTREAM_BASE_COMMIT,
     });
@@ -56,34 +79,34 @@ describe("Daytona production source pin", () => {
 
   it.each([
     { TERMINALX_DAYTONA_FORK_REPOSITORY: DAYTONA_FORK_REPOSITORY },
-    { TERMINALX_DAYTONA_FORK_COMMIT: DAYTONA_FORK_COMMIT },
+    { TERMINALX_DAYTONA_PRODUCTION_FORK_COMMIT: DAYTONA_PRODUCTION_FORK_COMMIT },
     {
       TERMINALX_DAYTONA_FORK_REPOSITORY: "https://github.com/example/daytona",
-      TERMINALX_DAYTONA_FORK_COMMIT: DAYTONA_FORK_COMMIT,
+      TERMINALX_DAYTONA_PRODUCTION_FORK_COMMIT: DAYTONA_PRODUCTION_FORK_COMMIT,
     },
     {
       TERMINALX_DAYTONA_FORK_REPOSITORY: DAYTONA_UPSTREAM_REPOSITORY,
-      TERMINALX_DAYTONA_FORK_COMMIT: DAYTONA_FORK_COMMIT,
+      TERMINALX_DAYTONA_PRODUCTION_FORK_COMMIT: DAYTONA_PRODUCTION_FORK_COMMIT,
     },
     {
       TERMINALX_DAYTONA_FORK_REPOSITORY: `${DAYTONA_FORK_REPOSITORY}.git`,
-      TERMINALX_DAYTONA_FORK_COMMIT: DAYTONA_FORK_COMMIT,
+      TERMINALX_DAYTONA_PRODUCTION_FORK_COMMIT: DAYTONA_PRODUCTION_FORK_COMMIT,
     },
     {
       TERMINALX_DAYTONA_FORK_REPOSITORY: ` ${DAYTONA_FORK_REPOSITORY}`,
-      TERMINALX_DAYTONA_FORK_COMMIT: DAYTONA_FORK_COMMIT,
+      TERMINALX_DAYTONA_PRODUCTION_FORK_COMMIT: DAYTONA_PRODUCTION_FORK_COMMIT,
     },
     {
       TERMINALX_DAYTONA_FORK_REPOSITORY: DAYTONA_FORK_REPOSITORY,
-      TERMINALX_DAYTONA_FORK_COMMIT: "main",
+      TERMINALX_DAYTONA_PRODUCTION_FORK_COMMIT: "main",
     },
     {
       TERMINALX_DAYTONA_FORK_REPOSITORY: DAYTONA_FORK_REPOSITORY,
-      TERMINALX_DAYTONA_FORK_COMMIT: "0".repeat(40),
+      TERMINALX_DAYTONA_PRODUCTION_FORK_COMMIT: "0".repeat(40),
     },
     {
       TERMINALX_DAYTONA_FORK_REPOSITORY: DAYTONA_FORK_REPOSITORY,
-      TERMINALX_DAYTONA_FORK_COMMIT: DAYTONA_FORK_COMMIT.toUpperCase(),
+      TERMINALX_DAYTONA_PRODUCTION_FORK_COMMIT: DAYTONA_PRODUCTION_FORK_COMMIT.toUpperCase(),
     },
   ])("rejects absent, floating, normalized, or merely well-formed alternatives", (environment) => {
     expectErrorCode(() => resolveDaytonaSourcePin(environment), "invalid_source_pin");
@@ -182,7 +205,9 @@ describe("Daytona deployment artifact manifest", () => {
   it("accepts a content-digested immutable Daytona snapshot alternative", () => {
     const sandboxArtifact: DaytonaImmutableSandboxArtifact = {
       kind: "daytona-snapshot",
-      snapshotId: "123e4567-e89b-42d3-a456-426614174000",
+      snapshotId: SNAPSHOT_ID,
+      snapshotRef: SNAPSHOT_REF,
+      imageId: SNAPSHOT_IMAGE_ID,
       sha256: DIGESTS.snapshot,
     };
     const manifest = signedManifest(manifestClaims(sandboxArtifact));
@@ -231,21 +256,21 @@ describe("Daytona deployment artifact manifest", () => {
       label: "other fork",
       environment: {
         TERMINALX_DAYTONA_FORK_REPOSITORY: "https://github.com/example/daytona",
-        TERMINALX_DAYTONA_FORK_COMMIT: DAYTONA_FORK_COMMIT,
+        TERMINALX_DAYTONA_PRODUCTION_FORK_COMMIT: DAYTONA_PRODUCTION_FORK_COMMIT,
       },
     },
     {
       label: "floating commit",
       environment: {
         TERMINALX_DAYTONA_FORK_REPOSITORY: DAYTONA_FORK_REPOSITORY,
-        TERMINALX_DAYTONA_FORK_COMMIT: "main",
+        TERMINALX_DAYTONA_PRODUCTION_FORK_COMMIT: "main",
       },
     },
     {
       label: "other full commit",
       environment: {
         TERMINALX_DAYTONA_FORK_REPOSITORY: DAYTONA_FORK_REPOSITORY,
-        TERMINALX_DAYTONA_FORK_COMMIT: "a".repeat(40),
+        TERMINALX_DAYTONA_PRODUCTION_FORK_COMMIT: "a".repeat(40),
       },
     },
   ])("rejects $label before trusting a signed manifest", ({ environment }) => {
@@ -364,6 +389,13 @@ describe("Daytona deployment artifact manifest", () => {
 
   it("rejects floating, unpinned, or internally mismatched image and snapshot sources", () => {
     const manifest = signedManifest();
+    const snapshot = {
+      kind: "daytona-snapshot",
+      snapshotId: SNAPSHOT_ID,
+      snapshotRef: SNAPSHOT_REF,
+      imageId: SNAPSHOT_IMAGE_ID,
+      sha256: DIGESTS.snapshot,
+    } as const;
     const invalidArtifacts: unknown[] = [
       {
         kind: "oci-image",
@@ -380,20 +412,26 @@ describe("Daytona deployment artifact manifest", () => {
         reference: `https://ghcr.io/procyon-labs-io/terminalx@sha256:${DIGESTS.sandbox}`,
         sha256: DIGESTS.sandbox,
       },
-      { kind: "daytona-snapshot", snapshotId: "latest", sha256: DIGESTS.snapshot },
+      { ...snapshot, snapshotId: "latest" },
       {
-        kind: "daytona-snapshot",
+        ...snapshot,
         snapshotId: "123e4567-e89b-12d3-a456-426614174000",
-        sha256: DIGESTS.snapshot,
       },
       {
-        kind: "daytona-snapshot",
+        ...snapshot,
         snapshotId: "123E4567-E89B-42D3-A456-426614174000",
-        sha256: DIGESTS.snapshot,
       },
       {
-        kind: "daytona-snapshot",
-        snapshotId: "123e4567-e89b-42d3-a456-426614174000",
+        ...snapshot,
+        snapshotRef: `registry.example.com/terminalx/sandbox:latest`,
+      },
+      {
+        ...snapshot,
+        snapshotRef: `registry.example.com/terminalx/sandbox@sha256:${"a".repeat(64)}`,
+      },
+      { ...snapshot, imageId: "8".repeat(64) },
+      {
+        ...snapshot,
         sha256: "A".repeat(64),
       },
     ];
@@ -558,7 +596,7 @@ function manifestClaims(
     issuedAtMs: 2_000_000_000_000,
     source: {
       forkRepository: DAYTONA_FORK_REPOSITORY,
-      forkCommit: DAYTONA_FORK_COMMIT,
+      forkCommit: DAYTONA_PRODUCTION_FORK_COMMIT,
       upstreamRepository: DAYTONA_UPSTREAM_REPOSITORY,
       upstreamBaseCommit: DAYTONA_UPSTREAM_BASE_COMMIT,
     },

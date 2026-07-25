@@ -649,7 +649,9 @@ describe("Team Session kernel", () => {
         DROP TABLE goal_sets;
         DROP TABLE run_policy_revisions;
         DROP TABLE agent_runs;
+        DROP TABLE runtime_effect_enforcer_set_activations;
         DROP TABLE runtime_authorization_epochs;
+        DROP TABLE hosted_runtime_assignment_plans;
         DROP TABLE runtime_assignments;
         DROP TRIGGER sessions_runtime_configuration_immutable;
         DROP TRIGGER sessions_runtime_authorization_monotonic;
@@ -2807,7 +2809,7 @@ describe("Team Session kernel", () => {
 
     const database = new Database(filename, { readonly: true });
     try {
-      expect(database.pragma("user_version", { simple: true })).toBe(8);
+      expect(database.pragma("user_version", { simple: true })).toBe(10);
       expect(database.pragma("foreign_key_check")).toEqual([]);
       expect(
         database

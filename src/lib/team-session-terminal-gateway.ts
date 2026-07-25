@@ -1,8 +1,17 @@
+import { types as nodeTypes } from "node:util";
+import { digestHostedRuntimeAssignmentPlan } from "./runtime/hosted-runtime-adapter";
+import type {
+  HostedAssignmentLookup,
+  HostedAssignmentPlanSource,
+  HostedRuntimeAssignmentPlan,
+} from "./runtime/hosted-runtime-control-plane";
+import { snapshotRuntimeSupervisorPortableData } from "./runtime/runtime-supervisor-snapshot";
 import { isValidTmuxSessionName } from "./tmux";
 import {
   TEAM_SESSION_SCHEMA_VERSION,
   type ActorContext,
   type FollowSessionOptions,
+  type RuntimeBinding,
   type SessionEvent,
   type SessionGetQuery,
   type SessionTerminalAuthorizationQuery,
@@ -12,6 +21,13 @@ import {
 
 export type TerminalMutationAction = "input" | "resize" | "interrupt";
 export type HumanActorContext = ActorContext & { kind: "human" };
+type AnyFunction = (...args: unknown[]) => unknown;
+
+interface CapturedHostedAssignmentPlanSource {
+  readonly receiver: object;
+  readonly resolve: AnyFunction;
+  readonly isCurrent: AnyFunction;
+}
 
 /**
  * The narrow part of the Team Session kernel used at the terminal gateway
@@ -41,9 +57,33 @@ export interface TerminalConnectionInvalidation {
   publicReason: "Terminal authorization changed";
 }
 
+export interface LocalTeamSessionTerminalBinding {
+  readonly kind: "local-tmux";
+  readonly tmuxName: string;
+}
+
+/**
+ * Provider-neutral identity for a hosted terminal. Provider-native sandbox
+ * ids and errors stay behind the hosted transport adapter.
+ */
+export interface HostedTeamSessionTerminalBinding {
+  readonly kind: "hosted";
+  readonly binding: RuntimeBinding;
+  readonly runtimeAuthorizationGeneration: number;
+  readonly assignmentPlanDigest: string;
+  readonly incarnation: string;
+  readonly specificationDigest: string;
+}
+
+export type TeamSessionTerminalBinding =
+  | LocalTeamSessionTerminalBinding
+  | HostedTeamSessionTerminalBinding;
+
 export interface TeamSessionTerminalConnection {
   readonly sessionId: string;
-  readonly tmuxName: string;
+  readonly binding: TeamSessionTerminalBinding;
+  /** Compatibility projection for the local PTY path only. */
+  readonly tmuxName?: string;
   readonly controlEpoch: number;
   readonly runtimeAuthorizationGeneration: number;
 
@@ -72,6 +112,8 @@ export interface TeamSessionTerminalGateway {
 
 export interface CreateTeamSessionTerminalGatewayOptions {
   teamSessions: TeamSessionTerminalKernel;
+  /** Private durable source; required before a hosted terminal can attach. */
+  hostedAssignmentPlans?: HostedAssignmentPlanSource;
   monitorPollIntervalMs?: number;
   isRuntimeWriteAllowed?: (input: {
     sessionId: string;
@@ -94,7 +136,7 @@ export class TeamSessionTerminalGatewayError extends Error {
 
 interface AuthorizedSnapshot {
   sessionId: string;
-  tmuxName: string;
+  binding: TeamSessionTerminalBinding;
   controlEpoch: number;
   runtimeAuthorizationGeneration: number;
   latestSequence: number;
@@ -113,11 +155,15 @@ class CanonicalTeamSessionTerminalGateway implements TeamSessionTerminalGateway 
   private readonly isRuntimeWriteAllowed: NonNullable<
     CreateTeamSessionTerminalGatewayOptions["isRuntimeWriteAllowed"]
   >;
+  private readonly hostedAssignmentPlans: CapturedHostedAssignmentPlanSource | undefined;
 
   constructor(options: CreateTeamSessionTerminalGatewayOptions) {
     this.teamSessions = options.teamSessions;
     this.monitorPollIntervalMs = options.monitorPollIntervalMs ?? 100;
     this.isRuntimeWriteAllowed = options.isRuntimeWriteAllowed ?? (() => true);
+    this.hostedAssignmentPlans = options.hostedAssignmentPlans
+      ? captureHostedAssignmentPlanSource(options.hostedAssignmentPlans)
+      : undefined;
   }
 
   async open(options: OpenTeamSessionTerminalOptions): Promise<TeamSessionTerminalConnection> {
@@ -139,6 +185,7 @@ class CanonicalTeamSessionTerminalGateway implements TeamSessionTerminalGateway 
       snapshot,
       this.monitorPollIntervalMs,
       this.isRuntimeWriteAllowed,
+      this.hostedAssignmentPlans,
       (sessionId, currentActor) => this.readAuthorizedSnapshot(sessionId, currentActor)
     );
   }
@@ -175,11 +222,8 @@ class CanonicalTeamSessionTerminalGateway implements TeamSessionTerminalGateway 
       authorization.sessionId !== sessionId ||
       view.sessionId !== sessionId ||
       view.status !== "active" ||
-      view.runtime.kind !== "local-tmux" ||
-      view.runtime.isolation !== "trusted-shared-host" ||
       view.runtime.yoloEligible !== false ||
       view.runtime.authorizationState !== "enforced" ||
-      !isValidTmuxSessionName(view.runtime.tmuxName) ||
       !isSafeCounter(view.controlEpoch) ||
       !isSafeCounter(view.runtime.authorizationGeneration) ||
       !isSafeCounter(view.latestSequence) ||
@@ -192,9 +236,27 @@ class CanonicalTeamSessionTerminalGateway implements TeamSessionTerminalGateway 
       throw unavailable();
     }
 
+    let binding: TeamSessionTerminalBinding;
+    if (view.runtime.kind === "local-tmux") {
+      if (
+        view.runtime.isolation !== "trusted-shared-host" ||
+        !isValidTmuxSessionName(view.runtime.tmuxName)
+      ) {
+        throw unavailable();
+      }
+      binding = Object.freeze({ kind: "local-tmux", tmuxName: view.runtime.tmuxName });
+    } else {
+      if (view.runtime.isolation !== "isolated-hosted") throw unavailable();
+      binding = this.resolveHostedBinding(
+        view,
+        view.runtime.authorizationGeneration,
+        this.hostedAssignmentPlans
+      );
+    }
+
     return Object.freeze({
       sessionId,
-      tmuxName: view.runtime.tmuxName,
+      binding,
       controlEpoch: view.controlEpoch,
       runtimeAuthorizationGeneration: view.runtime.authorizationGeneration,
       latestSequence: view.latestSequence,
@@ -202,11 +264,46 @@ class CanonicalTeamSessionTerminalGateway implements TeamSessionTerminalGateway 
       participantVersion: participant.version,
     });
   }
+
+  private resolveHostedBinding(
+    view: SessionView,
+    runtimeAuthorizationGeneration: number,
+    source: CapturedHostedAssignmentPlanSource | undefined
+  ): HostedTeamSessionTerminalBinding {
+    if (!source) throw unavailable();
+    const lookup: HostedAssignmentLookup = Object.freeze({
+      kind: "session",
+      sessionId: view.sessionId,
+      runtimeAuthorizationGeneration,
+    });
+    if (Reflect.apply(source.isCurrent, source.receiver, [lookup]) !== true) throw unavailable();
+    const unsafePlan = Reflect.apply(source.resolve, source.receiver, [lookup]);
+    if (unsafePlan === null) throw unavailable();
+    const plan = snapshotRuntimeSupervisorPortableData(unsafePlan) as HostedRuntimeAssignmentPlan;
+    const assignmentPlanDigest = digestHostedRuntimeAssignmentPlan(plan);
+    if (
+      plan.binding.sessionId !== view.sessionId ||
+      plan.binding.teamId !== view.teamId ||
+      plan.binding.projectId !== view.projectId ||
+      plan.runtimeAuthorizationGeneration !== runtimeAuthorizationGeneration
+    ) {
+      throw unavailable();
+    }
+    return Object.freeze({
+      kind: "hosted",
+      binding: plan.binding,
+      runtimeAuthorizationGeneration,
+      assignmentPlanDigest,
+      incarnation: plan.incarnation,
+      specificationDigest: plan.specificationDigest,
+    });
+  }
 }
 
 class CanonicalTeamSessionTerminalConnection implements TeamSessionTerminalConnection {
   readonly sessionId: string;
-  readonly tmuxName: string;
+  readonly binding: TeamSessionTerminalBinding;
+  readonly tmuxName: string | undefined;
   readonly controlEpoch: number;
   readonly runtimeAuthorizationGeneration: number;
 
@@ -218,13 +315,15 @@ class CanonicalTeamSessionTerminalConnection implements TeamSessionTerminalConne
     private readonly isRuntimeWriteAllowed: NonNullable<
       CreateTeamSessionTerminalGatewayOptions["isRuntimeWriteAllowed"]
     >,
+    private readonly hostedAssignmentPlans: CapturedHostedAssignmentPlanSource | undefined,
     private readonly readAuthorizedSnapshot: (
       sessionId: string,
       actor: HumanActorContext
     ) => Promise<AuthorizedSnapshot>
   ) {
     this.sessionId = snapshot.sessionId;
-    this.tmuxName = snapshot.tmuxName;
+    this.binding = snapshot.binding;
+    this.tmuxName = snapshot.binding.kind === "local-tmux" ? snapshot.binding.tmuxName : undefined;
     this.controlEpoch = snapshot.controlEpoch;
     this.runtimeAuthorizationGeneration = snapshot.runtimeAuthorizationGeneration;
   }
@@ -280,9 +379,46 @@ class CanonicalTeamSessionTerminalConnection implements TeamSessionTerminalConne
   }
 
   private runtimeAllowsWrite(): boolean {
-    return this.isRuntimeWriteAllowed({
+    if (
+      !this.isRuntimeWriteAllowed({
+        sessionId: this.snapshot.sessionId,
+        runtimeAuthorizationGeneration: this.snapshot.runtimeAuthorizationGeneration,
+      })
+    ) {
+      return false;
+    }
+    if (this.snapshot.binding.kind !== "hosted") return true;
+    try {
+      const current = this.readHostedBinding();
+      return current !== null && sameTerminalBinding(current, this.snapshot.binding);
+    } catch {
+      return false;
+    }
+  }
+
+  private readHostedBinding(): HostedTeamSessionTerminalBinding | null {
+    // `readAuthorizedSnapshot` is asynchronous because it also reads the
+    // kernel. Hosted mutation fencing may not await inside the transaction, so
+    // capture just the synchronous durable-plan check here.
+    const source = this.hostedAssignmentPlans;
+    if (!source || this.snapshot.binding.kind !== "hosted") return null;
+    const lookup: HostedAssignmentLookup = Object.freeze({
+      kind: "session",
       sessionId: this.snapshot.sessionId,
       runtimeAuthorizationGeneration: this.snapshot.runtimeAuthorizationGeneration,
+    });
+    if (Reflect.apply(source.isCurrent, source.receiver, [lookup]) !== true) return null;
+    const unsafePlan = Reflect.apply(source.resolve, source.receiver, [lookup]);
+    if (unsafePlan === null) return null;
+    const plan = snapshotRuntimeSupervisorPortableData(unsafePlan) as HostedRuntimeAssignmentPlan;
+    const assignmentPlanDigest = digestHostedRuntimeAssignmentPlan(plan);
+    return Object.freeze({
+      kind: "hosted",
+      binding: plan.binding,
+      runtimeAuthorizationGeneration: plan.runtimeAuthorizationGeneration,
+      assignmentPlanDigest,
+      incarnation: plan.incarnation,
+      specificationDigest: plan.specificationDigest,
     });
   }
 
@@ -317,7 +453,7 @@ class CanonicalTeamSessionTerminalConnection implements TeamSessionTerminalConne
     const current = await this.readAuthorizedSnapshot(this.snapshot.sessionId, this.actor);
     return (
       current.sessionId === this.snapshot.sessionId &&
-      current.tmuxName === this.snapshot.tmuxName &&
+      sameTerminalBinding(current.binding, this.snapshot.binding) &&
       current.controlEpoch === this.snapshot.controlEpoch &&
       current.runtimeAuthorizationGeneration === this.snapshot.runtimeAuthorizationGeneration &&
       current.participantId === this.snapshot.participantId &&
@@ -359,6 +495,74 @@ function isSafeCounter(value: unknown): value is number {
 
 function isTerminalMutationAction(value: unknown): value is TerminalMutationAction {
   return value === "input" || value === "resize" || value === "interrupt";
+}
+
+function sameTerminalBinding(
+  left: TeamSessionTerminalBinding,
+  right: TeamSessionTerminalBinding
+): boolean {
+  if (left.kind !== right.kind) return false;
+  if (left.kind === "local-tmux") {
+    return right.kind === "local-tmux" && left.tmuxName === right.tmuxName;
+  }
+  return (
+    right.kind === "hosted" &&
+    left.runtimeAuthorizationGeneration === right.runtimeAuthorizationGeneration &&
+    left.assignmentPlanDigest === right.assignmentPlanDigest &&
+    left.incarnation === right.incarnation &&
+    left.specificationDigest === right.specificationDigest &&
+    sameRuntimeBinding(left.binding, right.binding)
+  );
+}
+
+function sameRuntimeBinding(left: RuntimeBinding, right: RuntimeBinding): boolean {
+  return (
+    left.teamId === right.teamId &&
+    left.projectId === right.projectId &&
+    left.sessionId === right.sessionId &&
+    left.runtimeAssignmentId === right.runtimeAssignmentId &&
+    left.runtimeAssignmentGeneration === right.runtimeAssignmentGeneration &&
+    left.sandboxId === right.sandboxId &&
+    left.sandboxGeneration === right.sandboxGeneration &&
+    left.runtimePrincipalId === right.runtimePrincipalId
+  );
+}
+
+function captureHostedAssignmentPlanSource(
+  value: HostedAssignmentPlanSource
+): CapturedHostedAssignmentPlanSource {
+  const receiver = safeObject(value);
+  return Object.freeze({
+    receiver,
+    resolve: captureDataMethod(receiver, "resolve"),
+    isCurrent: captureDataMethod(receiver, "isCurrent"),
+  });
+}
+
+function captureDataMethod(receiver: object, name: string): AnyFunction {
+  const visited = new Set<object>();
+  let current: object | null = receiver;
+  for (let depth = 0; current !== null && depth < 32; depth += 1) {
+    if (visited.has(current) || nodeTypes.isProxy(current)) throw new TypeError();
+    visited.add(current);
+    const descriptor = Object.getOwnPropertyDescriptor(current, name);
+    if (descriptor !== undefined) {
+      if (!("value" in descriptor) || typeof descriptor.value !== "function") {
+        throw new TypeError();
+      }
+      return descriptor.value as AnyFunction;
+    }
+    current = Object.getPrototypeOf(current) as object | null;
+  }
+  throw new TypeError();
+}
+
+function safeObject(value: unknown): object {
+  if ((typeof value !== "object" && typeof value !== "function") || value === null) {
+    throw new TypeError();
+  }
+  if (nodeTypes.isProxy(value)) throw new TypeError();
+  return value;
 }
 
 function unavailable(): TeamSessionTerminalGatewayError {

@@ -2,7 +2,8 @@
 set -euo pipefail
 
 readonly EXPECTED_REPOSITORY="https://github.com/procyon-labs-io/daytona"
-readonly EXPECTED_COMMIT="b5a5d9e78d76c8bcf351f2049620250e0f34eea4"
+readonly DAYTONA_UPSTREAM_BASE_COMMIT="b5a5d9e78d76c8bcf351f2049620250e0f34eea4"
+readonly DAYTONA_PRODUCTION_FORK_COMMIT="f9b4dfe428d37f3d956acda4403879516aa8d923"
 
 if [[ $# -ne 2 ]]; then
   echo "usage: $0 <daytona-source-directory> <empty-output-directory>" >&2
@@ -25,13 +26,22 @@ fi
 ACTUAL_COMMIT=$(git -C "$SOURCE_DIRECTORY" rev-parse --verify HEAD)
 ACTUAL_REPOSITORY=$(git -C "$SOURCE_DIRECTORY" remote get-url origin)
 ACTUAL_REPOSITORY=${ACTUAL_REPOSITORY%.git}
-if [[ "$ACTUAL_COMMIT" != "$EXPECTED_COMMIT" || "$ACTUAL_REPOSITORY" != "$EXPECTED_REPOSITORY" ]]; then
+if [[ "$ACTUAL_COMMIT" != "$DAYTONA_PRODUCTION_FORK_COMMIT" || "$ACTUAL_REPOSITORY" != "$EXPECTED_REPOSITORY" ]]; then
   echo "Daytona source pin does not match the TerminalX production baseline" >&2
+  exit 1
+fi
+if ! git -C "$SOURCE_DIRECTORY" merge-base --is-ancestor \
+  "$DAYTONA_UPSTREAM_BASE_COMMIT" "$DAYTONA_PRODUCTION_FORK_COMMIT"; then
+  echo "Daytona production commit does not descend from the reviewed upstream base" >&2
   exit 1
 fi
 if ! git -C "$SOURCE_DIRECTORY" diff --quiet --ignore-submodules -- ||
   ! git -C "$SOURCE_DIRECTORY" diff --cached --quiet --ignore-submodules --; then
   echo "Daytona source checkout must not contain tracked changes" >&2
+  exit 1
+fi
+if [[ -n "$(git -C "$SOURCE_DIRECTORY" status --porcelain=v1 --untracked-files=all)" ]]; then
+  echo "Daytona source checkout must not contain untracked or modified files" >&2
   exit 1
 fi
 
@@ -52,6 +62,7 @@ node "$SCRIPT_DIRECTORY/write-daytona-sdk-artifact.mjs" \
   "$OUTPUT_DIRECTORY/daytona-sdk-0.0.0-dev.tgz" \
   "$OUTPUT_DIRECTORY/daytona-toolbox-api-client-0.0.0-dev.tgz"
 
+PRODUCTION_COMMIT_SHORT=${DAYTONA_PRODUCTION_FORK_COMMIT:0:12}
 tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
   -C "$OUTPUT_DIRECTORY" \
   -cf - \
@@ -59,12 +70,12 @@ tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
   daytona-sdk-0.0.0-dev.tgz \
   daytona-sdk-artifact.json \
   daytona-toolbox-api-client-0.0.0-dev.tgz \
-  | gzip -n >"$OUTPUT_DIRECTORY/daytona-typescript-sdk-b5a5d9e.tar.gz"
+  | gzip -n >"$OUTPUT_DIRECTORY/daytona-typescript-sdk-$PRODUCTION_COMMIT_SHORT.tar.gz"
 
 (
   cd "$OUTPUT_DIRECTORY"
   sha256sum \
-    daytona-typescript-sdk-b5a5d9e.tar.gz \
+    "daytona-typescript-sdk-$PRODUCTION_COMMIT_SHORT.tar.gz" \
     daytona-api-client-0.0.0-dev.tgz \
     daytona-sdk-0.0.0-dev.tgz \
     daytona-sdk-artifact.json \

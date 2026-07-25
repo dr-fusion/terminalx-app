@@ -85,6 +85,15 @@ const CURRENT_RUNTIME_LIFECYCLE_DISPATCH_FENCE_SQL = `
     JOIN runtime_authorization_epochs epoch
       ON epoch.session_id = session.id
      AND epoch.generation = session.runtime_authorization_generation
+    JOIN runtime_effect_enforcer_set_activations activation
+      ON activation.session_id = epoch.session_id
+     AND activation.generation = epoch.generation
+     AND activation.runtime_assignment_id = epoch.runtime_assignment_id
+     AND activation.runtime_assignment_generation = epoch.runtime_assignment_generation
+     AND activation.sandbox_id = epoch.sandbox_id
+     AND activation.sandbox_generation = epoch.sandbox_generation
+     AND activation.runtime_principal_id = epoch.runtime_principal_id
+     AND activation.effect_enforcer_policy_digest = epoch.effect_enforcer_policy_digest
     WHERE run.id = command.agent_run_id
       AND run.session_id = command.session_id
       AND run.team_id = session.team_id
@@ -126,7 +135,7 @@ const CURRENT_RUNTIME_LIFECYCLE_DISPATCH_FENCE_SQL = `
       AND epoch.sandbox_id = command.sandbox_id
       AND epoch.sandbox_generation = command.sandbox_generation
       AND epoch.runtime_principal_id = command.runtime_principal_id
-      AND epoch.effect_enforcer_set_digest = command.required_effect_enforcer_set_digest
+      AND activation.effect_enforcer_set_digest = command.required_effect_enforcer_set_digest
       AND (command.operation <> 'run.start' OR run.start_command_id = command.id)
       AND (
         (command.operation = 'run.start' AND run.lifecycle = 'starting') OR

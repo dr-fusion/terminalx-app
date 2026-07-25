@@ -67,7 +67,8 @@ The application is built around two deliberately separate authorities:
 - the **Runtime** owns isolated execution and returns exact-bound receipts and events. Requested
   lifecycle changes do not become Session truth until Runtime enforcement is durably proven.
 
-Production execution is planned on a public Daytona fork based on
+Production execution uses the public Daytona fork at hardened merge
+`f9b4dfe428d37f3d956acda4403879516aa8d923`, descended from
 `b5a5d9e78d76c8bcf351f2049620250e0f34eea4`. Provider-native IDs and credentials stay behind the
 Runtime adapter. Local tmux remains a trusted development adapter and is never represented as a
 secure Sandbox.

@@ -1372,9 +1372,8 @@ function parseRuntime(value: unknown): TeamSessionRuntime {
     ["kind", "isolation", "yoloEligible", "authorizationGeneration", "authorizationState"],
     "Session Runtime"
   );
-  return {
-    kind: requireLiteral(runtime.kind, "local-tmux", "Runtime kind"),
-    isolation: requireLiteral(runtime.isolation, "trusted-shared-host", "Runtime isolation"),
+  const kind = requireEnum(runtime.kind, ["local-tmux", "daytona"] as const, "Runtime kind");
+  const common = {
     yoloEligible: requireLiteral(runtime.yoloEligible, false, "Runtime YOLO eligibility"),
     authorizationGeneration: requireSafeInteger(
       runtime.authorizationGeneration,
@@ -1387,6 +1386,17 @@ function parseRuntime(value: unknown): TeamSessionRuntime {
       "Runtime authorization state"
     ),
   };
+  return kind === "local-tmux"
+    ? {
+        ...common,
+        kind,
+        isolation: requireLiteral(runtime.isolation, "trusted-shared-host", "Runtime isolation"),
+      }
+    : {
+        ...common,
+        kind,
+        isolation: requireLiteral(runtime.isolation, "isolated-hosted", "Runtime isolation"),
+      };
 }
 
 function parseResponsibilities(value: unknown): TeamSessionResponsibilities {

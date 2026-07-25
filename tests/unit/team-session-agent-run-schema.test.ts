@@ -39,10 +39,10 @@ describe("Team Session Agent Run schema", () => {
     fs.rmSync(directory, { recursive: true, force: true });
   });
 
-  it("initializes the Agent Run, receipt-follow, compensation, and assignment interlock record set at schema v8", () => {
+  it("initializes the Agent Run, receipt-follow, compensation, assignment interlock, hosted plan, and provider-bound activation record set at schema v10", () => {
     database = openTeamSessionDatabase({ filename });
 
-    expect(database.db.pragma("user_version", { simple: true })).toBe(8);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(10);
     const tables = database.db
       .prepare(
         `SELECT name FROM sqlite_schema
@@ -53,6 +53,7 @@ describe("Team Session Agent Run schema", () => {
     expect(tables.map(({ name }) => name)).toEqual(
       expect.arrayContaining([
         "runtime_assignments",
+        "hosted_runtime_assignment_plans",
         "runtime_authorization_epochs",
         "agent_runs",
         "run_policy_revisions",
@@ -79,6 +80,7 @@ describe("Team Session Agent Run schema", () => {
         "runtime_compensation_receipts",
         "runtime_compensation_effects",
         "runtime_compensation_follow_events",
+        "runtime_effect_enforcer_set_activations",
       ])
     );
     const sessionColumns = database.db.prepare("PRAGMA table_info(sessions)").all() as Array<{
@@ -138,12 +140,12 @@ describe("Team Session Agent Run schema", () => {
     expect(commandTable.sql).toContain("target_run_state_version = 2");
   });
 
-  it("migrates a genuine v2 Session schema through v3, v4, v5, v6, v7, and v8 in one open", () => {
+  it("migrates a genuine v2 Session schema through v3, v4, v5, v6, v7, v8, v9, and v10 in one open", () => {
     createAgentRunSchemaV2Fixture(filename);
 
     database = openTeamSessionDatabase({ filename });
 
-    expect(database.db.pragma("user_version", { simple: true })).toBe(8);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(10);
     expect(
       database.db
         .prepare(`SELECT name FROM sqlite_schema WHERE type = 'table' AND name = 'agent_runs'`)
@@ -165,7 +167,7 @@ describe("Team Session Agent Run schema", () => {
     expect(database.db.pragma("foreign_key_check")).toEqual([]);
   });
 
-  it("accepts schema v8 when a peer finishes migration after this opener prepared v4", () => {
+  it("accepts schema v10 when a peer finishes migration after this opener prepared v4", () => {
     createRuntimeRunSchemaV4Fixture(filename);
     const pragmaDescriptor = Object.getOwnPropertyDescriptor(Database.prototype, "pragma");
     if (!pragmaDescriptor?.value) throw new Error("Expected better-sqlite3 pragma method");
@@ -178,7 +180,7 @@ describe("Team Session Agent Run schema", () => {
           peerAdvanceStarted = true;
           const peer = openTeamSessionDatabase({ filename });
           try {
-            expect(peer.db.pragma("user_version", { simple: true })).toBe(8);
+            expect(peer.db.pragma("user_version", { simple: true })).toBe(10);
             peerAdvanced = true;
           } finally {
             peer.close();
@@ -195,12 +197,12 @@ describe("Team Session Agent Run schema", () => {
 
     expect(peerAdvanceStarted).toBe(true);
     expect(peerAdvanced).toBe(true);
-    expect(database.db.pragma("user_version", { simple: true })).toBe(8);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(10);
     expect(database.db.pragma("foreign_key_check")).toEqual([]);
     expect(database.db.pragma("quick_check", { simple: true })).toBe("ok");
   });
 
-  it("accepts schema v8 when a peer wins the v6 to v8 migration race", () => {
+  it("accepts schema v10 when a peer wins after this opener reaches the v6 boundary", () => {
     createRuntimeCompensationSchemaV6Fixture(filename);
     const pragmaDescriptor = Object.getOwnPropertyDescriptor(Database.prototype, "pragma");
     if (!pragmaDescriptor?.value) throw new Error("Expected better-sqlite3 pragma method");
@@ -214,7 +216,7 @@ describe("Team Session Agent Run schema", () => {
           if (versionReads === 2) {
             const peer = openTeamSessionDatabase({ filename });
             try {
-              expect(peer.db.pragma("user_version", { simple: true })).toBe(8);
+              expect(peer.db.pragma("user_version", { simple: true })).toBe(10);
               peerAdvanced = true;
             } finally {
               peer.close();
@@ -231,11 +233,11 @@ describe("Team Session Agent Run schema", () => {
     }
 
     expect(peerAdvanced).toBe(true);
-    expect(database.db.pragma("user_version", { simple: true })).toBe(8);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(10);
     expect(database.db.pragma("foreign_key_check")).toEqual([]);
   });
 
-  it("upgrades an exact committed v7 database to v8 and marks attempted assignment work ambiguous", () => {
+  it("upgrades an exact committed v7 database through v8, v9, and v10 and marks attempted assignment work ambiguous", () => {
     createRuntimeAssignmentOutboxSchemaV7Fixture(filename);
     const legacy = new Database(filename);
     try {
@@ -286,7 +288,7 @@ describe("Team Session Agent Run schema", () => {
 
     database = openTeamSessionDatabase({ filename });
 
-    expect(database.db.pragma("user_version", { simple: true })).toBe(8);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(10);
     expect(
       database.db
         .prepare(
@@ -1198,22 +1200,14 @@ describe("Team Session Agent Run schema", () => {
     }
 
     insertRun(db, "run-1", "active");
-    if (hasColumn(db, "runtime_authorization_epochs", "effect_enforcer_set_digest")) {
-      db.prepare(
-        `INSERT INTO runtime_authorization_epochs
-           (session_id, generation, runtime_assignment_id, runtime_assignment_generation,
-            sandbox_id, sandbox_generation, runtime_principal_id, created_at_ms,
-            effect_enforcer_set_digest)
-         VALUES (?, 2, ?, 1, 'sandbox-1', 1, 'principal-1', 200, ?)`
-      ).run(SESSION_ID, ASSIGNMENT_ID, EFFECT_ENFORCER_SET_DIGEST);
-    } else {
-      db.prepare(
-        `INSERT INTO runtime_authorization_epochs
-           (session_id, generation, runtime_assignment_id, runtime_assignment_generation,
-            sandbox_id, sandbox_generation, runtime_principal_id, created_at_ms)
-         VALUES (?, 2, ?, 1, 'sandbox-1', 1, 'principal-1', 200)`
-      ).run(SESSION_ID, ASSIGNMENT_ID);
-    }
+    insertLocalRuntimeAuthorizationEpoch(db, {
+      sessionId: SESSION_ID,
+      generation: 2,
+      assignmentId: ASSIGNMENT_ID,
+      sandboxId: "sandbox-1",
+      runtimePrincipalId: "principal-1",
+      createdAtMs: 200,
+    });
     db.prepare(
       `UPDATE sessions
        SET runtime_authorization_generation = 2, runtime_authorization_state = 'quarantined'
@@ -1692,7 +1686,7 @@ describe("Team Session Agent Run schema", () => {
     }
   });
 
-  it("accepts v8 when a peer wins after this opener observes the committed v7 boundary", () => {
+  it("accepts v10 when a peer wins after this opener observes the committed v7 boundary", () => {
     createRuntimeAssignmentOutboxSchemaV7Fixture(filename);
     const pragmaDescriptor = Object.getOwnPropertyDescriptor(Database.prototype, "pragma");
     if (!pragmaDescriptor?.value) throw new Error("Expected better-sqlite3 pragma method");
@@ -1709,7 +1703,7 @@ describe("Team Session Agent Run schema", () => {
             peerAdvanceStarted = true;
             const peer = openTeamSessionDatabase({ filename });
             try {
-              expect(peer.db.pragma("user_version", { simple: true })).toBe(8);
+              expect(peer.db.pragma("user_version", { simple: true })).toBe(10);
               peerAdvanced = true;
             } finally {
               peer.close();
@@ -1727,12 +1721,12 @@ describe("Team Session Agent Run schema", () => {
 
     expect(peerAdvanceStarted).toBe(true);
     expect(peerAdvanced).toBe(true);
-    expect(database.db.pragma("user_version", { simple: true })).toBe(8);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(10);
     expect(database.db.pragma("foreign_key_check")).toEqual([]);
     expect(database.db.pragma("quick_check", { simple: true })).toBe("ok");
   });
 
-  it("migrates genuine v5 through v6, v7, and v8 without fabricating observation trust", () => {
+  it("migrates genuine v5 through v6, v7, v8, v9, and v10 without fabricating observation trust", () => {
     createRuntimeReceiptFollowSchemaV5Fixture(filename);
     const before = new Database(filename, { readonly: true });
     try {
@@ -1750,7 +1744,7 @@ describe("Team Session Agent Run schema", () => {
     }
 
     database = openTeamSessionDatabase({ filename });
-    expect(database.db.pragma("user_version", { simple: true })).toBe(8);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(10);
     expect(
       database.db.prepare(`SELECT COUNT(*) AS count FROM runtime_principal_observation_keys`).get()
     ).toEqual({ count: 0 });
@@ -1781,7 +1775,7 @@ describe("Team Session Agent Run schema", () => {
     }
 
     database = openTeamSessionDatabase({ filename });
-    expect(database.db.pragma("user_version", { simple: true })).toBe(8);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(10);
     expect(
       database.db
         .prepare(
@@ -2447,7 +2441,7 @@ describe("Team Session Agent Run schema", () => {
 
     database = openTeamSessionDatabase({ filename });
 
-    expect(database.db.pragma("user_version", { simple: true })).toBe(8);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(10);
     expect(
       database.db
         .prepare(`SELECT name FROM sqlite_schema WHERE type = 'table' AND name = ?`)
@@ -2485,12 +2479,12 @@ describe("Team Session Agent Run schema", () => {
     expect(database.db.pragma("foreign_key_check")).toEqual([]);
   });
 
-  it("migrates a populated v4 Runtime journal through v5, v6, v7, and v8 without losing truth", () => {
+  it("migrates a populated v4 Runtime journal through v5, v6, v7, v8, v9, and v10 without losing truth", () => {
     const beforeMigration = createPopulatedRuntimeRunSchemaV4Fixture(filename);
 
     database = openTeamSessionDatabase({ filename });
 
-    expect(database.db.pragma("user_version", { simple: true })).toBe(8);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(10);
     expect(
       database.db
         .prepare(`SELECT * FROM runtime_run_commands WHERE id = ?`)
@@ -2538,7 +2532,7 @@ describe("Team Session Agent Run schema", () => {
 
       database = openTeamSessionDatabase({ filename });
 
-      expect(database.db.pragma("user_version", { simple: true })).toBe(8);
+      expect(database.db.pragma("user_version", { simple: true })).toBe(10);
       expect(
         database.db
           .prepare(
@@ -3784,22 +3778,14 @@ function seedEmergencyCutoverEvidenceFixture(db: Database.Database): string {
     })
   );
   insertRun(db, "run-1", "active");
-  if (hasColumn(db, "runtime_authorization_epochs", "effect_enforcer_set_digest")) {
-    db.prepare(
-      `INSERT INTO runtime_authorization_epochs
-         (session_id, generation, runtime_assignment_id, runtime_assignment_generation,
-          sandbox_id, sandbox_generation, runtime_principal_id, created_at_ms,
-          effect_enforcer_set_digest)
-       VALUES (?, 2, ?, 1, 'sandbox-1', 1, 'principal-1', 200, ?)`
-    ).run(SESSION_ID, ASSIGNMENT_ID, EFFECT_ENFORCER_SET_DIGEST);
-  } else {
-    db.prepare(
-      `INSERT INTO runtime_authorization_epochs
-         (session_id, generation, runtime_assignment_id, runtime_assignment_generation,
-          sandbox_id, sandbox_generation, runtime_principal_id, created_at_ms)
-       VALUES (?, 2, ?, 1, 'sandbox-1', 1, 'principal-1', 200)`
-    ).run(SESSION_ID, ASSIGNMENT_ID);
-  }
+  insertLocalRuntimeAuthorizationEpoch(db, {
+    sessionId: SESSION_ID,
+    generation: 2,
+    assignmentId: ASSIGNMENT_ID,
+    sandboxId: "sandbox-1",
+    runtimePrincipalId: "principal-1",
+    createdAtMs: 200,
+  });
   db.prepare(
     `UPDATE sessions
      SET runtime_authorization_generation = 2, runtime_authorization_state = 'quarantined'
@@ -3868,22 +3854,14 @@ function seedRetiredBindingRetryFixture(db: Database.Database): void {
   seedSessionAndAssignment(db, { runtimeAuthorizationState: "pending" });
   insertRun(db, "run-1", "active");
   for (const generation of [2, 3, 4]) {
-    if (hasColumn(db, "runtime_authorization_epochs", "effect_enforcer_set_digest")) {
-      db.prepare(
-        `INSERT INTO runtime_authorization_epochs
-           (session_id, generation, runtime_assignment_id, runtime_assignment_generation,
-            sandbox_id, sandbox_generation, runtime_principal_id, created_at_ms,
-            effect_enforcer_set_digest)
-         VALUES (?, ?, ?, 1, 'sandbox-1', 1, 'principal-1', 100, ?)`
-      ).run(SESSION_ID, generation, ASSIGNMENT_ID, EFFECT_ENFORCER_SET_DIGEST);
-    } else {
-      db.prepare(
-        `INSERT INTO runtime_authorization_epochs
-           (session_id, generation, runtime_assignment_id, runtime_assignment_generation,
-            sandbox_id, sandbox_generation, runtime_principal_id, created_at_ms)
-         VALUES (?, ?, ?, 1, 'sandbox-1', 1, 'principal-1', 100)`
-      ).run(SESSION_ID, generation, ASSIGNMENT_ID);
-    }
+    insertLocalRuntimeAuthorizationEpoch(db, {
+      sessionId: SESSION_ID,
+      generation,
+      assignmentId: ASSIGNMENT_ID,
+      sandboxId: "sandbox-1",
+      runtimePrincipalId: "principal-1",
+      createdAtMs: 100,
+    });
   }
   db.prepare(
     `UPDATE sessions
@@ -4865,22 +4843,14 @@ function seedSessionAndAssignment(
         runtime_authorization_generation, status, created_at_ms)
      VALUES (?, ?, ?, ?, 1, 'local-tmux', 'sandbox-1', 1, 'principal-1', 1, 'ready', 2)`
   ).run(ASSIGNMENT_ID, SESSION_ID, TEAM_ID, PROJECT_ID);
-  if (hasColumn(db, "runtime_authorization_epochs", "effect_enforcer_set_digest")) {
-    db.prepare(
-      `INSERT INTO runtime_authorization_epochs
-         (session_id, generation, runtime_assignment_id, runtime_assignment_generation,
-          sandbox_id, sandbox_generation, runtime_principal_id, created_at_ms,
-          effect_enforcer_set_digest)
-       VALUES (?, 1, ?, 1, 'sandbox-1', 1, 'principal-1', 2, ?)`
-    ).run(SESSION_ID, ASSIGNMENT_ID, EFFECT_ENFORCER_SET_DIGEST);
-  } else {
-    db.prepare(
-      `INSERT INTO runtime_authorization_epochs
-         (session_id, generation, runtime_assignment_id, runtime_assignment_generation,
-          sandbox_id, sandbox_generation, runtime_principal_id, created_at_ms)
-       VALUES (?, 1, ?, 1, 'sandbox-1', 1, 'principal-1', 2)`
-    ).run(SESSION_ID, ASSIGNMENT_ID);
-  }
+  insertLocalRuntimeAuthorizationEpoch(db, {
+    sessionId: SESSION_ID,
+    generation: 1,
+    assignmentId: ASSIGNMENT_ID,
+    sandboxId: "sandbox-1",
+    runtimePrincipalId: "principal-1",
+    createdAtMs: 2,
+  });
 }
 
 function seedOtherSessionAndAssignment(db: Database.Database): void {
@@ -4898,22 +4868,14 @@ function seedOtherSessionAndAssignment(db: Database.Database): void {
         runtime_authorization_generation, status, created_at_ms)
      VALUES (?, ?, ?, ?, 1, 'local-tmux', 'sandbox-2', 1, 'principal-2', 1, 'ready', 2)`
   ).run(OTHER_ASSIGNMENT_ID, OTHER_SESSION_ID, TEAM_ID, PROJECT_ID);
-  if (hasColumn(db, "runtime_authorization_epochs", "effect_enforcer_set_digest")) {
-    db.prepare(
-      `INSERT INTO runtime_authorization_epochs
-         (session_id, generation, runtime_assignment_id, runtime_assignment_generation,
-          sandbox_id, sandbox_generation, runtime_principal_id, created_at_ms,
-          effect_enforcer_set_digest)
-       VALUES (?, 1, ?, 1, 'sandbox-2', 1, 'principal-2', 2, ?)`
-    ).run(OTHER_SESSION_ID, OTHER_ASSIGNMENT_ID, EFFECT_ENFORCER_SET_DIGEST);
-  } else {
-    db.prepare(
-      `INSERT INTO runtime_authorization_epochs
-         (session_id, generation, runtime_assignment_id, runtime_assignment_generation,
-          sandbox_id, sandbox_generation, runtime_principal_id, created_at_ms)
-       VALUES (?, 1, ?, 1, 'sandbox-2', 1, 'principal-2', 2)`
-    ).run(OTHER_SESSION_ID, OTHER_ASSIGNMENT_ID);
-  }
+  insertLocalRuntimeAuthorizationEpoch(db, {
+    sessionId: OTHER_SESSION_ID,
+    generation: 1,
+    assignmentId: OTHER_ASSIGNMENT_ID,
+    sandboxId: "sandbox-2",
+    runtimePrincipalId: "principal-2",
+    createdAtMs: 2,
+  });
 }
 
 function insertRun(
@@ -4927,6 +4889,20 @@ function insertRun(
     "run_policy_revisions",
     "required_effect_enforcer_set_digest"
   );
+  const requiredEffectEnforcerSetDigest = hasEnforcerSet
+    ? (
+        db
+          .prepare(
+            `SELECT effect_enforcer_set_digest
+             FROM runtime_authorization_epochs
+             WHERE session_id = ? AND generation = 1`
+          )
+          .get(SESSION_ID) as { effect_enforcer_set_digest: string | null } | undefined
+      )?.effect_enforcer_set_digest
+    : undefined;
+  if (hasEnforcerSet && !requiredEffectEnforcerSetDigest) {
+    throw new Error("Expected the Run fixture to use an epoch-bound effect-enforcer set");
+  }
   db.transaction(() => {
     insertDanglingRun(db, runId, lifecycle);
     db.prepare(
@@ -4961,7 +4937,7 @@ function insertRun(
       goalSetId,
       digestFor("project-ceiling"),
       ASSIGNMENT_ID,
-      ...(hasEnforcerSet ? [EFFECT_ENFORCER_SET_DIGEST] : [])
+      ...(hasEnforcerSet ? [requiredEffectEnforcerSetDigest] : [])
     );
   })();
 }
@@ -5426,6 +5402,7 @@ function createRuntimeRunSchemaV3Fixture(filename: string): {
   try {
     db.exec(`
       DROP TRIGGER IF EXISTS run_policy_revisions_enforcer_set_binding;
+      DROP TRIGGER IF EXISTS runtime_run_commands_enforcer_set_binding;
       DROP TRIGGER IF EXISTS sessions_runtime_lifecycle_dispatch_interlock;
       DROP TRIGGER IF EXISTS runtime_assignments_lifecycle_dispatch_interlock;
       DROP TRIGGER IF EXISTS agent_runs_lifecycle_dispatch_interlock;
@@ -5448,6 +5425,8 @@ function createRuntimeRunSchemaV3Fixture(filename: string): {
       DROP TRIGGER IF EXISTS accepted_commands_runtime_outbox_evidence;
       DROP TRIGGER IF EXISTS accepted_commands_immutable_update;
       DROP TRIGGER IF EXISTS accepted_commands_immutable_delete;
+      DROP TABLE runtime_effect_enforcer_set_activations;
+      DROP TABLE hosted_runtime_assignment_plans;
       DROP TABLE runtime_outbox_supersession_evidence;
       DROP TABLE runtime_outbox_settlements;
       DROP INDEX runtime_outbox_dispatch_interlock_acquired_at_idx;
@@ -5851,5 +5830,101 @@ function expectRuntimeOutboxV7MigrationRollback(
 function hasColumn(db: Database.Database, table: string, column: string): boolean {
   return (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).some(
     (entry) => entry.name === column
+  );
+}
+
+function hasTable(db: Database.Database, table: string): boolean {
+  return Boolean(
+    db.prepare(`SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?`).get(table)
+  );
+}
+
+function insertLocalRuntimeAuthorizationEpoch(
+  db: Database.Database,
+  input: {
+    sessionId: string;
+    generation: number;
+    assignmentId: string;
+    sandboxId: string;
+    runtimePrincipalId: string;
+    createdAtMs: number;
+  }
+): void {
+  const hasEffectEnforcerSet = hasColumn(
+    db,
+    "runtime_authorization_epochs",
+    "effect_enforcer_set_digest"
+  );
+  const hasEffectEnforcerPolicy = hasColumn(
+    db,
+    "runtime_authorization_epochs",
+    "effect_enforcer_policy_digest"
+  );
+  if (hasEffectEnforcerPolicy) {
+    db.prepare(
+      `INSERT INTO runtime_authorization_epochs
+         (session_id, generation, runtime_assignment_id, runtime_assignment_generation,
+          sandbox_id, sandbox_generation, runtime_principal_id, created_at_ms,
+          effect_enforcer_set_digest, effect_enforcer_policy_digest)
+       VALUES (?, ?, ?, 1, ?, 1, ?, ?, ?, ?)`
+    ).run(
+      input.sessionId,
+      input.generation,
+      input.assignmentId,
+      input.sandboxId,
+      input.runtimePrincipalId,
+      input.createdAtMs,
+      EFFECT_ENFORCER_SET_DIGEST,
+      EFFECT_ENFORCER_SET_DIGEST
+    );
+  } else if (hasEffectEnforcerSet) {
+    db.prepare(
+      `INSERT INTO runtime_authorization_epochs
+         (session_id, generation, runtime_assignment_id, runtime_assignment_generation,
+          sandbox_id, sandbox_generation, runtime_principal_id, created_at_ms,
+          effect_enforcer_set_digest)
+       VALUES (?, ?, ?, 1, ?, 1, ?, ?, ?)`
+    ).run(
+      input.sessionId,
+      input.generation,
+      input.assignmentId,
+      input.sandboxId,
+      input.runtimePrincipalId,
+      input.createdAtMs,
+      EFFECT_ENFORCER_SET_DIGEST
+    );
+  } else {
+    db.prepare(
+      `INSERT INTO runtime_authorization_epochs
+         (session_id, generation, runtime_assignment_id, runtime_assignment_generation,
+          sandbox_id, sandbox_generation, runtime_principal_id, created_at_ms)
+       VALUES (?, ?, ?, 1, ?, 1, ?, ?)`
+    ).run(
+      input.sessionId,
+      input.generation,
+      input.assignmentId,
+      input.sandboxId,
+      input.runtimePrincipalId,
+      input.createdAtMs
+    );
+  }
+
+  if (!hasTable(db, "runtime_effect_enforcer_set_activations")) return;
+  db.prepare(
+    `INSERT INTO runtime_effect_enforcer_set_activations (
+       session_id, generation, runtime_assignment_id, runtime_assignment_generation,
+       sandbox_id, sandbox_generation, runtime_principal_id, activation_kind,
+       effect_enforcer_policy_digest, effect_enforcer_set_digest,
+       activated_at_ms
+     ) VALUES (?, ?, ?, 1, ?, 1, ?, 'local-static', ?, ?, ?)`
+  ).run(
+    input.sessionId,
+    input.generation,
+    input.assignmentId,
+    input.sandboxId,
+    input.runtimePrincipalId,
+    EFFECT_ENFORCER_SET_DIGEST,
+    EFFECT_ENFORCER_SET_DIGEST,
+    input.createdAtMs
   );
 }

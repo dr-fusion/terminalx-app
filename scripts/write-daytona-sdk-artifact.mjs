@@ -3,7 +3,8 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { basename, resolve } from "node:path";
 
 const FORK_REPOSITORY = "https://github.com/procyon-labs-io/daytona";
-const FORK_COMMIT = "b5a5d9e78d76c8bcf351f2049620250e0f34eea4";
+const UPSTREAM_BASE_COMMIT = "b5a5d9e78d76c8bcf351f2049620250e0f34eea4";
+const PRODUCTION_FORK_COMMIT = "f9b4dfe428d37f3d956acda4403879516aa8d923";
 const EXPECTED_FILES = [
   "daytona-api-client-0.0.0-dev.tgz",
   "daytona-sdk-0.0.0-dev.tgz",
@@ -33,7 +34,8 @@ const artifact = Object.freeze({
   kind: "terminalx.daytona-typescript-sdk-build",
   source: Object.freeze({
     repository: FORK_REPOSITORY,
-    commit: FORK_COMMIT,
+    productionCommit: PRODUCTION_FORK_COMMIT,
+    upstreamBaseCommit: UPSTREAM_BASE_COMMIT,
   }),
   build: Object.freeze({
     packageVersion: "0.0.0-dev",

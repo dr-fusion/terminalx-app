@@ -1,22 +1,13 @@
 import { NextResponse } from "next/server";
-import { isMultiplayerTransportAvailable } from "@/lib/team-sessions/feature";
+import { getMultiplayerTransportStatus } from "@/lib/team-sessions/feature";
 
 export const dynamic = "force-dynamic";
 
 export async function GET() {
-  return NextResponse.json(
-    {
-      enabled: isMultiplayerTransportAvailable(),
-      runtime: {
-        kind: "local-tmux",
-        isolation: "trusted-shared-host",
-        yoloEligible: false,
-      },
+  const status = getMultiplayerTransportStatus();
+  return NextResponse.json(status, {
+    headers: {
+      "Cache-Control": "no-store",
     },
-    {
-      headers: {
-        "Cache-Control": "no-store",
-      },
-    }
-  );
+  });
 }

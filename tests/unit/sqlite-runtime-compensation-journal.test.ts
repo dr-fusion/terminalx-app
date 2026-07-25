@@ -938,9 +938,10 @@ function seedVerifiedCompensationIncident(db: Database.Database): void {
   db.prepare(
     `INSERT INTO sessions (
        id, team_id, project_id, name, status, steering_policy,
+       runtime_authorization_generation, runtime_authorization_state,
        runtime_kind, isolation, tmux_name, yolo_eligible, created_at_ms
      ) VALUES (?, ?, ?, 'Session', 'active', 'shared',
-       'local-tmux', 'trusted-shared-host', 'compensation-test', 0, 1)`
+       1, 'enforced', 'local-tmux', 'trusted-shared-host', 'compensation-test', 0, 1)`
   ).run(SESSION_ID, TEAM_ID, PROJECT_ID);
   db.prepare(
     `INSERT INTO runtime_assignments (
@@ -953,10 +954,20 @@ function seedVerifiedCompensationIncident(db: Database.Database): void {
   db.prepare(
     `INSERT INTO runtime_authorization_epochs (
        session_id, generation, runtime_assignment_id, runtime_assignment_generation,
-       sandbox_id, sandbox_generation, runtime_principal_id, created_at_ms,
-       effect_enforcer_set_digest
-     ) VALUES (?, 1, ?, 1, 'sandbox-1', 1, 'principal-1', 2, ?)`
-  ).run(SESSION_ID, ASSIGNMENT_ID, SOURCE_ENFORCER_SET_DIGEST);
+       sandbox_id, sandbox_generation, runtime_principal_id,
+       effect_enforcer_policy_digest, effect_enforcer_set_digest, created_at_ms
+     ) VALUES (?, 1, ?, 1, 'sandbox-1', 1, 'principal-1', ?, ?, 2)`
+  ).run(SESSION_ID, ASSIGNMENT_ID, SOURCE_ENFORCER_SET_DIGEST, SOURCE_ENFORCER_SET_DIGEST);
+  db.prepare(
+    `INSERT INTO runtime_effect_enforcer_set_activations (
+       session_id, generation, runtime_assignment_id, runtime_assignment_generation,
+       sandbox_id, sandbox_generation, runtime_principal_id, activation_kind,
+       effect_enforcer_policy_digest, effect_enforcer_set_digest,
+       assignment_plan_digest, provider_identity_commitment, provider_revision,
+       effect_manifest_binding_digest, activated_at_ms
+     ) VALUES (?, 1, ?, 1, 'sandbox-1', 1, 'principal-1', 'local-static',
+       ?, ?, NULL, NULL, NULL, NULL, 2)`
+  ).run(SESSION_ID, ASSIGNMENT_ID, SOURCE_ENFORCER_SET_DIGEST, SOURCE_ENFORCER_SET_DIGEST);
 
   db.transaction(() => {
     db.prepare(

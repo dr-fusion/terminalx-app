@@ -158,7 +158,7 @@ describe("Phase 6 SQLite concurrency and crash boundaries", () => {
           networkPolicyDigest: "d".repeat(64),
           credentialPolicyRef: "test-credential-policy:v1",
           credentialPolicyDigest: "e".repeat(64),
-          effectEnforcerSetDigest: EFFECT_ENFORCER_SET_DIGEST,
+          effectEnforcerPolicyDigest: EFFECT_ENFORCER_SET_DIGEST,
         }),
       },
       runtimeEnforcementProofVerifier: () => true,

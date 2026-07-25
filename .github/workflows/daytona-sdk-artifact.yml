@@ -1,4 +1,4 @@
-name: Pinned Daytona SDK artifact
+name: Pinned Daytona SDK and TerminalX supervisor artifacts
 
 on:
   workflow_dispatch:
@@ -11,30 +11,54 @@ permissions:
   id-token: write
   attestations: write
 
+env:
+  DAYTONA_UPSTREAM_BASE_COMMIT: b5a5d9e78d76c8bcf351f2049620250e0f34eea4
+  DAYTONA_PRODUCTION_FORK_COMMIT: f9b4dfe428d37f3d956acda4403879516aa8d923
+
 jobs:
   build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
       - name: Check out TerminalX
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
 
-      - name: Check out the exact public Daytona fork commit
+      - name: Check out the exact production Daytona fork commit
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: procyon-labs-io/daytona
-          ref: b5a5d9e78d76c8bcf351f2049620250e0f34eea4
+          ref: ${{ env.DAYTONA_PRODUCTION_FORK_COMMIT }}
           path: .daytona-source
           persist-credentials: false
+          fetch-depth: 0
+
+      - name: Verify exact production fork ancestry
+        run: |
+          test "$(git -C .daytona-source rev-parse HEAD)" = "$DAYTONA_PRODUCTION_FORK_COMMIT"
+          test "$DAYTONA_PRODUCTION_FORK_COMMIT" != "$DAYTONA_UPSTREAM_BASE_COMMIT"
+          git -C .daytona-source merge-base --is-ancestor "$DAYTONA_UPSTREAM_BASE_COMMIT" "$DAYTONA_PRODUCTION_FORK_COMMIT"
 
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 22
 
+      - name: Install exact TerminalX build dependencies
+        run: npm ci --ignore-scripts
+
       - name: Build the pinned SDK bundle
         run: scripts/build-pinned-daytona-sdk.sh "$GITHUB_WORKSPACE/.daytona-source" "$RUNNER_TEMP/daytona-sdk"
+
+      - name: Build the pinned TerminalX supervisor bundle
+        run: scripts/build-pinned-daytona-supervisor.sh "$GITHUB_WORKSPACE" "$RUNNER_TEMP/daytona-supervisor"
+
+      - name: Rebuild and verify deterministic release inputs
+        run: |
+          scripts/build-pinned-daytona-sdk.sh "$GITHUB_WORKSPACE/.daytona-source" "$RUNNER_TEMP/daytona-sdk-rebuild"
+          scripts/build-pinned-daytona-supervisor.sh "$GITHUB_WORKSPACE" "$RUNNER_TEMP/daytona-supervisor-rebuild"
+          diff --no-dereference --recursive "$RUNNER_TEMP/daytona-sdk" "$RUNNER_TEMP/daytona-sdk-rebuild"
+          diff --no-dereference --recursive "$RUNNER_TEMP/daytona-supervisor" "$RUNNER_TEMP/daytona-supervisor-rebuild"
 
       - name: Generate SPDX 2.3 SBOM
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
@@ -45,10 +69,25 @@ jobs:
           upload-artifact: false
           upload-release-assets: false
 
+      - name: Generate supervisor SPDX 2.3 SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          path: ${{ runner.temp }}/daytona-supervisor
+          format: spdx-json
+          output-file: ${{ runner.temp }}/daytona-supervisor/daytona-supervisor.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
       - name: Record final artifact checksums
         run: |
           cd "$RUNNER_TEMP/daytona-sdk"
           sha256sum daytona-sdk.spdx.json >>checksums.sha256
+          sha256sum --check checksums.sha256
+
+      - name: Record final supervisor artifact checksums
+        run: |
+          cd "$RUNNER_TEMP/daytona-supervisor"
+          sha256sum daytona-supervisor.spdx.json >>checksums.sha256
           sha256sum --check checksums.sha256
 
       - name: Attest exact build provenance
@@ -56,6 +95,12 @@ jobs:
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
         with:
           subject-checksums: ${{ runner.temp }}/daytona-sdk/checksums.sha256
+
+      - name: Attest exact supervisor build provenance
+        id: supervisor-provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-checksums: ${{ runner.temp }}/daytona-supervisor/checksums.sha256
 
       - name: Include the signed provenance bundle
         env:
@@ -66,11 +111,29 @@ jobs:
           sha256sum daytona-sdk.provenance.json >>checksums.sha256
           sha256sum --check checksums.sha256
 
+      - name: Include the signed supervisor provenance bundle
+        env:
+          PROVENANCE_BUNDLE: ${{ steps.supervisor-provenance.outputs.bundle-path }}
+        run: |
+          cp "$PROVENANCE_BUNDLE" "$RUNNER_TEMP/daytona-supervisor/daytona-supervisor.provenance.json"
+          cd "$RUNNER_TEMP/daytona-supervisor"
+          sha256sum daytona-supervisor.provenance.json >>checksums.sha256
+          sha256sum --check checksums.sha256
+
       - name: Upload release inputs
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: daytona-sdk-b5a5d9e-${{ github.sha }}
+          name: daytona-sdk-${{ env.DAYTONA_PRODUCTION_FORK_COMMIT }}-${{ github.sha }}
           path: ${{ runner.temp }}/daytona-sdk
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0
+
+      - name: Upload supervisor release inputs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: terminalx-daytona-supervisor-${{ github.sha }}
+          path: ${{ runner.temp }}/daytona-supervisor
           if-no-files-found: error
           retention-days: 90
           compression-level: 0

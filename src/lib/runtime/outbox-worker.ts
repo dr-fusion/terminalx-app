@@ -572,6 +572,7 @@ function runtimeOutboxPayloadKeySets(kind: unknown): readonly (readonly string[]
           "binding",
           "assignmentPlanRef",
           "assignmentPlanDigest",
+          "assignmentPlanRuntimeAuthorizationGeneration",
         ],
       ];
     case "runtime.session.retire":
@@ -600,6 +601,7 @@ function runtimeOutboxPayloadKeySets(kind: unknown): readonly (readonly string[]
           "binding",
           "assignmentPlanRef",
           "assignmentPlanDigest",
+          "assignmentPlanRuntimeAuthorizationGeneration",
         ],
       ];
     default:

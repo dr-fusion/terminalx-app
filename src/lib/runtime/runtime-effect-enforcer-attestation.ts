@@ -70,6 +70,11 @@ const MANIFEST_CLAIMS_FIELDS = [
   "version",
   "kind",
   "manifestId",
+  "assignmentPlanDigest",
+  "effectEnforcerPolicyDigest",
+  "providerIdentityCommitment",
+  "providerRevision",
+  "effectManifestBindingDigest",
   "validFromMs",
   "expiresAtMs",
   "enforcers",
@@ -176,6 +181,16 @@ export interface RuntimeEffectEnforcerManifestClaims {
   readonly version: 1;
   readonly kind: "runtime.effect-enforcer-manifest";
   readonly manifestId: string;
+  /** Digest of the complete exact assignment plan admitted by this manifest. */
+  readonly assignmentPlanDigest: string;
+  /** Key-independent policy selecting allowed enforcer kinds, purposes, and quorum. */
+  readonly effectEnforcerPolicyDigest: string;
+  /** Privacy-preserving commitment to the one provider Sandbox identity. */
+  readonly providerIdentityCommitment: string;
+  /** Immutable root assignment revision admitted by this manifest. */
+  readonly providerRevision: number;
+  /** Domain-separated commitment to the plan, policy, provider, revision, and enforcer set. */
+  readonly effectManifestBindingDigest: string;
   readonly validFromMs: number;
   readonly expiresAtMs: number;
   /** Exact required enforcer set, strictly sorted by enforcerRef. */
@@ -802,6 +817,11 @@ function parseManifestClaimsRecord(
       version: 1,
       kind: MANIFEST_KIND,
       manifestId: safeReference(field(record, "manifestId", code), code),
+      assignmentPlanDigest: sha256(field(record, "assignmentPlanDigest", code), code),
+      effectEnforcerPolicyDigest: sha256(field(record, "effectEnforcerPolicyDigest", code), code),
+      providerIdentityCommitment: sha256(field(record, "providerIdentityCommitment", code), code),
+      providerRevision: positiveInteger(field(record, "providerRevision", code), code),
+      effectManifestBindingDigest: sha256(field(record, "effectManifestBindingDigest", code), code),
       validFromMs,
       expiresAtMs,
       enforcers: snapshots,

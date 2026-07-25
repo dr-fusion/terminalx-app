@@ -1,0 +1,16 @@
+{
+  "name": "@terminalx/daytona-supervisor",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Fail-closed TerminalX in-Sandbox supervisor protocol daemon",
+  "license": "MIT",
+  "type": "commonjs",
+  "bin": {
+    "terminalx-daytona-supervisor": "bin/terminalx-daytona-supervisor",
+    "terminalx-supervisor-relay": "bin/terminalx-supervisor-relay",
+    "terminalx-assignment-bootstrap": "bin/terminalx-assignment-bootstrap"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}

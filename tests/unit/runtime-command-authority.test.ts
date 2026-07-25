@@ -130,6 +130,16 @@ describe("Runtime command canonical claims", () => {
     );
   });
 
+  it("rejects lone UTF-16 surrogates in values and object keys but permits valid pairs", () => {
+    for (const value of ["\ud800", "\udbff", "\udc00", "\udfff", `left\ud800right`]) {
+      expect(() => canonicalRuntimeJson(value)).toThrow(RuntimeCommandCanonicalError);
+      expect(() => canonicalRuntimeJson({ [value]: true })).toThrow(RuntimeCommandCanonicalError);
+    }
+    expect(
+      canonicalRuntimeJson({ "astral-\ud83d\ude80": "\ud83d\ude80", separator: "\u2028\u2029" })
+    ).toBe('{"astral-🚀":"🚀","separator":"  "}');
+  });
+
   it("rejects cycles, accessors, non-finite numbers, negative zero, and unsupported values safely", () => {
     const cyclic: Record<string, unknown> = {};
     cyclic.self = cyclic;

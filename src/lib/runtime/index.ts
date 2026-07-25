@@ -1,8 +1,8 @@
 export {
   DAYTONA_DEPLOYMENT_MANIFEST_AUTHORITY_SIGNATURE_DOMAIN,
   DAYTONA_DEPLOYMENT_MANIFEST_CLAIMS_DIGEST_DOMAIN,
-  DAYTONA_FORK_COMMIT,
   DAYTONA_FORK_REPOSITORY,
+  DAYTONA_PRODUCTION_FORK_COMMIT,
   DAYTONA_UPSTREAM_BASE_COMMIT,
   DAYTONA_UPSTREAM_REPOSITORY,
   DaytonaDeploymentArtifactError,
@@ -24,6 +24,102 @@ export {
   type VerifiedDaytonaDeploymentArtifacts,
   type VerifyDaytonaDeploymentArtifactsOptions,
 } from "./daytona-source";
+export {
+  TERMINALX_DAYTONA_SOURCE_COMMIT,
+  createDaytonaHostedRuntimeControlPlane,
+  createPinnedDaytonaFetchApi,
+  type CreateDaytonaHostedRuntimeControlPlaneOptions,
+  type CreatePinnedDaytonaFetchApiOptions,
+  type DaytonaCommandAuthorityVerificationInput,
+  type DaytonaCommandAuthorityVerifier,
+  type DaytonaHostedControlPlaneConfiguration,
+  type DaytonaIsolationAttestationVerificationInput,
+  type DaytonaIsolationAttestationVerifier,
+  type DaytonaSandboxApiPort,
+  type DaytonaSandboxArtifact,
+  type DaytonaSandboxLifecycleConfiguration,
+  type PinnedDaytonaSupervisorTransport,
+} from "./daytona-hosted-control-plane";
+export {
+  createDurableDaytonaAssignmentBootstrapCoordinator,
+  type CreateDurableDaytonaAssignmentBootstrapCoordinatorOptions,
+  type DaytonaAssignmentBootstrapCoordinator,
+  type DaytonaAssignmentBootstrapInstallRequest,
+  type DaytonaAssignmentBootstrapPrivateKeys,
+} from "./daytona-assignment-bootstrap-saga";
+export {
+  DAYTONA_ASSIGNMENT_KEY_CONTEXT_DIGEST_DOMAIN,
+  DAYTONA_EFFECT_ENFORCER_KEY_SEED_DOMAIN,
+  DAYTONA_OBSERVATION_KEY_SEED_DOMAIN,
+  createDaytonaAssignmentKeyRegistry,
+  type CreateDaytonaAssignmentKeyRegistryOptions,
+  type DaytonaAssignmentEffectEnforcerIdentity,
+  type DaytonaAssignmentKeyRegistry,
+} from "./daytona-assignment-key-registry";
+export {
+  DAYTONA_EFFECT_MANIFEST_BINDING_DIGEST_DOMAIN,
+  DAYTONA_PROVIDER_IDENTITY_DIGEST_DOMAIN,
+  commitDaytonaProviderIdentity,
+  createDaytonaAssignmentEffectManifest,
+  digestDaytonaEffectManifestBinding,
+  verifyDaytonaAssignmentEffectManifestBinding,
+  type CreateDaytonaAssignmentEffectManifestOptions,
+  type DaytonaAssignmentEffectManifestRecord,
+} from "./daytona-assignment-effect-manifest";
+export { snapshotHostedRuntimeActivation } from "./hosted-runtime-activation";
+export {
+  DaytonaAssignmentBootstrapTransportError,
+  createDaytonaAssignmentBootstrapTransport,
+  type CreateDaytonaAssignmentBootstrapTransportOptions,
+  type DaytonaAssignmentBootstrapTransport,
+  type DaytonaAssignmentBootstrapTransportErrorCode,
+} from "./daytona-assignment-bootstrap-transport";
+export {
+  DAYTONA_SUPERVISOR_RELAY_MEDIA_TYPE,
+  createDaytonaSupervisorRelayTransport,
+  type CreateDaytonaSupervisorRelayTransportOptions,
+} from "./daytona-supervisor-relay-transport";
+export {
+  HostedControlPlaneError,
+  type HostedAssignmentLookup,
+  type HostedAssignmentPlanSource,
+  type HostedControlPlaneCommandRequest,
+  type HostedControlPlaneCommandResult,
+  type HostedControlPlaneCreateRequest,
+  type HostedControlPlaneErrorCode,
+  type HostedControlPlaneFollowRequest,
+  type HostedControlPlaneMutationRequest,
+  type HostedControlPlaneSandbox,
+  type HostedRuntimeAssignmentPlan,
+  type HostedRuntimeActivation,
+  type HostedRuntimeActivationQuery,
+  type HostedRuntimeActivationSink,
+  type HostedRuntimeActivationSource,
+  type HostedRuntimeControlPlane,
+  type HostedRuntimeIsolationControls,
+} from "./hosted-runtime-control-plane";
+export {
+  createHostedRuntimeActivationRegistry,
+  type HostedRuntimeActivationRegistry,
+} from "./hosted-runtime-activation-registry";
+export {
+  createHostedRuntimeAdapterBundle,
+  type CreateHostedRuntimeAdapterBundleOptions,
+  type HostedRuntimeAdapterBundle,
+} from "./hosted-runtime-adapter";
+export {
+  HostedMultiplayerServiceError,
+  createDaytonaHostedMultiplayerService,
+  startDaytonaHostedMultiplayerService,
+  type CreateDaytonaHostedMultiplayerServiceOptions,
+  type DaytonaHostedMultiplayerService,
+  type HostedMultiplayerAvailability,
+  type HostedMultiplayerIngress,
+  type HostedMultiplayerIngressContext,
+  type HostedMultiplayerServiceErrorCode,
+  type HostedMultiplayerServiceState,
+  type MeasuredDaytonaDeploymentArtifacts,
+} from "./hosted-multiplayer-service";
 export {
   CANONICAL_TMUX_CONFIG_FILE,
   CANONICAL_TMUX_SOCKET_NAME_ENV,
@@ -326,6 +422,13 @@ export {
   type RuntimeEffectEnforcerPurpose,
   type RuntimeEffectEnforcerTrustRegistry,
 } from "./runtime-effect-enforcer-attestation";
+export {
+  createRuntimeEffectEnforcerTrustRouter,
+  type CreateRuntimeEffectEnforcerTrustRouterOptions,
+  type RuntimeEffectEnforcerAttestationBatch,
+  type RuntimeEffectEnforcerManifestActivation,
+  type RuntimeEffectEnforcerTrustRouter,
+} from "./runtime-effect-enforcer-trust-router";
 export {
   RUNTIME_RECEIPT_OBSERVATION_CLAIMS_DIGEST_DOMAIN,
   RUNTIME_RECEIPT_OBSERVATION_RECEIPT_DIGEST_DOMAIN,

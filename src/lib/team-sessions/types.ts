@@ -1,4 +1,5 @@
 import type * as Phase4Contracts from "./contracts";
+import type { RuntimeBinding } from "./contracts";
 
 export const TEAM_SESSION_SCHEMA_VERSION = 1 as const;
 
@@ -86,7 +87,8 @@ export type SessionCommand =
       /** Canonical lowercase RFC 4122 UUID v4 when supplied. */
       sessionId?: string;
       name: string;
-      tmuxName: string;
+      /** Deployment-owned local Runtime detail; ignored by hosted deployments. */
+      tmuxName?: string;
       steeringPolicy?: SteeringPolicy;
     })
   | (CommandBase & {
@@ -513,37 +515,104 @@ interface RuntimeOutboxDeliveryBase {
   dispatchMode: RuntimeOutboxDispatchMode;
 }
 
+export interface HostedRuntimeOutboxAssignment {
+  runtimeKind: "daytona";
+  binding: RuntimeBinding;
+  assignmentPlanRef: string;
+  assignmentPlanDigest: string;
+}
+
+/**
+ * A destructive hosted transition is authorized by the new Session fence, but
+ * must address the immutable plan that created the existing provider instance.
+ */
+export interface HostedRuntimeOutboxTransitionTarget extends HostedRuntimeOutboxAssignment {
+  assignmentPlanRuntimeAuthorizationGeneration: number;
+}
+
+export interface HostedRuntimeRecoveryEnsureAssignment extends HostedRuntimeOutboxAssignment {
+  recoveryId: string;
+  agentRunId: string;
+  fenceOutboxId: string;
+  previousRuntimeAuthorizationGeneration: number;
+  previousBinding: RuntimeBinding;
+  previousAssignmentPlanRef: string;
+  previousAssignmentPlanDigest: string;
+  previousAssignmentPlanRuntimeAuthorizationGeneration: number;
+}
+
+export interface HostedRuntimeRecoveryRetireAssignment extends HostedRuntimeOutboxTransitionTarget {
+  recoveryId: string;
+  fenceOutboxId: string;
+  previousRuntimeAuthorizationGeneration: number;
+  replacementBinding: RuntimeBinding;
+  replacementAssignmentPlanRef: string;
+  replacementAssignmentPlanDigest: string;
+}
+
 export type RuntimeOutboxDelivery = RuntimeOutboxDeliveryBase &
   (
     | {
         kind: "runtime.session.ensure";
-        payload: {
-          sessionId: string;
-          runtimeKind: "local-tmux";
-          tmuxName: string;
-          runtimeAuthorizationGeneration: number;
-        };
+        payload:
+          | {
+              sessionId: string;
+              runtimeKind: "local-tmux";
+              tmuxName: string;
+              runtimeAuthorizationGeneration: number;
+            }
+          | ({
+              sessionId: string;
+              runtimeAuthorizationGeneration: number;
+            } & (HostedRuntimeOutboxAssignment | HostedRuntimeRecoveryEnsureAssignment));
       }
     | {
         kind: "runtime.authorization.fence";
-        payload: {
-          sessionId: string;
-          reason: "assignee-loss" | "emergency-stop";
-          runtimeAuthorizationGeneration: number;
-        };
+        payload:
+          | {
+              sessionId: string;
+              reason: "assignee-loss" | "emergency-stop";
+              runtimeAuthorizationGeneration: number;
+            }
+          | ({
+              sessionId: string;
+              reason: "assignee-loss" | "emergency-stop";
+              runtimeAuthorizationGeneration: number;
+            } & HostedRuntimeOutboxTransitionTarget);
       }
     | {
         kind: "runtime.session.retire";
-        payload: {
-          sessionId: string;
-          runtimeAuthorizationGeneration: number;
-          reason: "emergency-stop";
-          agentRunId: string;
-          runtimeAssignmentId: string;
-          runtimeAssignmentGeneration: number;
-          sandboxId: string;
-          sandboxGeneration: number;
-        };
+        payload:
+          | {
+              sessionId: string;
+              runtimeAuthorizationGeneration: number;
+              reason: "emergency-stop";
+              agentRunId: string;
+              runtimeAssignmentId: string;
+              runtimeAssignmentGeneration: number;
+              sandboxId: string;
+              sandboxGeneration: number;
+            }
+          | ({
+              sessionId: string;
+              runtimeAuthorizationGeneration: number;
+              reason: "emergency-stop";
+              agentRunId: string;
+              runtimeAssignmentId: string;
+              runtimeAssignmentGeneration: number;
+              sandboxId: string;
+              sandboxGeneration: number;
+            } & HostedRuntimeOutboxTransitionTarget)
+          | ({
+              sessionId: string;
+              runtimeAuthorizationGeneration: number;
+              reason: "assignee-replacement";
+              agentRunId: string;
+              runtimeAssignmentId: string;
+              runtimeAssignmentGeneration: number;
+              sandboxId: string;
+              sandboxGeneration: number;
+            } & HostedRuntimeRecoveryRetireAssignment);
       }
   );
 
@@ -678,13 +747,17 @@ export interface SessionViewerView extends PublicSessionIdentityView {
   capabilities: SessionViewerCapabilities;
 }
 
-export interface PublicSessionRuntimeView {
-  kind: "local-tmux";
-  isolation: "trusted-shared-host";
+interface PublicSessionRuntimeViewBase {
   yoloEligible: false;
   authorizationGeneration: number;
   authorizationState: "enforced" | "pending" | "quarantined";
 }
+
+export type PublicSessionRuntimeView = PublicSessionRuntimeViewBase &
+  (
+    | { kind: "local-tmux"; isolation: "trusted-shared-host" }
+    | { kind: "daytona"; isolation: "isolated-hosted" }
+  );
 
 export interface PublicSessionResponsibilityView {
   assignee?: PublicSessionIdentityView;
@@ -981,14 +1054,16 @@ export interface SessionView {
   controlRevision: number;
   controlEpoch: number;
   runStateRevision: number;
-  runtime: {
-    kind: "local-tmux";
-    isolation: "trusted-shared-host";
-    tmuxName: string;
-    yoloEligible: false;
-    authorizationGeneration: number;
-    authorizationState: "enforced" | "pending" | "quarantined";
-  };
+  runtime:
+    | (PublicSessionRuntimeViewBase & {
+        kind: "local-tmux";
+        isolation: "trusted-shared-host";
+        tmuxName: string;
+      })
+    | (PublicSessionRuntimeViewBase & {
+        kind: "daytona";
+        isolation: "isolated-hosted";
+      });
   participants: SessionParticipantView[];
   shares: SessionShareView[];
   invitations: SessionInvitationView[];

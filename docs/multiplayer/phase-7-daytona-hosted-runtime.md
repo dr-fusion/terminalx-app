@@ -6,15 +6,21 @@ this document is evidenced. LocalTmux remains a development-only Adapter.
 ## Immutable source baseline
 
 - Public fork: `https://github.com/procyon-labs-io/daytona`
-- Required fork commit: `b5a5d9e78d76c8bcf351f2049620250e0f34eea4`
+- Upstream/base ancestry commit: `b5a5d9e78d76c8bcf351f2049620250e0f34eea4`
+- Production fork commit: `f9b4dfe428d37f3d956acda4403879516aa8d923`
 - Immutable reference: `terminalx-v1-base-b5a5d9e`
 - Verified upstream: `https://github.com/daytonaio/daytona`
 - Verified upstream base: `b5a5d9e78d76c8bcf351f2049620250e0f34eea4`
 
-The fork's `main` reference and the peeled immutable tag both resolve to the required full commit.
+The base fork's `main` reference and peeled immutable tag resolved to the reviewed ancestry commit.
 The two removed fork commits were `b40f732a38a9bdb5a124312bbe4b32712836c7dc` and
 `ec4c21b2d597091ac09ecc278f3bcc172575a987`. Builds and deployments must verify the full commit,
-artifact digests, and signed provenance; neither a branch nor a tag is sufficient evidence.
+artifact digests, and signed provenance; neither a branch nor a tag is sufficient evidence. The
+base commit is privileged for ordinary non-GPU Sandboxes and has no PID limit, so it must never be
+attested as the isolated production Runtime. SDK, runner, image, and supervisor evidence must all
+name the reviewed production descendant `f9b4dfe428d37f3d956acda4403879516aa8d923`.
+The release workflow, application activation gate, image trust pins, supervisor artifact, and
+control-plane settings reject every other commit.
 
 The Daytona server repository is AGPL-3.0. The TypeScript SDK and generated TypeScript clients are
 Apache-2.0. TerminalX does not copy Daytona server code into its MIT repository. Any deployed fork
@@ -48,8 +54,9 @@ the complete Runtime Assignment and Sandbox generations; it is never a provider 
 
 ## Required ordering and reconciliation
 
-1. Verify the signed deployment manifest, exact fork ancestry, artifacts, SBOM, provenance, image
-   or snapshot digest, supervisor identity, and effective isolation profile.
+1. Verify the signed deployment manifest, exact fork ancestry, artifacts, SBOM, provenance, the
+   snapshot UUID-to-reference mapping, independently inspected image ID, supervisor identity, and
+   effective isolation profile.
 2. Load the complete signed Runtime trust group from an explicit operator-owned private root.
 3. Open the Team Session kernel and reconstruct exact durable hosted assignment plans.
 4. Construct the hosted Adapter and portable `RuntimeSupervisorRoot`.
@@ -57,23 +64,121 @@ the complete Runtime Assignment and Sandbox generations; it is never a provider 
 6. On shutdown, withdraw availability, close ingress, stop the root, dispose provider streams and
    clients, zero credential buffers, and close the Team Session kernel last.
 
+## Production activation and private configuration
+
+Hosted production has one selector: `TERMINALX_HOSTED_RUNTIME=daytona`. Absence means disabled and
+dormant hosted paths are not read. An empty value, `true`, `false`, or a differently cased selector
+is invalid; once selected, every unsupported `TERMINALX_HOSTED_*` variable is also rejected.
+Activation additionally requires `NODE_ENV=production` and the existing canonical transport gate
+`TERMINALX_MULTIPLAYER_ENABLED=true`. The selector is installed before multiplayer service
+selection and before the HTTP server listens. An enabled deployment with a missing setting,
+unavailable file, incomplete composer, or failed Runtime graph exits through the generic startup
+failure and never falls back to LocalTmux.
+
+These are the complete accepted `TERMINALX_HOSTED_*` environment variables. Values other than the
+selector are absolute canonical paths; secret bytes are never accepted from the environment.
+
+| Variable                                                            | File contract                                                          |
+| ------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| `TERMINALX_HOSTED_RUNTIME`                                          | Exact literal `daytona`; the only hosted enable selector.              |
+| `TERMINALX_HOSTED_TRUST_ROOT`                                       | Absolute canonical operator-owned configuration directory.             |
+| `TERMINALX_HOSTED_RUNTIME_CONFIG_FILE`                              | Canonical public configuration JSON plus exactly one LF.               |
+| `TERMINALX_HOSTED_DAYTONA_API_CREDENTIAL_FILE`                      | 1–8192 raw visible-ASCII bytes, no whitespace or trailing LF.          |
+| `TERMINALX_HOSTED_RUNNER_CREDENTIAL_FILE`                           | Distinct 1–8192 raw visible-ASCII bytes, no whitespace or trailing LF. |
+| `TERMINALX_HOSTED_ASSIGNMENT_MASTER_KEY_FILE`                       | Exactly 32 nonzero raw bytes.                                          |
+| `TERMINALX_HOSTED_BOOTSTRAP_AUTHORITY_PRIVATE_KEY_FILE`             | Canonical unencrypted Ed25519 PKCS8 PEM matching its public pin.       |
+| `TERMINALX_HOSTED_TEAM_COMMAND_AUTHORITY_PRIVATE_KEY_FILE`          | Distinct canonical unencrypted Ed25519 PKCS8 PEM matching its pin.     |
+| `TERMINALX_HOSTED_PLATFORM_COMPENSATION_AUTHORITY_PRIVATE_KEY_FILE` | Distinct canonical unencrypted Ed25519 PKCS8 PEM matching its pin.     |
+| `TERMINALX_HOSTED_OPAQUE_HANDLE_KEY_FILE`                           | 32–64 nonzero raw bytes, distinct from every other private value.      |
+
+The trust root and every directory below it must be owned by the process effective UID with mode
+`0500` or `0700`. Every file must be a no-follow regular file owned by that UID, have exactly one
+link, and use mode `0400` or `0600`. All paths, metadata, inode identity, timestamps, and sizes are
+checked before and after a bounded descriptor read. Symlinks, hard links, accessors, relative or
+noncanonical paths, replacement races, permissive parents, and unsupported `TERMINALX_HOSTED_*`
+variables fail closed.
+
+The public configuration file has the exact top-level fields `version`, `kind`, `identities`, and
+`settings`; it uses the bounded Runtime canonical-JSON profile and exactly one trailing LF:
+
+```json
+{
+  "identities": {
+    "bootstrapAuthority": { "keyId": "…", "publicKeySpkiPem": "…" },
+    "platformCompensationAuthority": { "keyId": "…", "publicKeySpkiPem": "…" },
+    "teamCommandAuthority": { "keyId": "…", "publicKeySpkiPem": "…" }
+  },
+  "kind": "terminalx.daytona-hosted-runtime-configuration",
+  "settings": {},
+  "version": 1
+}
+```
+
+The rendered example is structural; operators must generate canonical bytes rather than copying
+the ellipses. Each SPKI must be canonical Ed25519 PEM and match its role's exact canonical,
+unencrypted PKCS8 PEM, including its final LF. Key IDs, SPKI digests, file paths, and all private
+byte values must be unique across roles. The loader holds private bytes in a one-shot lease: the
+concrete composer must transfer them into their owning constructors, after which every source
+buffer is zeroed on success, rejection, or disposal.
+
+There is intentionally no effect-manifest private-key variable. The concrete production composer
+derives assignment-scoped effect identities, persists the exact provider/plan/policy/manifest/set
+binding, routes verification through the matching trust set, and transfers each private owner into
+the root graph before availability. The pinned image exposes the real four-operation PTY protocol
+over its root-private Unix socket; ambiguous create results reconcile by exact terminal identity
+before one bounded retry. `TERMINALX_HOSTED_RUNTIME=daytona` still fails before listen on any
+missing trust input, invalid production pin, incomplete owner transfer, or root-readiness failure.
+
 An ordinary apply may initiate an effect only after the durable dispatch interlock. Reconciliation
 observes first and never blindly repeats a create or destructive operation. Zero, one, or multiple
 exact binding matches mean create only while still desired, validate the one exact match, or fail
 closed and quarantine. A timeout or abort after dispatch is an ambiguous outcome and retains the
 same idempotency identity until observation resolves it.
 
+## Per-assignment observation credentials and recovery
+
+Every hosted Runtime Assignment has a fresh Ed25519 observation identity. The durable assignment
+plan and Runtime observation-key registry contain only an opaque `keyProvisioningRef`, issuer key
+ID, and canonical public SPKI. The private key must remain in the distinct root-owned supervisor
+boundary: it must never enter Team Session SQLite, an outbox payload, the Daytona agent process or
+environment, a provider request, a terminal stream, a log, or a public projection. The supervisor
+resolves the opaque reference from a root-owned provisioning record, verifies the complete Runtime
+binding and public/private key match, and returns signing capabilities rather than private bytes.
+Assignment creation and readiness fail closed if any part of that resolution cannot be proven.
+
+Assignee-loss recovery never relabels or resumes the fenced Sandbox. After the exact fence receipt,
+an assignee claim advances the Runtime authorization generation, creates a new immutable assignment
+plan with a fresh Sandbox generation and observation identity, and durably queues two independently
+retryable effects: ensure the replacement and retire the exact old binding. The Session remains
+authorization-pending and the Run remains paused on its historical binding until the replacement's
+ensure receipt atomically installs a new immutable Run policy revision and rebinds the Run. The old
+retire effect stays pinned to its original plan and binding, so it remains safe if it arrives before
+ensure, after resume, after restart, or after a later authorization generation. A terminal ensure
+failure quarantines the replacement and Session rather than making either Runtime available.
+
+The root-private resolver is necessary but not sufficient production evidence. The pinned Daytona
+image/init path must install and start the supervisor as a separate root-only process and transport
+its provisioning record through a root-owned file or socket that the Daytona daemon and agent user
+cannot read. Until that image and transport pass the real-provider isolation suite, hosted
+production admission remains disabled.
+
 ## Isolation profile for this phase
 
 Every hosted Session receives one non-public, dedicated Sandbox with:
 
-- an immutable image or snapshot digest;
+- one deployment-attested Daytona snapshot UUID that resolves to an exact preloaded digest
+  reference and an independently pinned Docker-inspected image ID; build-based image artifacts are
+  rejected;
 - a non-root per-Sandbox identity and distinct filesystem/process namespace;
 - no host, shared writable, Docker, container-runtime, or cross-Session mounts;
 - finite CPU, memory, disk, process, and provider ceilings;
-- outbound network blocked by default, with only signed exact allow-list configuration; and
+- all direct outbound network blocked for Phase 7; and
 - a pinned TerminalX supervisor that returns signed, replayable receipts and effective enforcement
   attestations.
+
+The runner consumes both standard `Authorization` and `X-Daytona-Authorization` credentials before
+toolbox proxying. Neither header, the runner-wide API token, nor any provider credential may reach
+the non-root Daytona daemon, agent, supervisor protocol, terminal stream, or observation output.
 
 Requested configuration is not proof of enforcement. Readiness requires the deployed supervisor
 and every relevant effect enforcer to attest the exact binding, authorization generation, policy
