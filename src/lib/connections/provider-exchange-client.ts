@@ -28,6 +28,8 @@ export interface SlackOauthExchangeInput {
   readonly expectationDigest: string;
   readonly signingSecret: string;
   readonly redirectUri?: string;
+  /** Non-null routes the broker seal through rotation.prepare with this linkage. */
+  readonly replaces?: { readonly handleId: string } | null;
 }
 
 export interface SlackInstallationIdentity {
@@ -50,6 +52,8 @@ export interface TelegramBotTokenExchangeInput {
   readonly expectedAppId: string;
   readonly webhookUrl: string;
   readonly expectationDigest: string;
+  /** Non-null routes the broker seal through rotation.prepare with this linkage. */
+  readonly replaces?: { readonly handleId: string } | null;
 }
 
 export interface TelegramBotIdentity {
@@ -120,6 +124,7 @@ export function createProviderExchangeClient(
         expectationDigest: input.expectationDigest,
         signingSecret: input.signingSecret,
         redirectUri: input.redirectUri,
+        ...(input.replaces ? { replaces: { handleId: input.replaces.handleId } } : {}),
       })) as { receipt: unknown; installation: unknown };
       return Object.freeze({
         receipt: snapshotReceipt(result.receipt),
@@ -136,6 +141,7 @@ export function createProviderExchangeClient(
         expectedAppId: input.expectedAppId,
         webhookUrl: input.webhookUrl,
         expectationDigest: input.expectationDigest,
+        ...(input.replaces ? { replaces: { handleId: input.replaces.handleId } } : {}),
       })) as { receipt: unknown; botIdentity: unknown; webhookAuthDigest: unknown };
       const digest = result.webhookAuthDigest;
       if (typeof digest !== "string" || !/^[0-9a-f]{64}$/.test(digest)) {

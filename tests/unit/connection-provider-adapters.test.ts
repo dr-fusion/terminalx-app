@@ -1,9 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
-import { canonicalStringSet, sha256 } from "@/lib/connections/contracts";
-import type {
-  ProviderProofExpectation,
-  OutboundBindingResolution,
-} from "@/lib/connections/authority";
+import {
+  canonicalStringSet,
+  sha256,
+  type OutboundBindingResolution,
+} from "@/lib/connections/contracts";
+import type { ProviderProofExpectation } from "@/lib/connections/authority";
 import {
   normalizeTelegramUpdate,
   verifyTelegramDeepLinkProof,

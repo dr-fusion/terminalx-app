@@ -163,9 +163,11 @@ export function createSecretBroker(options: CreateSecretBrokerOptions): SecretBr
             provider,
             expectationDigest,
             tokenUtf8,
+            replaces,
           }) => {
             const base64 = tokenUtf8.toString("base64");
             tokenUtf8.fill(0);
+            const rotation = replaces !== null;
             const { receipt } = await prepare(
               {
                 operationId,
@@ -173,10 +175,10 @@ export function createSecretBroker(options: CreateSecretBrokerOptions): SecretBr
                 brokerKind: "oauth-envelope",
                 usage: "installation",
                 expectationDigest,
-                replaces: null,
+                replaces: rotation ? { handleId: replaces.handleId } : null,
                 secretMaterial: base64,
               },
-              false
+              rotation
             );
             return receipt;
           },
