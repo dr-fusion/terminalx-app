@@ -1,9 +1,9 @@
 # Phase 8 brokered secrets and connections
 
-Status: in progress. The canonical authentication identity foundation and Slice 8B local connection
-authority are complete. Secret Broker and Credential Proxy processes, real provider adapters, and
-hosted exfiltration evidence remain closed. Release Gate 3 is open, and hosted Runtimes must
-continue to advertise `brokeredCredentials: false` and `proxyOnlyEgress: false`.
+Status: in progress. The canonical authentication identity foundation, the Slice 8B local connection
+authority, and the Slice 8C Secret Broker process are complete. The Credential Proxy process, real
+provider adapters, and hosted exfiltration evidence remain closed. Release Gate 3 is open, and hosted
+Runtimes must continue to advertise `brokeredCredentials: false` and `proxyOnlyEgress: false`.
 
 ## Authority boundaries
 
@@ -187,13 +187,46 @@ can still race a parent-directory rename between validation and creation. That i
 the explicitly trusted LocalTmux adapter, but it must be replaced with descriptor-relative creation
 or retired with the legacy adapter before any untrusted same-host Runtime is supported.
 
+## Slice 8C — Secret Broker
+
+Status: complete. The Secret Broker is a distinct, non-exporting Node process (`packages/secret-broker`)
+that owns credential material and registers opaque Credential Handles for the 8B authority. The design
+and its rationale are recorded in [`ADR 0002`](../adr/0002-secret-broker-registration-protocol.md).
+
+- **Distinct process, private transport.** The broker is reached only over a Unix domain socket inside
+  a `0700` broker-root directory, framed as NDJSON. Each accepted connection is admitted only after
+  `SO_PEERCRED` (via a hash-pinned helper, since Node exposes no `getsockopt(SO_PEERCRED)`) confirms
+  the peer shares the broker's effective uid and, when configured, the expected parent pid.
+- **Non-exporting by construction.** Operations are exactly `registration.prepare|finalize|abort`,
+  `rotation.prepare|finalize|abort`, `handle.revoke`, `handle.status`, and `broker.health`. Response
+  schemas are closed and a runtime guard rejects any handler or adapter return value carrying a
+  non-schema field, so no operation can return secret material.
+- **Approved adapters.** `oauth-envelope` stores OAuth material broker-locally, encrypted at rest with
+  AES-256-GCM under a broker-root keyfile that never leaves the process; `onepassword-connect`
+  references an external 1Password Connect server (network I/O only inside the broker, injectable HTTP
+  client, fail-closed retryable errors), persisting only the opaque reference. TerminalX main-process
+  state stores only handle IDs and digests, as enforced by 8B.
+- **Two-phase registration with durable reconciliation.** `prepare` durably persists the secret plus a
+  `pending` row (broker-private SQLite, WAL, `0600`) and returns a single-use, Ed25519-signed
+  Registration Receipt binding the exact expectation. The main process verifies the receipt locally and
+  synchronously against the broker's published verification key — no IPC or network inside the SQLite
+  transaction — then `finalize`s on commit or `abort`s on rollback. A broker TTL-reap sweep plus a
+  main-side reconciler resolve every ambiguous outcome; a rollback, uniqueness failure, crash, or
+  duplicate/ambiguous message converges with no externally active orphan handle. Rotation uses the same
+  flow with the `replaces` linkage: the replaced secret survives until the replacement finalizes, then
+  becomes irreversibly revoked.
+- **Composition.** The connection authority receives the broker receipt verifier only when a broker is
+  configured and has published its verification key; production startup fails closed if a configured
+  broker is not ready. Local development without a broker keeps today's behavior (connection
+  installation APIs fail closed). The broker process is supervised as a separate service.
+
+Deliberately closed in 8C: there is no operation that uses a credential (that is the 8D Credential
+Proxy), no real Slack/Telegram provider adapters (8E), and no hosted enforcement evidence (8F/8G).
+`brokeredCredentials` and `proxyOnlyEgress` remain `false` everywhere and Release Gate 3 stays open.
+
 ## Remaining implementation slices
 
-- **8C — Secret Broker:** resolve opaque handles only inside a distinct non-exporting process using
-  approved secret-manager adapters. No API may decrypt or return credential material. Broker
-  registration must use an idempotent prepare/finalize/abort protocol or durable reconciliation
-  outbox so a SQLite rollback, uniqueness failure, crash, or ambiguous response cannot strand an
-  externally active orphan handle or diverge rotation state.
+- **8C — Secret Broker:** complete; see the Slice 8C section above.
 - **8D — Credential Proxy:** permit only typed, destination-scoped provider operations and account
   outbound bytes and results without exposing authorization headers or signing keys.
 - **8E — providers:** implement Telegram and Slack installation, linking, rotation, revocation,

@@ -1,0 +1,13 @@
+{
+  "name": "@terminalx/secret-broker",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Fail-closed TerminalX Secret Broker: a distinct non-exporting process that registers opaque Credential Handles",
+  "license": "MIT",
+  "bin": {
+    "terminalx-secret-broker": "bin/terminalx-secret-broker"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}
