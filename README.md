@@ -36,6 +36,8 @@ On a brand-new Linux host with nothing pre-installed, install the system prerequ
 # 1. System packages: git, tmux, and node-pty build tools
 sudo apt-get update
 sudo apt-get install -y git tmux build-essential python3 curl ca-certificates
+# Also install CMake when enabling optional Telegram voice transcription:
+sudo apt-get install -y cmake
 
 # 2. Node.js 20+ (NodeSource); skip if Node 20+ is already present
 curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
@@ -50,7 +52,7 @@ cd terminalx-app-mono
 npm run setup            # add --pm2 to run under PM2, --with-whisper for voice notes
 ```
 
-On macOS, install the equivalents with Homebrew (`brew install git tmux node`) plus the Xcode command-line tools (`xcode-select --install`), then run steps 3–4.
+On macOS, install the equivalents with Homebrew (`brew install git tmux node cmake`) plus the Xcode command-line tools (`xcode-select --install`), then run steps 3–4. CMake is only required for optional Telegram voice transcription.
 
 > AI-CLI session kinds also need the `claude` and/or `codex` CLI installed on the host `PATH` **and logged in** — that login is shared across all TerminalX users on the machine. Install and authenticate them separately from this app.
 
@@ -221,11 +223,22 @@ Authenticated admins can inspect it through `GET /api/telegram/messages`. Result
 /api/telegram/messages?routingStatus=mismatch&includeContent=true&limit=50
 ```
 
-Voice notes sent inside a session topic are downloaded by the bot, converted with the bundled ffmpeg binary, transcribed locally with whisper.cpp, and sent to the bound tmux session as normal text input. Install the default small native model with:
+Voice notes sent inside a session topic are downloaded by the bot, converted with ffmpeg, transcribed locally with whisper.cpp, and sent to the bound tmux session as normal text input. The setup command clones the official upstream into a fresh staging directory at exact commit `23ee03506a91ac3d3f0071b40e66a430eebdfa1d` (v1.8.6), builds a static CLI, and installs it under the ignored `data/tools/whisper.cpp` development tool root. Models come from immutable Hugging Face revision `5359861c739e955e79d9a303bcbc70fb988958b1`; every supported model has an exact size and SHA-256 pin in [`config/whisper-artifacts.json`](config/whisper-artifacts.json). Downloads use a same-directory temporary file and become active only after verification. Install the default model with:
 
 ```bash
 npm run setup:whisper -- tiny.en
 ```
+
+Development verifies the generated runtime manifest plus the binary and model bytes before every first use. Production fails closed unless the server is non-root and the trust root, manifest, binary, model, their directories, and all directory ancestors are root-owned without group/world write access. ffmpeg receives the same production ownership/ancestry checks. Promote the verified development artifacts into one protected tree (all explicit paths must remain descendants of `TERMINALX_WHISPER_CPP_ROOT`):
+
+```bash
+sudo install -d -o root -g root -m 0755 /opt/terminalx-whisper/bin /opt/terminalx-whisper/models
+sudo install -o root -g root -m 0555 data/tools/whisper.cpp/bin/whisper-cli /opt/terminalx-whisper/bin/whisper-cli
+sudo install -o root -g root -m 0444 data/tools/whisper.cpp/models/ggml-tiny.en.bin /opt/terminalx-whisper/models/ggml-tiny.en.bin
+sudo install -o root -g root -m 0444 data/tools/whisper.cpp/runtime-manifest.json /opt/terminalx-whisper/runtime-manifest.json
+```
+
+Set `TERMINALX_WHISPER_CPP_ROOT=/opt/terminalx-whisper` and `TERMINALX_FFMPEG_PATH=/usr/bin/ffmpeg`; production deliberately has no bundled ffmpeg fallback, so this explicit root-owned system decoder must be kept on the operating system's security-patch cadence. The default binary, model, and manifest locations then resolve inside the Whisper root. If explicit paths are used, keep all three beneath the same canonical root. Native children receive a small OS-only environment allowlist rather than server secrets, audio is capped at 50 MiB/10 minutes, command output and time are bounded, and the process-wide concurrency limit defaults to one (`TERMINALX_TELEGRAM_TRANSCRIBE_MAX_CONCURRENCY`, maximum four).
 
 ## How It Compares
 
