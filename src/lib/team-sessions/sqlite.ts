@@ -7158,6 +7158,7 @@ export function openTeamSessionDatabase(
   try {
     db.pragma("busy_timeout = 5000");
     db.pragma("foreign_keys = ON");
+    db.pragma("recursive_triggers = ON");
     db.pragma("trusted_schema = OFF");
 
     // Version discovery and first initialization share the same write lock so
@@ -7276,6 +7277,10 @@ export function openTeamSessionDatabase(
     const foreignKeys = db.pragma("foreign_keys", { simple: true }) as number;
     if (foreignKeys !== 1) {
       throw new Error("Team Session database requires SQLite foreign key enforcement");
+    }
+    const recursiveTriggers = db.pragma("recursive_triggers", { simple: true }) as number;
+    if (recursiveTriggers !== 1) {
+      throw new Error("Team Session database requires recursive trigger enforcement");
     }
     secureDatabaseFiles(filename);
   } catch (error) {

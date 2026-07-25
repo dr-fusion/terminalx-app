@@ -87,6 +87,7 @@ describe("canonical identity schema", () => {
 
   it("makes provider subjects immutable and identity revocation generation-fenced", () => {
     database = openTeamSessionDatabase({ filename: ":memory:" });
+    expect(database.db.pragma("recursive_triggers", { simple: true })).toBe(1);
     database.db.exec(`
       INSERT INTO users (
         id, username, display_name, legacy_role, status, generation,
@@ -109,6 +110,32 @@ describe("canonical identity schema", () => {
     expect(() =>
       database!.db.prepare("DELETE FROM auth_identities WHERE id = 'identity-1'").run()
     ).toThrow("history is immutable");
+    database.db
+      .prepare(
+        `INSERT INTO users (
+           id, username, display_name, legacy_role, status, generation,
+           created_at_ms, updated_at_ms, last_login_at_ms, revoked_at_ms
+         ) VALUES ('user-2', 'mallory', 'Mallory', 'user', 'active', 1, 300, 300, NULL, NULL)`
+      )
+      .run();
+    expect(() =>
+      database!.db
+        .prepare(
+          `INSERT OR REPLACE INTO auth_identities (
+             id, user_id, provider, subject, status, generation,
+             created_at_ms, updated_at_ms, last_authenticated_at_ms, revoked_at_ms
+           ) VALUES (
+             'identity-2', 'user-2', 'google', 'subject-1', 'active', 1,
+             300, 300, 300, NULL
+           )`
+        )
+        .run()
+    ).toThrow("history is immutable");
+    expect(
+      database.db
+        .prepare("SELECT id, user_id, status, generation FROM auth_identities WHERE subject = ?")
+        .get("subject-1")
+    ).toEqual({ id: "identity-1", user_id: "user-1", status: "active", generation: 1 });
     expect(() =>
       database!.db
         .prepare(
@@ -129,6 +156,24 @@ describe("canonical identity schema", () => {
     expect(() =>
       database!.db.prepare("DELETE FROM auth_identities WHERE id = 'identity-1'").run()
     ).toThrow("history is immutable");
+    expect(() =>
+      database!.db
+        .prepare(
+          `INSERT OR REPLACE INTO auth_identities (
+             id, user_id, provider, subject, status, generation,
+             created_at_ms, updated_at_ms, last_authenticated_at_ms, revoked_at_ms
+           ) VALUES (
+             'identity-2', 'user-2', 'google', 'subject-1', 'active', 1,
+             300, 300, 300, NULL
+           )`
+        )
+        .run()
+    ).toThrow("history is immutable");
+    expect(
+      database.db
+        .prepare("SELECT id, user_id, status, generation FROM auth_identities WHERE subject = ?")
+        .get("subject-1")
+    ).toEqual({ id: "identity-1", user_id: "user-1", status: "revoked", generation: 2 });
     expect(() =>
       database!.db
         .prepare(
