@@ -148,7 +148,7 @@ describe("broker provider exchange — telegram bot token", () => {
     expect(setWebhook).toHaveBeenCalledOnce();
     // The webhook secret token is generated in-broker; only its digest leaves.
     expect(JSON.stringify(result)).not.toContain(BOT_TOKEN);
-    expect(result.webhookSecretTokenDigest).toMatch(/^[0-9a-f]{64}$/);
+    expect(result.webhookAuthDigest).toMatch(/^[0-9a-f]{64}$/);
     // The set secret token (deterministic in the harness) is not surfaced raw.
     const rawSecret = Buffer.alloc(32, 7).toString("hex");
     expect(JSON.stringify(result)).not.toContain(rawSecret);

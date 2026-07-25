@@ -360,7 +360,10 @@ function snapshotReceiptId(params: unknown): string {
 }
 
 function newHandleId(): string {
-  return `hnd_${randomBytes(18).toString("base64url")}`;
+  // The 8B connection authority pins Credential Handle ids to `txch_v1_` + 64 hex
+  // (enforced by both its validator and the SQLite CHECK), so the broker mints
+  // handle ids in that exact shape for the receipt it returns.
+  return `txch_v1_${randomBytes(32).toString("hex")}`;
 }
 
 function newReceiptId(): string {

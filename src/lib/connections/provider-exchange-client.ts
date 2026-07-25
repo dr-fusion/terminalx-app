@@ -64,7 +64,7 @@ export interface TelegramBotTokenExchangeResult {
   readonly receipt: SecretBrokerReceipt;
   readonly botIdentity: TelegramBotIdentity;
   /** SHA-256 of the broker-generated Telegram webhook `secret_token`. */
-  readonly webhookSecretTokenDigest: string;
+  readonly webhookAuthDigest: string;
 }
 
 export interface SlackWebhookVerifyInput {
@@ -136,15 +136,15 @@ export function createProviderExchangeClient(
         expectedAppId: input.expectedAppId,
         webhookUrl: input.webhookUrl,
         expectationDigest: input.expectationDigest,
-      })) as { receipt: unknown; botIdentity: unknown; webhookSecretTokenDigest: unknown };
-      const digest = result.webhookSecretTokenDigest;
+      })) as { receipt: unknown; botIdentity: unknown; webhookAuthDigest: unknown };
+      const digest = result.webhookAuthDigest;
       if (typeof digest !== "string" || !/^[0-9a-f]{64}$/.test(digest)) {
         throw new ProviderExchangeClientError("internal");
       }
       return Object.freeze({
         receipt: snapshotReceipt(result.receipt),
         botIdentity: snapshotTelegramIdentity(result.botIdentity),
-        webhookSecretTokenDigest: digest,
+        webhookAuthDigest: digest,
       });
     },
     async verifySlackWebhook(input: SlackWebhookVerifyInput): Promise<SlackWebhookVerifyResult> {

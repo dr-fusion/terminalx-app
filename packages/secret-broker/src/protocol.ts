@@ -182,7 +182,7 @@ export const RESPONSE_SCHEMAS: Readonly<Record<SecretBrokerMethod, readonly stri
     "handle.status": ["handleId", "status", "brokerKind", "provider", "usage", "expiresAtMs"],
     "broker.health": ["brokerInstanceId", "brokerEpoch", "signingKeyId", "pendingRegistrations"],
     "exchange.slack-oauth": ["receipt", "installation"],
-    "exchange.telegram-bot-token": ["receipt", "botIdentity", "webhookSecretTokenDigest"],
+    "exchange.telegram-bot-token": ["receipt", "botIdentity", "webhookAuthDigest"],
     "webhook.verify-slack": ["valid", "withinReplayWindow"],
   });
 
@@ -256,7 +256,7 @@ export function assertClosedResponse(method: SecretBrokerMethod, response: unkno
     }
     if (method === "exchange.telegram-bot-token") {
       exactRecord(field(record, "botIdentity"), TELEGRAM_BOT_IDENTITY_FIELDS);
-      if (typeof field(record, "webhookSecretTokenDigest") !== "string") throw new TypeError();
+      if (typeof field(record, "webhookAuthDigest") !== "string") throw new TypeError();
     }
     if (method === "webhook.verify-slack") {
       if (

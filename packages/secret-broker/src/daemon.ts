@@ -297,16 +297,24 @@ function readBootstrapConfig(configPath: string): BootstrapConfig {
 
 function parseExchangeConfig(value: unknown): ExchangeBootstrapConfig | undefined {
   if (value === undefined || value === null) return undefined;
-  const record = exactRecord(value, [
+  if (typeof value !== "object" || Array.isArray(value)) throw new TypeError();
+  if (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) {
+    throw new TypeError();
+  }
+  const record = value as Record<string, unknown>;
+  const allowed = new Set([
     "enabled",
     "originOverrides",
     "slackClientIdEnv",
     "slackClientSecretEnv",
     "requestTimeoutMs",
   ]);
-  const enabled = field(record, "enabled");
+  for (const key of Object.keys(record)) {
+    if (!allowed.has(key)) throw new TypeError();
+  }
+  const enabled = record.enabled;
   if (typeof enabled !== "boolean") throw new TypeError();
-  const overridesRaw = field(record, "originOverrides");
+  const overridesRaw = record.originOverrides;
   let originOverrides: Record<string, string> | undefined;
   if (overridesRaw !== undefined && overridesRaw !== null) {
     if (
@@ -325,9 +333,9 @@ function parseExchangeConfig(value: unknown): ExchangeBootstrapConfig | undefine
   return Object.freeze({
     enabled,
     originOverrides: originOverrides ? Object.freeze(originOverrides) : undefined,
-    slackClientIdEnv: optionalString(field(record, "slackClientIdEnv")),
-    slackClientSecretEnv: optionalString(field(record, "slackClientSecretEnv")),
-    requestTimeoutMs: optionalPositive(field(record, "requestTimeoutMs")),
+    slackClientIdEnv: optionalString(record.slackClientIdEnv),
+    slackClientSecretEnv: optionalString(record.slackClientSecretEnv),
+    requestTimeoutMs: optionalPositive(record.requestTimeoutMs),
   });
 }
 

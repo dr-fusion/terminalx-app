@@ -59,6 +59,28 @@ const VALID_RESPONSES: Readonly<Record<SecretBrokerMethod, unknown>> = {
     signingKeyId: "k",
     pendingRegistrations: 0,
   },
+  "exchange.slack-oauth": {
+    receipt: RECEIPT,
+    installation: {
+      provider: "slack",
+      externalTenantId: "T1",
+      externalAppId: "A1",
+      externalBotUserId: "U1",
+      grantedScopes: ["chat:write"],
+    },
+  },
+  "exchange.telegram-bot-token": {
+    receipt: RECEIPT,
+    botIdentity: {
+      provider: "telegram",
+      externalTenantId: "998877",
+      externalAppId: "998877",
+      botId: "998877",
+      username: "example_bot",
+    },
+    webhookAuthDigest: "d".repeat(64),
+  },
+  "webhook.verify-slack": { valid: true, withinReplayWindow: true },
 };
 
 const FORBIDDEN =

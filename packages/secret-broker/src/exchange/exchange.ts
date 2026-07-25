@@ -46,7 +46,7 @@ export interface ProviderExchange {
   telegramBotToken(params: unknown): Promise<{
     receipt: SecretBrokerReceipt;
     botIdentity: object;
-    webhookSecretTokenDigest: string;
+    webhookAuthDigest: string;
   }>;
   verifySlackWebhook(params: unknown): { valid: boolean; withinReplayWindow: boolean };
 }
@@ -112,7 +112,7 @@ export function createProviderExchange(options: CreateProviderExchangeOptions): 
     async telegramBotToken(params: unknown): Promise<{
       receipt: SecretBrokerReceipt;
       botIdentity: object;
-      webhookSecretTokenDigest: string;
+      webhookAuthDigest: string;
     }> {
       const request = snapshotTelegramParams(params);
       let identity;
@@ -136,9 +136,7 @@ export function createProviderExchange(options: CreateProviderExchangeOptions): 
       } catch (error) {
         throw mapExchangeError(error);
       }
-      const webhookSecretTokenDigest = createHash("sha256")
-        .update(secretToken, "utf8")
-        .digest("hex");
+      const webhookAuthDigest = createHash("sha256").update(secretToken, "utf8").digest("hex");
       const receipt = await prepareInstallationCredential({
         operationId: request.operationId,
         provider: "telegram",
@@ -154,7 +152,7 @@ export function createProviderExchange(options: CreateProviderExchangeOptions): 
           botId: identity.botId,
           username: identity.username,
         }),
-        webhookSecretTokenDigest,
+        webhookAuthDigest,
       };
     },
 
