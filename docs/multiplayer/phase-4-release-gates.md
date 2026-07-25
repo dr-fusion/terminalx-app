@@ -19,10 +19,10 @@ YOLO mutations:
    The internal command/receipt and durable-journal foundation is specified in
    [Phase 5 Runtime truth](./phase-5-runtime-truth.md); Gate 1 remains open until that foundation is
    wired to the Team Session kernel and a hosted Runtime.
-2. **Hosted isolation:** implement the Daytona adapter and credential proxy using the public fork
-   pinned to hardened production merge `f9b4dfe428d37f3d956acda4403879516aa8d923`, descended from
-   upstream base `b5a5d9e78d76c8bcf351f2049620250e0f34eea4`; verify repository accessibility
-   and commit ancestry during release, not only URL/SHA shape.
+2. **Hosted isolation:** implement the Daytona adapter and credential proxy using the immutable
+   fork, hardened production merge, and upstream base in the canonical
+   [`daytona-production-source.json`](../../config/daytona-production-source.json); verify
+   repository accessibility and commit ancestry during release, not only URL/SHA shape.
 3. **Brokered secrets:** store opaque credential handles backed by an approved secret manager,
    inject them only at the proxy boundary, redact outputs, and make raw values/private keys
    unavailable even when a user or agent explicitly asks for them.

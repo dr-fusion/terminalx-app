@@ -92,6 +92,9 @@ import {
 const DIGESTS = Object.freeze({
   sdk: "1".repeat(64),
   supervisor: "2".repeat(64),
+  runtimeArtifactManifest: "f".repeat(64),
+  runner: "0".repeat(64),
+  daemon: "a".repeat(64),
   sbom: "3".repeat(64),
   provenance: "4".repeat(64),
   sandbox: "5".repeat(64),
@@ -317,6 +320,9 @@ function productionSettings(
       measuredArtifacts: {
         sdkSha256: DIGESTS.sdk,
         supervisorSha256: DIGESTS.supervisor,
+        runtimeArtifactManifestDigest: DIGESTS.runtimeArtifactManifest,
+        runnerBinaryDigest: DIGESTS.runner,
+        daemonBinaryDigest: DIGESTS.daemon,
         sbomSha256: DIGESTS.sbom,
         provenanceSha256: DIGESTS.provenance,
         sandboxSha256: DIGESTS.sandbox,
@@ -400,6 +406,7 @@ function productionSettings(
           contentDigest: DIGESTS.sandbox,
         },
         supervisorArtifactDigest: DIGESTS.supervisor,
+        runnerBinaryDigest: DIGESTS.runner,
         lifecycle: {
           autoStopIntervalMinutes: 0,
           autoArchiveIntervalMinutes: 0,

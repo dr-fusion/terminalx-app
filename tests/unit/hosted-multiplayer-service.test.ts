@@ -54,6 +54,9 @@ vi.mock("@/lib/runtime/runtime-supervisor-composition", () => ({
 const DIGESTS = Object.freeze({
   sdk: "a".repeat(64),
   supervisor: "b".repeat(64),
+  runtimeArtifactManifest: "1".repeat(64),
+  runner: "2".repeat(64),
+  daemon: "3".repeat(64),
   sbom: "c".repeat(64),
   provenance: "d".repeat(64),
   sandbox: "e".repeat(64),
@@ -419,23 +422,48 @@ describe("Daytona hosted multiplayer production composition", () => {
     expect(asserted.credential.every((byte) => byte === 0)).toBe(true);
     expect(asserted.opaqueHandleKey.every((byte) => byte === 0)).toBe(true);
 
-    const mismatched = options();
+    for (const field of [
+      "sdkSha256",
+      "runtimeArtifactManifestDigest",
+      "runnerBinaryDigest",
+      "daemonBinaryDigest",
+    ] as const) {
+      const mismatched = options();
+      expectServiceError(
+        () =>
+          createDaytonaHostedMultiplayerService({
+            ...mismatched.options,
+            deployment: {
+              ...mismatched.options.deployment,
+              measuredArtifacts: {
+                ...mismatched.options.deployment.measuredArtifacts,
+                [field]: "7".repeat(64),
+              },
+            },
+          }),
+        "deployment-rejected"
+      );
+      expect(mismatched.credential.every((byte) => byte === 0)).toBe(true);
+      expect(mismatched.opaqueHandleKey.every((byte) => byte === 0)).toBe(true);
+    }
+
+    const runnerConfigurationMismatch = options();
     expectServiceError(
       () =>
         createDaytonaHostedMultiplayerService({
-          ...mismatched.options,
-          deployment: {
-            ...mismatched.options.deployment,
-            measuredArtifacts: {
-              ...mismatched.options.deployment.measuredArtifacts,
-              sdkSha256: "9".repeat(64),
+          ...runnerConfigurationMismatch.options,
+          provider: {
+            ...runnerConfigurationMismatch.options.provider,
+            configuration: {
+              ...runnerConfigurationMismatch.options.provider.configuration,
+              runnerBinaryDigest: "7".repeat(64),
             },
           },
         }),
       "deployment-rejected"
     );
-    expect(mismatched.credential.every((byte) => byte === 0)).toBe(true);
-    expect(mismatched.opaqueHandleKey.every((byte) => byte === 0)).toBe(true);
+    expect(runnerConfigurationMismatch.credential.every((byte) => byte === 0)).toBe(true);
+    expect(runnerConfigurationMismatch.opaqueHandleKey.every((byte) => byte === 0)).toBe(true);
 
     const badLaterConfiguration = options();
     expectServiceError(
@@ -685,6 +713,9 @@ describe("Daytona hosted multiplayer production composition", () => {
         measuredArtifacts: {
           sdkSha256: DIGESTS.sdk,
           supervisorSha256: DIGESTS.supervisor,
+          runtimeArtifactManifestDigest: DIGESTS.runtimeArtifactManifest,
+          runnerBinaryDigest: DIGESTS.runner,
+          daemonBinaryDigest: DIGESTS.daemon,
           sbomSha256: DIGESTS.sbom,
           provenanceSha256: DIGESTS.provenance,
           sandboxSha256: DIGESTS.sandbox,
@@ -734,6 +765,7 @@ describe("Daytona hosted multiplayer production composition", () => {
             contentDigest: DIGESTS.sandbox,
           },
           supervisorArtifactDigest: DIGESTS.supervisor,
+          runnerBinaryDigest: DIGESTS.runner,
           lifecycle: {
             autoStopIntervalMinutes: 0,
             autoArchiveIntervalMinutes: 0,
@@ -774,9 +806,9 @@ describe("Daytona hosted multiplayer production composition", () => {
 
 function manifestClaims(): DaytonaDeploymentArtifactManifestClaims {
   return {
-    version: 1,
+    version: 2,
     kind: "terminalx.daytona-deployment-artifacts",
-    manifestId: "terminalx-daytona-production:2026-07-24:v1",
+    manifestId: "terminalx-daytona-production:2026-07-24:v2",
     issuedAtMs: 2_000_000_000_000,
     source: {
       forkRepository: DAYTONA_FORK_REPOSITORY,
@@ -787,6 +819,12 @@ function manifestClaims(): DaytonaDeploymentArtifactManifestClaims {
     artifacts: {
       sdk: { kind: "daytona-typescript-sdk", sha256: DIGESTS.sdk },
       supervisor: { kind: "terminalx-daytona-supervisor", sha256: DIGESTS.supervisor },
+      runtimeArtifactManifest: {
+        kind: "terminalx-daytona-hardened-runtime-artifacts",
+        sha256: DIGESTS.runtimeArtifactManifest,
+      },
+      runner: { kind: "daytona-hardened-runner-linux-amd64", sha256: DIGESTS.runner },
+      daemon: { kind: "daytona-hardened-daemon-linux-amd64", sha256: DIGESTS.daemon },
       sbom: { kind: "spdx-2.3-json", sha256: DIGESTS.sbom },
       provenance: { kind: "slsa-v1-dsse", sha256: DIGESTS.provenance },
     },
@@ -811,7 +849,7 @@ function signedManifest(
     ...claims,
     authority: {
       issuer: "terminalx-release",
-      issuerKeyId: "terminalx-release:daytona-production:v1",
+      issuerKeyId: "terminalx-release:daytona-production:v2",
       audience: "terminalx-runtime",
       capability: "daytona.deployment.activate",
       algorithm: "ed25519",

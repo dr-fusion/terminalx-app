@@ -1,6 +1,11 @@
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
+import { spawnSync } from "node:child_process";
 import { describe, expect, it, vi } from "vitest";
+import productionSourceConfiguration from "../../config/daytona-production-source.json";
+import { validateDaytonaProductionSourceConfiguration } from "@/lib/runtime/daytona-production-source";
 import {
   DAYTONA_DEPLOYMENT_MANIFEST_AUTHORITY_SIGNATURE_DOMAIN,
   DAYTONA_FORK_REPOSITORY,
@@ -22,6 +27,9 @@ import {
 const DIGESTS = Object.freeze({
   sdk: "1".repeat(64),
   supervisor: "2".repeat(64),
+  runtimeArtifactManifest: "8".repeat(64),
+  runner: "9".repeat(64),
+  daemon: "a".repeat(64),
   sbom: "3".repeat(64),
   provenance: "4".repeat(64),
   sandbox: "5".repeat(64),
@@ -38,21 +46,187 @@ const SOURCE_ENVIRONMENT: DaytonaSourceEnvironment = Object.freeze({
 });
 
 describe("Daytona production source pin", () => {
-  it("keeps every release surface on the reviewed hardened merge", () => {
-    expect(DAYTONA_PRODUCTION_FORK_COMMIT).toBe("f9b4dfe428d37f3d956acda4403879516aa8d923");
+  it("loads every runtime source field from the exact canonical JSON schema", () => {
+    expect(Object.keys(productionSourceConfiguration)).toEqual([
+      "schemaVersion",
+      "kind",
+      "forkRepository",
+      "productionForkCommit",
+      "upstreamRepository",
+      "upstreamBaseCommit",
+    ]);
+    expect(productionSourceConfiguration.schemaVersion).toBe(1);
+    expect(productionSourceConfiguration.kind).toBe("terminalx.daytona-production-source");
+    expect(DAYTONA_FORK_REPOSITORY).toBe(productionSourceConfiguration.forkRepository);
+    expect(DAYTONA_PRODUCTION_FORK_COMMIT).toBe(productionSourceConfiguration.productionForkCommit);
+    expect(DAYTONA_UPSTREAM_REPOSITORY).toBe(productionSourceConfiguration.upstreamRepository);
+    expect(DAYTONA_UPSTREAM_BASE_COMMIT).toBe(productionSourceConfiguration.upstreamBaseCommit);
     expect(DAYTONA_PRODUCTION_FORK_COMMIT).not.toBe(DAYTONA_UPSTREAM_BASE_COMMIT);
+  });
+
+  it("exports the canonical source semantically to shell and workflow consumers", () => {
+    const reader = resolve(process.cwd(), "scripts/read-daytona-production-source.mjs");
+    const json = spawnSync(process.execPath, [reader, "json"], { encoding: "utf8" });
+    expect(json.status, json.stderr).toBe(0);
+    expect(JSON.parse(json.stdout)).toEqual(productionSourceConfiguration);
+
+    const outputs = spawnSync(process.execPath, [reader, "github-output"], {
+      encoding: "utf8",
+    });
+    expect(outputs.status, outputs.stderr).toBe(0);
+    expect(
+      Object.fromEntries(
+        outputs.stdout
+          .trim()
+          .split("\n")
+          .map((line) => line.split("="))
+      )
+    ).toEqual({
+      fork_repository: new URL(productionSourceConfiguration.forkRepository).pathname.slice(1),
+      fork_repository_url: productionSourceConfiguration.forkRepository,
+      production_fork_commit: productionSourceConfiguration.productionForkCommit,
+      upstream_repository_url: productionSourceConfiguration.upstreamRepository,
+      upstream_base_commit: productionSourceConfiguration.upstreamBaseCommit,
+    });
+
+    const workflow = readFileSync(
+      resolve(process.cwd(), ".github/workflows/daytona-sdk-artifact.yml"),
+      "utf8"
+    );
+    expect(workflow).toContain("node scripts/read-daytona-production-source.mjs github-output");
+    expect(workflow).toContain("steps.daytona-source.outputs.production_fork_commit");
+    expect(workflow).toContain("steps.daytona-source.outputs.upstream_base_commit");
+  });
+
+  it("rejects malformed, floating, aliased, and extended canonical configurations", async () => {
+    const helper = (await import(
+      pathToFileURL(resolve(process.cwd(), "scripts/lib/daytona-production-source.mjs")).href
+    )) as {
+      validateDaytonaProductionSource(value: unknown): unknown;
+    };
+    const invalid = [
+      { ...productionSourceConfiguration, extra: true },
+      { ...productionSourceConfiguration, productionForkCommit: "main" },
+      {
+        ...productionSourceConfiguration,
+        productionForkCommit: productionSourceConfiguration.upstreamBaseCommit,
+      },
+      {
+        ...productionSourceConfiguration,
+        upstreamRepository: productionSourceConfiguration.forkRepository,
+      },
+      { ...productionSourceConfiguration, forkRepository: "git@github.com:example/daytona.git" },
+    ];
+    for (const value of invalid) {
+      expect(() => helper.validateDaytonaProductionSource(value)).toThrow(TypeError);
+      expect(() => validateDaytonaProductionSourceConfiguration(value)).toThrow(TypeError);
+    }
+
+    let getterInvoked = false;
+    const accessor = Object.defineProperty(
+      { ...productionSourceConfiguration },
+      "productionForkCommit",
+      {
+        enumerable: true,
+        get() {
+          getterInvoked = true;
+          return productionSourceConfiguration.productionForkCommit;
+        },
+      }
+    );
+    expect(() => helper.validateDaytonaProductionSource(accessor)).toThrow(TypeError);
+    expect(() => validateDaytonaProductionSourceConfiguration(accessor)).toThrow(TypeError);
+    expect(getterInvoked).toBe(false);
+
+    let proxyTrapInvoked = false;
+    const proxy = new Proxy(productionSourceConfiguration, {
+      ownKeys() {
+        proxyTrapInvoked = true;
+        return [];
+      },
+    });
+    expect(() => helper.validateDaytonaProductionSource(proxy)).toThrow(TypeError);
+    expect(() => validateDaytonaProductionSourceConfiguration(proxy)).toThrow(TypeError);
+    expect(proxyTrapInvoked).toBe(false);
+  });
+
+  it("writes SDK and supervisor artifact source records from the canonical config", () => {
+    const root = mkdtempSync(join(tmpdir(), "terminalx-daytona-source-artifacts-"));
+    try {
+      const archives = [
+        "daytona-api-client-0.0.0-dev.tgz",
+        "daytona-sdk-0.0.0-dev.tgz",
+        "daytona-toolbox-api-client-0.0.0-dev.tgz",
+      ].map((name, index) => {
+        const path = join(root, name);
+        writeFileSync(path, `archive-${index}`);
+        return path;
+      });
+      const sdkOutput = join(root, "daytona-sdk-artifact.json");
+      const sdk = spawnSync(
+        process.execPath,
+        [resolve(process.cwd(), "scripts/write-daytona-sdk-artifact.mjs"), sdkOutput, ...archives],
+        { encoding: "utf8" }
+      );
+      expect(sdk.status, sdk.stderr).toBe(0);
+      expect(JSON.parse(readFileSync(sdkOutput, "utf8")).source).toEqual({
+        repository: productionSourceConfiguration.forkRepository,
+        productionCommit: productionSourceConfiguration.productionForkCommit,
+        upstreamBaseCommit: productionSourceConfiguration.upstreamBaseCommit,
+      });
+
+      const artifactRoot = join(root, "supervisor");
+      mkdirSync(join(artifactRoot, "bin"), { recursive: true });
+      for (const name of [
+        "terminalx-daytona-supervisor",
+        "terminalx-supervisor-relay",
+        "terminalx-assignment-bootstrap",
+      ]) {
+        const path = join(artifactRoot, "bin", name);
+        writeFileSync(path, `executable-${name}`);
+        chmodSync(path, 0o555);
+      }
+      const supervisorOutput = join(root, "daytona-supervisor-artifact.json");
+      const terminalxCommit = "1".repeat(40);
+      const supervisor = spawnSync(
+        process.execPath,
+        [
+          resolve(process.cwd(), "scripts/write-daytona-supervisor-artifact.mjs"),
+          supervisorOutput,
+          artifactRoot,
+          terminalxCommit,
+          productionSourceConfiguration.productionForkCommit,
+        ],
+        { encoding: "utf8" }
+      );
+      expect(supervisor.status, supervisor.stderr).toBe(0);
+      expect(JSON.parse(readFileSync(supervisorOutput, "utf8")).source).toEqual({
+        terminalxCommit,
+        daytonaProductionCommit: productionSourceConfiguration.productionForkCommit,
+        daytonaUpstreamBaseCommit: productionSourceConfiguration.upstreamBaseCommit,
+      });
+    } finally {
+      rmSync(root, { force: true, recursive: true });
+    }
+  });
+
+  it("does not duplicate active commit values across release consumers", () => {
     for (const relativePath of [
       ".github/workflows/daytona-sdk-artifact.yml",
       "scripts/build-pinned-daytona-sdk.sh",
+      "scripts/build-pinned-daytona-runtime.sh",
       "scripts/build-pinned-daytona-supervisor.sh",
+      "scripts/verify-daytona-runtime-release-archive.sh",
       "scripts/write-daytona-sdk-artifact.mjs",
       "scripts/write-daytona-supervisor-artifact.mjs",
       "packages/daytona-sandbox-image/scripts/prepare-build-context.mjs",
       "packages/daytona-sandbox-image/scripts/write-static-pins.mjs",
+      "packages/daytona-supervisor/src/effective-isolation.ts",
+      "src/lib/runtime/daytona-production-source.ts",
     ]) {
-      expect(readFileSync(resolve(process.cwd(), relativePath), "utf8"), relativePath).toContain(
-        DAYTONA_PRODUCTION_FORK_COMMIT
-      );
+      const source = readFileSync(resolve(process.cwd(), relativePath), "utf8");
+      expect(source, relativePath).not.toContain(DAYTONA_PRODUCTION_FORK_COMMIT);
+      expect(source, relativePath).not.toContain(DAYTONA_UPSTREAM_BASE_COMMIT);
     }
   });
 
@@ -170,7 +344,7 @@ describe("Daytona deployment artifact manifest", () => {
       expect(signatureVerifier).toHaveBeenCalledTimes(1);
       expect(signatureVerifier).toHaveBeenCalledWith({
         algorithm: "ed25519",
-        issuerKeyId: "terminalx-release:daytona-production:v1",
+        issuerKeyId: "terminalx-release:daytona-production:v2",
         claimsDigest,
         canonicalPayload: expect.stringMatching(
           new RegExp(`^${escapeRegExp(DAYTONA_DEPLOYMENT_MANIFEST_AUTHORITY_SIGNATURE_DOMAIN)}`)
@@ -187,6 +361,9 @@ describe("Daytona deployment artifact manifest", () => {
       expect(Object.isFrozen(verified.manifest.source)).toBe(true);
       expect(Object.isFrozen(verified.manifest.artifacts)).toBe(true);
       expect(Object.isFrozen(verified.manifest.artifacts.sdk)).toBe(true);
+      expect(Object.isFrozen(verified.manifest.artifacts.runtimeArtifactManifest)).toBe(true);
+      expect(Object.isFrozen(verified.manifest.artifacts.runner)).toBe(true);
+      expect(Object.isFrozen(verified.manifest.artifacts.daemon)).toBe(true);
       expect(Object.isFrozen(verified.manifest.sandboxArtifact)).toBe(true);
       expect(Object.isFrozen(verified.manifest.isolationProfile)).toBe(true);
       expect(Object.isFrozen(verified.manifest.authority)).toBe(true);
@@ -378,6 +555,24 @@ describe("Daytona deployment artifact manifest", () => {
         ...manifest,
         artifacts: {
           ...manifest.artifacts,
+          runtimeArtifactManifest: {
+            ...manifest.artifacts.runtimeArtifactManifest,
+            kind: "terminalx.runtime-artifacts",
+          },
+          runner: { ...manifest.artifacts.runner, kind: "daytona-runner" },
+        },
+      },
+      {
+        ...manifest,
+        artifacts: {
+          ...manifest.artifacts,
+          daemon: { ...manifest.artifacts.daemon, sha256: DIGESTS.runner },
+        },
+      },
+      {
+        ...manifest,
+        artifacts: {
+          ...manifest.artifacts,
           supervisor: { ...manifest.artifacts.supervisor, sha256: DIGESTS.sdk },
         },
       },
@@ -385,6 +580,11 @@ describe("Daytona deployment artifact manifest", () => {
     for (const invalid of invalidManifests) {
       expectErrorCode(() => verifyManifest(invalid), "invalid_manifest");
     }
+  });
+
+  it("rejects legacy v1 manifests instead of implicitly upgrading their trust statement", () => {
+    const manifest = signedManifest();
+    expectErrorCode(() => verifyManifest({ ...manifest, version: 1 }), "invalid_manifest");
   });
 
   it("rejects floating, unpinned, or internally mismatched image and snapshot sources", () => {
@@ -590,9 +790,9 @@ function manifestClaims(
   }
 ): DaytonaDeploymentArtifactManifestClaims {
   return {
-    version: 1,
+    version: 2,
     kind: "terminalx.daytona-deployment-artifacts",
-    manifestId: "terminalx-daytona-production:2026-07-24:v1",
+    manifestId: "terminalx-daytona-production:2026-07-24:v2",
     issuedAtMs: 2_000_000_000_000,
     source: {
       forkRepository: DAYTONA_FORK_REPOSITORY,
@@ -603,6 +803,12 @@ function manifestClaims(
     artifacts: {
       sdk: { kind: "daytona-typescript-sdk", sha256: DIGESTS.sdk },
       supervisor: { kind: "terminalx-daytona-supervisor", sha256: DIGESTS.supervisor },
+      runtimeArtifactManifest: {
+        kind: "terminalx-daytona-hardened-runtime-artifacts",
+        sha256: DIGESTS.runtimeArtifactManifest,
+      },
+      runner: { kind: "daytona-hardened-runner-linux-amd64", sha256: DIGESTS.runner },
+      daemon: { kind: "daytona-hardened-daemon-linux-amd64", sha256: DIGESTS.daemon },
       sbom: { kind: "spdx-2.3-json", sha256: DIGESTS.sbom },
       provenance: { kind: "slsa-v1-dsse", sha256: DIGESTS.provenance },
     },
@@ -621,7 +827,7 @@ function signedManifest(
     ...claims,
     authority: {
       issuer: "terminalx-release",
-      issuerKeyId: "terminalx-release:daytona-production:v1",
+      issuerKeyId: "terminalx-release:daytona-production:v2",
       audience: "terminalx-runtime",
       capability: "daytona.deployment.activate",
       algorithm: "ed25519",

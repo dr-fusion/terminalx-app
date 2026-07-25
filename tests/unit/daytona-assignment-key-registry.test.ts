@@ -213,6 +213,7 @@ function installRequest(
     artifactDigest: "1".repeat(64),
     sandboxUser: "terminalx",
     supervisorArtifactDigest: "2".repeat(64),
+    runnerBinaryDigest: "9".repeat(64),
   });
 }
 

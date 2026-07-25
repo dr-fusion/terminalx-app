@@ -17,6 +17,8 @@ import {
 } from "node:fs";
 
 const TRUST_INPUT = "/terminalx-build/inputs/sandbox-trust-input.json";
+const PRODUCTION_SOURCE_INPUT = "/terminalx-build/inputs/daytona-production-source.json";
+const RUNTIME_ARTIFACT_MANIFEST = "/usr/share/terminalx/daytona-runtime-artifact-manifest.json";
 const NATIVE_HASHES = "/terminalx-build/native-hashes.json";
 const BOOTSTRAP_AUTHORITY_PIN = "/etc/terminalx/bootstrap-authority-pin.json";
 const OUTPUT = "/etc/terminalx/sandbox-trust-pins.json";
@@ -24,6 +26,7 @@ const TRUST_FIELDS = [
   "version",
   "kind",
   "supervisorArtifactDigest",
+  "runtimeArtifactManifestDigest",
   "effectExecutableSha256",
   "nodeExecutableSha256",
   "isolationIssuerKeyId",
@@ -41,20 +44,49 @@ const NATIVE_FIELDS = [
 ];
 const SHA256 = /^[0-9a-f]{64}$/;
 const GIT_COMMIT = /^[0-9a-f]{40}$/;
-const DAYTONA_PRODUCTION_FORK_COMMIT = "f9b4dfe428d37f3d956acda4403879516aa8d923";
+const GITHUB_REPOSITORY =
+  /^https:\/\/github\.com\/[a-z0-9](?:[a-z0-9-]{0,38})\/[A-Za-z0-9_.-]{1,100}$/;
+const PRODUCTION_SOURCE_FIELDS = [
+  "schemaVersion",
+  "kind",
+  "forkRepository",
+  "productionForkCommit",
+  "upstreamRepository",
+  "upstreamBaseCommit",
+];
 const KEY_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 
-export function createStaticTrustPins(trustInput, nativeHashes) {
+export function createStaticTrustPins(
+  trustInput,
+  nativeHashes,
+  productionSourceInput,
+  runtimeArtifactManifestInput
+) {
   const trust = exactRecord(trustInput, TRUST_FIELDS);
   const native = exactRecord(nativeHashes, NATIVE_FIELDS);
+  const productionSource = productionSourcePin(productionSourceInput);
+  const runtimeArtifacts = runtimeArtifactManifestPin(
+    runtimeArtifactManifestInput,
+    productionSource.productionForkCommit
+  );
+  const runtimeArtifactManifestDigest = digest(trust.runtimeArtifactManifestDigest);
   if (
     trust.version !== 1 ||
     trust.kind !== "terminalx.daytona-sandbox-trust-input" ||
     !GIT_COMMIT.test(trust.hardenedDaytonaSourceCommit) ||
-    trust.hardenedDaytonaSourceCommit !== DAYTONA_PRODUCTION_FORK_COMMIT ||
+    trust.hardenedDaytonaSourceCommit !== productionSource.productionForkCommit ||
     !KEY_ID.test(trust.isolationIssuerKeyId) ||
     !KEY_ID.test(trust.effectManifestAuthorityIssuerKeyId) ||
     !KEY_ID.test(trust.deploymentBindingIssuerKeyId)
+  ) {
+    throw new TypeError();
+  }
+  if (
+    new Set([
+      runtimeArtifactManifestDigest,
+      runtimeArtifacts.runnerBinaryDigest,
+      runtimeArtifacts.daemonBinaryDigest,
+    ]).size !== 3
   ) {
     throw new TypeError();
   }
@@ -80,9 +112,12 @@ export function createStaticTrustPins(trustInput, nativeHashes) {
     throw new TypeError();
   }
   const pins = Object.freeze({
-    version: 1,
+    version: 2,
     kind: "terminalx.daytona-sandbox-trust-pins",
     supervisorArtifactDigest: digest(trust.supervisorArtifactDigest),
+    runtimeArtifactManifestDigest,
+    runnerBinaryDigest: runtimeArtifacts.runnerBinaryDigest,
+    daemonBinaryDigest: runtimeArtifacts.daemonBinaryDigest,
     peerCredentialExecutableSha256: digest(native.peerCredentialExecutableSha256),
     effectExecutableSha256: digest(trust.effectExecutableSha256),
     nodeExecutableSha256: digest(trust.nodeExecutableSha256),
@@ -107,6 +142,14 @@ function run() {
     throw new TypeError();
   }
   const trust = readProtectedJson(TRUST_INPUT, 256 * 1024, 0o600);
+  const productionSource = readProtectedJson(PRODUCTION_SOURCE_INPUT, 16 * 1024, 0o600);
+  const runtimeArtifacts = readProtectedJson(
+    RUNTIME_ARTIFACT_MANIFEST,
+    64 * 1024,
+    0o444,
+    digest(trust.runtimeArtifactManifestDigest),
+    true
+  );
   const native = readProtectedJson(NATIVE_HASHES, 16 * 1024, 0o600);
   const bootstrap = exactRecord(readProtectedJson(BOOTSTRAP_AUTHORITY_PIN, 64 * 1024, 0o600), [
     "version",
@@ -114,7 +157,7 @@ function run() {
     "issuerKeyId",
     "publicKeySpkiPem",
   ]);
-  const pins = createStaticTrustPins(trust, native);
+  const pins = createStaticTrustPins(trust, native, productionSource, runtimeArtifacts);
   const bootstrapPublicKey = canonicalEd25519PublicKey(bootstrap.publicKeySpkiPem);
   if (
     bootstrap.version !== 1 ||
@@ -133,6 +176,12 @@ function run() {
   ) {
     throw new TypeError();
   }
+  assertExecutableDigest(
+    "/usr/local/bin/daytona",
+    pins.daemonBinaryDigest,
+    0o555,
+    256 * 1024 * 1024
+  );
   assertExecutableDigest(
     "/usr/local/bin/node",
     pins.nodeExecutableSha256,
@@ -154,7 +203,7 @@ function run() {
   writePrivateJson(OUTPUT, pins);
 }
 
-function readProtectedJson(path, maximumBytes, mode) {
+function readProtectedJson(path, maximumBytes, mode, expectedDigest, requireCanonical = false) {
   const status = lstatSync(path);
   let descriptor = -1;
   let bytes;
@@ -183,7 +232,17 @@ function readProtectedJson(path, maximumBytes, mode) {
       throw new TypeError();
     }
     bytes = readFileSync(descriptor);
-    return JSON.parse(bytes.toString("utf8"));
+    if (
+      expectedDigest !== undefined &&
+      createHash("sha256").update(bytes).digest("hex") !== expectedDigest
+    ) {
+      throw new TypeError();
+    }
+    const parsed = JSON.parse(bytes.toString("utf8"));
+    if (requireCanonical && bytes.toString("utf8") !== `${canonicalJson(parsed)}\n`) {
+      throw new TypeError();
+    }
+    return parsed;
   } finally {
     bytes?.fill(0);
     if (descriptor >= 0) closeSync(descriptor);
@@ -286,6 +345,56 @@ function exactRecord(value, fields) {
     throw new TypeError();
   }
   return value;
+}
+
+function productionSourcePin(value) {
+  const source = exactRecord(value, PRODUCTION_SOURCE_FIELDS);
+  if (
+    source.schemaVersion !== 1 ||
+    source.kind !== "terminalx.daytona-production-source" ||
+    typeof source.forkRepository !== "string" ||
+    !GITHUB_REPOSITORY.test(source.forkRepository) ||
+    typeof source.upstreamRepository !== "string" ||
+    !GITHUB_REPOSITORY.test(source.upstreamRepository) ||
+    source.forkRepository === source.upstreamRepository ||
+    typeof source.productionForkCommit !== "string" ||
+    !GIT_COMMIT.test(source.productionForkCommit) ||
+    typeof source.upstreamBaseCommit !== "string" ||
+    !GIT_COMMIT.test(source.upstreamBaseCommit) ||
+    source.productionForkCommit === source.upstreamBaseCommit
+  ) {
+    throw new TypeError();
+  }
+  return source;
+}
+
+function runtimeArtifactManifestPin(value, productionForkCommit) {
+  const manifest = exactRecord(value, ["artifacts", "kind", "version"]);
+  if (manifest.version !== 1 || manifest.kind !== "terminalx.daytona-hardened-runtime-artifacts") {
+    throw new TypeError();
+  }
+  const artifacts = exactRecord(manifest.artifacts, ["daemon", "runner"]);
+  const daemonBinaryDigest = runtimeArtifactPin(artifacts.daemon, productionForkCommit);
+  const runnerBinaryDigest = runtimeArtifactPin(artifacts.runner, productionForkCommit);
+  if (daemonBinaryDigest === runnerBinaryDigest) throw new TypeError();
+  return Object.freeze({ daemonBinaryDigest, runnerBinaryDigest });
+}
+
+function runtimeArtifactPin(value, productionForkCommit) {
+  const artifact = exactRecord(value, [
+    "architecture",
+    "binaryDigest",
+    "operatingSystem",
+    "sourceCommit",
+  ]);
+  if (
+    artifact.architecture !== "amd64" ||
+    artifact.operatingSystem !== "linux" ||
+    artifact.sourceCommit !== productionForkCommit
+  ) {
+    throw new TypeError();
+  }
+  return digest(artifact.binaryDigest);
 }
 
 function canonicalEd25519PublicKey(value) {

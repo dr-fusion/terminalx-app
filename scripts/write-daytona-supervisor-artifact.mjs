@@ -1,9 +1,9 @@
 import { createHash } from "node:crypto";
 import { readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { relative, resolve, sep } from "node:path";
+import { loadDaytonaProductionSource } from "./lib/daytona-production-source.mjs";
 
-const DAYTONA_UPSTREAM_BASE_COMMIT = "b5a5d9e78d76c8bcf351f2049620250e0f34eea4";
-const DAYTONA_PRODUCTION_FORK_COMMIT = "f9b4dfe428d37f3d956acda4403879516aa8d923";
+const productionSource = loadDaytonaProductionSource();
 const [outputFile, artifactRoot, sourceCommit, daytonaProductionCommit] = process.argv.slice(2);
 
 if (
@@ -12,7 +12,7 @@ if (
   !sourceCommit ||
   !/^[0-9a-f]{40}$/.test(sourceCommit) ||
   !daytonaProductionCommit ||
-  daytonaProductionCommit !== DAYTONA_PRODUCTION_FORK_COMMIT
+  daytonaProductionCommit !== productionSource.productionForkCommit
 ) {
   throw new TypeError(
     "Expected output, artifact root, exact TerminalX commit, and hardened Daytona commit"
@@ -70,7 +70,7 @@ const artifact = Object.freeze({
   source: Object.freeze({
     terminalxCommit: sourceCommit,
     daytonaProductionCommit,
-    daytonaUpstreamBaseCommit: DAYTONA_UPSTREAM_BASE_COMMIT,
+    daytonaUpstreamBaseCommit: productionSource.upstreamBaseCommit,
   }),
   protocol: Object.freeze({
     version: 1,

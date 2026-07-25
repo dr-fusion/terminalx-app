@@ -17,10 +17,10 @@ import {
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
+import { loadDaytonaProductionSource } from "../../../scripts/lib/daytona-production-source.mjs";
 
 const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const DAYTONA_UPSTREAM_BASE_COMMIT = "b5a5d9e78d76c8bcf351f2049620250e0f34eea4";
-const DAYTONA_PRODUCTION_FORK_COMMIT = "f9b4dfe428d37f3d956acda4403879516aa8d923";
+const productionSource = loadDaytonaProductionSource();
 const SHA256 = /^[0-9a-f]{64}$/;
 const GIT_COMMIT = /^[0-9a-f]{40}$/;
 const CONTENT_IMAGE = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,300}@sha256:[0-9a-f]{64}$/;
@@ -37,8 +37,9 @@ const CONFIG_FIELDS = [
   "sourceDateEpoch",
   "supervisorArchiveFile",
   "supervisorArtifactDigest",
+  "daytonaRuntimeArtifactManifestFile",
+  "daytonaRuntimeArtifactManifestDigest",
   "daytonaDaemonFile",
-  "daytonaDaemonSha256",
   "effectEnforcerFile",
   "effectEnforcerSha256",
   "nodeExecutableSha256",
@@ -85,11 +86,30 @@ export function prepareBuildContext(configurationFile, outputDirectory) {
     supervisorMembers.executables,
     snapshot.trust.hardenedDaytonaSourceCommit
   );
+  const runtimeArtifactManifestBytes = readProtectedFile(
+    snapshot.daytonaRuntimeArtifactManifestFile,
+    64 * 1024,
+    false,
+    snapshot.daytonaRuntimeArtifactManifestDigest
+  );
+  const runtimeArtifactManifest = validateRuntimeArtifactManifest(
+    runtimeArtifactManifestBytes,
+    snapshot.trust.hardenedDaytonaSourceCommit
+  );
+  if (
+    new Set([
+      snapshot.daytonaRuntimeArtifactManifestDigest,
+      runtimeArtifactManifest.artifacts.daemon.binaryDigest,
+      runtimeArtifactManifest.artifacts.runner.binaryDigest,
+    ]).size !== 3
+  ) {
+    throw new TypeError("Runtime manifest, daemon, and runner digests must be distinct");
+  }
   const daytona = readProtectedFile(
     snapshot.daytonaDaemonFile,
     256 * 1024 * 1024,
     true,
-    snapshot.daytonaDaemonSha256
+    runtimeArtifactManifest.artifacts.daemon.binaryDigest
   );
   const effect = readProtectedFile(
     snapshot.effectEnforcerFile,
@@ -189,6 +209,12 @@ export function prepareBuildContext(configurationFile, outputDirectory) {
     0o444
   );
   writeExclusive(
+    join(outputRoot, "inputs", "daytona-runtime-artifact-manifest.json"),
+    runtimeArtifactManifestBytes,
+    0o444
+  );
+  runtimeArtifactManifestBytes.fill(0);
+  writeExclusive(
     join(outputRoot, "inputs", "bootstrap-authority-pin.json"),
     Buffer.from(`${canonicalJson(bootstrapPin)}\n`, "utf8"),
     0o600
@@ -197,6 +223,7 @@ export function prepareBuildContext(configurationFile, outputDirectory) {
     version: 1,
     kind: "terminalx.daytona-sandbox-trust-input",
     supervisorArtifactDigest: snapshot.supervisorArtifactDigest,
+    runtimeArtifactManifestDigest: snapshot.daytonaRuntimeArtifactManifestDigest,
     effectExecutableSha256: snapshot.effectEnforcerSha256,
     nodeExecutableSha256: snapshot.nodeExecutableSha256,
     ...snapshot.trust,
@@ -204,6 +231,11 @@ export function prepareBuildContext(configurationFile, outputDirectory) {
   writeExclusive(
     join(outputRoot, "inputs", "sandbox-trust-input.json"),
     Buffer.from(`${canonicalJson(trustInput)}\n`, "utf8"),
+    0o600
+  );
+  writeExclusive(
+    join(outputRoot, "inputs", "daytona-production-source.json"),
+    Buffer.from(`${canonicalJson(productionSource)}\n`, "utf8"),
     0o600
   );
 
@@ -220,7 +252,9 @@ export function prepareBuildContext(configurationFile, outputDirectory) {
     ["TERMINALX_SUPERVISOR_SHA256", supervisor.sha256],
     ["TERMINALX_SUPERVISOR_RELAY_SHA256", relay.sha256],
     ["TERMINALX_ASSIGNMENT_BOOTSTRAP_SHA256", bootstrap.sha256],
-    ["TERMINALX_DAYTONA_DAEMON_SHA256", snapshot.daytonaDaemonSha256],
+    ["TERMINALX_RUNTIME_ARTIFACT_MANIFEST_SHA256", snapshot.daytonaRuntimeArtifactManifestDigest],
+    ["TERMINALX_RUNNER_BINARY_SHA256", runtimeArtifactManifest.artifacts.runner.binaryDigest],
+    ["TERMINALX_DAYTONA_DAEMON_SHA256", runtimeArtifactManifest.artifacts.daemon.binaryDigest],
     ["TERMINALX_EFFECT_ENFORCER_SHA256", snapshot.effectEnforcerSha256],
     ["TERMINALX_NODE_SHA256", snapshot.nodeExecutableSha256],
     ["TERMINALX_DEPLOYMENT_BINDING_INSTALL_SHA256", installerSha],
@@ -242,6 +276,7 @@ export function prepareBuildContext(configurationFile, outputDirectory) {
   chmodSync(outputRoot, 0o700);
   return Object.freeze({
     artifact,
+    runtimeArtifactManifest,
     buildArguments: Object.freeze(Object.fromEntries(buildArguments)),
     imageName: snapshot.imageName,
     platform: snapshot.platform,
@@ -261,8 +296,11 @@ function snapshotConfiguration(value) {
       "Build frontend, runtime, and toolchain images must be independently pinned"
     );
   }
-  if (value.platform !== "linux/amd64" && value.platform !== "linux/arm64") {
-    throw new TypeError("Only a pinned Linux platform is supported");
+  if (value.schemaVersion !== 1) {
+    throw new TypeError("Unsupported sandbox image build configuration version");
+  }
+  if (value.platform !== "linux/amd64") {
+    throw new TypeError("Only the manifest-bound linux/amd64 platform is supported");
   }
   if (
     typeof value.imageName !== "string" ||
@@ -279,7 +317,7 @@ function snapshotConfiguration(value) {
     trust.hardenedDaytonaSourceCommit,
     "hardenedDaytonaSourceCommit"
   );
-  if (hardenedCommit !== DAYTONA_PRODUCTION_FORK_COMMIT) {
+  if (hardenedCommit !== productionSource.productionForkCommit) {
     throw new TypeError("The Daytona source commit is not the pinned production fork commit");
   }
   return Object.freeze({
@@ -291,8 +329,15 @@ function snapshotConfiguration(value) {
     sourceDateEpoch: value.sourceDateEpoch,
     supervisorArchiveFile: canonicalSourcePath(value.supervisorArchiveFile, "supervisor archive"),
     supervisorArtifactDigest: digest(value.supervisorArtifactDigest, "supervisorArtifactDigest"),
+    daytonaRuntimeArtifactManifestFile: canonicalSourcePath(
+      value.daytonaRuntimeArtifactManifestFile,
+      "Daytona runtime artifact manifest"
+    ),
+    daytonaRuntimeArtifactManifestDigest: digest(
+      value.daytonaRuntimeArtifactManifestDigest,
+      "daytonaRuntimeArtifactManifestDigest"
+    ),
     daytonaDaemonFile: canonicalSourcePath(value.daytonaDaemonFile, "Daytona daemon"),
-    daytonaDaemonSha256: digest(value.daytonaDaemonSha256, "daytonaDaemonSha256"),
     effectEnforcerFile: canonicalSourcePath(value.effectEnforcerFile, "effect enforcer"),
     effectEnforcerSha256: digest(value.effectEnforcerSha256, "effectEnforcerSha256"),
     nodeExecutableSha256: digest(value.nodeExecutableSha256, "nodeExecutableSha256"),
@@ -324,6 +369,71 @@ function snapshotConfiguration(value) {
         "deployment binding issuer"
       ),
     }),
+  });
+}
+
+function validateRuntimeArtifactManifest(bytes, hardenedDaytonaCommit) {
+  let manifest;
+  try {
+    manifest = JSON.parse(bytes.toString("utf8"));
+  } catch {
+    throw new TypeError("Daytona runtime artifact manifest is invalid JSON");
+  }
+  const canonicalBytes = Buffer.from(`${canonicalJson(manifest)}\n`, "utf8");
+  try {
+    if (!bytes.equals(canonicalBytes)) {
+      throw new TypeError(
+        "Daytona runtime artifact manifest must be canonical one-line JSON followed by LF"
+      );
+    }
+  } finally {
+    canonicalBytes.fill(0);
+  }
+  const record = exactRecord(
+    manifest,
+    ["artifacts", "kind", "version"],
+    "Daytona runtime artifact manifest"
+  );
+  if (record.version !== 1 || record.kind !== "terminalx.daytona-hardened-runtime-artifacts") {
+    throw new TypeError("Daytona runtime artifact manifest kind is invalid");
+  }
+  const artifacts = exactRecord(
+    record.artifacts,
+    ["daemon", "runner"],
+    "Daytona runtime artifacts"
+  );
+  const daemon = validateRuntimeArtifact(artifacts.daemon, "daemon", hardenedDaytonaCommit);
+  const runner = validateRuntimeArtifact(artifacts.runner, "runner", hardenedDaytonaCommit);
+  if (daemon.binaryDigest === runner.binaryDigest) {
+    throw new TypeError("Daytona daemon and runner must have distinct binary digests");
+  }
+  return Object.freeze({
+    version: 1,
+    kind: record.kind,
+    artifacts: Object.freeze({ daemon, runner }),
+  });
+}
+
+function validateRuntimeArtifact(value, name, hardenedDaytonaCommit) {
+  const artifact = exactRecord(
+    value,
+    ["architecture", "binaryDigest", "operatingSystem", "sourceCommit"],
+    `Daytona ${name} artifact`
+  );
+  if (
+    artifact.architecture !== "amd64" ||
+    artifact.operatingSystem !== "linux" ||
+    gitCommit(artifact.sourceCommit, `${name} sourceCommit`) !== hardenedDaytonaCommit
+  ) {
+    throw new TypeError(
+      `Daytona ${name} artifact identity is not the production linux/amd64 build`
+    );
+  }
+  return Object.freeze({
+    architecture: "amd64",
+    binaryDigest: digest(artifact.binaryDigest, `${name} binaryDigest`),
+    operatingSystem: "linux",
+    sourceCommit: hardenedDaytonaCommit,
   });
 }
 
@@ -420,7 +530,7 @@ function validateSupervisorArtifact(manifest, executables, hardenedDaytonaCommit
   if (
     !GIT_COMMIT.test(source.terminalxCommit) ||
     source.daytonaProductionCommit !== hardenedDaytonaCommit ||
-    source.daytonaUpstreamBaseCommit !== DAYTONA_UPSTREAM_BASE_COMMIT
+    source.daytonaUpstreamBaseCommit !== productionSource.upstreamBaseCommit
   ) {
     throw new TypeError("Supervisor artifact source does not match the hardened Daytona release");
   }

@@ -37,6 +37,9 @@ const PIN_FIELDS = [
   "version",
   "kind",
   "supervisorArtifactDigest",
+  "runtimeArtifactManifestDigest",
+  "runnerBinaryDigest",
+  "daemonBinaryDigest",
   "peerCredentialExecutableSha256",
   "effectExecutableSha256",
   "nodeExecutableSha256",
@@ -177,8 +180,13 @@ function validateSignedBinding(binding, requireFresh) {
   const expiresAtMs = integer(authority.expiresAtMs, 1, Number.MAX_SAFE_INTEGER);
   const now = Date.now();
   if (
-    pins.version !== 1 ||
+    pins.version !== 2 ||
     pins.kind !== "terminalx.daytona-sandbox-trust-pins" ||
+    !SHA256.test(pins.runtimeArtifactManifestDigest) ||
+    !SHA256.test(pins.runnerBinaryDigest) ||
+    !SHA256.test(pins.daemonBinaryDigest) ||
+    new Set([pins.runtimeArtifactManifestDigest, pins.runnerBinaryDigest, pins.daemonBinaryDigest])
+      .size !== 3 ||
     authority.issuer !== "daytona-runner" ||
     authority.issuerKeyId !== pins.deploymentBindingIssuerKeyId ||
     authority.audience !== "terminalx-assignment-bootstrap" ||

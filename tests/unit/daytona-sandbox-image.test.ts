@@ -13,14 +13,15 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { spawnSync } from "node:child_process";
 import { afterEach, describe, expect, it } from "vitest";
+import productionSourceConfiguration from "../../config/daytona-production-source.json";
 
 const REPOSITORY_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const IMAGE_ROOT = join(REPOSITORY_ROOT, "packages/daytona-sandbox-image");
 const PREPARE_MODULE = join(IMAGE_ROOT, "scripts/prepare-build-context.mjs");
 const STATIC_PINS_MODULE = join(IMAGE_ROOT, "scripts/write-static-pins.mjs");
 const OCI_MODULE = join(IMAGE_ROOT, "scripts/verify-oci-layout.mjs");
-const BASE_COMMIT = "b5a5d9e78d76c8bcf351f2049620250e0f34eea4";
-const HARDENED_COMMIT = "f9b4dfe428d37f3d956acda4403879516aa8d923";
+const BASE_COMMIT = productionSourceConfiguration.upstreamBaseCommit;
+const HARDENED_COMMIT = productionSourceConfiguration.productionForkCommit;
 const TERMINALX_COMMIT = "1".repeat(40);
 
 interface MutableSupervisorManifest {
@@ -59,6 +60,11 @@ describe("hardened Daytona sandbox image", () => {
     expect(dockerfile).toMatch(/^# syntax=TERMINALX_REQUIRES_PREPARED_CONTENT_ADDRESSED_FRONTEND/);
     expect(dockerfile).toContain("io.terminalx.deployment-binding-installer.sha256");
     expect(dockerfile).toContain("io.terminalx.isolation-probe.sha256");
+    expect(dockerfile).toContain("io.terminalx.runtime-artifact-manifest.sha256");
+    expect(dockerfile).toContain("io.terminalx.daytona-runner.sha256");
+    expect(dockerfile).toContain(
+      "inputs/daytona-runtime-artifact-manifest.json /usr/share/terminalx/daytona-runtime-artifact-manifest.json"
+    );
     expect(dockerfile).not.toContain("--attest type=sbom");
 
     const buildScript = readFileSync(join(IMAGE_ROOT, "build-image.sh"), "utf8");
@@ -68,6 +74,7 @@ describe("hardened Daytona sandbox image", () => {
     expect(buildScript).toContain("oci-mediatypes=true,oci-artifact=true,rewrite-timestamp=true");
     expect(buildScript).toContain("mv --no-target-directory --no-clobber");
     expect(buildScript).toContain("STAGING_OUTPUT_ID");
+    expect(buildScript).toContain('[[ "$PLATFORM" != "linux/amd64" ]]');
   });
 
   it("compiles all native helpers with the production warning policy", () => {
@@ -105,7 +112,7 @@ describe("hardened Daytona sandbox image", () => {
     expect(spawnSync(join(output, "terminalx-isolation-probe"), ["unexpected"]).status).toBe(74);
   });
 
-  it("pins the exact public 13-field bootstrap trust record", async () => {
+  it("pins the exact public manifest-derived bootstrap trust record", async () => {
     const { createStaticTrustPins } = await import(pathToFileURL(STATIC_PINS_MODULE).href);
     const isolation = publicKey();
     const effectManifest = publicKey();
@@ -114,6 +121,7 @@ describe("hardened Daytona sandbox image", () => {
       version: 1,
       kind: "terminalx.daytona-sandbox-trust-input",
       supervisorArtifactDigest: "1".repeat(64),
+      runtimeArtifactManifestDigest: "4".repeat(64),
       effectExecutableSha256: "2".repeat(64),
       nodeExecutableSha256: "3".repeat(64),
       isolationIssuerKeyId: "isolation-1",
@@ -129,11 +137,21 @@ describe("hardened Daytona sandbox image", () => {
       peerCredentialExecutableSha256: "7".repeat(64),
       sandboxInitSha256: "8".repeat(64),
     };
-    const pins = createStaticTrustPins(trust, native);
+    const runtimeArtifactManifest = runtimeManifest("a".repeat(64), "b".repeat(64));
+    const pins = createStaticTrustPins(
+      trust,
+      native,
+      productionSourceConfiguration,
+      runtimeArtifactManifest
+    );
+    expect(pins.version).toBe(2);
     expect(Object.keys(pins)).toEqual([
       "version",
       "kind",
       "supervisorArtifactDigest",
+      "runtimeArtifactManifestDigest",
+      "runnerBinaryDigest",
+      "daemonBinaryDigest",
       "peerCredentialExecutableSha256",
       "effectExecutableSha256",
       "nodeExecutableSha256",
@@ -147,13 +165,54 @@ describe("hardened Daytona sandbox image", () => {
     ]);
     expect(JSON.stringify(pins)).not.toContain("PRIVATE KEY");
     expect(() =>
-      createStaticTrustPins({ ...trust, isolationIssuerPublicKeySpkiPem: privateKey() }, native)
+      createStaticTrustPins(
+        { ...trust, isolationIssuerPublicKeySpkiPem: privateKey() },
+        native,
+        productionSourceConfiguration,
+        runtimeArtifactManifest
+      )
     ).toThrow();
-    expect(() => createStaticTrustPins({ ...trust, secret: "forbidden" }, native)).toThrow();
+    expect(() =>
+      createStaticTrustPins(
+        { ...trust, secret: "forbidden" },
+        native,
+        productionSourceConfiguration,
+        runtimeArtifactManifest
+      )
+    ).toThrow();
     expect(() =>
       createStaticTrustPins(
         { ...trust, effectManifestAuthorityPublicKeySpkiPem: isolation },
-        native
+        native,
+        productionSourceConfiguration,
+        runtimeArtifactManifest
+      )
+    ).toThrow();
+    expect(() =>
+      createStaticTrustPins(
+        trust,
+        native,
+        {
+          ...productionSourceConfiguration,
+          productionForkCommit: "a".repeat(40),
+        },
+        runtimeArtifactManifest
+      )
+    ).toThrow();
+    expect(() =>
+      createStaticTrustPins(
+        trust,
+        native,
+        productionSourceConfiguration,
+        runtimeManifest("a".repeat(64), "a".repeat(64))
+      )
+    ).toThrow();
+    expect(() =>
+      createStaticTrustPins(
+        { ...trust, runtimeArtifactManifestDigest: "a".repeat(64) },
+        native,
+        productionSourceConfiguration,
+        runtimeArtifactManifest
       )
     ).toThrow();
   });
@@ -164,14 +223,23 @@ describe("hardened Daytona sandbox image", () => {
     const result = prepareBuildContext(fixture.configFile, fixture.output);
     expect(result.platform).toBe("linux/amd64");
     expect(result.artifact.source.daytonaProductionCommit).toBe(HARDENED_COMMIT);
+    expect(result.runtimeArtifactManifest.artifacts.daemon.binaryDigest).toBe(
+      sha256File(join(fixture.output, "inputs/daytona"))
+    );
     const trustInput = JSON.parse(
       readFileSync(join(fixture.output, "inputs/sandbox-trust-input.json"), "utf8")
     );
+    expect(
+      JSON.parse(
+        readFileSync(join(fixture.output, "inputs/daytona-production-source.json"), "utf8")
+      )
+    ).toEqual(productionSourceConfiguration);
     expect(Object.keys(trustInput).sort()).toEqual(
       [
         "version",
         "kind",
         "supervisorArtifactDigest",
+        "runtimeArtifactManifestDigest",
         "effectExecutableSha256",
         "nodeExecutableSha256",
         "isolationIssuerKeyId",
@@ -186,6 +254,13 @@ describe("hardened Daytona sandbox image", () => {
     expect(
       readFileSync(join(fixture.output, "inputs/daytona")).subarray(0, 4).toString("hex")
     ).toBe("7f454c46");
+    expect(
+      readFileSync(join(fixture.output, "inputs/daytona-runtime-artifact-manifest.json"), "utf8")
+    ).toBe(readFileSync(fixture.runtimeArtifactManifestFile, "utf8"));
+    expect(result.buildArguments.TERMINALX_RUNTIME_ARTIFACT_MANIFEST_SHA256).toBe(
+      sha256File(fixture.runtimeArtifactManifestFile)
+    );
+    expect(result.buildArguments.TERMINALX_RUNNER_BINARY_SHA256).toBe("d".repeat(64));
     expect(readFileSync(join(fixture.output, "inputs/terminalx-effect-enforcer"), "utf8")).toBe(
       "#!/usr/local/bin/node\neffect-enforcer"
     );
@@ -204,6 +279,10 @@ describe("hardened Daytona sandbox image", () => {
   it.each([
     "floating runtime image",
     "floating Dockerfile frontend",
+    "runtime manifest digest mismatch",
+    "noncanonical runtime manifest",
+    "wrong runtime manifest source",
+    "arm64 platform",
     "daemon digest mismatch",
     "scripted daemon",
     "symlinked daemon",
@@ -222,14 +301,56 @@ describe("hardened Daytona sandbox image", () => {
     if (attack === "floating Dockerfile frontend") {
       configuration.dockerfileFrontendImage = "docker/dockerfile:1.7";
     }
-    if (attack === "daemon digest mismatch") configuration.daytonaDaemonSha256 = "0".repeat(64);
+    if (attack === "runtime manifest digest mismatch") {
+      configuration.daytonaRuntimeArtifactManifestDigest = "0".repeat(64);
+    }
+    if (attack === "noncanonical runtime manifest") {
+      const manifest = JSON.parse(
+        readFileSync(configuration.daytonaRuntimeArtifactManifestFile, "utf8")
+      );
+      chmodSync(configuration.daytonaRuntimeArtifactManifestFile, 0o644);
+      writeFileSync(
+        configuration.daytonaRuntimeArtifactManifestFile,
+        `${JSON.stringify(manifest, null, 2)}\n`,
+        { mode: 0o444 }
+      );
+      chmodSync(configuration.daytonaRuntimeArtifactManifestFile, 0o444);
+      configuration.daytonaRuntimeArtifactManifestDigest = sha256File(
+        configuration.daytonaRuntimeArtifactManifestFile
+      );
+    }
+    if (attack === "wrong runtime manifest source") {
+      const manifest = JSON.parse(
+        readFileSync(configuration.daytonaRuntimeArtifactManifestFile, "utf8")
+      );
+      manifest.artifacts.runner.sourceCommit = "f".repeat(40);
+      chmodSync(configuration.daytonaRuntimeArtifactManifestFile, 0o644);
+      writeFileSync(
+        configuration.daytonaRuntimeArtifactManifestFile,
+        `${JSON.stringify(manifest)}\n`,
+        { mode: 0o444 }
+      );
+      chmodSync(configuration.daytonaRuntimeArtifactManifestFile, 0o444);
+      configuration.daytonaRuntimeArtifactManifestDigest = sha256File(
+        configuration.daytonaRuntimeArtifactManifestFile
+      );
+    }
+    if (attack === "arm64 platform") configuration.platform = "linux/arm64";
+    if (attack === "daemon digest mismatch") {
+      chmodSync(configuration.daytonaDaemonFile, 0o755);
+      writeFileSync(
+        configuration.daytonaDaemonFile,
+        Buffer.concat([Buffer.from([0x7f, 0x45, 0x4c, 0x46]), Buffer.from("changed-daemon")]),
+        { mode: 0o555 }
+      );
+      chmodSync(configuration.daytonaDaemonFile, 0o555);
+    }
     if (attack === "scripted daemon") {
       chmodSync(configuration.daytonaDaemonFile, 0o755);
       writeFileSync(configuration.daytonaDaemonFile, "#!/usr/local/bin/node\ndaemon", {
         mode: 0o555,
       });
       chmodSync(configuration.daytonaDaemonFile, 0o555);
-      configuration.daytonaDaemonSha256 = sha256File(configuration.daytonaDaemonFile);
     }
     if (attack === "symlinked daemon") {
       const link = join(fixture.root, "daytona-link");
@@ -360,6 +481,9 @@ describe("hardened Daytona sandbox image", () => {
       normalizedMetadata
     );
     expect(release.dockerImageId).toMatch(/^sha256:[0-9a-f]{64}$/);
+    expect(release.runtimeArtifactManifestDigest).toMatch(/^[0-9a-f]{64}$/);
+    expect(release.runnerBinaryDigest).toBe("f".repeat(64));
+    expect(release.daemonBinaryDigest).toBe("7".repeat(64));
     expect(release.attestations).toEqual([
       "https://slsa.dev/provenance/v1",
       "https://spdx.dev/Document",
@@ -384,6 +508,39 @@ describe("hardened Daytona sandbox image", () => {
         join(fixture.root, "normalized-build-metadata.json")
       )
     ).toThrow(/inherit environment/);
+  });
+
+  it("rejects an arm64 OCI output until matching hardened runtime artifacts exist", async () => {
+    const fixture = createOciFixture();
+    writeFileSync(join(fixture.context, "platform.txt"), "linux/arm64\n");
+    const { verifyOciLayout } = await import(pathToFileURL(OCI_MODULE).href);
+    expect(() =>
+      verifyOciLayout(
+        fixture.layout,
+        fixture.context,
+        join(fixture.root, "release.json"),
+        fixture.rawBuildMetadata,
+        join(fixture.root, "normalized-build-metadata.json")
+      )
+    ).toThrow(/identity/);
+  });
+
+  it("rejects a runtime artifact manifest changed after context preparation", async () => {
+    const fixture = createOciFixture();
+    const manifestFile = join(fixture.context, "inputs", "daytona-runtime-artifact-manifest.json");
+    const manifest = JSON.parse(readFileSync(manifestFile, "utf8"));
+    manifest.artifacts.runner.binaryDigest = "0".repeat(64);
+    writeFileSync(manifestFile, `${JSON.stringify(manifest)}\n`);
+    const { verifyOciLayout } = await import(pathToFileURL(OCI_MODULE).href);
+    expect(() =>
+      verifyOciLayout(
+        fixture.layout,
+        fixture.context,
+        join(fixture.root, "release.json"),
+        fixture.rawBuildMetadata,
+        join(fixture.root, "normalized-build-metadata.json")
+      )
+    ).toThrow(/manifest digest/);
   });
 
   it("rejects malformed native helper measurements before release", async () => {
@@ -496,6 +653,13 @@ describe("hardened Daytona sandbox image", () => {
     writeFileSync(effect, "#!/usr/local/bin/node\neffect-enforcer", { mode: 0o555 });
     chmodSync(daytona, 0o555);
     chmodSync(effect, 0o555);
+    const runtimeArtifactManifestFile = join(root, "daytona-runtime-artifact-manifest.json");
+    writeFileSync(
+      runtimeArtifactManifestFile,
+      `${JSON.stringify(runtimeManifest(sha256File(daytona), "d".repeat(64)))}\n`,
+      { mode: 0o444 }
+    );
+    chmodSync(runtimeArtifactManifestFile, 0o444);
     const bootstrap = {
       version: 1,
       kind: "terminalx.daytona-bootstrap-authority-pin",
@@ -515,8 +679,9 @@ describe("hardened Daytona sandbox image", () => {
       sourceDateEpoch: 1,
       supervisorArchiveFile: archive,
       supervisorArtifactDigest: sha256File(archive),
+      daytonaRuntimeArtifactManifestFile: runtimeArtifactManifestFile,
+      daytonaRuntimeArtifactManifestDigest: sha256File(runtimeArtifactManifestFile),
       daytonaDaemonFile: daytona,
-      daytonaDaemonSha256: sha256File(daytona),
       effectEnforcerFile: effect,
       effectEnforcerSha256: sha256File(effect),
       nodeExecutableSha256: "c".repeat(64),
@@ -534,7 +699,14 @@ describe("hardened Daytona sandbox image", () => {
     const configFile = join(root, "build.json");
     writeFileSync(configFile, `${JSON.stringify(configuration)}\n`, { mode: 0o600 });
     chmodSync(configFile, 0o600);
-    return { root, artifactRoot, archive, configFile, output: join(root, "context") };
+    return {
+      root,
+      artifactRoot,
+      archive,
+      runtimeArtifactManifestFile,
+      configFile,
+      output: join(root, "context"),
+    };
   }
 
   function rewriteSupervisorArchive(
@@ -614,7 +786,10 @@ describe("hardened Daytona sandbox image", () => {
     const layout = join(root, "oci");
     const context = join(root, "context");
     mkdirSync(join(layout, "blobs", "sha256"), { recursive: true });
-    mkdirSync(context);
+    mkdirSync(join(context, "inputs"), { recursive: true });
+    const runtimeArtifactManifestBytes = Buffer.from(
+      `${JSON.stringify(runtimeManifest("7".repeat(64), "f".repeat(64)))}\n`
+    );
     const args = {
       BUILDKIT_SYNTAX: `docker/dockerfile:1.7@sha256:${"0".repeat(64)}`,
       TERMINALX_RUNTIME_IMAGE: `runtime@sha256:${"1".repeat(64)}`,
@@ -624,6 +799,10 @@ describe("hardened Daytona sandbox image", () => {
       TERMINALX_SUPERVISOR_SHA256: "4".repeat(64),
       TERMINALX_SUPERVISOR_RELAY_SHA256: "5".repeat(64),
       TERMINALX_ASSIGNMENT_BOOTSTRAP_SHA256: "6".repeat(64),
+      TERMINALX_RUNTIME_ARTIFACT_MANIFEST_SHA256: createHash("sha256")
+        .update(runtimeArtifactManifestBytes)
+        .digest("hex"),
+      TERMINALX_RUNNER_BINARY_SHA256: "f".repeat(64),
       TERMINALX_DAYTONA_DAEMON_SHA256: "7".repeat(64),
       TERMINALX_EFFECT_ENFORCER_SHA256: "8".repeat(64),
       TERMINALX_NODE_SHA256: "9".repeat(64),
@@ -646,6 +825,10 @@ describe("hardened Daytona sandbox image", () => {
         .join("\n")}\n`
     );
     writeFileSync(join(context, "native-hashes.json"), `${JSON.stringify(native)}\n`);
+    writeFileSync(
+      join(context, "inputs", "daytona-runtime-artifact-manifest.json"),
+      runtimeArtifactManifestBytes
+    );
     const labels = {
       "io.terminalx.sandbox.profile": "v1",
       "io.terminalx.supervisor-relay.sha256": args.TERMINALX_SUPERVISOR_RELAY_SHA256,
@@ -656,6 +839,9 @@ describe("hardened Daytona sandbox image", () => {
       "io.terminalx.isolation-probe.sha256": native.isolationProbeSha256,
       "io.terminalx.sandbox-init.sha256": native.sandboxInitSha256,
       "io.terminalx.peercred.sha256": native.peerCredentialExecutableSha256,
+      "io.terminalx.runtime-artifact-manifest.sha256":
+        args.TERMINALX_RUNTIME_ARTIFACT_MANIFEST_SHA256,
+      "io.terminalx.daytona-runner.sha256": args.TERMINALX_RUNNER_BINARY_SHA256,
       "io.terminalx.daytona-daemon.sha256": args.TERMINALX_DAYTONA_DAEMON_SHA256,
       "io.terminalx.effect-enforcer.sha256": args.TERMINALX_EFFECT_ENFORCER_SHA256,
       "io.terminalx.supervisor.sha256": args.TERMINALX_SUPERVISOR_SHA256,
@@ -836,6 +1022,27 @@ describe("hardened Daytona sandbox image", () => {
     const digest = createHash("sha256").update(bytes).digest("hex");
     writeFileSync(join(layout, "blobs", "sha256", digest), bytes);
     return { mediaType, digest: `sha256:${digest}`, size: bytes.byteLength };
+  }
+
+  function runtimeManifest(daemonBinaryDigest: string, runnerBinaryDigest: string) {
+    return {
+      artifacts: {
+        daemon: {
+          architecture: "amd64",
+          binaryDigest: daemonBinaryDigest,
+          operatingSystem: "linux",
+          sourceCommit: HARDENED_COMMIT,
+        },
+        runner: {
+          architecture: "amd64",
+          binaryDigest: runnerBinaryDigest,
+          operatingSystem: "linux",
+          sourceCommit: HARDENED_COMMIT,
+        },
+      },
+      kind: "terminalx.daytona-hardened-runtime-artifacts",
+      version: 1,
+    };
   }
 
   function publicKey(): string {

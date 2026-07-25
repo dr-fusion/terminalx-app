@@ -2,7 +2,10 @@
 
 This package builds the immutable Sandbox half of the hosted TerminalX runtime. It is intentionally not a general Daytona image: it runs the pinned Daytona daemon as uid/gid `10001` (`terminalx`) while a root-only supervisor, effect executor, trust pins, and assignment credentials remain behind `/run/terminalx-root` and `/var/lib/terminalx-supervisor`.
 
-The image is useful only with the dedicated hardened Daytona runner at production commit `f9b4dfe428d37f3d956acda4403879516aa8d923`, descended from upstream commit `b5a5d9e78d76c8bcf351f2049620250e0f34eea4`. A generic or unmodified Daytona runner is not an acceptable production boundary.
+The image is useful only with the dedicated hardened Daytona runner whose exact production and
+base commits are declared in
+[`config/daytona-production-source.json`](../../config/daytona-production-source.json). A generic
+or unmodified Daytona runner is not an acceptable production boundary.
 
 ## Startup and admission
 
@@ -30,7 +33,8 @@ The immutable image contains only these public trust roles:
 - isolation-attestation issuer Ed25519 public key;
 - effect-manifest authority Ed25519 public key;
 - runner deployment-binding Ed25519 public key;
-- exact public artifact, executable, source-commit, and Node digests.
+- exact public runtime-manifest, runner, daemon, supervisor, executable, source-commit, and Node
+  digests.
 
 The bootstrap, isolation, deployment-binding, and effect-manifest authority keys and key ids must all be distinct. The image pins only the static effect-manifest authority; each assignment carries its own signed manifest and digest bound to its plan, assignment, and derived enforcer identity. Assignment bootstrap installs the matching unique effect-enforcer PKCS#8 key, plus the observation key, as root-owned `0600` files. The supplied effect executable must read only `/run/terminalx-root/assignment/effect-enforcer-provisioning.json` and the fixed `privateKeyFile` it names (`effect-enforcer-key.pk8`). There is no globally pinned per-assignment manifest digest and no permissive fallback executor.
 
@@ -81,6 +85,26 @@ packages/daytona-sandbox-image/build-image.sh \
   /absolute/new/output-directory
 ```
 
+When the daemon and runtime manifest come from the release workflow, do not point this build at the
+raw files produced by GitHub's workflow-artifact download: that transport normalizes file modes.
+First verify the downloaded mode-preserving tar subject against the repository attestation, then
+extract it through the fail-closed release helper:
+
+```bash
+gh attestation verify \
+  /absolute/terminalx-daytona-runtime-<commit-prefix>.tar.gz \
+  --repo <owner>/terminalx-app-mono
+scripts/verify-daytona-runtime-release-archive.sh \
+  /absolute/terminalx-daytona-runtime-<commit-prefix>.tar.gz \
+  /absolute/checksums.sha256 \
+  /absolute/new/verified-runtime
+```
+
+Use `verified-runtime/terminalx-daytona-runtime-artifacts.json` and
+`verified-runtime/daytona-daemon-linux-amd64` as the two runtime paths below. The helper admits an
+exact four-file archive, verifies its outer and internal SHA-256 records, and requires restored
+`0555` binary and `0444` manifest/checksum modes.
+
 The configuration has these exact fields:
 
 ```json
@@ -94,8 +118,9 @@ The configuration has these exact fields:
   "sourceDateEpoch": 0,
   "supervisorArchiveFile": "/absolute/terminalx-daytona-supervisor.tar.gz",
   "supervisorArtifactDigest": "<archive SHA-256>",
+  "daytonaRuntimeArtifactManifestFile": "/absolute/terminalx-daytona-runtime-artifacts.json",
+  "daytonaRuntimeArtifactManifestDigest": "<manifest SHA-256>",
   "daytonaDaemonFile": "/absolute/daytona",
-  "daytonaDaemonSha256": "<daemon SHA-256>",
   "effectEnforcerFile": "/absolute/terminalx-effect-enforcer",
   "effectEnforcerSha256": "<effect executable SHA-256>",
   "nodeExecutableSha256": "<regular /usr/local/bin/node SHA-256 in runtimeImage>",
@@ -103,7 +128,7 @@ The configuration has these exact fields:
   "trust": {
     "isolationIssuerKeyId": "isolation-production-1",
     "isolationIssuerPublicKeySpkiPem": "<canonical Ed25519 public PEM>",
-    "hardenedDaytonaSourceCommit": "f9b4dfe428d37f3d956acda4403879516aa8d923",
+    "hardenedDaytonaSourceCommit": "<copy productionForkCommit from the canonical source config>",
     "effectManifestAuthorityIssuerKeyId": "effect-manifest-production-1",
     "effectManifestAuthorityPublicKeySpkiPem": "<canonical Ed25519 public PEM>",
     "deploymentBindingIssuerKeyId": "runner-deployment-production-1",
@@ -112,7 +137,25 @@ The configuration has these exact fields:
 }
 ```
 
-The Dockerfile frontend and both base image references are mandatory, mutually distinct, content-addressed references with no floating default. The preparation step embeds the exact frontend digest in the generated Dockerfile and the build also supplies it through BuildKit's `BUILDKIT_SYNTAX` override. The runtime base must already contain a regular root-owned `/usr/local/bin/node`, `/bin/sh`, GNU-compatible account/core utilities, and the desired user toolchain. Its OCI `Config.Env` must be empty: PID 1 admits only the three runner-supplied Daytona variables and constructs each child's environment itself. The Daytona daemon must be ELF; the effect executor may be ELF or use exactly `#!/usr/local/bin/node`. Every supervisor artifact executable must use that exact Node shebang. The build performs no package installation or network access in a `RUN` step. If the exact Daytona daemon, effect executor, Node interpreter, supervisor archive, manifest path/mode/hash, or any public pin is absent or changed, the build fails.
+The Dockerfile frontend and both base image references are mandatory, mutually distinct, content-addressed references with no floating default. The preparation step embeds the exact frontend digest in the generated Dockerfile and the build also supplies it through BuildKit's `BUILDKIT_SYNTAX` override. The runtime base must already contain a regular root-owned `/usr/local/bin/node`, `/bin/sh`, GNU-compatible account/core utilities, and the desired user toolchain. Its OCI `Config.Env` must be empty: PID 1 admits only the three runner-supplied Daytona variables and constructs each child's environment itself. Only `linux/amd64` is admitted until the hardened fork publishes independently measured arm64 runner and daemon artifacts.
+
+`daytonaRuntimeArtifactManifestFile` is the sole authority for both native binaries. Its exact bytes
+must be canonical one-line JSON followed by LF, and its SHA-256 must equal
+`daytonaRuntimeArtifactManifestDigest`. It must use version `1`, kind
+`terminalx.daytona-hardened-runtime-artifacts`, contain exactly `daemon` and `runner`, identify both
+as `linux`/`amd64` builds of the canonical production fork commit, and give each a distinct lowercase
+SHA-256 `binaryDigest`. The builder derives the daemon and runner pins from that manifest and verifies
+the local daemon bytes; there is no independent operator-supplied daemon digest seam. The canonical
+manifest is installed read-only at
+`/usr/share/terminalx/daytona-runtime-artifact-manifest.json`, reverified while static trust pins are
+created in the closed `terminalx.daytona-sandbox-trust-pins` version `2` record, and recorded in OCI
+labels and provenance alongside both binary digests.
+
+The Daytona daemon must be ELF; the effect executor may be ELF or use exactly
+`#!/usr/local/bin/node`. Every supervisor artifact executable must use that exact Node shebang. The
+build performs no package installation or network access in a `RUN` step. If the exact Daytona daemon,
+effect executor, Node interpreter, supervisor archive, manifest path/mode/hash, or any public pin is
+absent or changed, the build fails.
 
 Native helpers are compiled twice from the same prepared sources. The first pinned-toolchain build measures their hashes; the final target depends directly on the same pinned toolchain stage, recompiles them, and refuses the image unless its bytes match those measurements. No host-exported executable is copied into the final image.
 
@@ -123,7 +166,8 @@ The supervisor archive digest becomes `supervisorArtifactDigest`; the archive ma
 The native helper stage and final stage both run with build networking disabled. Buildx emits modern OCI-artifact attestations containing a non-empty SPDX SBOM and maximum-mode SLSA v1 provenance marked reproducible. The verifier requires the pinned frontend, runtime, and toolchain materials; exact build arguments; empty secret/SSH inputs; the hermetic flag; and manifest/subject binding. It also checks all OCI descriptor hashes, final image configuration, required digest labels, and absence of private material before producing:
 
 - `terminalx-daytona-sandbox.oci.tar` — deterministic runnable image layers/config plus build-specific attestations;
-- `terminalx-sandbox-image.json` — image manifest/config ids and public labels;
+- `terminalx-sandbox-image.json` — image manifest/config ids, runtime artifact identities, and public
+  labels;
 - `buildkit-metadata.json` — BuildKit result metadata;
 - `checksums.sha256` — checksums for every release output.
 

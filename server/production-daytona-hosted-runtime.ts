@@ -183,6 +183,7 @@ export async function composeProductionDaytonaHostedRuntime(
       issuerKeyId: settings.supervisor.isolation.issuerKeyId,
       issuerPublicKeySpkiPem: settings.supervisor.isolation.issuerPublicKeySpkiPem,
       hardenedDaytonaSourceCommit: settings.supervisor.isolation.hardenedDaytonaSourceCommit,
+      expectedRunnerBinaryDigest: settings.provider.configuration.runnerBinaryDigest,
       expectedSandboxImageId: settings.provider.configuration.artifact.imageId,
       expectedSandboxSnapshotRef: settings.provider.configuration.artifact.snapshotRef,
       expectedSandboxUser: "terminalx",
@@ -369,6 +370,7 @@ function bootstrapConfiguration(
     isolation: Object.freeze({
       attestationFile: `${RUNTIME_ROOT}/live/isolation-attestation.json`,
       ...settings.supervisor.isolation,
+      expectedRunnerBinaryDigest: request.runnerBinaryDigest,
       expectedSandboxImageId: settings.provider.configuration.artifact.imageId,
       expectedSandboxSnapshotRef: settings.provider.configuration.artifact.snapshotRef,
       expectedSandboxUser: "terminalx" as const,

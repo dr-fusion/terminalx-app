@@ -31,6 +31,8 @@ ARG TERMINALX_SUPERVISOR_ARTIFACT_SHA256
 ARG TERMINALX_SUPERVISOR_SHA256
 ARG TERMINALX_SUPERVISOR_RELAY_SHA256
 ARG TERMINALX_ASSIGNMENT_BOOTSTRAP_SHA256
+ARG TERMINALX_RUNTIME_ARTIFACT_MANIFEST_SHA256
+ARG TERMINALX_RUNNER_BINARY_SHA256
 ARG TERMINALX_DAYTONA_DAEMON_SHA256
 ARG TERMINALX_EFFECT_ENFORCER_SHA256
 ARG TERMINALX_NODE_SHA256
@@ -80,7 +82,9 @@ COPY --chown=0:0 --chmod=0555 inputs/terminalx-deployment-binding-install /usr/l
 COPY --chown=0:0 --chmod=0500 inputs/terminalx-effect-enforcer /usr/local/libexec/terminalx/terminalx-effect-enforcer
 COPY --chown=0:0 --chmod=0600 inputs/bootstrap-authority-pin.json /etc/terminalx/bootstrap-authority-pin.json
 COPY --chown=0:0 --chmod=0444 inputs/daytona-supervisor-artifact.json /usr/share/terminalx/daytona-supervisor-artifact.json
+COPY --chown=0:0 --chmod=0444 inputs/daytona-runtime-artifact-manifest.json /usr/share/terminalx/daytona-runtime-artifact-manifest.json
 COPY --chown=0:0 --chmod=0600 inputs/sandbox-trust-input.json /terminalx-build/inputs/sandbox-trust-input.json
+COPY --chown=0:0 --chmod=0600 inputs/daytona-production-source.json /terminalx-build/inputs/daytona-production-source.json
 COPY --chown=0:0 --chmod=0600 native-hashes.json /terminalx-build/native-hashes.json
 COPY --chown=0:0 --chmod=0500 scripts/write-static-pins.mjs /terminalx-build/write-static-pins.mjs
 COPY --chown=0:0 --chmod=0500 scripts/audit-final-rootfs.mjs /terminalx-build/audit-final-rootfs.mjs
@@ -99,8 +103,13 @@ RUN --network=none \
     check_file /usr/local/libexec/terminalx/terminalx-isolation-probe 555; \
     check_file /usr/local/libexec/terminalx/terminalx-peercred 500; \
     check_file /usr/local/libexec/terminalx/terminalx-effect-enforcer 500; \
+    check_file /usr/share/terminalx/daytona-runtime-artifact-manifest.json 444; \
+    test "$TERMINALX_RUNNER_BINARY_SHA256" != "$TERMINALX_DAYTONA_DAEMON_SHA256"; \
+    test "$TERMINALX_RUNTIME_ARTIFACT_MANIFEST_SHA256" != "$TERMINALX_RUNNER_BINARY_SHA256"; \
+    test "$TERMINALX_RUNTIME_ARTIFACT_MANIFEST_SHA256" != "$TERMINALX_DAYTONA_DAEMON_SHA256"; \
     check_hash /usr/local/bin/node "$TERMINALX_NODE_SHA256"; \
     check_hash /usr/local/bin/daytona "$TERMINALX_DAYTONA_DAEMON_SHA256"; \
+    check_hash /usr/share/terminalx/daytona-runtime-artifact-manifest.json "$TERMINALX_RUNTIME_ARTIFACT_MANIFEST_SHA256"; \
     check_hash /usr/local/bin/terminalx-sandbox-init "$TERMINALX_SANDBOX_INIT_SHA256"; \
     check_hash /usr/local/libexec/terminalx/terminalx-daytona-supervisor "$TERMINALX_SUPERVISOR_SHA256"; \
     check_hash /usr/local/libexec/terminalx/terminalx-supervisor-relay "$TERMINALX_SUPERVISOR_RELAY_SHA256"; \
@@ -130,6 +139,8 @@ LABEL io.terminalx.sandbox.profile="v1" \
       io.terminalx.isolation-probe.sha256="${TERMINALX_ISOLATION_PROBE_SHA256}" \
       io.terminalx.sandbox-init.sha256="${TERMINALX_SANDBOX_INIT_SHA256}" \
       io.terminalx.peercred.sha256="${TERMINALX_PEERCRED_SHA256}" \
+      io.terminalx.runtime-artifact-manifest.sha256="${TERMINALX_RUNTIME_ARTIFACT_MANIFEST_SHA256}" \
+      io.terminalx.daytona-runner.sha256="${TERMINALX_RUNNER_BINARY_SHA256}" \
       io.terminalx.daytona-daemon.sha256="${TERMINALX_DAYTONA_DAEMON_SHA256}" \
       io.terminalx.effect-enforcer.sha256="${TERMINALX_EFFECT_ENFORCER_SHA256}" \
       io.terminalx.supervisor.sha256="${TERMINALX_SUPERVISOR_SHA256}" \

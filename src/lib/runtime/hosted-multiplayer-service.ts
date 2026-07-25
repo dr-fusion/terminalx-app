@@ -92,6 +92,9 @@ const DEPLOYMENT_FIELDS = [
 const MEASURED_ARTIFACT_FIELDS = [
   "sdkSha256",
   "supervisorSha256",
+  "runtimeArtifactManifestDigest",
+  "runnerBinaryDigest",
+  "daemonBinaryDigest",
   "sbomSha256",
   "provenanceSha256",
   "sandboxSha256",
@@ -144,6 +147,9 @@ type AnyFunction = (...args: never[]) => unknown;
 export interface MeasuredDaytonaDeploymentArtifacts {
   readonly sdkSha256: string;
   readonly supervisorSha256: string;
+  readonly runtimeArtifactManifestDigest: string;
+  readonly runnerBinaryDigest: string;
+  readonly daemonBinaryDigest: string;
   readonly sbomSha256: string;
   readonly provenanceSha256: string;
   readonly sandboxSha256: string;
@@ -1068,6 +1074,9 @@ function assertMeasuredArtifacts(
   if (
     manifest.artifacts.sdk.sha256 !== measured.sdkSha256 ||
     manifest.artifacts.supervisor.sha256 !== measured.supervisorSha256 ||
+    manifest.artifacts.runtimeArtifactManifest.sha256 !== measured.runtimeArtifactManifestDigest ||
+    manifest.artifacts.runner.sha256 !== measured.runnerBinaryDigest ||
+    manifest.artifacts.daemon.sha256 !== measured.daemonBinaryDigest ||
     manifest.artifacts.sbom.sha256 !== measured.sbomSha256 ||
     manifest.artifacts.provenance.sha256 !== measured.provenanceSha256 ||
     manifest.sandboxArtifact.sha256 !== measured.sandboxSha256 ||
@@ -1103,6 +1112,7 @@ function assertManifestComposition(
     manifest.source.forkCommit !== DAYTONA_PRODUCTION_FORK_COMMIT ||
     configuration.sourceCommit !== DAYTONA_PRODUCTION_FORK_COMMIT ||
     configuration.supervisorArtifactDigest !== manifest.artifacts.supervisor.sha256 ||
+    configuration.runnerBinaryDigest !== manifest.artifacts.runner.sha256 ||
     profile.kind !== "daytona" ||
     profile.isolation.isolationPolicyDigest !== manifest.isolationProfile.sha256 ||
     !phase7IsolationMatches ||

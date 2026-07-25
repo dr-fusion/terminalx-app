@@ -9,7 +9,9 @@ The supervisor must run as uid 0 from `/usr/local/bin/terminalx-sandbox-init`. T
 The daemon has no network listener and inherits only stdin/stdout from the root-side transport. It requires all of the following before it becomes useful:
 
 - signed effective-isolation evidence from an independently pinned root/platform enforcer;
-- a reviewed hardened Daytona descendant of base commit `b5a5d9e78d76c8bcf351f2049620250e0f34eea4` (the base itself is rejected because it runs ordinary sandboxes privileged and has no PID limit);
+- a reviewed hardened Daytona descendant of the base commit in the canonical
+  [`daytona-production-source.json`](../../config/daytona-production-source.json) (the base itself is
+  rejected because it runs ordinary sandboxes privileged and has no PID limit);
 - a root-owned, hash-pinned external effect executor that supports exact `apply` and `reconcile` operations and returns enforced receipts plus signed enforcer attestations;
 - signed enforcer-manifest trust pins, command-authority public-key pins, and root-only state/observation key provisioning.
 

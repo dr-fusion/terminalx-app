@@ -626,6 +626,9 @@ function validateImageOwnedPins(
     "version",
     "kind",
     "supervisorArtifactDigest",
+    "runtimeArtifactManifestDigest",
+    "runnerBinaryDigest",
+    "daemonBinaryDigest",
     "peerCredentialExecutableSha256",
     "effectExecutableSha256",
     "nodeExecutableSha256",
@@ -638,7 +641,7 @@ function validateImageOwnedPins(
     "deploymentBindingIssuerPublicKeySpkiPem",
   ]);
   if (
-    field(pins, "version") !== 1 ||
+    field(pins, "version") !== 2 ||
     field(pins, "kind") !== "terminalx.daytona-sandbox-trust-pins"
   ) {
     malformed();
@@ -667,11 +670,18 @@ function validateImageOwnedPins(
     }),
   ]);
   const nodeExecutableSha256 = digest(field(pins, "nodeExecutableSha256"));
+  const runtimeArtifactManifestDigest = digest(field(pins, "runtimeArtifactManifestDigest"));
+  const runnerBinaryDigest = digest(field(pins, "runnerBinaryDigest"));
+  const daemonBinaryDigest = digest(field(pins, "daemonBinaryDigest"));
+  if (new Set([runtimeArtifactManifestDigest, runnerBinaryDigest, daemonBinaryDigest]).size !== 3) {
+    malformed();
+  }
   if (
     !sameDigest(
       bootstrap.assignment.supervisorArtifactDigest,
       digest(field(pins, "supervisorArtifactDigest"))
     ) ||
+    !sameDigest(bootstrap.isolation.expectedRunnerBinaryDigest, runnerBinaryDigest) ||
     !sameDigest(
       bootstrap.transport.peerCredentialExecutableSha256,
       digest(field(pins, "peerCredentialExecutableSha256"))

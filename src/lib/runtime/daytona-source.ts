@@ -1,16 +1,25 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import { types as utilTypes } from "node:util";
+import {
+  DAYTONA_FORK_REPOSITORY,
+  DAYTONA_PRODUCTION_FORK_COMMIT,
+  DAYTONA_UPSTREAM_BASE_COMMIT,
+  DAYTONA_UPSTREAM_REPOSITORY,
+} from "./daytona-production-source";
 import { canonicalRuntimeJson } from "./runtime-command-canonical";
 import { suppressNativePromiseRejection } from "./runtime-native-promise";
 
-export const DAYTONA_FORK_REPOSITORY = "https://github.com/procyon-labs-io/daytona";
-export const DAYTONA_PRODUCTION_FORK_COMMIT = "f9b4dfe428d37f3d956acda4403879516aa8d923";
-export const DAYTONA_UPSTREAM_REPOSITORY = "https://github.com/daytonaio/daytona";
-export const DAYTONA_UPSTREAM_BASE_COMMIT = "b5a5d9e78d76c8bcf351f2049620250e0f34eea4";
+export {
+  DAYTONA_FORK_REPOSITORY,
+  DAYTONA_PRODUCTION_FORK_COMMIT,
+  DAYTONA_UPSTREAM_BASE_COMMIT,
+  DAYTONA_UPSTREAM_REPOSITORY,
+};
+
 export const DAYTONA_DEPLOYMENT_MANIFEST_CLAIMS_DIGEST_DOMAIN =
-  "terminalx/daytona-deployment-manifest-claims/v1\0" as const;
+  "terminalx/daytona-deployment-manifest-claims/v2\0" as const;
 export const DAYTONA_DEPLOYMENT_MANIFEST_AUTHORITY_SIGNATURE_DOMAIN =
-  "terminalx/daytona-deployment-manifest-authority/v1\0" as const;
+  "terminalx/daytona-deployment-manifest-authority/v2\0" as const;
 
 const MANIFEST_KIND = "terminalx.daytona-deployment-artifacts" as const;
 const AUTHORITY_ISSUER = "terminalx-release" as const;
@@ -43,9 +52,20 @@ const SOURCE_FIELDS = [
   "upstreamRepository",
   "upstreamBaseCommit",
 ] as const;
-const ARTIFACT_FIELDS = ["sdk", "supervisor", "sbom", "provenance"] as const;
+const ARTIFACT_FIELDS = [
+  "sdk",
+  "supervisor",
+  "runtimeArtifactManifest",
+  "runner",
+  "daemon",
+  "sbom",
+  "provenance",
+] as const;
 const SDK_ARTIFACT_FIELDS = ["kind", "sha256"] as const;
 const SUPERVISOR_ARTIFACT_FIELDS = ["kind", "sha256"] as const;
+const RUNTIME_ARTIFACT_MANIFEST_FIELDS = ["kind", "sha256"] as const;
+const RUNNER_ARTIFACT_FIELDS = ["kind", "sha256"] as const;
+const DAEMON_ARTIFACT_FIELDS = ["kind", "sha256"] as const;
 const SBOM_ARTIFACT_FIELDS = ["kind", "sha256"] as const;
 const PROVENANCE_ARTIFACT_FIELDS = ["kind", "sha256"] as const;
 const IMAGE_FIELDS = ["kind", "reference", "sha256"] as const;
@@ -110,6 +130,9 @@ export interface DaytonaDeploymentArtifactPin<Kind extends string> {
 export interface DaytonaDeploymentArtifacts {
   readonly sdk: DaytonaDeploymentArtifactPin<"daytona-typescript-sdk">;
   readonly supervisor: DaytonaDeploymentArtifactPin<"terminalx-daytona-supervisor">;
+  readonly runtimeArtifactManifest: DaytonaDeploymentArtifactPin<"terminalx-daytona-hardened-runtime-artifacts">;
+  readonly runner: DaytonaDeploymentArtifactPin<"daytona-hardened-runner-linux-amd64">;
+  readonly daemon: DaytonaDeploymentArtifactPin<"daytona-hardened-daemon-linux-amd64">;
   readonly sbom: DaytonaDeploymentArtifactPin<"spdx-2.3-json">;
   readonly provenance: DaytonaDeploymentArtifactPin<"slsa-v1-dsse">;
 }
@@ -139,7 +162,7 @@ export interface DaytonaIsolationProfilePin {
 }
 
 export interface DaytonaDeploymentArtifactManifestClaims {
-  readonly version: 1;
+  readonly version: 2;
   readonly kind: typeof MANIFEST_KIND;
   readonly manifestId: string;
   readonly issuedAtMs: number;
@@ -306,7 +329,7 @@ function snapshotManifestClaims(value: unknown): DaytonaDeploymentArtifactManife
 function snapshotManifestClaimsRecord(
   record: Record<string, unknown>
 ): DaytonaDeploymentArtifactManifestClaims {
-  if (field(record, "version", "invalid_manifest") !== 1) fail("invalid_manifest");
+  if (field(record, "version", "invalid_manifest") !== 2) fail("invalid_manifest");
   if (field(record, "kind", "invalid_manifest") !== MANIFEST_KIND) fail("invalid_manifest");
   const manifestId = safeReference(field(record, "manifestId", "invalid_manifest"));
   const issuedAtMs = safeInstant(field(record, "issuedAtMs", "invalid_manifest"));
@@ -321,6 +344,9 @@ function snapshotManifestClaimsRecord(
   const digests = [
     artifacts.sdk.sha256,
     artifacts.supervisor.sha256,
+    artifacts.runtimeArtifactManifest.sha256,
+    artifacts.runner.sha256,
+    artifacts.daemon.sha256,
     artifacts.sbom.sha256,
     artifacts.provenance.sha256,
     sandboxArtifact.sha256,
@@ -328,7 +354,7 @@ function snapshotManifestClaimsRecord(
   ];
   if (new Set(digests).size !== digests.length) fail("invalid_manifest");
   return Object.freeze({
-    version: 1,
+    version: 2,
     kind: MANIFEST_KIND,
     manifestId,
     issuedAtMs,
@@ -364,6 +390,21 @@ function snapshotArtifacts(value: unknown): DaytonaDeploymentArtifacts {
       field(artifacts, "supervisor", "invalid_manifest"),
       SUPERVISOR_ARTIFACT_FIELDS,
       "terminalx-daytona-supervisor"
+    ),
+    runtimeArtifactManifest: snapshotArtifact(
+      field(artifacts, "runtimeArtifactManifest", "invalid_manifest"),
+      RUNTIME_ARTIFACT_MANIFEST_FIELDS,
+      "terminalx-daytona-hardened-runtime-artifacts"
+    ),
+    runner: snapshotArtifact(
+      field(artifacts, "runner", "invalid_manifest"),
+      RUNNER_ARTIFACT_FIELDS,
+      "daytona-hardened-runner-linux-amd64"
+    ),
+    daemon: snapshotArtifact(
+      field(artifacts, "daemon", "invalid_manifest"),
+      DAEMON_ARTIFACT_FIELDS,
+      "daytona-hardened-daemon-linux-amd64"
     ),
     sbom: snapshotArtifact(
       field(artifacts, "sbom", "invalid_manifest"),
@@ -475,7 +516,7 @@ function verifyManifestSignature(
 ): void {
   const statement = exactRecord(
     Object.freeze({
-      version: 1,
+      version: 2,
       issuer: manifest.authority.issuer,
       issuerKeyId: manifest.authority.issuerKeyId,
       audience: manifest.authority.audience,

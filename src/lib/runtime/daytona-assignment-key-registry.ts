@@ -262,6 +262,7 @@ function snapshotInstallRequest(value: unknown): SnapshotPlanContext {
       "artifactDigest",
       "sandboxUser",
       "supervisorArtifactDigest",
+      "runnerBinaryDigest",
     ]);
     const providerSandboxId = field(record, "providerSandboxId");
     if (
@@ -274,6 +275,7 @@ function snapshotInstallRequest(value: unknown): SnapshotPlanContext {
     positiveInteger(field(record, "expectedRevision"));
     digest(field(record, "artifactDigest"));
     digest(field(record, "supervisorArtifactDigest"));
+    digest(field(record, "runnerBinaryDigest"));
     return snapshotPlanContext(field(record, "plan"));
   } catch (error) {
     if (error instanceof HostedControlPlaneError) throw error;

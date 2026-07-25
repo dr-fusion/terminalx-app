@@ -157,6 +157,7 @@ describe("Daytona assignment bootstrap", () => {
     "sandbox user environment",
     "hostname binding",
     "image-owned artifact pin",
+    "image-owned runtime artifact alias",
     "bootstrap authority pin",
     "deployment signature",
     "deployment canonical bytes",
@@ -176,6 +177,10 @@ describe("Daytona assignment bootstrap", () => {
       } else if (drift === "image-owned artifact pin") {
         const pins = readJsonRecord(fixture.provision.imageTrustPinFile);
         pins.supervisorArtifactDigest = "f".repeat(64);
+        writePrivateJson(fixture.provision.imageTrustPinFile, pins);
+      } else if (drift === "image-owned runtime artifact alias") {
+        const pins = readJsonRecord(fixture.provision.imageTrustPinFile);
+        pins.daemonBinaryDigest = pins.runnerBinaryDigest;
         writePrivateJson(fixture.provision.imageTrustPinFile, pins);
       } else if (drift === "bootstrap authority pin") {
         const pin = readJsonRecord(fixture.provision.authorityPinFile);
@@ -466,6 +471,7 @@ function bootstrapFixture() {
       issuerKeyId: "isolation-key-1",
       issuerPublicKeySpkiPem: isolationPublicPem,
       hardenedDaytonaSourceCommit: "e".repeat(40),
+      expectedRunnerBinaryDigest: "9".repeat(64),
       expectedSandboxImageId: `sha256:${"5".repeat(64)}`,
       expectedSandboxSnapshotRef: `registry.example/terminalx@sha256:${"6".repeat(64)}`,
       expectedSandboxUser: "terminalx",
@@ -509,9 +515,12 @@ function bootstrapFixture() {
     publicKeySpkiPem: authorityPublicPem,
   });
   writePrivateJson(imageTrustPinFile, {
-    version: 1,
+    version: 2,
     kind: "terminalx.daytona-sandbox-trust-pins",
     supervisorArtifactDigest: bootstrap.assignment.supervisorArtifactDigest,
+    runtimeArtifactManifestDigest: "8".repeat(64),
+    runnerBinaryDigest: bootstrap.isolation.expectedRunnerBinaryDigest,
+    daemonBinaryDigest: "a".repeat(64),
     peerCredentialExecutableSha256: peerSha,
     effectExecutableSha256: effectSha,
     nodeExecutableSha256: nodeSha,

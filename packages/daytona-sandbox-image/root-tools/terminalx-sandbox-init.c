@@ -51,6 +51,8 @@ static const char *const TRUST_ROOT = "/etc/terminalx";
 static const char *const AUTHORITY_PIN =
     "/etc/terminalx/bootstrap-authority-pin.json";
 static const char *const IMAGE_PINS = "/etc/terminalx/sandbox-trust-pins.json";
+static const char *const RUNTIME_ARTIFACT_MANIFEST =
+    "/usr/share/terminalx/daytona-runtime-artifact-manifest.json";
 static const char *const RUNTIME_ROOT = "/run/terminalx-root";
 static const char *const PRIVATE_RUNTIME_ROOT = "/run/terminalx-private";
 static const char *const DAYTONA_SOCKET =
@@ -241,7 +243,8 @@ static bool validate_image_boundary(void) {
          protected_regular_file(ISOLATION_PROBE_PATH, 0555,
                                 16 * 1024 * 1024) &&
          protected_regular_file(AUTHORITY_PIN, 0600, 64 * 1024) &&
-         protected_regular_file(IMAGE_PINS, 0600, 256 * 1024);
+         protected_regular_file(IMAGE_PINS, 0600, 256 * 1024) &&
+         protected_regular_file(RUNTIME_ARTIFACT_MANIFEST, 0444, 64 * 1024);
 }
 
 static void reset_process_signals(void) {

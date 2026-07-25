@@ -1,10 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly EXPECTED_REPOSITORY="https://github.com/procyon-labs-io/daytona"
-readonly DAYTONA_UPSTREAM_BASE_COMMIT="b5a5d9e78d76c8bcf351f2049620250e0f34eea4"
-readonly DAYTONA_PRODUCTION_FORK_COMMIT="f9b4dfe428d37f3d956acda4403879516aa8d923"
-
 if [[ $# -ne 2 ]]; then
   echo "usage: $0 <daytona-source-directory> <empty-output-directory>" >&2
   exit 64
@@ -13,6 +9,11 @@ fi
 SOURCE_DIRECTORY=$(realpath "$1")
 OUTPUT_DIRECTORY=$(realpath -m "$2")
 SCRIPT_DIRECTORY=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+PIN_READER="$SCRIPT_DIRECTORY/read-daytona-production-source.mjs"
+EXPECTED_REPOSITORY=$(node "$PIN_READER" field forkRepository)
+DAYTONA_UPSTREAM_BASE_COMMIT=$(node "$PIN_READER" field upstreamBaseCommit)
+DAYTONA_PRODUCTION_FORK_COMMIT=$(node "$PIN_READER" field productionForkCommit)
+readonly PIN_READER EXPECTED_REPOSITORY DAYTONA_UPSTREAM_BASE_COMMIT DAYTONA_PRODUCTION_FORK_COMMIT
 
 if [[ ! -d "$SOURCE_DIRECTORY/.git" && ! -f "$SOURCE_DIRECTORY/.git" ]]; then
   echo "Daytona source must be a Git checkout" >&2
@@ -50,7 +51,8 @@ mkdir -p "$OUTPUT_DIRECTORY"
 (
   cd "$SOURCE_DIRECTORY"
   corepack yarn install --immutable
-  corepack yarn nx build sdk-typescript --configuration=production
+  NX_DAEMON=false NX_SKIP_NX_CACHE=true \
+    corepack yarn nx build sdk-typescript --configuration=production
   npm pack ./dist/libs/api-client --pack-destination "$OUTPUT_DIRECTORY" --json >/dev/null
   npm pack ./dist/libs/sdk-typescript --pack-destination "$OUTPUT_DIRECTORY" --json >/dev/null
   npm pack ./dist/libs/toolbox-api-client --pack-destination "$OUTPUT_DIRECTORY" --json >/dev/null

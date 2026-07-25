@@ -7,10 +7,9 @@ import {
 } from "node:crypto";
 import { types as nodeTypes } from "node:util";
 import type { DaytonaSupervisorIsolationRequest } from "../../../src/lib/runtime/daytona-hosted-control-plane";
-import {
-  HOSTED_RUNTIME_ASSIGNMENT_PLAN_DIGEST_DOMAIN,
-  type HostedRuntimeAssignmentPlan,
-} from "../../../src/lib/runtime/hosted-runtime-control-plane";
+import { DAYTONA_UPSTREAM_BASE_COMMIT as CANONICAL_DAYTONA_UPSTREAM_BASE_COMMIT } from "../../../src/lib/runtime/daytona-production-source";
+import { digestHostedRuntimeAssignmentPlan } from "../../../src/lib/runtime/hosted-runtime-adapter";
+import type { HostedRuntimeAssignmentPlan } from "../../../src/lib/runtime/hosted-runtime-control-plane";
 import { canonicalRuntimeJson } from "../../../src/lib/runtime/runtime-command-canonical";
 import { snapshotRuntimeSupervisorPortableData } from "../../../src/lib/runtime/runtime-supervisor-snapshot";
 import { readTrustedConfigurationFile } from "../../../src/lib/runtime/runtime-trusted-configuration-file";
@@ -20,7 +19,7 @@ import {
   type DaytonaSupervisorIsolationEvidenceSource,
 } from "./supervisor";
 
-export const DAYTONA_UPSTREAM_BASE_COMMIT = "b5a5d9e78d76c8bcf351f2049620250e0f34eea4" as const;
+export const DAYTONA_UPSTREAM_BASE_COMMIT = CANONICAL_DAYTONA_UPSTREAM_BASE_COMMIT;
 export const TERMINALX_DAYTONA_BASE_SOURCE_COMMIT = DAYTONA_UPSTREAM_BASE_COMMIT;
 export const DAYTONA_EFFECTIVE_ISOLATION_ATTESTATION_KIND =
   "terminalx.daytona-effective-isolation" as const;
@@ -53,6 +52,8 @@ export interface DaytonaEffectiveIsolationClaims {
   readonly observationKeyProvisioningRefDigest: string;
   readonly isolationPolicyDigest: string;
   readonly networkPolicyDigest: string;
+  /** SHA-256 measured from the live runner executable that signed these claims. */
+  readonly runnerBinaryDigest: string;
   readonly resources: {
     readonly cpu: number;
     readonly memoryGiB: number;
@@ -178,6 +179,7 @@ export interface CreateDaytonaEffectiveIsolationVerifierOptions {
   readonly issuerPublicKeySpkiPem: string;
   /** A reviewed hardened descendant; the immutable b5 base itself is rejected. */
   readonly hardenedDaytonaSourceCommit: string;
+  readonly expectedRunnerBinaryDigest: string;
   readonly expectedSandboxImageId: string;
   readonly expectedSandboxSnapshotRef: string;
   readonly expectedSandboxUser: "terminalx";
@@ -279,9 +281,10 @@ export function createDaytonaEffectiveIsolationVerifier(
       if (
         !sameDigest(claims.providerIdentityCommitment, input.providerIdentityCommitment) ||
         claims.providerRevision !== options.expectedProviderRevision ||
-        !sameDigest(claims.planDigest, planDigest(plan)) ||
+        !sameDigest(claims.planDigest, digestHostedRuntimeAssignmentPlan(plan)) ||
         !sameDigest(claims.artifactDigest, input.artifactDigest) ||
         !sameDigest(claims.supervisorArtifactDigest, input.supervisorArtifactDigest) ||
+        !sameDigest(claims.runnerBinaryDigest, options.expectedRunnerBinaryDigest) ||
         claims.sandboxUser !== options.expectedSandboxUser ||
         claims.observationIssuerKeyId !== input.observationIssuerKeyId ||
         claims.observationIssuerKeyId !== plan.observation.issuerKeyId ||
@@ -411,6 +414,7 @@ function captureVerifierOptions(value: CreateDaytonaEffectiveIsolationVerifierOp
   issuerKeyId: string;
   issuerPublicKey: KeyObject;
   hardenedDaytonaSourceCommit: string;
+  expectedRunnerBinaryDigest: string;
   expectedSandboxImageId: string;
   expectedSandboxSnapshotRef: string;
   expectedSandboxUser: "terminalx";
@@ -448,6 +452,7 @@ function captureVerifierOptions(value: CreateDaytonaEffectiveIsolationVerifierOp
     issuerKeyId: safeReference(value.issuerKeyId),
     issuerPublicKey: publicKey,
     hardenedDaytonaSourceCommit: hardenedCommit,
+    expectedRunnerBinaryDigest: digest(value.expectedRunnerBinaryDigest),
     expectedSandboxImageId: sandboxImageId(value.expectedSandboxImageId),
     expectedSandboxSnapshotRef: sandboxSnapshotRef(value.expectedSandboxSnapshotRef),
     expectedSandboxUser: "terminalx",
@@ -478,10 +483,10 @@ function captureVerificationInput(
   const plan = snapshotRuntimeSupervisorPortableData(
     field(record, "plan")
   ) as HostedRuntimeAssignmentPlan;
-  canonicalRuntimeJson(plan);
-  safeReference(plan.observation.keyProvisioningRef);
-  safeReference(plan.observation.issuerKeyId);
-  if (typeof plan.observation.publicKeySpkiPem !== "string") throw new TypeError();
+  // Use the canonical adapter parser instead of checking a handful of nested
+  // fields here. An isolation signature must never make a plan acceptable when
+  // the production adapter itself would reject that exact plan.
+  digestHostedRuntimeAssignmentPlan(plan);
   return Object.freeze({
     attestation: field(record, "attestation"),
     plan,
@@ -524,6 +529,7 @@ function snapshotClaims(value: unknown): DaytonaEffectiveIsolationClaims {
     "observationKeyProvisioningRefDigest",
     "isolationPolicyDigest",
     "networkPolicyDigest",
+    "runnerBinaryDigest",
     "resources",
     "source",
     "hardenedImage",
@@ -553,6 +559,7 @@ function snapshotClaims(value: unknown): DaytonaEffectiveIsolationClaims {
     ),
     isolationPolicyDigest: digest(field(record, "isolationPolicyDigest")),
     networkPolicyDigest: digest(field(record, "networkPolicyDigest")),
+    runnerBinaryDigest: digest(field(record, "runnerBinaryDigest")),
     resources: snapshotResources(field(record, "resources")),
     source: snapshotSource(field(record, "source")),
     hardenedImage: snapshotHardenedImage(field(record, "hardenedImage")),
@@ -923,10 +930,6 @@ function verifyAuthority(
     key,
     Buffer.from(attestation.authority.signature, "base64url")
   );
-}
-
-function planDigest(plan: HostedRuntimeAssignmentPlan): string {
-  return sha256(`${HOSTED_RUNTIME_ASSIGNMENT_PLAN_DIGEST_DOMAIN}${canonicalRuntimeJson(plan)}`);
 }
 
 function parsePublicKey(value: unknown): KeyObject {

@@ -68,6 +68,7 @@ export interface DaytonaAssignmentBootstrapInstallRequest {
   readonly artifactDigest: string;
   readonly sandboxUser: "terminalx";
   readonly supervisorArtifactDigest: string;
+  readonly runnerBinaryDigest: string;
 }
 
 export interface DaytonaAssignmentBootstrapCoordinator {
@@ -372,13 +373,14 @@ class DurableDaytonaAssignmentBootstrapCoordinator implements DaytonaAssignmentB
     try {
       const effect = effectIdentity(configuration);
       const metadata: BootstrapIntentMetadata = Object.freeze({
-        version: 1,
+        version: 2,
         kind: INTENT_KIND,
         providerSandboxId: request.providerSandboxId,
         planDigest: planDigest(request.plan),
         bindingDigest: bindingDigest(request.plan.binding),
         artifactDigest: request.artifactDigest,
         supervisorArtifactDigest: request.supervisorArtifactDigest,
+        runnerBinaryDigest: request.runnerBinaryDigest,
         assignmentPlanDigest: effectRecord.activation.assignmentPlanDigest,
         effectEnforcerPolicyDigest: effectRecord.activation.effectEnforcerPolicyDigest,
         providerIdentityCommitment: effectRecord.activation.providerIdentityCommitment,
@@ -508,13 +510,14 @@ interface CapturedOptions extends Omit<
 }
 
 interface BootstrapIntentMetadata {
-  readonly version: 1;
+  readonly version: 2;
   readonly kind: typeof INTENT_KIND;
   readonly providerSandboxId: string;
   readonly planDigest: string;
   readonly bindingDigest: string;
   readonly artifactDigest: string;
   readonly supervisorArtifactDigest: string;
+  readonly runnerBinaryDigest: string;
   readonly assignmentPlanDigest: string;
   readonly effectEnforcerPolicyDigest: string;
   readonly providerIdentityCommitment: string;
@@ -665,6 +668,7 @@ function snapshotInstallRequest(value: unknown): DaytonaAssignmentBootstrapInsta
   }
   digest(snapshot.artifactDigest);
   digest(snapshot.supervisorArtifactDigest);
+  digest(snapshot.runnerBinaryDigest);
   digest(snapshot.plan.effectEnforcerPolicyDigest);
   canonicalRuntimeJson(snapshot.plan);
   return Object.freeze(snapshot);
@@ -682,6 +686,7 @@ function validateBootstrapConfiguration(
     assignment.sandboxUser !== request.sandboxUser ||
     !sameDigest(assignment.artifactDigest, request.artifactDigest) ||
     !sameDigest(assignment.supervisorArtifactDigest, request.supervisorArtifactDigest) ||
+    !sameDigest(configuration.isolation.expectedRunnerBinaryDigest, request.runnerBinaryDigest) ||
     !sameDigest(
       assignment.effectEnforcerSetDigest,
       snapshotRuntimeEffectEnforcerManifest(configuration.effect.manifest).authority.claimsDigest
@@ -995,6 +1000,7 @@ function snapshotIntent(value: unknown): BootstrapIntentMetadata {
     "bindingDigest",
     "artifactDigest",
     "supervisorArtifactDigest",
+    "runnerBinaryDigest",
     "assignmentPlanDigest",
     "effectEnforcerPolicyDigest",
     "providerIdentityCommitment",
@@ -1009,20 +1015,21 @@ function snapshotIntent(value: unknown): BootstrapIntentMetadata {
     "issuedAtMs",
     "expiresAtMs",
   ]);
-  if (field(record, "version") !== 1 || field(record, "kind") !== INTENT_KIND) invalidState();
+  if (field(record, "version") !== 2 || field(record, "kind") !== INTENT_KIND) invalidState();
   const issuedAtMs = nonNegativeInteger(field(record, "issuedAtMs"));
   const expiresAtMs = positiveInteger(field(record, "expiresAtMs"));
   if (expiresAtMs <= issuedAtMs || expiresAtMs - issuedAtMs > MAX_AUTHORITY_TTL_MS) {
     invalidState();
   }
   return Object.freeze({
-    version: 1,
+    version: 2,
     kind: INTENT_KIND,
     providerSandboxId: sandboxId(field(record, "providerSandboxId")),
     planDigest: digest(field(record, "planDigest")),
     bindingDigest: digest(field(record, "bindingDigest")),
     artifactDigest: digest(field(record, "artifactDigest")),
     supervisorArtifactDigest: digest(field(record, "supervisorArtifactDigest")),
+    runnerBinaryDigest: digest(field(record, "runnerBinaryDigest")),
     assignmentPlanDigest: digest(field(record, "assignmentPlanDigest")),
     effectEnforcerPolicyDigest: digest(field(record, "effectEnforcerPolicyDigest")),
     providerIdentityCommitment: digest(field(record, "providerIdentityCommitment")),
@@ -1049,6 +1056,7 @@ function validateIntent(
     !sameDigest(intent.bindingDigest, bindingDigest(request.plan.binding)) ||
     !sameDigest(intent.artifactDigest, request.artifactDigest) ||
     !sameDigest(intent.supervisorArtifactDigest, request.supervisorArtifactDigest) ||
+    !sameDigest(intent.runnerBinaryDigest, request.runnerBinaryDigest) ||
     !sameDigest(intent.effectEnforcerPolicyDigest, request.plan.effectEnforcerPolicyDigest) ||
     intent.providerRevision !== request.expectedRevision ||
     !sameDigest(intent.providerIdentityCommitment, providerIdentity(request.providerSandboxId)) ||

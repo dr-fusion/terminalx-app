@@ -44,9 +44,11 @@ Status: complete. The implementation and deliberately closed production boundary
 
 Close the hosted evidence boundary of release Gate 1 and release Gate 2.
 
-- Create and verify the public TerminalX Daytona fork based on
-  `b5a5d9e78d76c8bcf351f2049620250e0f34eea4`.
-- Pin the fork commit and signed SDK/supervisor artifacts with SBOM and provenance.
+- Create and verify the public TerminalX Daytona fork from the reviewed base declared in the
+  canonical [`daytona-production-source.json`](../../config/daytona-production-source.json).
+- Pin the fork commit and signed SDK, supervisor, runtime-manifest, runner, and daemon artifacts
+  with SBOM and provenance; derive runtime identity from measured clean binaries rather than
+  operator configuration.
 - Compose the hosted adapter, complete signed trust group, and `RuntimeSupervisorRoot` into the
   production server; keep hosted transports unavailable until root readiness, and stop the root
   before closing the Team Session kernel.

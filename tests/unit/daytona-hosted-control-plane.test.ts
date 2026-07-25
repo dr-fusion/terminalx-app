@@ -89,6 +89,7 @@ const configuration = Object.freeze({
     contentDigest: "5".repeat(64),
   }),
   supervisorArtifactDigest: "6".repeat(64),
+  runnerBinaryDigest: "7".repeat(64),
   lifecycle: Object.freeze({
     autoStopIntervalMinutes: 0,
     autoArchiveIntervalMinutes: 0,
@@ -164,6 +165,7 @@ describe("Daytona hosted control plane", () => {
         expectedRevision: 1,
         sandboxUser: "terminalx",
         supervisorArtifactDigest: configuration.supervisorArtifactDigest,
+        runnerBinaryDigest: configuration.runnerBinaryDigest,
       }),
       expect.any(AbortSignal)
     );

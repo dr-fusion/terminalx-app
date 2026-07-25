@@ -36,7 +36,7 @@ export function verifyOciLayout(
   const platform = readSmallText(join(contextRoot, "platform.txt"));
   const imageName = readSmallText(join(contextRoot, "image-name.txt"));
   if (
-    (platform !== "linux/amd64" && platform !== "linux/arm64") ||
+    platform !== "linux/amd64" ||
     !IMAGE_NAME.test(imageName) ||
     imageName.includes("@") ||
     imageName.slice(imageName.lastIndexOf("/") + 1).includes(":")
@@ -45,6 +45,15 @@ export function verifyOciLayout(
   }
   const arguments_ = readBuildArguments(join(contextRoot, "build-arguments.txt"));
   validateBuildArguments(arguments_);
+  const runtimeArtifactManifestBytes = readProtectedFile(
+    join(contextRoot, "inputs", "daytona-runtime-artifact-manifest.json"),
+    64 * 1024
+  );
+  try {
+    validateRuntimeArtifactManifest(runtimeArtifactManifestBytes, arguments_);
+  } finally {
+    runtimeArtifactManifestBytes.fill(0);
+  }
   const dockerfile = readProtectedFile(join(contextRoot, "Dockerfile"), 512 * 1024).toString(
     "utf8"
   );
@@ -215,6 +224,9 @@ export function verifyOciLayout(
     imageManifestDigest: imageDescriptor.digest,
     imageConfigDigest: configDescriptor.digest,
     dockerImageId: configDescriptor.digest,
+    runtimeArtifactManifestDigest: arguments_.TERMINALX_RUNTIME_ARTIFACT_MANIFEST_SHA256,
+    runnerBinaryDigest: arguments_.TERMINALX_RUNNER_BINARY_SHA256,
+    daemonBinaryDigest: arguments_.TERMINALX_DAYTONA_DAEMON_SHA256,
     sourceDateEpoch: Number(arguments_.SOURCE_DATE_EPOCH),
     attestations: Object.freeze(predicates),
     labels: Object.freeze({ ...imageConfiguration.config.Labels }),
@@ -471,6 +483,9 @@ function validateImageConfiguration(
     "io.terminalx.isolation-probe.sha256": native.isolationProbeSha256,
     "io.terminalx.sandbox-init.sha256": native.sandboxInitSha256,
     "io.terminalx.peercred.sha256": native.peerCredentialExecutableSha256,
+    "io.terminalx.runtime-artifact-manifest.sha256":
+      arguments_.TERMINALX_RUNTIME_ARTIFACT_MANIFEST_SHA256,
+    "io.terminalx.daytona-runner.sha256": arguments_.TERMINALX_RUNNER_BINARY_SHA256,
     "io.terminalx.daytona-daemon.sha256": arguments_.TERMINALX_DAYTONA_DAEMON_SHA256,
     "io.terminalx.effect-enforcer.sha256": arguments_.TERMINALX_EFFECT_ENFORCER_SHA256,
     "io.terminalx.supervisor.sha256": arguments_.TERMINALX_SUPERVISOR_SHA256,
@@ -523,6 +538,8 @@ function validateBuildArguments(value) {
     "TERMINALX_SUPERVISOR_SHA256",
     "TERMINALX_SUPERVISOR_RELAY_SHA256",
     "TERMINALX_ASSIGNMENT_BOOTSTRAP_SHA256",
+    "TERMINALX_RUNTIME_ARTIFACT_MANIFEST_SHA256",
+    "TERMINALX_RUNNER_BINARY_SHA256",
     "TERMINALX_DAYTONA_DAEMON_SHA256",
     "TERMINALX_EFFECT_ENFORCER_SHA256",
     "TERMINALX_NODE_SHA256",
@@ -541,13 +558,72 @@ function validateBuildArguments(value) {
     !/^(?:0|[1-9][0-9]{0,15})$/.test(value.SOURCE_DATE_EPOCH) ||
     !Number.isSafeInteger(Number(value.SOURCE_DATE_EPOCH)) ||
     !GIT_COMMIT.test(value.TERMINALX_SOURCE_COMMIT) ||
-    !GIT_COMMIT.test(value.TERMINALX_DAYTONA_SOURCE_COMMIT)
+    !GIT_COMMIT.test(value.TERMINALX_DAYTONA_SOURCE_COMMIT) ||
+    new Set([
+      value.TERMINALX_RUNTIME_ARTIFACT_MANIFEST_SHA256,
+      value.TERMINALX_RUNNER_BINARY_SHA256,
+      value.TERMINALX_DAYTONA_DAEMON_SHA256,
+    ]).size !== 3
   ) {
     throw new TypeError("OCI build arguments are invalid");
   }
   for (const field of fields.filter((field) => field.endsWith("SHA256"))) {
     if (!SHA256.test(value[field])) throw new TypeError("OCI build digest is invalid");
   }
+}
+
+function validateRuntimeArtifactManifest(bytes, arguments_) {
+  if (sha256(bytes) !== arguments_.TERMINALX_RUNTIME_ARTIFACT_MANIFEST_SHA256) {
+    throw new TypeError("Runtime artifact manifest digest does not match the OCI build");
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(bytes.toString("utf8"));
+  } catch {
+    throw new TypeError("Runtime artifact manifest is not valid JSON");
+  }
+  if (bytes.toString("utf8") !== `${canonicalJson(parsed)}\n`) {
+    throw new TypeError("Runtime artifact manifest is not canonical JSON");
+  }
+  const manifest = exactRecord(parsed, ["artifacts", "kind", "version"]);
+  const artifacts = exactRecord(manifest.artifacts, ["daemon", "runner"]);
+  if (manifest.version !== 1 || manifest.kind !== "terminalx.daytona-hardened-runtime-artifacts") {
+    throw new TypeError("Runtime artifact manifest kind is invalid");
+  }
+  const daemonDigest = validateRuntimeArtifact(
+    artifacts.daemon,
+    arguments_.TERMINALX_DAYTONA_SOURCE_COMMIT
+  );
+  const runnerDigest = validateRuntimeArtifact(
+    artifacts.runner,
+    arguments_.TERMINALX_DAYTONA_SOURCE_COMMIT
+  );
+  if (
+    daemonDigest !== arguments_.TERMINALX_DAYTONA_DAEMON_SHA256 ||
+    runnerDigest !== arguments_.TERMINALX_RUNNER_BINARY_SHA256 ||
+    daemonDigest === runnerDigest
+  ) {
+    throw new TypeError("Runtime artifact manifest binaries do not match the OCI build");
+  }
+}
+
+function validateRuntimeArtifact(value, sourceCommit) {
+  const artifact = exactRecord(value, [
+    "architecture",
+    "binaryDigest",
+    "operatingSystem",
+    "sourceCommit",
+  ]);
+  if (
+    artifact.architecture !== "amd64" ||
+    artifact.operatingSystem !== "linux" ||
+    artifact.sourceCommit !== sourceCommit ||
+    typeof artifact.binaryDigest !== "string" ||
+    !SHA256.test(artifact.binaryDigest)
+  ) {
+    throw new TypeError("Runtime artifact identity is invalid");
+  }
+  return artifact.binaryDigest;
 }
 
 function validateDescriptorAndBlob(layoutRoot, value) {
@@ -722,6 +798,21 @@ function exactRecord(value, fields) {
 
 function sha256(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
+}
+
+function canonicalJson(value) {
+  if (value === null || typeof value === "boolean" || typeof value === "string") {
+    return JSON.stringify(value);
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value) || Object.is(value, -0)) throw new TypeError();
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  return `{${Object.keys(value)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
+    .join(",")}}`;
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

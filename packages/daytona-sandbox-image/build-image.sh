@@ -57,7 +57,7 @@ node "$SCRIPT_DIRECTORY/scripts/prepare-build-context.mjs" \
 
 readonly PLATFORM="$(tr -d '\n' <"$BUILD_CONTEXT/platform.txt")"
 readonly IMAGE_NAME="$(tr -d '\n' <"$BUILD_CONTEXT/image-name.txt")"
-if [[ "$PLATFORM" != "linux/amd64" && "$PLATFORM" != "linux/arm64" ]]; then
+if [[ "$PLATFORM" != "linux/amd64" ]]; then
   echo "Prepared sandbox platform is invalid" >&2
   exit 1
 fi
@@ -97,6 +97,8 @@ for required_argument in \
   TERMINALX_SUPERVISOR_SHA256 \
   TERMINALX_SUPERVISOR_RELAY_SHA256 \
   TERMINALX_ASSIGNMENT_BOOTSTRAP_SHA256 \
+  TERMINALX_RUNTIME_ARTIFACT_MANIFEST_SHA256 \
+  TERMINALX_RUNNER_BINARY_SHA256 \
   TERMINALX_DAYTONA_DAEMON_SHA256 \
   TERMINALX_EFFECT_ENFORCER_SHA256 \
   TERMINALX_NODE_SHA256 \

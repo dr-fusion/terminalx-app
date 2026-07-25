@@ -42,7 +42,15 @@ jobs:
 
       - name: Verify release script syntax
         run: |
-          bash -n scripts/build-pinned-daytona-sdk.sh scripts/build-pinned-daytona-supervisor.sh packages/daytona-sandbox-image/build-image.sh
+          bash -n \
+            scripts/build-pinned-daytona-sdk.sh \
+            scripts/build-pinned-daytona-runtime.sh \
+            scripts/build-pinned-daytona-supervisor.sh \
+            scripts/setup-whisper.sh \
+            scripts/verify-daytona-runtime-release-archive.sh \
+            packages/daytona-sandbox-image/build-image.sh
+          node --check scripts/lib/daytona-production-source.mjs
+          node --check scripts/read-daytona-production-source.mjs
           node --check scripts/write-daytona-sdk-artifact.mjs
           node --check scripts/write-daytona-supervisor-artifact.mjs
           node --check packages/daytona-sandbox-image/root-tools/terminalx-deployment-binding-install.mjs

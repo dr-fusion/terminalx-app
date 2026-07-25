@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly DAYTONA_UPSTREAM_BASE_COMMIT="b5a5d9e78d76c8bcf351f2049620250e0f34eea4"
-readonly DAYTONA_PRODUCTION_FORK_COMMIT="f9b4dfe428d37f3d956acda4403879516aa8d923"
-
 if [[ $# -ne 2 ]]; then
   echo "usage: $0 <terminalx-source-directory> <empty-output-directory>" >&2
   exit 64
@@ -12,6 +9,10 @@ fi
 SOURCE_DIRECTORY=$(realpath "$1")
 OUTPUT_DIRECTORY=$(realpath -m "$2")
 SCRIPT_DIRECTORY=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+PIN_READER="$SCRIPT_DIRECTORY/read-daytona-production-source.mjs"
+DAYTONA_UPSTREAM_BASE_COMMIT=$(node "$PIN_READER" field upstreamBaseCommit)
+DAYTONA_PRODUCTION_FORK_COMMIT=$(node "$PIN_READER" field productionForkCommit)
+readonly PIN_READER DAYTONA_UPSTREAM_BASE_COMMIT DAYTONA_PRODUCTION_FORK_COMMIT
 SOURCE_COMMIT=$(git -C "$SOURCE_DIRECTORY" rev-parse --verify HEAD)
 
 if [[ ! -f "$SOURCE_DIRECTORY/packages/daytona-supervisor/tsconfig.build.json" ]]; then
@@ -29,7 +30,8 @@ if ! git -C "$SOURCE_DIRECTORY" diff --quiet --ignore-submodules -- ||
 fi
 if [[ -n "$(
   git -C "$SOURCE_DIRECTORY" status --porcelain=v1 --untracked-files=all -- . \
-    ':(exclude).daytona-source'
+    ':(exclude).daytona-source' \
+    ':(exclude).daytona-source-rebuild'
 )" ]]; then
   echo "TerminalX source checkout must not contain untracked or modified files" >&2
   exit 1

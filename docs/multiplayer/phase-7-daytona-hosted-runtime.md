@@ -5,12 +5,13 @@ this document is evidenced. LocalTmux remains a development-only Adapter.
 
 ## Immutable source baseline
 
-- Public fork: `https://github.com/procyon-labs-io/daytona`
-- Upstream/base ancestry commit: `b5a5d9e78d76c8bcf351f2049620250e0f34eea4`
-- Production fork commit: `f9b4dfe428d37f3d956acda4403879516aa8d923`
+The exact public fork, upstream repository, base ancestry commit, and production fork commit are the
+four validated fields in
+[`config/daytona-production-source.json`](../../config/daytona-production-source.json). That file is
+the only editable release authority for these source values; workflows, builders, artifacts,
+runtime admission, and image trust inputs derive from or compare against it.
+
 - Immutable reference: `terminalx-v1-base-b5a5d9e`
-- Verified upstream: `https://github.com/daytonaio/daytona`
-- Verified upstream base: `b5a5d9e78d76c8bcf351f2049620250e0f34eea4`
 
 The base fork's `main` reference and peeled immutable tag resolved to the reviewed ancestry commit.
 The two removed fork commits were `b40f732a38a9bdb5a124312bbe4b32712836c7dc` and
@@ -18,7 +19,7 @@ The two removed fork commits were `b40f732a38a9bdb5a124312bbe4b32712836c7dc` and
 artifact digests, and signed provenance; neither a branch nor a tag is sufficient evidence. The
 base commit is privileged for ordinary non-GPU Sandboxes and has no PID limit, so it must never be
 attested as the isolated production Runtime. SDK, runner, image, and supervisor evidence must all
-name the reviewed production descendant `f9b4dfe428d37f3d956acda4403879516aa8d923`.
+name the canonical `productionForkCommit`.
 The release workflow, application activation gate, image trust pins, supervisor artifact, and
 control-plane settings reject every other commit.
 
@@ -33,6 +34,37 @@ build command in the bundle. The release workflow generates an SPDX 2.3 SBOM, cr
 artifact provenance using OIDC, and uploads the complete release inputs. The workflow artifacts
 still require the separately pinned release-authority signature represented by the deployment
 manifest below; CI provenance does not grant production activation by itself.
+
+`scripts/build-pinned-daytona-runtime.sh` applies the same source and ancestry checks, then builds
+the linux/amd64 runner and daemon twice with separate fresh Go build caches, `-buildvcs=true`, and
+`-trimpath`. Both binaries must be byte-identical across rebuilds and must independently report the
+canonical clean fork commit. The fork-owned generator emits the exact canonical
+`terminalx.daytona-hardened-runtime-artifacts` manifest; the image builder derives its daemon and
+runner pins only from that manifest and verifies the daemon bytes before building.
+The builder requires a standalone checkout with a real `.git` directory: linked worktrees are
+rejected before compilation because Go does not reliably emit the VCS settings required by the
+runtime identity contract from a `.git` indirection file.
+
+The runtime release directory contains raw measured subjects and a deterministic
+`terminalx-daytona-runtime-<commit-prefix>.tar.gz`. GitHub workflow-artifact downloads normalize raw
+file permissions, so only the tar archive is the mode-preserving handoff to the Sandbox image build.
+Before extraction, verify the tar subject with `gh attestation verify` against this repository, then
+run `scripts/verify-daytona-runtime-release-archive.sh` with the downloaded archive, downloaded
+`checksums.sha256`, and a new absolute output directory. The verifier binds the tar digest to the
+release checksums, admits exactly the runner, daemon, runtime manifest, and internal checksum file,
+checks all bytes, and restores/rechecks `0555` executable and `0444` manifest/checksum modes. Image
+build configuration may reference only those verified extracted files.
+
+SDK determinism uses two independent exact fork checkouts with the Nx daemon and local/remote Nx
+cache bypassed. Runtime determinism also uses those independent checkouts in addition to the two
+fresh Go build caches inside each runtime build.
+
+Production activation accepts only the signed deployment-manifest v2 trust domain. Its closed
+artifact set binds the SDK, supervisor, complete runtime-artifact manifest, runner binary, daemon
+binary, SBOM, and provenance by distinct lowercase SHA-256 values. The measured deployment inputs,
+provider runner configuration, image labels, root-owned image trust pins, signed bootstrap, and
+live runner isolation claim must agree with those values. Legacy v1 deployment manifests fail
+closed rather than being upgraded implicitly.
 
 ## Module shape
 
@@ -54,9 +86,9 @@ the complete Runtime Assignment and Sandbox generations; it is never a provider 
 
 ## Required ordering and reconciliation
 
-1. Verify the signed deployment manifest, exact fork ancestry, artifacts, SBOM, provenance, the
-   snapshot UUID-to-reference mapping, independently inspected image ID, supervisor identity, and
-   effective isolation profile.
+1. Verify the signed v2 deployment manifest, exact fork ancestry, SDK, supervisor, runtime
+   manifest, runner, daemon, SBOM, provenance, the snapshot UUID-to-reference mapping,
+   independently inspected image ID, supervisor identity, and effective isolation profile.
 2. Load the complete signed Runtime trust group from an explicit operator-owned private root.
 3. Open the Team Session kernel and reconstruct exact durable hosted assignment plans.
 4. Construct the hosted Adapter and portable `RuntimeSupervisorRoot`.
@@ -198,8 +230,9 @@ can become true.
   ensure/follow/pause/resume/stop/fence/retire mappings, and timeout reconciliation.
 - **7C — signed supervisor and terminal transport:** command idempotency, signed receipt cursor,
   provider-neutral terminal connector, reconnect, resize, input fencing, and readiness loss.
-- **7D — production composition and artifacts:** exact-commit SDK/supervisor build, SBOM and
-  provenance attestations, strict private configuration, server wiring, probes, and shutdown.
+- **7D — production composition and artifacts:** exact-commit SDK/supervisor/runner/daemon build,
+  signed v2 deployment manifest, SBOM and provenance attestations, strict private configuration,
+  server wiring, probes, and shutdown.
 - **7E — hosted isolation evidence:** real-provider restart, duplicate-create, stale replacement,
   escape, network, namespace, resource, retirement, and destructive-race tests.
 

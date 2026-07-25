@@ -127,6 +127,8 @@ export interface DaytonaHostedControlPlaneConfiguration {
   readonly sandboxUser: string;
   readonly artifact: DaytonaSandboxArtifact;
   readonly supervisorArtifactDigest: string;
+  /** Release-pinned SHA-256 of the hardened runner executable. */
+  readonly runnerBinaryDigest: string;
   readonly lifecycle: DaytonaSandboxLifecycleConfiguration;
 }
 
@@ -1340,6 +1342,7 @@ function snapshotConfiguration(value: unknown): DaytonaHostedControlPlaneConfigu
     "sandboxUser",
     "artifact",
     "supervisorArtifactDigest",
+    "runnerBinaryDigest",
     "lifecycle",
   ]);
   if (field(configuration, "sourceCommit") !== TERMINALX_DAYTONA_SOURCE_COMMIT) {
@@ -1365,6 +1368,7 @@ function snapshotConfiguration(value: unknown): DaytonaHostedControlPlaneConfigu
     sandboxUser,
     artifact: snapshotArtifact(field(configuration, "artifact")),
     supervisorArtifactDigest: digest(field(configuration, "supervisorArtifactDigest")),
+    runnerBinaryDigest: digest(field(configuration, "runnerBinaryDigest")),
     lifecycle: Object.freeze({
       autoStopIntervalMinutes: boundedInteger(
         field(lifecycle, "autoStopIntervalMinutes"),
@@ -1810,6 +1814,7 @@ function assignmentBootstrapRequest(
     artifactDigest: artifactDigest(configuration.artifact),
     sandboxUser: "terminalx",
     supervisorArtifactDigest: configuration.supervisorArtifactDigest,
+    runnerBinaryDigest: configuration.runnerBinaryDigest,
   });
 }
 

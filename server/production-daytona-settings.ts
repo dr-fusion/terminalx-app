@@ -30,6 +30,9 @@ const RELEASE_AUTHORITY_FIELDS = ["keyId", "publicKeySpkiPem"] as const;
 const MEASURED_ARTIFACT_FIELDS = [
   "sdkSha256",
   "supervisorSha256",
+  "runtimeArtifactManifestDigest",
+  "runnerBinaryDigest",
+  "daemonBinaryDigest",
   "sbomSha256",
   "provenanceSha256",
   "sandboxSha256",
@@ -55,6 +58,7 @@ const PROVIDER_CONFIGURATION_FIELDS = [
   "sandboxUser",
   "artifact",
   "supervisorArtifactDigest",
+  "runnerBinaryDigest",
   "lifecycle",
 ] as const;
 const PROVIDER_ARTIFACT_FIELDS = [
@@ -364,6 +368,7 @@ export function parseProductionDaytonaSettings(
       runtimeProfile.projectCeiling.credentialPolicyDigest !==
         digest(field(authorization, "credentialPolicyDigest")) ||
       providerConfiguration.supervisorArtifactDigest !== measuredArtifacts.supervisorSha256 ||
+      providerConfiguration.runnerBinaryDigest !== measuredArtifacts.runnerBinaryDigest ||
       providerConfiguration.artifact.contentDigest !== measuredArtifacts.sandboxSha256 ||
       runtimeProfile.isolation.isolationPolicyDigest !== measuredArtifacts.isolationProfileSha256 ||
       providerConfiguration.artifact.snapshotRef !==

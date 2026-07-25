@@ -281,6 +281,7 @@ describe("Daytona effective isolation verifier", () => {
       issuerKeyId: "isolation-authority-1",
       issuerPublicKeySpkiPem: publicKeyPem,
       hardenedDaytonaSourceCommit: "a".repeat(40),
+      expectedRunnerBinaryDigest: "8".repeat(64),
       expectedSandboxImageId: `sha256:${"b".repeat(64)}`,
       expectedSandboxSnapshotRef: SANDBOX_SNAPSHOT_REF,
       expectedSandboxUser: "terminalx",
@@ -295,6 +296,31 @@ describe("Daytona effective isolation verifier", () => {
     });
     expect(verifier(input)).toBe(true);
 
+    const wrongRunnerVerifier = createDaytonaEffectiveIsolationVerifier({
+      issuerKeyId: "isolation-authority-1",
+      issuerPublicKeySpkiPem: publicKeyPem,
+      hardenedDaytonaSourceCommit: "a".repeat(40),
+      expectedRunnerBinaryDigest: "9".repeat(64),
+      expectedSandboxImageId: `sha256:${"b".repeat(64)}`,
+      expectedSandboxSnapshotRef: SANDBOX_SNAPSHOT_REF,
+      expectedSandboxUser: "terminalx",
+      expectedSeccompProfileDigest: "d".repeat(64),
+      expectedDockerVersion: "docker-29.1.3",
+      expectedContainerdVersion: "containerd-2.2.1",
+      expectedProviderRevision: 1,
+      expectedSupervisorUid: 0,
+      expectedDaytonaDaemonUid: 1000,
+      expectedAgentUid: 1000,
+      clock: () => 150,
+    });
+    expect(wrongRunnerVerifier(input)).toBe(false);
+    expect(
+      verifier({
+        ...input,
+        plan: { ...plan, effectEnforcerPolicyDigest: "" },
+      })
+    ).toBe(false);
+
     const privileged = structuredClone(input.attestation) as {
       claims: { controls: { privileged: boolean } };
     };
@@ -305,6 +331,7 @@ describe("Daytona effective isolation verifier", () => {
         issuerKeyId: "isolation-authority-1",
         issuerPublicKeySpkiPem: publicKeyPem,
         hardenedDaytonaSourceCommit: TERMINALX_DAYTONA_BASE_SOURCE_COMMIT,
+        expectedRunnerBinaryDigest: "8".repeat(64),
         expectedSandboxImageId: `sha256:${"b".repeat(64)}`,
         expectedSandboxSnapshotRef: SANDBOX_SNAPSHOT_REF,
         expectedSandboxUser: "terminalx",
@@ -322,6 +349,7 @@ describe("Daytona effective isolation verifier", () => {
         issuerKeyId: "isolation-authority-1",
         issuerPublicKeySpkiPem: publicKeyPem,
         hardenedDaytonaSourceCommit: "a".repeat(40),
+        expectedRunnerBinaryDigest: "8".repeat(64),
         expectedSandboxImageId: `sha256:${"b".repeat(64)}`,
         expectedSandboxSnapshotRef: SANDBOX_SNAPSHOT_REF,
         expectedSandboxUser: "terminalx",
@@ -738,6 +766,7 @@ function isolationVerificationInput(plan: HostedRuntimeAssignmentPlan, privateKe
     ),
     isolationPolicyDigest: plan.isolation.isolationPolicyDigest,
     networkPolicyDigest: plan.isolation.network.policyDigest,
+    runnerBinaryDigest: "8".repeat(64),
     resources: plan.isolation.resources,
     source: Object.freeze({
       baseCommit: TERMINALX_DAYTONA_BASE_SOURCE_COMMIT,

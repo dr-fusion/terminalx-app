@@ -413,6 +413,7 @@ function sagaFixture() {
     artifactDigest: "1".repeat(64),
     sandboxUser: "terminalx",
     supervisorArtifactDigest: "2".repeat(64),
+    runnerBinaryDigest: "9".repeat(64),
   });
   const assignmentRoot = "/run/terminalx-root/assignment";
   const bootstrap: DaytonaSupervisorBootstrapConfiguration = Object.freeze({
@@ -474,6 +475,7 @@ function sagaFixture() {
       issuerKeyId: "isolation-key-1",
       issuerPublicKeySpkiPem: keyPem(isolationAuthority.publicKey),
       hardenedDaytonaSourceCommit: "e".repeat(40),
+      expectedRunnerBinaryDigest: request.runnerBinaryDigest,
       expectedSandboxImageId: `sha256:${"5".repeat(64)}`,
       expectedSandboxSnapshotRef: `registry.example/terminalx@sha256:${"6".repeat(64)}`,
       expectedSandboxUser: "terminalx",
