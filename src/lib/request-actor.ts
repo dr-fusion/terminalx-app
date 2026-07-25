@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { parseCookies, verifyJwt } from "./auth";
 import { getAuthMode } from "./auth-config";
 
@@ -21,6 +22,13 @@ export interface RequestActor {
     subject: string;
     userGeneration: number;
     identityGeneration: number;
+    /** Absent on older JWTs that predate the signed auth_time claim. */
+    authenticatedAtMs?: number;
+    credentialIssuedAtMs: number;
+    credentialExpiresAtMs: number;
+    /** SHA-256 of the signed JTI. The raw token identifier never leaves auth. */
+    credentialJtiDigest: string;
+    device: { provenance: "browser" } | { provenance: "paired-device"; id: string };
   };
 }
 
@@ -81,6 +89,13 @@ export async function resolveRequestActor(headers: RequestHeaders): Promise<Requ
           subject: payload.authSubject,
           userGeneration: payload.userGeneration,
           identityGeneration: payload.authIdentityGeneration,
+          ...(payload.authTime !== undefined ? { authenticatedAtMs: payload.authTime * 1000 } : {}),
+          credentialIssuedAtMs: payload.iat * 1000,
+          credentialExpiresAtMs: payload.exp * 1000,
+          credentialJtiDigest: createHash("sha256").update(payload.jti, "utf8").digest("hex"),
+          device: payload.deviceId
+            ? { provenance: "paired-device" as const, id: payload.deviceId }
+            : { provenance: "browser" as const },
         }
       : undefined;
 

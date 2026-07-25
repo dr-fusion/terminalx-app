@@ -42,7 +42,7 @@ describe("Team Session Agent Run schema", () => {
   it("initializes Runtime records and the canonical identity authority at schema v12", () => {
     database = openTeamSessionDatabase({ filename });
 
-    expect(database.db.pragma("user_version", { simple: true })).toBe(12);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(13);
     const tables = database.db
       .prepare(
         `SELECT name FROM sqlite_schema
@@ -145,7 +145,7 @@ describe("Team Session Agent Run schema", () => {
 
     database = openTeamSessionDatabase({ filename });
 
-    expect(database.db.pragma("user_version", { simple: true })).toBe(12);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(13);
     expect(
       database.db
         .prepare(`SELECT name FROM sqlite_schema WHERE type = 'table' AND name = 'agent_runs'`)
@@ -180,7 +180,7 @@ describe("Team Session Agent Run schema", () => {
           peerAdvanceStarted = true;
           const peer = openTeamSessionDatabase({ filename });
           try {
-            expect(peer.db.pragma("user_version", { simple: true })).toBe(12);
+            expect(peer.db.pragma("user_version", { simple: true })).toBe(13);
             peerAdvanced = true;
           } finally {
             peer.close();
@@ -197,7 +197,7 @@ describe("Team Session Agent Run schema", () => {
 
     expect(peerAdvanceStarted).toBe(true);
     expect(peerAdvanced).toBe(true);
-    expect(database.db.pragma("user_version", { simple: true })).toBe(12);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(13);
     expect(database.db.pragma("foreign_key_check")).toEqual([]);
     expect(database.db.pragma("quick_check", { simple: true })).toBe("ok");
   });
@@ -216,7 +216,7 @@ describe("Team Session Agent Run schema", () => {
           if (versionReads === 2) {
             const peer = openTeamSessionDatabase({ filename });
             try {
-              expect(peer.db.pragma("user_version", { simple: true })).toBe(12);
+              expect(peer.db.pragma("user_version", { simple: true })).toBe(13);
               peerAdvanced = true;
             } finally {
               peer.close();
@@ -233,7 +233,7 @@ describe("Team Session Agent Run schema", () => {
     }
 
     expect(peerAdvanced).toBe(true);
-    expect(database.db.pragma("user_version", { simple: true })).toBe(12);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(13);
     expect(database.db.pragma("foreign_key_check")).toEqual([]);
   });
 
@@ -288,7 +288,7 @@ describe("Team Session Agent Run schema", () => {
 
     database = openTeamSessionDatabase({ filename });
 
-    expect(database.db.pragma("user_version", { simple: true })).toBe(12);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(13);
     expect(
       database.db
         .prepare(
@@ -1703,7 +1703,7 @@ describe("Team Session Agent Run schema", () => {
             peerAdvanceStarted = true;
             const peer = openTeamSessionDatabase({ filename });
             try {
-              expect(peer.db.pragma("user_version", { simple: true })).toBe(12);
+              expect(peer.db.pragma("user_version", { simple: true })).toBe(13);
               peerAdvanced = true;
             } finally {
               peer.close();
@@ -1721,7 +1721,7 @@ describe("Team Session Agent Run schema", () => {
 
     expect(peerAdvanceStarted).toBe(true);
     expect(peerAdvanced).toBe(true);
-    expect(database.db.pragma("user_version", { simple: true })).toBe(12);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(13);
     expect(database.db.pragma("foreign_key_check")).toEqual([]);
     expect(database.db.pragma("quick_check", { simple: true })).toBe("ok");
   });
@@ -1744,7 +1744,7 @@ describe("Team Session Agent Run schema", () => {
     }
 
     database = openTeamSessionDatabase({ filename });
-    expect(database.db.pragma("user_version", { simple: true })).toBe(12);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(13);
     expect(
       database.db.prepare(`SELECT COUNT(*) AS count FROM runtime_principal_observation_keys`).get()
     ).toEqual({ count: 0 });
@@ -1775,7 +1775,7 @@ describe("Team Session Agent Run schema", () => {
     }
 
     database = openTeamSessionDatabase({ filename });
-    expect(database.db.pragma("user_version", { simple: true })).toBe(12);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(13);
     expect(
       database.db
         .prepare(
@@ -2441,7 +2441,7 @@ describe("Team Session Agent Run schema", () => {
 
     database = openTeamSessionDatabase({ filename });
 
-    expect(database.db.pragma("user_version", { simple: true })).toBe(12);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(13);
     expect(
       database.db
         .prepare(`SELECT name FROM sqlite_schema WHERE type = 'table' AND name = ?`)
@@ -2484,7 +2484,7 @@ describe("Team Session Agent Run schema", () => {
 
     database = openTeamSessionDatabase({ filename });
 
-    expect(database.db.pragma("user_version", { simple: true })).toBe(12);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(13);
     expect(
       database.db
         .prepare(`SELECT * FROM runtime_run_commands WHERE id = ?`)
@@ -2532,7 +2532,7 @@ describe("Team Session Agent Run schema", () => {
 
       database = openTeamSessionDatabase({ filename });
 
-      expect(database.db.pragma("user_version", { simple: true })).toBe(12);
+      expect(database.db.pragma("user_version", { simple: true })).toBe(13);
       expect(
         database.db
           .prepare(
@@ -5401,6 +5401,15 @@ function createRuntimeRunSchemaV3Fixture(filename: string): {
   const db = new Database(filename);
   try {
     db.exec(`
+      DROP TABLE mobile_auth_migrations;
+      DROP TABLE paired_devices;
+      DROP TABLE mobile_pairing_codes;
+      DROP TABLE connection_authority_ledger;
+      DROP TABLE channel_bindings;
+      DROP TABLE identity_connections;
+      DROP TABLE link_challenges;
+      DROP TABLE channel_installations;
+      DROP TABLE credential_handles;
       DROP TABLE legacy_google_identity_bridges;
       DROP TABLE local_auth_credentials;
       DROP TABLE auth_identities;

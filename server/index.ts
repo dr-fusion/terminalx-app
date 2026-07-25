@@ -36,6 +36,7 @@ import { getAuthMode } from "../src/lib/auth-config";
 import {
   closeCanonicalIdentityAuthorityService,
   initializeCanonicalIdentityAuthorityService,
+  initializeLegacyMobileAuthState,
 } from "../src/lib/identity-service";
 import { ensureDefaultAdmin } from "../src/lib/users";
 import { startTelegramBot, stopTelegramBot, ensureTopicForSession } from "../src/lib/telegram/bot";
@@ -43,6 +44,7 @@ import { acceptTelegramWebhookUpdate } from "../src/lib/telegram/webhook-accepta
 import { registerEnsureTopic } from "../src/lib/telegram/bot-bridge";
 import { getTelegramConfig, telegramConfigFingerprint } from "../src/lib/telegram/config";
 import { getConfiguredMaxSessions } from "../src/lib/security-config";
+import { stampAuthoritativeDirectPeer } from "../src/lib/rate-limit";
 import { assertValidStartupConfiguration } from "../src/lib/startup-validation";
 import {
   closeTeamSessions,
@@ -708,6 +710,9 @@ void app
       // an unauthenticated login request may trigger after the server listens.
       initializeCanonicalIdentityAuthorityService();
       await ensureDefaultAdmin();
+      // Legacy paired devices reference canonical User IDs. Import them only
+      // after User provisioning, and before any credential can reach ingress.
+      initializeLegacyMobileAuthState();
     }
     // Hosted production owns one explicit, fail-closed composition. Install it
     // before any service selection so an enabled but incomplete deployment can
@@ -723,6 +728,10 @@ void app
     );
 
     const server = createServer((req, res) => {
+      // Next route handlers do not expose Node's socket address. Replace any
+      // attacker-supplied internal header with an authenticated direct-peer
+      // value before request routing so default rate limits are not global.
+      stampAuthoritativeDirectPeer(req);
       const parsedUrl = parseUrl(req.url || "", true);
 
       // Health endpoint — minimal public info only

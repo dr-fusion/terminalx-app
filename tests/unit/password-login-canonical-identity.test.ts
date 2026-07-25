@@ -48,6 +48,9 @@ describe("shared-password login canonical identity", () => {
         authSubject?: string;
         userGeneration?: number;
         authIdentityGeneration?: number;
+        auth_time?: number;
+        iat?: number;
+        jti?: string;
       };
     });
     expect(payloads[0]).toMatchObject({
@@ -56,7 +59,12 @@ describe("shared-password login canonical identity", () => {
       authSubject: "shared-password",
       userGeneration: 1,
       authIdentityGeneration: 1,
+      auth_time: expect.any(Number),
+      iat: expect.any(Number),
+      jti: expect.any(String),
     });
+    expect(payloads[0]!.iat! - payloads[0]!.auth_time!).toBeGreaterThanOrEqual(0);
+    expect(payloads[0]!.iat! - payloads[0]!.auth_time!).toBeLessThanOrEqual(1);
     expect(payloads[1]!.userId).toBe(payloads[0]!.userId);
   });
 });

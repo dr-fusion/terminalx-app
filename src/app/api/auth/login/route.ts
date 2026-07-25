@@ -96,6 +96,7 @@ export async function POST(req: NextRequest) {
       authSubject: canonicalIdentity.identity.subject,
       userGeneration: canonicalIdentity.user.generation,
       authIdentityGeneration: canonicalIdentity.identity.generation,
+      authTime: Math.floor(Date.now() / 1000),
     });
 
     audit("login_success", { username: "admin", detail: "password mode" });
@@ -143,6 +144,7 @@ export async function POST(req: NextRequest) {
       authSubject: canonicalIdentity.identity.subject,
       userGeneration: canonicalIdentity.user.generation,
       authIdentityGeneration: canonicalIdentity.identity.generation,
+      authTime: Math.floor(Date.now() / 1000),
     });
 
     audit("login_success", { username: user.username, userId: user.id });

@@ -155,6 +155,7 @@ export async function GET(req: NextRequest) {
     authSubject: canonicalIdentity.identity.subject,
     userGeneration: canonicalIdentity.user.generation,
     authIdentityGeneration: canonicalIdentity.identity.generation,
+    authTime: Math.floor(Date.now() / 1000),
   });
 
   audit("login_success", {

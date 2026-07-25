@@ -2,11 +2,20 @@ import * as fs from "fs";
 import * as path from "path";
 import { createHash } from "node:crypto";
 import Database from "better-sqlite3";
+import {
+  LINK_CHALLENGE_ISSUANCE_WINDOW_MS,
+  LINK_CHALLENGE_MAX_ACTIVE_PER_INSTALLATION,
+  LINK_CHALLENGE_MAX_ACTIVE_PER_USER_INSTALLATION,
+  LINK_CHALLENGE_MAX_ISSUED_PER_INSTALLATION_WINDOW,
+  LINK_CHALLENGE_MAX_ISSUED_PER_USER_INSTALLATION_WINDOW,
+  LINK_CHALLENGE_MAX_TTL_MS,
+  LINK_CHALLENGE_MIN_TTL_MS,
+} from "../connections/contracts";
 import { digestRuntimeCompensationIncident } from "../runtime/runtime-compensation-incident";
 import { RUNTIME_RECEIPT_OBSERVATION_MAX_CURSOR_CODE_POINTS } from "../runtime/runtime-receipt-observation-contract";
 import { isValidTmuxSessionName } from "../tmux";
 
-const SCHEMA_VERSION = 12;
+const SCHEMA_VERSION = 13;
 const PRE_RUNTIME_START_SCHEMA_VERSION = 4;
 const RUNTIME_START_SCHEMA_VERSION = 5;
 const RUNTIME_RECEIPT_FOLLOW_SCHEMA_VERSION = 6;
@@ -16,6 +25,7 @@ const HOSTED_RUNTIME_ASSIGNMENT_SCHEMA_VERSION = 9;
 const PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION = 10;
 const CANONICAL_IDENTITY_SCHEMA_VERSION = 11;
 const GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION = 12;
+const CONNECTION_AUTHORITY_SCHEMA_VERSION = 13;
 const APPLICATION_ID = 0x54585331; // "TXS1"
 
 const CANONICAL_IDENTITY_SCHEMA_V11 = `
@@ -226,6 +236,1362 @@ CREATE TRIGGER legacy_google_identity_bridges_immutable_delete
 BEFORE DELETE ON legacy_google_identity_bridges
 BEGIN
   SELECT RAISE(ABORT, 'Legacy Google identity bridge history is immutable');
+END;
+`;
+
+const CONNECTION_AUTHORITY_SCHEMA_V13 = `
+CREATE TABLE credential_handles (
+  id TEXT PRIMARY KEY CHECK (
+    length(id) = 72 AND
+    substr(id, 1, 8) = 'txch_v1_' AND
+    substr(id, 9) NOT GLOB '*[^0-9a-f]*'
+  ),
+  provider TEXT NOT NULL CHECK (provider IN ('slack', 'telegram')),
+  broker_kind TEXT NOT NULL CHECK (broker_kind IN ('onepassword-connect', 'oauth-envelope')),
+  usage TEXT NOT NULL CHECK (usage IN ('installation', 'identity-connection')),
+  broker_receipt_digest TEXT NOT NULL UNIQUE CHECK (
+    length(broker_receipt_digest) = 64 AND
+    broker_receipt_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  authority_binding_digest TEXT NOT NULL CHECK (
+    length(authority_binding_digest) = 64 AND
+    authority_binding_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  team_id TEXT REFERENCES teams(id) ON DELETE RESTRICT,
+  user_id TEXT REFERENCES users(id) ON DELETE RESTRICT,
+  external_tenant_id TEXT NOT NULL CHECK (length(external_tenant_id) BETWEEN 1 AND 1024),
+  external_app_id TEXT CHECK (
+    external_app_id IS NULL OR length(external_app_id) BETWEEN 1 AND 1024
+  ),
+  identity_installation_id TEXT,
+  identity_installation_revision INTEGER CHECK (
+    identity_installation_revision IS NULL OR identity_installation_revision >= 1
+  ),
+  external_subject TEXT CHECK (
+    external_subject IS NULL OR length(external_subject) BETWEEN 1 AND 1024
+  ),
+  provider_proof_replay_digest TEXT CHECK (
+    provider_proof_replay_digest IS NULL OR
+    (length(provider_proof_replay_digest) = 64 AND
+      provider_proof_replay_digest NOT GLOB '*[^0-9a-f]*')
+  ),
+  status TEXT NOT NULL CHECK (status IN ('active', 'revoked')),
+  generation INTEGER NOT NULL CHECK (generation >= 1),
+  replaces_handle_id TEXT UNIQUE REFERENCES credential_handles(id) ON DELETE RESTRICT,
+  replaces_generation INTEGER CHECK (replaces_generation IS NULL OR replaces_generation >= 1),
+  created_by_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+  created_by_user_generation INTEGER NOT NULL CHECK (created_by_user_generation >= 1),
+  created_by_auth_identity_id TEXT NOT NULL,
+  created_by_auth_identity_generation INTEGER NOT NULL
+    CHECK (created_by_auth_identity_generation >= 1),
+  updated_by_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+  updated_by_user_generation INTEGER NOT NULL CHECK (updated_by_user_generation >= 1),
+  updated_by_auth_identity_id TEXT NOT NULL,
+  updated_by_auth_identity_generation INTEGER NOT NULL
+    CHECK (updated_by_auth_identity_generation >= 1),
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= created_at_ms),
+  revoked_at_ms INTEGER,
+  CHECK (
+    (replaces_handle_id IS NULL AND replaces_generation IS NULL) OR
+    (replaces_handle_id IS NOT NULL AND replaces_generation IS NOT NULL)
+  ),
+  CHECK (
+    (status = 'active' AND revoked_at_ms IS NULL) OR
+    (status = 'revoked' AND revoked_at_ms IS NOT NULL AND revoked_at_ms >= created_at_ms)
+  ),
+  CHECK (
+    (usage = 'installation' AND team_id IS NOT NULL AND user_id IS NULL AND
+      external_app_id IS NOT NULL AND identity_installation_id IS NULL AND
+      identity_installation_revision IS NULL AND external_subject IS NULL AND
+      provider_proof_replay_digest IS NULL) OR
+    (usage = 'identity-connection' AND team_id IS NULL AND user_id IS NOT NULL AND
+      external_app_id IS NULL AND identity_installation_id IS NOT NULL AND
+      identity_installation_revision IS NOT NULL AND external_subject IS NOT NULL AND
+      provider_proof_replay_digest IS NOT NULL)
+  ),
+  UNIQUE (id, generation),
+  FOREIGN KEY (created_by_auth_identity_id, created_by_user_id)
+    REFERENCES auth_identities(id, user_id) ON DELETE RESTRICT,
+  FOREIGN KEY (updated_by_auth_identity_id, updated_by_user_id)
+    REFERENCES auth_identities(id, user_id) ON DELETE RESTRICT,
+  FOREIGN KEY (identity_installation_id)
+    REFERENCES channel_installations(id) ON DELETE RESTRICT
+) STRICT;
+
+CREATE INDEX credential_handles_by_provider_usage_status
+  ON credential_handles(provider, usage, status, id);
+
+CREATE INDEX credential_handles_by_authority_binding
+  ON credential_handles(provider, usage, authority_binding_digest, status, id);
+
+CREATE TRIGGER credential_handles_current_actor_insert
+BEFORE INSERT ON credential_handles
+WHEN NOT (
+  NEW.status = 'active' AND NEW.generation = 1 AND
+  NEW.revoked_at_ms IS NULL AND NEW.updated_at_ms = NEW.created_at_ms AND
+  EXISTS (
+    SELECT 1
+    FROM users user
+    JOIN auth_identities identity ON identity.user_id = user.id
+    WHERE user.id = NEW.created_by_user_id
+      AND user.status = 'active'
+      AND user.generation = NEW.created_by_user_generation
+      AND identity.id = NEW.created_by_auth_identity_id
+      AND identity.status = 'active'
+      AND identity.generation = NEW.created_by_auth_identity_generation
+      AND NEW.updated_by_user_id = NEW.created_by_user_id
+      AND NEW.updated_by_user_generation = NEW.created_by_user_generation
+      AND NEW.updated_by_auth_identity_id = NEW.created_by_auth_identity_id
+      AND NEW.updated_by_auth_identity_generation = NEW.created_by_auth_identity_generation
+  ) AND
+  (
+    (NEW.usage = 'installation' AND EXISTS (
+      SELECT 1 FROM team_memberships membership
+      WHERE membership.team_id = NEW.team_id
+        AND membership.user_id = NEW.created_by_user_id
+        AND membership.status = 'active'
+        AND membership.role IN ('owner', 'admin')
+    )) OR
+    (NEW.usage = 'identity-connection' AND NEW.user_id = NEW.created_by_user_id)
+  )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Credential Handle initial authority snapshot is invalid');
+END;
+
+CREATE TRIGGER credential_handles_replacement_insert
+BEFORE INSERT ON credential_handles
+WHEN NEW.replaces_handle_id IS NOT NULL AND NOT EXISTS (
+  SELECT 1
+  FROM credential_handles predecessor
+  WHERE predecessor.id = NEW.replaces_handle_id
+    AND predecessor.status = 'revoked'
+    AND predecessor.generation = NEW.replaces_generation
+    AND predecessor.revoked_at_ms <= NEW.created_at_ms
+    AND predecessor.provider = NEW.provider
+    AND predecessor.broker_kind = NEW.broker_kind
+    AND predecessor.usage = NEW.usage
+    AND predecessor.authority_binding_digest = NEW.authority_binding_digest
+    AND predecessor.team_id IS NEW.team_id AND predecessor.user_id IS NEW.user_id
+    AND predecessor.external_tenant_id = NEW.external_tenant_id
+    AND predecessor.external_app_id IS NEW.external_app_id
+    AND predecessor.identity_installation_id IS NEW.identity_installation_id
+    AND predecessor.identity_installation_revision IS NEW.identity_installation_revision
+    AND predecessor.external_subject IS NEW.external_subject
+    AND predecessor.provider_proof_replay_digest IS NEW.provider_proof_replay_digest
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Credential Handle replacement lineage is invalid');
+END;
+
+CREATE TRIGGER credential_handles_transition
+BEFORE UPDATE ON credential_handles
+WHEN NOT (
+  OLD.status = 'active' AND NEW.status = 'revoked' AND
+  NEW.generation = OLD.generation + 1 AND
+  NEW.revoked_at_ms IS NOT NULL AND NEW.revoked_at_ms >= OLD.created_at_ms AND
+  NEW.updated_at_ms >= OLD.updated_at_ms AND
+  NEW.id IS OLD.id AND NEW.provider IS OLD.provider AND
+  NEW.broker_kind IS OLD.broker_kind AND NEW.usage IS OLD.usage AND
+  NEW.broker_receipt_digest IS OLD.broker_receipt_digest AND
+  NEW.authority_binding_digest IS OLD.authority_binding_digest AND
+  NEW.team_id IS OLD.team_id AND NEW.user_id IS OLD.user_id AND
+  NEW.external_tenant_id IS OLD.external_tenant_id AND
+  NEW.external_app_id IS OLD.external_app_id AND
+  NEW.identity_installation_id IS OLD.identity_installation_id AND
+  NEW.identity_installation_revision IS OLD.identity_installation_revision AND
+  NEW.external_subject IS OLD.external_subject AND
+  NEW.provider_proof_replay_digest IS OLD.provider_proof_replay_digest AND
+  NEW.replaces_handle_id IS OLD.replaces_handle_id AND
+  NEW.replaces_generation IS OLD.replaces_generation AND
+  NEW.created_by_user_id IS OLD.created_by_user_id AND
+  NEW.created_by_user_generation IS OLD.created_by_user_generation AND
+  NEW.created_by_auth_identity_id IS OLD.created_by_auth_identity_id AND
+  NEW.created_by_auth_identity_generation IS OLD.created_by_auth_identity_generation AND
+  EXISTS (
+    SELECT 1
+    FROM users user
+    JOIN auth_identities identity ON identity.user_id = user.id
+    WHERE user.id = NEW.updated_by_user_id
+      AND user.status = 'active'
+      AND user.generation = NEW.updated_by_user_generation
+      AND identity.id = NEW.updated_by_auth_identity_id
+      AND identity.status = 'active'
+      AND identity.generation = NEW.updated_by_auth_identity_generation
+  ) AND
+  (
+    (NEW.usage = 'installation' AND EXISTS (
+      SELECT 1 FROM team_memberships membership
+      WHERE membership.team_id = NEW.team_id
+        AND membership.user_id = NEW.updated_by_user_id
+        AND membership.status = 'active'
+        AND membership.role IN ('owner', 'admin')
+    )) OR
+    (NEW.usage = 'identity-connection' AND NEW.user_id = NEW.updated_by_user_id)
+  )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Credential Handle transition is invalid');
+END;
+
+CREATE TRIGGER credential_handles_immutable_delete
+BEFORE DELETE ON credential_handles
+BEGIN
+  SELECT RAISE(ABORT, 'Credential Handle history is immutable');
+END;
+
+CREATE TABLE channel_installations (
+  id TEXT PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 300),
+  team_id TEXT NOT NULL REFERENCES teams(id) ON DELETE RESTRICT,
+  provider TEXT NOT NULL CHECK (provider IN ('slack', 'telegram')),
+  external_tenant_id TEXT NOT NULL CHECK (length(external_tenant_id) BETWEEN 1 AND 1024),
+  external_app_id TEXT NOT NULL CHECK (length(external_app_id) BETWEEN 1 AND 1024),
+  credential_handle_id TEXT NOT NULL REFERENCES credential_handles(id) ON DELETE RESTRICT,
+  credential_handle_generation INTEGER NOT NULL CHECK (credential_handle_generation >= 1),
+  reviewed_scopes_schema INTEGER NOT NULL CHECK (reviewed_scopes_schema = 1),
+  reviewed_scopes_json TEXT NOT NULL CHECK (
+    length(reviewed_scopes_json) BETWEEN 2 AND 16384 AND
+    json_valid(reviewed_scopes_json) AND json_type(reviewed_scopes_json) = 'array'
+  ),
+  reviewed_scopes_digest TEXT NOT NULL CHECK (
+    length(reviewed_scopes_digest) = 64 AND
+    reviewed_scopes_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  capabilities_schema INTEGER NOT NULL CHECK (capabilities_schema = 1),
+  capabilities_json TEXT NOT NULL CHECK (
+    length(capabilities_json) BETWEEN 2 AND 16384 AND
+    json_valid(capabilities_json) AND json_type(capabilities_json) = 'array'
+  ),
+  capabilities_digest TEXT NOT NULL CHECK (
+    length(capabilities_digest) = 64 AND capabilities_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  status TEXT NOT NULL CHECK (status IN ('active', 'revoked')),
+  revision INTEGER NOT NULL CHECK (revision >= 1),
+  created_by_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+  created_under_membership_version INTEGER NOT NULL CHECK (created_under_membership_version >= 1),
+  created_by_user_generation INTEGER NOT NULL CHECK (created_by_user_generation >= 1),
+  created_by_auth_identity_id TEXT NOT NULL,
+  created_by_auth_identity_generation INTEGER NOT NULL
+    CHECK (created_by_auth_identity_generation >= 1),
+  updated_by_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+  updated_under_membership_version INTEGER NOT NULL CHECK (updated_under_membership_version >= 1),
+  updated_by_user_generation INTEGER NOT NULL CHECK (updated_by_user_generation >= 1),
+  updated_by_auth_identity_id TEXT NOT NULL,
+  updated_by_auth_identity_generation INTEGER NOT NULL
+    CHECK (updated_by_auth_identity_generation >= 1),
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= created_at_ms),
+  revoked_at_ms INTEGER,
+  CHECK (
+    (status = 'active' AND revoked_at_ms IS NULL) OR
+    (status = 'revoked' AND revoked_at_ms IS NOT NULL AND revoked_at_ms >= created_at_ms)
+  ),
+  UNIQUE (credential_handle_id),
+  UNIQUE (id, team_id),
+  UNIQUE (id, revision),
+  FOREIGN KEY (created_by_auth_identity_id, created_by_user_id)
+    REFERENCES auth_identities(id, user_id) ON DELETE RESTRICT,
+  FOREIGN KEY (updated_by_auth_identity_id, updated_by_user_id)
+    REFERENCES auth_identities(id, user_id) ON DELETE RESTRICT
+) STRICT;
+
+CREATE INDEX channel_installations_by_team_status
+  ON channel_installations(team_id, status, provider, id);
+
+CREATE UNIQUE INDEX one_active_channel_installation
+  ON channel_installations(team_id, provider, external_tenant_id, external_app_id)
+  WHERE status = 'active';
+
+CREATE TRIGGER channel_installations_insert_authority
+BEFORE INSERT ON channel_installations
+WHEN NOT (
+  NEW.status = 'active' AND NEW.revision = 1 AND
+  NEW.revoked_at_ms IS NULL AND NEW.updated_at_ms = NEW.created_at_ms AND
+  EXISTS (
+    SELECT 1
+    FROM credential_handles handle
+    WHERE handle.id = NEW.credential_handle_id
+      AND handle.provider = NEW.provider
+      AND handle.usage = 'installation'
+      AND handle.team_id = NEW.team_id
+      AND handle.external_tenant_id = NEW.external_tenant_id
+      AND handle.external_app_id = NEW.external_app_id
+      AND handle.status = 'active'
+      AND handle.generation = NEW.credential_handle_generation
+  ) AND
+  EXISTS (
+    SELECT 1
+    FROM users user
+    JOIN auth_identities identity ON identity.user_id = user.id
+    JOIN team_memberships membership
+      ON membership.user_id = user.id AND membership.team_id = NEW.team_id
+    WHERE user.id = NEW.created_by_user_id
+      AND user.status = 'active'
+      AND user.generation = NEW.created_by_user_generation
+      AND identity.id = NEW.created_by_auth_identity_id
+      AND identity.status = 'active'
+      AND identity.generation = NEW.created_by_auth_identity_generation
+      AND membership.status = 'active'
+      AND membership.role IN ('owner', 'admin')
+      AND membership.version = NEW.created_under_membership_version
+      AND NEW.updated_by_user_id = NEW.created_by_user_id
+      AND NEW.updated_by_user_generation = NEW.created_by_user_generation
+      AND NEW.updated_by_auth_identity_id = NEW.created_by_auth_identity_id
+      AND NEW.updated_by_auth_identity_generation = NEW.created_by_auth_identity_generation
+      AND NEW.updated_under_membership_version = NEW.created_under_membership_version
+  )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Channel Installation authority snapshot is invalid');
+END;
+
+CREATE TRIGGER channel_installations_transition
+BEFORE UPDATE ON channel_installations
+WHEN NOT (
+  OLD.status = 'active' AND NEW.revision = OLD.revision + 1 AND
+  NEW.updated_at_ms >= OLD.updated_at_ms AND
+  NEW.id IS OLD.id AND NEW.team_id IS OLD.team_id AND
+  NEW.provider IS OLD.provider AND NEW.external_tenant_id IS OLD.external_tenant_id AND
+  NEW.external_app_id IS OLD.external_app_id AND
+  NEW.created_by_user_id IS OLD.created_by_user_id AND
+  NEW.created_under_membership_version IS OLD.created_under_membership_version AND
+  NEW.created_by_user_generation IS OLD.created_by_user_generation AND
+  NEW.created_by_auth_identity_id IS OLD.created_by_auth_identity_id AND
+  NEW.created_by_auth_identity_generation IS OLD.created_by_auth_identity_generation AND
+  (
+    (NEW.status = 'active' AND NEW.revoked_at_ms IS NULL AND EXISTS (
+      SELECT 1 FROM credential_handles handle
+      WHERE handle.id = NEW.credential_handle_id
+        AND handle.provider = NEW.provider
+        AND handle.usage = 'installation'
+        AND handle.team_id = NEW.team_id
+        AND handle.external_tenant_id = NEW.external_tenant_id
+        AND handle.external_app_id = NEW.external_app_id
+        AND handle.status = 'active'
+        AND handle.generation = NEW.credential_handle_generation
+    )) OR
+    (NEW.status = 'revoked' AND NEW.revoked_at_ms IS NOT NULL AND
+      NEW.revoked_at_ms >= OLD.created_at_ms)
+  ) AND
+  EXISTS (
+    SELECT 1
+    FROM users user
+    JOIN auth_identities identity ON identity.user_id = user.id
+    JOIN team_memberships membership
+      ON membership.user_id = user.id AND membership.team_id = NEW.team_id
+    WHERE user.id = NEW.updated_by_user_id
+      AND user.status = 'active'
+      AND user.generation = NEW.updated_by_user_generation
+      AND identity.id = NEW.updated_by_auth_identity_id
+      AND identity.status = 'active'
+      AND identity.generation = NEW.updated_by_auth_identity_generation
+      AND membership.status = 'active'
+      AND membership.role IN ('owner', 'admin')
+      AND membership.version = NEW.updated_under_membership_version
+  )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Channel Installation transition is invalid');
+END;
+
+CREATE TRIGGER channel_installations_immutable_delete
+BEFORE DELETE ON channel_installations
+BEGIN
+  SELECT RAISE(ABORT, 'Channel Installation history is immutable');
+END;
+
+CREATE TABLE link_challenges (
+  id TEXT PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 300),
+  challenge_digest TEXT NOT NULL UNIQUE CHECK (
+    length(challenge_digest) = 64 AND challenge_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+  user_generation INTEGER NOT NULL CHECK (user_generation >= 1),
+  auth_identity_id TEXT NOT NULL,
+  auth_identity_generation INTEGER NOT NULL CHECK (auth_identity_generation >= 1),
+  auth_session_jti_digest TEXT NOT NULL CHECK (
+    length(auth_session_jti_digest) = 64 AND
+    auth_session_jti_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  auth_session_issued_at_ms INTEGER NOT NULL CHECK (auth_session_issued_at_ms >= 0),
+  auth_session_expires_at_ms INTEGER NOT NULL CHECK (
+    auth_session_expires_at_ms > auth_session_issued_at_ms
+  ),
+  auth_session_provenance TEXT NOT NULL
+    CHECK (auth_session_provenance IN ('browser', 'paired-device')),
+  auth_session_device_id TEXT CHECK (
+    auth_session_device_id IS NULL OR length(auth_session_device_id) BETWEEN 1 AND 300
+  ),
+  team_id TEXT NOT NULL REFERENCES teams(id) ON DELETE RESTRICT,
+  team_membership_version INTEGER NOT NULL CHECK (team_membership_version >= 1),
+  installation_id TEXT NOT NULL REFERENCES channel_installations(id) ON DELETE RESTRICT,
+  installation_revision INTEGER NOT NULL CHECK (installation_revision >= 1),
+  requested_scopes_schema INTEGER NOT NULL CHECK (requested_scopes_schema = 1),
+  requested_scopes_json TEXT NOT NULL CHECK (
+    length(requested_scopes_json) BETWEEN 2 AND 16384 AND
+    json_valid(requested_scopes_json) AND json_type(requested_scopes_json) = 'array'
+  ),
+  requested_scopes_digest TEXT NOT NULL CHECK (
+    length(requested_scopes_digest) = 64 AND
+    requested_scopes_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  authenticated_at_ms INTEGER NOT NULL CHECK (authenticated_at_ms >= 0),
+  status TEXT NOT NULL CHECK (status IN ('active', 'consumed', 'revoked')),
+  version INTEGER NOT NULL CHECK (version >= 1),
+  issued_at_ms INTEGER NOT NULL CHECK (issued_at_ms >= authenticated_at_ms),
+  expires_at_ms INTEGER NOT NULL CHECK (
+    expires_at_ms >= issued_at_ms + ${LINK_CHALLENGE_MIN_TTL_MS} AND
+    expires_at_ms <= issued_at_ms + ${LINK_CHALLENGE_MAX_TTL_MS}
+  ),
+  resolved_at_ms INTEGER,
+  provider_proof_replay_digest TEXT CHECK (
+    provider_proof_replay_digest IS NULL OR
+    (length(provider_proof_replay_digest) = 64 AND
+      provider_proof_replay_digest NOT GLOB '*[^0-9a-f]*')
+  ),
+  CHECK (issued_at_ms - authenticated_at_ms <= 300000),
+  CHECK (
+    auth_session_issued_at_ms >= authenticated_at_ms AND
+    auth_session_issued_at_ms <= issued_at_ms
+  ),
+  CHECK (expires_at_ms <= auth_session_expires_at_ms),
+  CHECK (
+    (auth_session_provenance = 'browser' AND auth_session_device_id IS NULL) OR
+    (auth_session_provenance = 'paired-device' AND auth_session_device_id IS NOT NULL)
+  ),
+  CHECK (
+    (status = 'active' AND resolved_at_ms IS NULL AND provider_proof_replay_digest IS NULL) OR
+    (status = 'revoked' AND resolved_at_ms IS NOT NULL AND
+      resolved_at_ms >= issued_at_ms AND resolved_at_ms <= expires_at_ms AND
+      provider_proof_replay_digest IS NULL) OR
+    (status = 'consumed' AND resolved_at_ms IS NOT NULL AND
+      resolved_at_ms >= issued_at_ms AND resolved_at_ms <= expires_at_ms AND
+      provider_proof_replay_digest IS NOT NULL)
+  ),
+  UNIQUE (id, user_id, installation_id),
+  FOREIGN KEY (auth_identity_id, user_id)
+    REFERENCES auth_identities(id, user_id) ON DELETE RESTRICT,
+  FOREIGN KEY (installation_id, team_id)
+    REFERENCES channel_installations(id, team_id) ON DELETE RESTRICT
+) STRICT;
+
+CREATE INDEX link_challenges_by_user_status_expiry
+  ON link_challenges(user_id, status, expires_at_ms, id);
+
+CREATE INDEX link_challenges_by_installation_status_expiry
+  ON link_challenges(installation_id, status, expires_at_ms, id);
+
+CREATE INDEX link_challenges_by_user_installation_issuance
+  ON link_challenges(user_id, installation_id, issued_at_ms);
+
+CREATE INDEX link_challenges_by_installation_issuance
+  ON link_challenges(installation_id, issued_at_ms);
+
+CREATE UNIQUE INDEX one_consumption_per_provider_proof
+  ON link_challenges(provider_proof_replay_digest)
+  WHERE provider_proof_replay_digest IS NOT NULL;
+
+CREATE TRIGGER link_challenges_insert_authority
+BEFORE INSERT ON link_challenges
+WHEN NOT (
+  NEW.status = 'active' AND NEW.version = 1 AND NEW.resolved_at_ms IS NULL AND
+  NEW.provider_proof_replay_digest IS NULL AND
+  EXISTS (
+    SELECT 1
+    FROM users user
+    JOIN auth_identities identity ON identity.user_id = user.id
+    WHERE user.id = NEW.user_id
+      AND user.status = 'active'
+      AND user.generation = NEW.user_generation
+      AND identity.id = NEW.auth_identity_id
+      AND identity.status = 'active'
+      AND identity.generation = NEW.auth_identity_generation
+  ) AND
+  EXISTS (
+    SELECT 1
+    FROM channel_installations installation
+    JOIN credential_handles handle ON handle.id = installation.credential_handle_id
+    JOIN team_memberships membership
+      ON membership.team_id = installation.team_id AND membership.user_id = NEW.user_id
+    WHERE installation.id = NEW.installation_id
+      AND installation.team_id = NEW.team_id
+      AND installation.status = 'active'
+      AND installation.revision = NEW.installation_revision
+      AND handle.status = 'active'
+      AND handle.generation = installation.credential_handle_generation
+      AND membership.status = 'active'
+      AND membership.version = NEW.team_membership_version
+      AND (
+        SELECT COUNT(*) FROM link_challenges active_user
+        WHERE active_user.user_id = NEW.user_id
+          AND active_user.installation_id = NEW.installation_id
+          AND active_user.status = 'active'
+          AND active_user.expires_at_ms >= NEW.issued_at_ms
+      ) < ${LINK_CHALLENGE_MAX_ACTIVE_PER_USER_INSTALLATION}
+      AND (
+        SELECT COUNT(*) FROM link_challenges active_installation
+        WHERE active_installation.installation_id = NEW.installation_id
+          AND active_installation.status = 'active'
+          AND active_installation.expires_at_ms >= NEW.issued_at_ms
+      ) < ${LINK_CHALLENGE_MAX_ACTIVE_PER_INSTALLATION}
+      AND (
+        SELECT COUNT(*) FROM link_challenges issued_user
+        WHERE issued_user.user_id = NEW.user_id
+          AND issued_user.installation_id = NEW.installation_id
+          AND issued_user.issued_at_ms >= NEW.issued_at_ms - ${LINK_CHALLENGE_ISSUANCE_WINDOW_MS}
+      ) < ${LINK_CHALLENGE_MAX_ISSUED_PER_USER_INSTALLATION_WINDOW}
+      AND (
+        SELECT COUNT(*) FROM link_challenges issued_installation
+        WHERE issued_installation.installation_id = NEW.installation_id
+          AND issued_installation.issued_at_ms >= NEW.issued_at_ms - ${LINK_CHALLENGE_ISSUANCE_WINDOW_MS}
+      ) < ${LINK_CHALLENGE_MAX_ISSUED_PER_INSTALLATION_WINDOW}
+      AND NOT EXISTS (
+        SELECT 1
+        FROM json_each(NEW.requested_scopes_json) requested
+        WHERE requested.type <> 'text'
+           OR NOT EXISTS (
+             SELECT 1 FROM json_each(installation.reviewed_scopes_json) reviewed
+             WHERE reviewed.type = 'text' AND reviewed.value = requested.value
+           )
+      )
+  )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Link Challenge authority snapshot is invalid');
+END;
+
+CREATE TRIGGER link_challenges_single_use
+BEFORE UPDATE ON link_challenges
+WHEN NOT (
+  OLD.status = 'active' AND NEW.status IN ('consumed', 'revoked') AND
+  NEW.version = OLD.version + 1 AND
+  NEW.resolved_at_ms IS NOT NULL AND NEW.resolved_at_ms >= OLD.issued_at_ms AND
+  NEW.resolved_at_ms <= OLD.expires_at_ms AND
+  NEW.id IS OLD.id AND NEW.challenge_digest IS OLD.challenge_digest AND
+  NEW.user_id IS OLD.user_id AND NEW.user_generation IS OLD.user_generation AND
+  NEW.auth_identity_id IS OLD.auth_identity_id AND
+  NEW.auth_identity_generation IS OLD.auth_identity_generation AND
+  NEW.auth_session_jti_digest IS OLD.auth_session_jti_digest AND
+  NEW.auth_session_issued_at_ms IS OLD.auth_session_issued_at_ms AND
+  NEW.auth_session_expires_at_ms IS OLD.auth_session_expires_at_ms AND
+  NEW.auth_session_provenance IS OLD.auth_session_provenance AND
+  NEW.auth_session_device_id IS OLD.auth_session_device_id AND
+  NEW.team_id IS OLD.team_id AND
+  NEW.team_membership_version IS OLD.team_membership_version AND
+  NEW.installation_id IS OLD.installation_id AND
+  NEW.installation_revision IS OLD.installation_revision AND
+  NEW.requested_scopes_schema IS OLD.requested_scopes_schema AND
+  NEW.requested_scopes_json IS OLD.requested_scopes_json AND
+  NEW.requested_scopes_digest IS OLD.requested_scopes_digest AND
+  NEW.authenticated_at_ms IS OLD.authenticated_at_ms AND
+  NEW.issued_at_ms IS OLD.issued_at_ms AND NEW.expires_at_ms IS OLD.expires_at_ms AND
+  (
+    (NEW.status = 'consumed' AND OLD.provider_proof_replay_digest IS NULL AND
+      NEW.provider_proof_replay_digest IS NOT NULL) OR
+    (NEW.status = 'revoked' AND OLD.provider_proof_replay_digest IS NULL AND
+      NEW.provider_proof_replay_digest IS NULL)
+  )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Link Challenge transition is invalid');
+END;
+
+CREATE TRIGGER link_challenges_immutable_delete
+BEFORE DELETE ON link_challenges
+BEGIN
+  SELECT RAISE(ABORT, 'Link Challenge history is immutable');
+END;
+
+CREATE TABLE identity_connections (
+  id TEXT PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 300),
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+  provider TEXT NOT NULL CHECK (provider IN ('slack', 'telegram')),
+  external_tenant_id TEXT NOT NULL CHECK (length(external_tenant_id) BETWEEN 1 AND 1024),
+  external_subject TEXT NOT NULL CHECK (length(external_subject) BETWEEN 1 AND 1024),
+  installation_id TEXT NOT NULL REFERENCES channel_installations(id) ON DELETE RESTRICT,
+  installation_revision INTEGER NOT NULL CHECK (installation_revision >= 1),
+  scopes_schema INTEGER NOT NULL CHECK (scopes_schema = 1),
+  scopes_json TEXT NOT NULL CHECK (
+    length(scopes_json) BETWEEN 2 AND 16384 AND
+    json_valid(scopes_json) AND json_type(scopes_json) = 'array'
+  ),
+  scopes_digest TEXT NOT NULL CHECK (
+    length(scopes_digest) = 64 AND scopes_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  credential_handle_id TEXT REFERENCES credential_handles(id) ON DELETE RESTRICT,
+  credential_handle_generation INTEGER CHECK (
+    credential_handle_generation IS NULL OR credential_handle_generation >= 1
+  ),
+  link_challenge_id TEXT NOT NULL UNIQUE REFERENCES link_challenges(id) ON DELETE RESTRICT,
+  provider_proof_replay_digest TEXT NOT NULL CHECK (
+    length(provider_proof_replay_digest) = 64 AND
+    provider_proof_replay_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  replaces_connection_id TEXT UNIQUE REFERENCES identity_connections(id) ON DELETE RESTRICT,
+  status TEXT NOT NULL CHECK (status IN ('active', 'revoked')),
+  generation INTEGER NOT NULL CHECK (generation >= 1),
+  updated_by_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+  updated_by_user_generation INTEGER NOT NULL CHECK (updated_by_user_generation >= 1),
+  updated_by_auth_identity_id TEXT NOT NULL,
+  updated_by_auth_identity_generation INTEGER NOT NULL
+    CHECK (updated_by_auth_identity_generation >= 1),
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= created_at_ms),
+  revoked_at_ms INTEGER,
+  CHECK (
+    (credential_handle_id IS NULL AND credential_handle_generation IS NULL) OR
+    (credential_handle_id IS NOT NULL AND credential_handle_generation IS NOT NULL)
+  ),
+  CHECK (
+    (status = 'active' AND revoked_at_ms IS NULL) OR
+    (status = 'revoked' AND revoked_at_ms IS NOT NULL AND revoked_at_ms >= created_at_ms)
+  ),
+  UNIQUE (id, generation),
+  UNIQUE (credential_handle_id),
+  FOREIGN KEY (updated_by_auth_identity_id, updated_by_user_id)
+    REFERENCES auth_identities(id, user_id) ON DELETE RESTRICT
+) STRICT;
+
+CREATE UNIQUE INDEX one_active_external_identity_connection
+  ON identity_connections(installation_id, provider, external_tenant_id, external_subject)
+  WHERE status = 'active';
+
+CREATE UNIQUE INDEX one_active_user_connection_per_installation
+  ON identity_connections(user_id, installation_id, provider, external_tenant_id)
+  WHERE status = 'active';
+
+CREATE INDEX identity_connections_by_user_status
+  ON identity_connections(user_id, status, provider, id);
+
+CREATE INDEX identity_connections_by_installation_external_identity_history
+  ON identity_connections(
+    installation_id, provider, external_tenant_id, external_subject,
+    created_at_ms DESC, id DESC, status, user_id
+  );
+
+CREATE INDEX identity_connections_by_external_identity_owner
+  ON identity_connections(provider, external_tenant_id, external_subject, user_id);
+
+CREATE TRIGGER identity_connections_insert_authority
+BEFORE INSERT ON identity_connections
+WHEN NOT (
+  NEW.status = 'active' AND NEW.generation = 1 AND NEW.revoked_at_ms IS NULL AND
+  EXISTS (
+    SELECT 1
+    FROM link_challenges challenge
+    JOIN users user ON user.id = challenge.user_id
+    JOIN auth_identities identity ON identity.id = challenge.auth_identity_id
+    JOIN channel_installations installation ON installation.id = challenge.installation_id
+    JOIN team_memberships membership
+      ON membership.team_id = challenge.team_id AND membership.user_id = challenge.user_id
+    WHERE challenge.id = NEW.link_challenge_id
+      AND challenge.status = 'consumed'
+      AND challenge.user_id = NEW.user_id
+      AND challenge.installation_id = NEW.installation_id
+      AND challenge.installation_revision = NEW.installation_revision
+      AND challenge.requested_scopes_schema = NEW.scopes_schema
+      AND challenge.requested_scopes_json = NEW.scopes_json
+      AND challenge.requested_scopes_digest = NEW.scopes_digest
+      AND challenge.provider_proof_replay_digest = NEW.provider_proof_replay_digest
+      AND challenge.resolved_at_ms = NEW.created_at_ms
+      AND user.status = 'active' AND user.generation = challenge.user_generation
+      AND identity.user_id = user.id AND identity.status = 'active'
+      AND identity.generation = challenge.auth_identity_generation
+      AND installation.provider = NEW.provider
+      AND installation.external_tenant_id = NEW.external_tenant_id
+      AND installation.status = 'active'
+      AND installation.revision = NEW.installation_revision
+      AND membership.status = 'active'
+      AND membership.version = challenge.team_membership_version
+      AND NEW.updated_by_user_id = NEW.user_id
+      AND NEW.updated_by_user_generation = challenge.user_generation
+      AND NEW.updated_by_auth_identity_id = challenge.auth_identity_id
+      AND NEW.updated_by_auth_identity_generation = challenge.auth_identity_generation
+  ) AND
+  (
+    NEW.credential_handle_id IS NULL OR EXISTS (
+      SELECT 1 FROM credential_handles handle
+      WHERE handle.id = NEW.credential_handle_id
+        AND handle.provider = NEW.provider
+        AND handle.usage = 'identity-connection'
+        AND handle.user_id = NEW.user_id
+        AND handle.external_tenant_id = NEW.external_tenant_id
+        AND handle.external_subject = NEW.external_subject
+        AND handle.identity_installation_id = NEW.installation_id
+        AND handle.identity_installation_revision = NEW.installation_revision
+        AND handle.provider_proof_replay_digest = (
+          SELECT challenge.provider_proof_replay_digest
+          FROM link_challenges challenge WHERE challenge.id = NEW.link_challenge_id
+        )
+        AND handle.status = 'active'
+        AND handle.generation = NEW.credential_handle_generation
+    )
+  ) AND
+  NOT EXISTS (
+    SELECT 1 FROM identity_connections historical
+    WHERE historical.provider = NEW.provider
+      AND historical.external_tenant_id = NEW.external_tenant_id
+      AND historical.external_subject = NEW.external_subject
+      AND historical.user_id <> NEW.user_id
+  ) AND
+  (
+    (NEW.replaces_connection_id IS NULL AND NOT EXISTS (
+      SELECT 1 FROM identity_connections historical
+      WHERE historical.installation_id = NEW.installation_id
+        AND historical.provider = NEW.provider
+        AND historical.external_tenant_id = NEW.external_tenant_id
+        AND historical.external_subject = NEW.external_subject
+    )) OR
+    EXISTS (
+      SELECT 1 FROM identity_connections predecessor
+      WHERE predecessor.id = NEW.replaces_connection_id
+        AND predecessor.status = 'revoked'
+        AND predecessor.user_id = NEW.user_id
+        AND predecessor.installation_id = NEW.installation_id
+        AND predecessor.provider = NEW.provider
+        AND predecessor.external_tenant_id = NEW.external_tenant_id
+        AND predecessor.external_subject = NEW.external_subject
+    )
+  )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Identity Connection authority snapshot is invalid');
+END;
+
+CREATE TRIGGER identity_connections_transition
+BEFORE UPDATE ON identity_connections
+WHEN NOT (
+  OLD.status = 'active' AND NEW.status = 'revoked' AND
+  NEW.generation = OLD.generation + 1 AND
+  NEW.revoked_at_ms IS NOT NULL AND NEW.revoked_at_ms >= OLD.created_at_ms AND
+  NEW.updated_at_ms >= OLD.updated_at_ms AND
+  NEW.id IS OLD.id AND NEW.user_id IS OLD.user_id AND
+  NEW.provider IS OLD.provider AND NEW.external_tenant_id IS OLD.external_tenant_id AND
+  NEW.external_subject IS OLD.external_subject AND
+  NEW.installation_id IS OLD.installation_id AND
+  NEW.installation_revision IS OLD.installation_revision AND
+  NEW.scopes_schema IS OLD.scopes_schema AND
+  NEW.scopes_json IS OLD.scopes_json AND NEW.scopes_digest IS OLD.scopes_digest AND
+  NEW.credential_handle_id IS OLD.credential_handle_id AND
+  NEW.credential_handle_generation IS OLD.credential_handle_generation AND
+  NEW.link_challenge_id IS OLD.link_challenge_id AND
+  NEW.provider_proof_replay_digest IS OLD.provider_proof_replay_digest AND
+  NEW.replaces_connection_id IS OLD.replaces_connection_id AND
+  EXISTS (
+    SELECT 1
+    FROM users user
+    JOIN auth_identities identity ON identity.user_id = user.id
+    WHERE user.id = NEW.updated_by_user_id
+      AND NEW.updated_by_user_id = OLD.user_id
+      AND user.status = 'active'
+      AND user.generation = NEW.updated_by_user_generation
+      AND identity.id = NEW.updated_by_auth_identity_id
+      AND identity.status = 'active'
+      AND identity.generation = NEW.updated_by_auth_identity_generation
+  )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Identity Connection transition is invalid');
+END;
+
+CREATE TRIGGER identity_connections_immutable_delete
+BEFORE DELETE ON identity_connections
+BEGIN
+  SELECT RAISE(ABORT, 'Identity Connection history is immutable');
+END;
+
+CREATE TABLE channel_bindings (
+  id TEXT PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 300),
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE RESTRICT,
+  team_id TEXT NOT NULL REFERENCES teams(id) ON DELETE RESTRICT,
+  installation_id TEXT NOT NULL,
+  installation_revision INTEGER NOT NULL CHECK (installation_revision >= 1),
+  provider TEXT NOT NULL CHECK (provider IN ('slack', 'telegram')),
+  conversation_kind TEXT NOT NULL CHECK (conversation_kind IN ('channel', 'thread', 'topic')),
+  external_conversation_id TEXT NOT NULL
+    CHECK (length(external_conversation_id) BETWEEN 1 AND 2048),
+  external_thread_id TEXT NOT NULL CHECK (length(external_thread_id) <= 2048),
+  policy_schema INTEGER NOT NULL CHECK (policy_schema = 1),
+  inbound_policy_json TEXT NOT NULL CHECK (
+    length(inbound_policy_json) BETWEEN 2 AND 32768 AND
+    json_valid(inbound_policy_json) AND json_type(inbound_policy_json) = 'object'
+  ),
+  inbound_policy_digest TEXT NOT NULL CHECK (
+    length(inbound_policy_digest) = 64 AND inbound_policy_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  outbound_policy_json TEXT NOT NULL CHECK (
+    length(outbound_policy_json) BETWEEN 2 AND 32768 AND
+    json_valid(outbound_policy_json) AND json_type(outbound_policy_json) = 'object'
+  ),
+  outbound_policy_digest TEXT NOT NULL CHECK (
+    length(outbound_policy_digest) = 64 AND outbound_policy_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  status TEXT NOT NULL CHECK (status IN ('active', 'revoked')),
+  revision INTEGER NOT NULL CHECK (revision >= 1),
+  created_by_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+  created_under_membership_version INTEGER NOT NULL CHECK (created_under_membership_version >= 1),
+  created_by_user_generation INTEGER NOT NULL CHECK (created_by_user_generation >= 1),
+  created_by_auth_identity_id TEXT NOT NULL,
+  created_by_auth_identity_generation INTEGER NOT NULL
+    CHECK (created_by_auth_identity_generation >= 1),
+  updated_by_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+  updated_under_membership_version INTEGER NOT NULL CHECK (updated_under_membership_version >= 1),
+  updated_by_user_generation INTEGER NOT NULL CHECK (updated_by_user_generation >= 1),
+  updated_by_auth_identity_id TEXT NOT NULL,
+  updated_by_auth_identity_generation INTEGER NOT NULL
+    CHECK (updated_by_auth_identity_generation >= 1),
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= created_at_ms),
+  revoked_at_ms INTEGER,
+  CHECK (
+    (status = 'active' AND revoked_at_ms IS NULL) OR
+    (status = 'revoked' AND revoked_at_ms IS NOT NULL AND revoked_at_ms >= created_at_ms)
+  ),
+  CHECK (
+    (conversation_kind = 'thread' AND length(external_thread_id) BETWEEN 1 AND 2048) OR
+    (conversation_kind IN ('channel', 'topic') AND external_thread_id = '')
+  ),
+  UNIQUE (id, revision),
+  FOREIGN KEY (installation_id, team_id)
+    REFERENCES channel_installations(id, team_id) ON DELETE RESTRICT,
+  FOREIGN KEY (created_by_auth_identity_id, created_by_user_id)
+    REFERENCES auth_identities(id, user_id) ON DELETE RESTRICT,
+  FOREIGN KEY (updated_by_auth_identity_id, updated_by_user_id)
+    REFERENCES auth_identities(id, user_id) ON DELETE RESTRICT
+) STRICT;
+
+CREATE UNIQUE INDEX one_active_binding_per_external_conversation
+  ON channel_bindings(
+    installation_id, conversation_kind, external_conversation_id, external_thread_id
+  )
+  WHERE status = 'active';
+
+CREATE INDEX channel_bindings_by_session_status
+  ON channel_bindings(session_id, status, id);
+
+CREATE TRIGGER channel_bindings_insert_authority
+BEFORE INSERT ON channel_bindings
+WHEN NOT (
+  NEW.status = 'active' AND NEW.revision = 1 AND
+  json_extract(NEW.inbound_policy_json, '$.mode') IN (
+    'comments-only', 'comments-and-directives', 'notifications-only'
+  ) AND
+  json_type(NEW.inbound_policy_json, '$.requireLinkedIdentity') IN ('true', 'false') AND
+  (SELECT COUNT(*) FROM json_each(NEW.inbound_policy_json)) = 2 AND
+  NOT EXISTS (
+    SELECT 1 FROM json_each(NEW.inbound_policy_json)
+    WHERE key NOT IN ('mode', 'requireLinkedIdentity')
+  ) AND
+  (
+    json_extract(NEW.inbound_policy_json, '$.mode') <> 'comments-and-directives' OR
+    json_extract(NEW.inbound_policy_json, '$.requireLinkedIdentity') = 1
+  ) AND
+  json_extract(NEW.outbound_policy_json, '$.mode') IN (
+    'disabled', 'mentions', 'all-session-messages'
+  ) AND
+  json_type(NEW.outbound_policy_json, '$.allowArtifacts') IN ('true', 'false') AND
+  (SELECT COUNT(*) FROM json_each(NEW.outbound_policy_json)) = 2 AND
+  NOT EXISTS (
+    SELECT 1 FROM json_each(NEW.outbound_policy_json)
+    WHERE key NOT IN ('mode', 'allowArtifacts')
+  ) AND
+  EXISTS (
+    SELECT 1
+    FROM sessions session
+    JOIN channel_installations installation ON installation.team_id = session.team_id
+    JOIN credential_handles handle ON handle.id = installation.credential_handle_id
+    WHERE session.id = NEW.session_id AND session.team_id = NEW.team_id
+      AND session.status = 'active'
+      AND installation.id = NEW.installation_id
+      AND installation.provider = NEW.provider
+      AND installation.status = 'active'
+      AND installation.revision = NEW.installation_revision
+      AND handle.status = 'active'
+      AND handle.generation = installation.credential_handle_generation
+  ) AND
+  EXISTS (
+    SELECT 1
+    FROM users user
+    JOIN auth_identities identity ON identity.user_id = user.id
+    JOIN team_memberships membership
+      ON membership.team_id = NEW.team_id AND membership.user_id = user.id
+    WHERE user.id = NEW.created_by_user_id
+      AND user.status = 'active'
+      AND user.generation = NEW.created_by_user_generation
+      AND identity.id = NEW.created_by_auth_identity_id
+      AND identity.status = 'active'
+      AND identity.generation = NEW.created_by_auth_identity_generation
+      AND membership.status = 'active' AND membership.role IN ('owner', 'admin')
+      AND membership.version = NEW.created_under_membership_version
+      AND NEW.updated_by_user_id = NEW.created_by_user_id
+      AND NEW.updated_by_user_generation = NEW.created_by_user_generation
+      AND NEW.updated_by_auth_identity_id = NEW.created_by_auth_identity_id
+      AND NEW.updated_by_auth_identity_generation = NEW.created_by_auth_identity_generation
+      AND NEW.updated_under_membership_version = NEW.created_under_membership_version
+  )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Channel Binding authority snapshot is invalid');
+END;
+
+CREATE TRIGGER channel_bindings_transition
+BEFORE UPDATE ON channel_bindings
+WHEN NOT (
+  OLD.status = 'active' AND NEW.revision = OLD.revision + 1 AND
+  NEW.updated_at_ms >= OLD.updated_at_ms AND
+  NEW.id IS OLD.id AND NEW.session_id IS OLD.session_id AND NEW.team_id IS OLD.team_id AND
+  NEW.installation_id IS OLD.installation_id AND
+  NEW.provider IS OLD.provider AND NEW.conversation_kind IS OLD.conversation_kind AND
+  NEW.external_conversation_id IS OLD.external_conversation_id AND
+  NEW.external_thread_id IS OLD.external_thread_id AND
+  NEW.policy_schema IS OLD.policy_schema AND
+  NEW.created_by_user_id IS OLD.created_by_user_id AND
+  NEW.created_under_membership_version IS OLD.created_under_membership_version AND
+  NEW.created_by_user_generation IS OLD.created_by_user_generation AND
+  NEW.created_by_auth_identity_id IS OLD.created_by_auth_identity_id AND
+  NEW.created_by_auth_identity_generation IS OLD.created_by_auth_identity_generation AND
+  json_extract(NEW.inbound_policy_json, '$.mode') IN (
+    'comments-only', 'comments-and-directives', 'notifications-only'
+  ) AND
+  json_type(NEW.inbound_policy_json, '$.requireLinkedIdentity') IN ('true', 'false') AND
+  (SELECT COUNT(*) FROM json_each(NEW.inbound_policy_json)) = 2 AND
+  NOT EXISTS (
+    SELECT 1 FROM json_each(NEW.inbound_policy_json)
+    WHERE key NOT IN ('mode', 'requireLinkedIdentity')
+  ) AND
+  (
+    json_extract(NEW.inbound_policy_json, '$.mode') <> 'comments-and-directives' OR
+    json_extract(NEW.inbound_policy_json, '$.requireLinkedIdentity') = 1
+  ) AND
+  json_extract(NEW.outbound_policy_json, '$.mode') IN (
+    'disabled', 'mentions', 'all-session-messages'
+  ) AND
+  json_type(NEW.outbound_policy_json, '$.allowArtifacts') IN ('true', 'false') AND
+  (SELECT COUNT(*) FROM json_each(NEW.outbound_policy_json)) = 2 AND
+  NOT EXISTS (
+    SELECT 1 FROM json_each(NEW.outbound_policy_json)
+    WHERE key NOT IN ('mode', 'allowArtifacts')
+  ) AND
+  (
+    (NEW.status = 'active' AND NEW.revoked_at_ms IS NULL AND EXISTS (
+      SELECT 1 FROM channel_installations installation
+      JOIN credential_handles handle ON handle.id = installation.credential_handle_id
+      JOIN sessions session ON session.id = NEW.session_id
+      WHERE installation.id = NEW.installation_id
+        AND installation.team_id = NEW.team_id
+        AND installation.provider = NEW.provider
+        AND installation.status = 'active'
+        AND installation.revision = NEW.installation_revision
+        AND handle.status = 'active'
+        AND handle.generation = installation.credential_handle_generation
+        AND session.team_id = NEW.team_id
+        AND session.status = 'active'
+    )) OR
+    (NEW.status = 'revoked' AND NEW.revoked_at_ms IS NOT NULL AND
+      NEW.revoked_at_ms >= OLD.created_at_ms)
+  ) AND
+  EXISTS (
+    SELECT 1
+    FROM users user
+    JOIN auth_identities identity ON identity.user_id = user.id
+    JOIN team_memberships membership
+      ON membership.team_id = NEW.team_id AND membership.user_id = user.id
+    WHERE user.id = NEW.updated_by_user_id
+      AND user.status = 'active'
+      AND user.generation = NEW.updated_by_user_generation
+      AND identity.id = NEW.updated_by_auth_identity_id
+      AND identity.status = 'active'
+      AND identity.generation = NEW.updated_by_auth_identity_generation
+      AND membership.status = 'active' AND membership.role IN ('owner', 'admin')
+      AND membership.version = NEW.updated_under_membership_version
+  )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Channel Binding transition is invalid');
+END;
+
+CREATE TRIGGER channel_bindings_immutable_delete
+BEFORE DELETE ON channel_bindings
+BEGIN
+  SELECT RAISE(ABORT, 'Channel Binding history is immutable');
+END;
+
+CREATE TABLE connection_authority_ledger (
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  event_id TEXT NOT NULL UNIQUE CHECK (length(event_id) BETWEEN 1 AND 300),
+  event_type TEXT NOT NULL CHECK (event_type IN (
+    'credential-handle.registered', 'credential-handle.revoked',
+    'credential-handle.mutation-recorded',
+    'channel-installation.created', 'channel-installation.updated',
+    'channel-installation.revoked', 'channel-installation.mutation-recorded',
+    'link-challenge.issued', 'link-challenge.mutation-recorded',
+    'link-challenge.consumed', 'link-challenge.revoked',
+    'identity-connection.created', 'identity-connection.revoked',
+    'identity-connection.mutation-recorded',
+    'channel-binding.created', 'channel-binding.updated', 'channel-binding.revoked',
+    'channel-binding.mutation-recorded'
+  )),
+  actor_kind TEXT NOT NULL CHECK (actor_kind IN ('human', 'provider', 'system')),
+  actor_user_id TEXT REFERENCES users(id) ON DELETE RESTRICT,
+  actor_user_generation INTEGER CHECK (actor_user_generation IS NULL OR actor_user_generation >= 1),
+  actor_auth_identity_id TEXT REFERENCES auth_identities(id) ON DELETE RESTRICT,
+  actor_auth_identity_generation INTEGER CHECK (
+    actor_auth_identity_generation IS NULL OR actor_auth_identity_generation >= 1
+  ),
+  resource_kind TEXT NOT NULL CHECK (resource_kind IN (
+    'credential-handle', 'channel-installation', 'link-challenge',
+    'identity-connection', 'channel-binding'
+  )),
+  resource_id TEXT NOT NULL CHECK (length(resource_id) BETWEEN 1 AND 300),
+  resource_version INTEGER NOT NULL CHECK (resource_version >= 1),
+  team_id TEXT REFERENCES teams(id) ON DELETE RESTRICT,
+  session_id TEXT REFERENCES sessions(id) ON DELETE RESTRICT,
+  subject_user_id TEXT REFERENCES users(id) ON DELETE RESTRICT,
+  provider TEXT CHECK (provider IS NULL OR provider IN ('slack', 'telegram')),
+  detail_digest TEXT NOT NULL CHECK (
+    length(detail_digest) = 64 AND detail_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  occurred_at_ms INTEGER NOT NULL CHECK (occurred_at_ms >= 0),
+  CHECK (
+    (actor_kind = 'system' AND actor_user_id IS NULL AND actor_user_generation IS NULL AND
+      actor_auth_identity_id IS NULL AND actor_auth_identity_generation IS NULL) OR
+    (actor_kind IN ('human', 'provider') AND actor_user_id IS NOT NULL AND
+      actor_user_generation IS NOT NULL AND actor_auth_identity_id IS NOT NULL AND
+      actor_auth_identity_generation IS NOT NULL)
+  ),
+  FOREIGN KEY (actor_auth_identity_id, actor_user_id)
+    REFERENCES auth_identities(id, user_id) ON DELETE RESTRICT
+) STRICT;
+
+CREATE INDEX connection_authority_ledger_by_resource
+  ON connection_authority_ledger(resource_kind, resource_id, sequence);
+
+CREATE INDEX connection_authority_ledger_by_team_sequence
+  ON connection_authority_ledger(team_id, sequence);
+
+CREATE UNIQUE INDEX one_database_mutation_receipt_per_resource_version
+  ON connection_authority_ledger(resource_kind, resource_id, resource_version)
+  WHERE event_type IN (
+    'credential-handle.mutation-recorded',
+    'channel-installation.mutation-recorded',
+    'link-challenge.mutation-recorded',
+    'identity-connection.mutation-recorded',
+    'channel-binding.mutation-recorded'
+  );
+
+CREATE TRIGGER connection_authority_ledger_immutable_update
+BEFORE UPDATE ON connection_authority_ledger
+BEGIN
+  SELECT RAISE(ABORT, 'Connection authority ledger is immutable');
+END;
+
+CREATE TRIGGER connection_authority_ledger_immutable_delete
+BEFORE DELETE ON connection_authority_ledger
+BEGIN
+  SELECT RAISE(ABORT, 'Connection authority ledger is immutable');
+END;
+
+CREATE TRIGGER credential_handles_record_insert
+AFTER INSERT ON credential_handles
+BEGIN
+  INSERT INTO connection_authority_ledger (
+    event_id, event_type, actor_kind, actor_user_id, actor_user_generation,
+    actor_auth_identity_id, actor_auth_identity_generation,
+    resource_kind, resource_id, resource_version,
+    team_id, session_id, subject_user_id, provider, detail_digest, occurred_at_ms
+  ) VALUES (
+    'txdb_' || lower(hex(randomblob(16))), 'credential-handle.mutation-recorded',
+    'system', NULL, NULL, NULL, NULL, 'credential-handle', NEW.id, NEW.generation,
+    NEW.team_id, NULL, NEW.user_id, NEW.provider, NEW.authority_binding_digest, NEW.created_at_ms
+  );
+END;
+
+CREATE TRIGGER credential_handles_record_update
+AFTER UPDATE ON credential_handles
+BEGIN
+  INSERT INTO connection_authority_ledger (
+    event_id, event_type, actor_kind, actor_user_id, actor_user_generation,
+    actor_auth_identity_id, actor_auth_identity_generation,
+    resource_kind, resource_id, resource_version,
+    team_id, session_id, subject_user_id, provider, detail_digest, occurred_at_ms
+  ) VALUES (
+    'txdb_' || lower(hex(randomblob(16))), 'credential-handle.mutation-recorded',
+    'system', NULL, NULL, NULL, NULL, 'credential-handle', NEW.id, NEW.generation,
+    NEW.team_id, NULL, NEW.user_id, NEW.provider, NEW.authority_binding_digest, NEW.updated_at_ms
+  );
+END;
+
+CREATE TRIGGER channel_installations_record_insert
+AFTER INSERT ON channel_installations
+BEGIN
+  INSERT INTO connection_authority_ledger (
+    event_id, event_type, actor_kind, actor_user_id, actor_user_generation,
+    actor_auth_identity_id, actor_auth_identity_generation,
+    resource_kind, resource_id, resource_version,
+    team_id, session_id, subject_user_id, provider, detail_digest, occurred_at_ms
+  ) VALUES (
+    'txdb_' || lower(hex(randomblob(16))), 'channel-installation.mutation-recorded',
+    'system', NULL, NULL, NULL, NULL, 'channel-installation', NEW.id, NEW.revision,
+    NEW.team_id, NULL, NULL, NEW.provider, NEW.capabilities_digest, NEW.created_at_ms
+  );
+END;
+
+CREATE TRIGGER channel_installations_record_update
+AFTER UPDATE ON channel_installations
+BEGIN
+  INSERT INTO connection_authority_ledger (
+    event_id, event_type, actor_kind, actor_user_id, actor_user_generation,
+    actor_auth_identity_id, actor_auth_identity_generation,
+    resource_kind, resource_id, resource_version,
+    team_id, session_id, subject_user_id, provider, detail_digest, occurred_at_ms
+  ) VALUES (
+    'txdb_' || lower(hex(randomblob(16))), 'channel-installation.mutation-recorded',
+    'system', NULL, NULL, NULL, NULL, 'channel-installation', NEW.id, NEW.revision,
+    NEW.team_id, NULL, NULL, NEW.provider, NEW.capabilities_digest, NEW.updated_at_ms
+  );
+END;
+
+CREATE TRIGGER link_challenges_record_insert
+AFTER INSERT ON link_challenges
+BEGIN
+  INSERT INTO connection_authority_ledger (
+    event_id, event_type, actor_kind, actor_user_id, actor_user_generation,
+    actor_auth_identity_id, actor_auth_identity_generation,
+    resource_kind, resource_id, resource_version,
+    team_id, session_id, subject_user_id, provider, detail_digest, occurred_at_ms
+  )
+  SELECT
+    'txdb_' || lower(hex(randomblob(16))), 'link-challenge.mutation-recorded',
+    'system', NULL, NULL, NULL, NULL, 'link-challenge', NEW.id, NEW.version,
+    NEW.team_id, NULL, NEW.user_id, installation.provider,
+    NEW.requested_scopes_digest, NEW.issued_at_ms
+  FROM channel_installations installation WHERE installation.id = NEW.installation_id;
+END;
+
+CREATE TRIGGER link_challenges_record_update
+AFTER UPDATE ON link_challenges
+BEGIN
+  INSERT INTO connection_authority_ledger (
+    event_id, event_type, actor_kind, actor_user_id, actor_user_generation,
+    actor_auth_identity_id, actor_auth_identity_generation,
+    resource_kind, resource_id, resource_version,
+    team_id, session_id, subject_user_id, provider, detail_digest, occurred_at_ms
+  )
+  SELECT
+    'txdb_' || lower(hex(randomblob(16))), 'link-challenge.mutation-recorded',
+    'system', NULL, NULL, NULL, NULL, 'link-challenge', NEW.id, NEW.version,
+    NEW.team_id, NULL, NEW.user_id, installation.provider,
+    COALESCE(NEW.provider_proof_replay_digest, NEW.requested_scopes_digest),
+    NEW.resolved_at_ms
+  FROM channel_installations installation WHERE installation.id = NEW.installation_id;
+END;
+
+CREATE TRIGGER identity_connections_record_insert
+AFTER INSERT ON identity_connections
+BEGIN
+  INSERT INTO connection_authority_ledger (
+    event_id, event_type, actor_kind, actor_user_id, actor_user_generation,
+    actor_auth_identity_id, actor_auth_identity_generation,
+    resource_kind, resource_id, resource_version,
+    team_id, session_id, subject_user_id, provider, detail_digest, occurred_at_ms
+  )
+  SELECT
+    'txdb_' || lower(hex(randomblob(16))), 'identity-connection.mutation-recorded',
+    'system', NULL, NULL, NULL, NULL, 'identity-connection', NEW.id, NEW.generation,
+    installation.team_id, NULL, NEW.user_id, NEW.provider, NEW.scopes_digest, NEW.created_at_ms
+  FROM channel_installations installation WHERE installation.id = NEW.installation_id;
+END;
+
+CREATE TRIGGER identity_connections_record_update
+AFTER UPDATE ON identity_connections
+BEGIN
+  INSERT INTO connection_authority_ledger (
+    event_id, event_type, actor_kind, actor_user_id, actor_user_generation,
+    actor_auth_identity_id, actor_auth_identity_generation,
+    resource_kind, resource_id, resource_version,
+    team_id, session_id, subject_user_id, provider, detail_digest, occurred_at_ms
+  )
+  SELECT
+    'txdb_' || lower(hex(randomblob(16))), 'identity-connection.mutation-recorded',
+    'system', NULL, NULL, NULL, NULL, 'identity-connection', NEW.id, NEW.generation,
+    installation.team_id, NULL, NEW.user_id, NEW.provider, NEW.scopes_digest, NEW.updated_at_ms
+  FROM channel_installations installation WHERE installation.id = NEW.installation_id;
+END;
+
+CREATE TRIGGER channel_bindings_record_insert
+AFTER INSERT ON channel_bindings
+BEGIN
+  INSERT INTO connection_authority_ledger (
+    event_id, event_type, actor_kind, actor_user_id, actor_user_generation,
+    actor_auth_identity_id, actor_auth_identity_generation,
+    resource_kind, resource_id, resource_version,
+    team_id, session_id, subject_user_id, provider, detail_digest, occurred_at_ms
+  ) VALUES (
+    'txdb_' || lower(hex(randomblob(16))), 'channel-binding.mutation-recorded',
+    'system', NULL, NULL, NULL, NULL, 'channel-binding', NEW.id, NEW.revision,
+    NEW.team_id, NEW.session_id, NULL, NEW.provider, NEW.inbound_policy_digest, NEW.created_at_ms
+  );
+END;
+
+CREATE TRIGGER channel_bindings_record_update
+AFTER UPDATE ON channel_bindings
+BEGIN
+  INSERT INTO connection_authority_ledger (
+    event_id, event_type, actor_kind, actor_user_id, actor_user_generation,
+    actor_auth_identity_id, actor_auth_identity_generation,
+    resource_kind, resource_id, resource_version,
+    team_id, session_id, subject_user_id, provider, detail_digest, occurred_at_ms
+  ) VALUES (
+    'txdb_' || lower(hex(randomblob(16))), 'channel-binding.mutation-recorded',
+    'system', NULL, NULL, NULL, NULL, 'channel-binding', NEW.id, NEW.revision,
+    NEW.team_id, NEW.session_id, NULL, NEW.provider, NEW.inbound_policy_digest, NEW.updated_at_ms
+  );
+END;
+
+-- Mobile pairing and paired-device authority share the canonical database so
+-- every process observes one transactional source of truth. Pairing secrets
+-- are returned once and only a domain-separated SHA-256 digest is persisted.
+CREATE TABLE mobile_pairing_codes (
+  code_digest TEXT PRIMARY KEY CHECK (
+    length(code_digest) = 64 AND code_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+  username TEXT NOT NULL CHECK (length(username) BETWEEN 1 AND 1024),
+  display_name TEXT CHECK (display_name IS NULL OR length(display_name) BETWEEN 1 AND 1024),
+  legacy_role TEXT NOT NULL CHECK (length(legacy_role) BETWEEN 1 AND 100),
+  auth_provider TEXT NOT NULL CHECK (auth_provider IN ('local', 'google', 'password')),
+  auth_subject TEXT NOT NULL CHECK (length(auth_subject) BETWEEN 1 AND 1024),
+  user_generation INTEGER NOT NULL CHECK (user_generation >= 1),
+  auth_identity_generation INTEGER NOT NULL CHECK (auth_identity_generation >= 1),
+  auth_time_seconds INTEGER CHECK (auth_time_seconds IS NULL OR auth_time_seconds >= 0),
+  source_credential_jti_digest TEXT NOT NULL CHECK (
+    length(source_credential_jti_digest) = 64 AND
+    source_credential_jti_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  source_credential_expires_at_ms INTEGER NOT NULL CHECK (
+    source_credential_expires_at_ms >= 0
+  ),
+  source_device_provenance TEXT NOT NULL CHECK (
+    source_device_provenance IN ('browser', 'paired-device')
+  ),
+  source_device_id TEXT CHECK (
+    source_device_id IS NULL OR length(source_device_id) BETWEEN 1 AND 300
+  ),
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  expires_at_ms INTEGER NOT NULL CHECK (
+    expires_at_ms > created_at_ms AND
+    expires_at_ms <= created_at_ms + 120000 AND
+    expires_at_ms <= source_credential_expires_at_ms
+  ),
+  consumed_at_ms INTEGER CHECK (
+    consumed_at_ms IS NULL OR
+    (consumed_at_ms >= created_at_ms AND consumed_at_ms < expires_at_ms)
+  ),
+  CHECK (
+    (source_device_provenance = 'browser' AND source_device_id IS NULL) OR
+    (source_device_provenance = 'paired-device' AND source_device_id IS NOT NULL)
+  ),
+  CHECK (
+    auth_time_seconds IS NULL OR
+    auth_time_seconds <= CAST(created_at_ms / 1000 AS INTEGER)
+  )
+) STRICT;
+
+CREATE INDEX mobile_pairing_codes_by_user_created
+  ON mobile_pairing_codes(user_id, created_at_ms);
+
+CREATE INDEX mobile_pairing_codes_by_created
+  ON mobile_pairing_codes(created_at_ms);
+
+CREATE INDEX mobile_pairing_codes_active_by_user
+  ON mobile_pairing_codes(user_id, expires_at_ms)
+  WHERE consumed_at_ms IS NULL;
+
+CREATE INDEX mobile_pairing_codes_active_global
+  ON mobile_pairing_codes(expires_at_ms)
+  WHERE consumed_at_ms IS NULL;
+
+CREATE TRIGGER mobile_pairing_codes_identity_immutable
+BEFORE UPDATE OF
+  code_digest, user_id, username, display_name, legacy_role, auth_provider, auth_subject,
+  user_generation, auth_identity_generation, auth_time_seconds,
+  source_credential_jti_digest, source_credential_expires_at_ms,
+  source_device_provenance, source_device_id, created_at_ms, expires_at_ms
+ON mobile_pairing_codes
+BEGIN
+  SELECT RAISE(ABORT, 'Mobile Pairing Code authority snapshot is immutable');
+END;
+
+CREATE TRIGGER mobile_pairing_codes_consumption_irreversible
+BEFORE UPDATE OF consumed_at_ms ON mobile_pairing_codes
+WHEN OLD.consumed_at_ms IS NOT NULL OR NEW.consumed_at_ms IS NULL
+BEGIN
+  SELECT RAISE(ABORT, 'Mobile Pairing Code consumption is irreversible');
+END;
+
+CREATE TABLE paired_devices (
+  id TEXT PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 300),
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+  username TEXT NOT NULL CHECK (length(username) BETWEEN 1 AND 1024),
+  name TEXT NOT NULL CHECK (length(name) <= 120),
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  last_seen_at_ms INTEGER NOT NULL CHECK (last_seen_at_ms >= created_at_ms),
+  revoked_at_ms INTEGER CHECK (revoked_at_ms IS NULL OR revoked_at_ms >= created_at_ms)
+) STRICT;
+
+CREATE INDEX paired_devices_by_user_status_created
+  ON paired_devices(user_id, revoked_at_ms, created_at_ms, id);
+
+CREATE TRIGGER paired_devices_identity_immutable
+BEFORE UPDATE OF id, user_id, username, name, created_at_ms ON paired_devices
+BEGIN
+  SELECT RAISE(ABORT, 'Paired Device identity is immutable');
+END;
+
+CREATE TRIGGER paired_devices_last_seen_monotonic
+BEFORE UPDATE OF last_seen_at_ms ON paired_devices
+WHEN
+  NEW.last_seen_at_ms < OLD.last_seen_at_ms OR
+  (OLD.revoked_at_ms IS NOT NULL AND NEW.last_seen_at_ms <> OLD.last_seen_at_ms)
+BEGIN
+  SELECT RAISE(ABORT, 'Paired Device last-seen transition is invalid');
+END;
+
+CREATE TRIGGER paired_devices_revocation_irreversible
+BEFORE UPDATE OF revoked_at_ms ON paired_devices
+WHEN
+  (OLD.revoked_at_ms IS NOT NULL AND NEW.revoked_at_ms IS NOT OLD.revoked_at_ms) OR
+  (OLD.revoked_at_ms IS NULL AND NEW.revoked_at_ms IS NULL)
+BEGIN
+  SELECT RAISE(ABORT, 'Paired Device revocation is irreversible');
+END;
+
+CREATE TRIGGER paired_devices_immutable_delete
+BEFORE DELETE ON paired_devices
+BEGIN
+  SELECT RAISE(ABORT, 'Paired Device history is immutable');
+END;
+
+CREATE TABLE mobile_auth_migrations (
+  migration_key TEXT PRIMARY KEY CHECK (length(migration_key) BETWEEN 1 AND 200),
+  source_digest TEXT NOT NULL CHECK (
+    length(source_digest) = 64 AND source_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  imported_count INTEGER NOT NULL CHECK (imported_count >= 0),
+  completed_at_ms INTEGER NOT NULL CHECK (completed_at_ms >= 0)
+) STRICT;
+
+CREATE TRIGGER mobile_auth_migrations_immutable_update
+BEFORE UPDATE ON mobile_auth_migrations
+BEGIN
+  SELECT RAISE(ABORT, 'Mobile authentication migration history is immutable');
+END;
+
+CREATE TRIGGER mobile_auth_migrations_immutable_delete
+BEFORE DELETE ON mobile_auth_migrations
+BEGIN
+  SELECT RAISE(ABORT, 'Mobile authentication migration history is immutable');
 END;
 `;
 
@@ -7247,7 +8613,8 @@ export function openTeamSessionDatabase(
         migratedVersion !== HOSTED_RUNTIME_ASSIGNMENT_SCHEMA_VERSION &&
         migratedVersion !== PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION &&
         migratedVersion !== CANONICAL_IDENTITY_SCHEMA_VERSION &&
-        migratedVersion !== GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION
+        migratedVersion !== GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION &&
+        migratedVersion !== CONNECTION_AUTHORITY_SCHEMA_VERSION
       ) {
         throw new Error(
           `Unsupported Team Session database schema ${currentVersion}; expected ${SCHEMA_VERSION}`
@@ -7295,6 +8662,12 @@ export function openTeamSessionDatabase(
     }) as number;
     if (googleIdentityContinuityPreparedVersion === CANONICAL_IDENTITY_SCHEMA_VERSION) {
       migrateGoogleIdentityContinuitySchemaV12(db);
+    }
+    const connectionAuthorityPreparedVersion = db.pragma("user_version", {
+      simple: true,
+    }) as number;
+    if (connectionAuthorityPreparedVersion === GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION) {
+      migrateConnectionAuthoritySchemaV13(db);
     }
 
     const applicationId = db.pragma("application_id", { simple: true }) as number;
@@ -7381,7 +8754,8 @@ function migrateRuntimeStartSchemaV5(db: Database.Database): void {
         currentVersion === HOSTED_RUNTIME_ASSIGNMENT_SCHEMA_VERSION ||
         currentVersion === PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION ||
         currentVersion === CANONICAL_IDENTITY_SCHEMA_VERSION ||
-        currentVersion === GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION
+        currentVersion === GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION ||
+        currentVersion === CONNECTION_AUTHORITY_SCHEMA_VERSION
       ) {
         return;
       }
@@ -7422,7 +8796,8 @@ function migrateRuntimeReceiptFollowSchemaV6(db: Database.Database): void {
       currentVersion === HOSTED_RUNTIME_ASSIGNMENT_SCHEMA_VERSION ||
       currentVersion === PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION ||
       currentVersion === CANONICAL_IDENTITY_SCHEMA_VERSION ||
-      currentVersion === GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION
+      currentVersion === GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION ||
+      currentVersion === CONNECTION_AUTHORITY_SCHEMA_VERSION
     ) {
       return;
     }
@@ -7456,7 +8831,8 @@ function migrateRuntimeCompensationSchemaV7(db: Database.Database): void {
       currentVersion === HOSTED_RUNTIME_ASSIGNMENT_SCHEMA_VERSION ||
       currentVersion === PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION ||
       currentVersion === CANONICAL_IDENTITY_SCHEMA_VERSION ||
-      currentVersion === GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION
+      currentVersion === GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION ||
+      currentVersion === CONNECTION_AUTHORITY_SCHEMA_VERSION
     ) {
       return;
     }
@@ -7493,7 +8869,8 @@ function migrateRuntimeAssignmentOutboxInterlockSchemaV8(db: Database.Database):
       currentVersion === HOSTED_RUNTIME_ASSIGNMENT_SCHEMA_VERSION ||
       currentVersion === PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION ||
       currentVersion === CANONICAL_IDENTITY_SCHEMA_VERSION ||
-      currentVersion === GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION
+      currentVersion === GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION ||
+      currentVersion === CONNECTION_AUTHORITY_SCHEMA_VERSION
     )
       return;
     if (currentVersion !== RUNTIME_COMPENSATION_SCHEMA_VERSION) {
@@ -7536,7 +8913,8 @@ function migrateHostedRuntimeAssignmentSchemaV9(db: Database.Database): void {
         currentVersion === HOSTED_RUNTIME_ASSIGNMENT_SCHEMA_VERSION ||
         currentVersion === PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION ||
         currentVersion === CANONICAL_IDENTITY_SCHEMA_VERSION ||
-        currentVersion === GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION
+        currentVersion === GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION ||
+        currentVersion === CONNECTION_AUTHORITY_SCHEMA_VERSION
       )
         return;
       if (currentVersion !== RUNTIME_ASSIGNMENT_OUTBOX_INTERLOCK_SCHEMA_VERSION) {
@@ -7631,7 +9009,8 @@ function migrateProviderBoundEffectActivationSchemaV10(db: Database.Database): v
     if (
       currentVersion === PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION ||
       currentVersion === CANONICAL_IDENTITY_SCHEMA_VERSION ||
-      currentVersion === GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION
+      currentVersion === GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION ||
+      currentVersion === CONNECTION_AUTHORITY_SCHEMA_VERSION
     ) {
       return;
     }
@@ -7864,7 +9243,8 @@ function migrateCanonicalIdentitySchemaV11(db: Database.Database): void {
     const currentVersion = db.pragma("user_version", { simple: true }) as number;
     if (
       currentVersion === CANONICAL_IDENTITY_SCHEMA_VERSION ||
-      currentVersion === GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION
+      currentVersion === GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION ||
+      currentVersion === CONNECTION_AUTHORITY_SCHEMA_VERSION
     )
       return;
     if (currentVersion !== PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION) {
@@ -7892,7 +9272,11 @@ interface V11GoogleIdentityRow {
 function migrateGoogleIdentityContinuitySchemaV12(db: Database.Database): void {
   const migrate = db.transaction(() => {
     const currentVersion = db.pragma("user_version", { simple: true }) as number;
-    if (currentVersion === GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION) return;
+    if (
+      currentVersion === GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION ||
+      currentVersion === CONNECTION_AUTHORITY_SCHEMA_VERSION
+    )
+      return;
     if (currentVersion !== CANONICAL_IDENTITY_SCHEMA_VERSION) {
       throw new Error(
         `Unsupported Team Session database schema ${currentVersion}; expected ${CANONICAL_IDENTITY_SCHEMA_VERSION}`
@@ -7942,6 +9326,30 @@ function migrateGoogleIdentityContinuitySchemaV12(db: Database.Database): void {
       throw new Error("Team Session v12 migration failed its foreign key check");
     }
     db.pragma(`user_version = ${GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION}`);
+  });
+  migrate.exclusive();
+}
+
+function migrateConnectionAuthoritySchemaV13(db: Database.Database): void {
+  const migrate = db.transaction(() => {
+    const currentVersion = db.pragma("user_version", { simple: true }) as number;
+    if (currentVersion === CONNECTION_AUTHORITY_SCHEMA_VERSION) return;
+    if (currentVersion !== GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION) {
+      throw new Error(
+        `Unsupported Team Session database schema ${currentVersion}; expected ${GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION}`
+      );
+    }
+
+    // This boundary is deliberately additive and empty. In particular, the
+    // host-global Telegram token, username allowlist, and topic JSON do not
+    // carry canonical Team/User/Session ownership and must never be inferred
+    // into the new authority.
+    db.exec(CONNECTION_AUTHORITY_SCHEMA_V13);
+    const violations = db.pragma("foreign_key_check") as unknown[];
+    if (violations.length > 0) {
+      throw new Error("Team Session v13 migration failed its foreign key check");
+    }
+    db.pragma(`user_version = ${CONNECTION_AUTHORITY_SCHEMA_VERSION}`);
   });
   migrate.exclusive();
 }

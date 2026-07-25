@@ -7,6 +7,7 @@ export type AuditEvent =
   | "login_success"
   | "login_failed"
   | "logout"
+  | "logout_failed"
   | "user_created"
   | "user_deleted"
   | "user_role_changed"
@@ -31,6 +32,8 @@ export type AuditEvent =
   | "pair_success"
   | "pair_failed"
   | "device_revoked"
+  | "device_revocation_failed"
+  | "device_registry_read_failed"
   // Workspace config (feature #5):
   | "workspace_config_edited"
   | "workspace_script_run"
