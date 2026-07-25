@@ -10,6 +10,7 @@ import {
 import { audit } from "@/lib/audit-log";
 import { isRateLimited, clientIp } from "@/lib/rate-limit";
 import { externalBaseUrl, isSecureRequest } from "@/lib/security-config";
+import { withCanonicalIdentityAuthority } from "@/lib/identity-service";
 
 interface GoogleTokenResponse {
   access_token: string;
@@ -88,8 +89,7 @@ export async function GET(req: NextRequest) {
     });
 
     if (!tokenRes.ok) {
-      const errText = await tokenRes.text();
-      audit("login_failed", { detail: `google token exchange failed: ${errText}` });
+      audit("login_failed", { detail: `google token exchange failed (${tokenRes.status})` });
       return NextResponse.redirect(new URL("/login?error=oauth_failed", base));
     }
 
@@ -128,14 +128,40 @@ export async function GET(req: NextRequest) {
     return NextResponse.redirect(new URL("/login?error=not_allowed", base));
   }
 
-  // Sign JWT — Google-authenticated users get "admin" role (they're on the allowed list)
+  let canonicalIdentity;
+  try {
+    canonicalIdentity = withCanonicalIdentityAuthority((authority) =>
+      authority.provisionGoogleIdentity({
+        subject: userInfo.sub,
+        email: userInfo.email,
+        displayName: userInfo.name || userInfo.email,
+        legacyRole: "admin",
+      })
+    );
+  } catch {
+    audit("login_failed", {
+      username: userInfo.email,
+      detail: "google canonical identity provisioning rejected",
+    });
+    return NextResponse.redirect(new URL("/login?error=oauth_failed", base));
+  }
+
   const token = await signJwt({
-    userId: `google-${userInfo.sub}`,
-    username: userInfo.email,
-    role: "admin",
+    userId: canonicalIdentity.user.id,
+    username: canonicalIdentity.user.username,
+    displayName: canonicalIdentity.user.displayName,
+    role: canonicalIdentity.user.legacyRole,
+    authProvider: canonicalIdentity.identity.provider,
+    authSubject: canonicalIdentity.identity.subject,
+    userGeneration: canonicalIdentity.user.generation,
+    authIdentityGeneration: canonicalIdentity.identity.generation,
   });
 
-  audit("login_success", { username: userInfo.email, detail: "google oauth" });
+  audit("login_success", {
+    username: canonicalIdentity.user.username,
+    userId: canonicalIdentity.user.id,
+    detail: "google oauth",
+  });
 
   // Set session cookie and clear OAuth state cookie using the cookies API
   // (mixing headers.set("Set-Cookie") with cookies.delete() causes Next.js to clobber the header)

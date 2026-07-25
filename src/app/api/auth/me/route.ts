@@ -32,7 +32,7 @@ export async function GET(req: NextRequest) {
   return NextResponse.json({
     userId: payload.userId,
     username: payload.username,
-    displayName: payload.username,
+    displayName: payload.displayName || payload.username,
     role: payload.role,
     authMode,
   });

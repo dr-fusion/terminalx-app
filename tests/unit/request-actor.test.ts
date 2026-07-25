@@ -52,7 +52,12 @@ describe("resolveRequestActor", () => {
     mocks.verifyJwt.mockResolvedValue({
       userId: "user-1",
       username: "alice",
+      displayName: "Alice Example",
       role: "user",
+      authProvider: "google",
+      authSubject: "google-subject-1",
+      userGeneration: 3,
+      authIdentityGeneration: 2,
     });
 
     const actor = await resolveRequestActor(
@@ -64,8 +69,14 @@ describe("resolveRequestActor", () => {
       kind: "human",
       userId: "user-1",
       username: "alice",
-      displayName: "alice",
+      displayName: "Alice Example",
       legacyRole: "user",
+      authentication: {
+        provider: "google",
+        subject: "google-subject-1",
+        userGeneration: 3,
+        identityGeneration: 2,
+      },
     });
   });
 

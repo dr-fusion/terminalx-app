@@ -1,7 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import { signJwt } from "@/lib/auth";
-import { consumePairingCode } from "@/lib/pairing";
+import { getAuthMode } from "@/lib/auth-config";
+import { withCanonicalIdentityAuthority } from "@/lib/identity-service";
+import { consumePairingCode, type ConsumedPairingCode } from "@/lib/pairing";
 import { registerDevice } from "@/lib/devices";
+import { getUserById } from "@/lib/users";
 import { audit } from "@/lib/audit-log";
 import { isRateLimited } from "@/lib/rate-limit";
 import { trustProxyHeaders } from "@/lib/security-config";
@@ -47,30 +50,114 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Invalid or expired code" }, { status: 401 });
   }
 
+  const identity = resolvePairingIdentity(consumed);
+  if (!identity) {
+    audit("pair_failed", { detail: "pairing identity is no longer authorized" });
+    return NextResponse.json({ error: "Invalid or expired code" }, { status: 401 });
+  }
+
   const device = await registerDevice({
-    userId: consumed.userId,
-    username: consumed.username,
+    userId: identity.userId,
+    username: identity.username,
     name: deviceName,
   });
 
   const token = await signJwt({
-    userId: consumed.userId,
-    username: consumed.username,
-    role: consumed.role,
+    ...identity,
     deviceId: device.id,
   });
 
   // signJwt sets 24h expiry — surface that so the client can show countdown.
   const expiresAt = Date.now() + 24 * 60 * 60 * 1000;
-  audit("pair_success", { username: consumed.username, detail: device.id });
+  audit("pair_success", { username: identity.username, detail: device.id });
 
   return NextResponse.json(
     {
       token,
       expiresAt,
       deviceId: device.id,
-      user: { id: consumed.userId, name: consumed.username },
+      user: { id: identity.userId, name: identity.username },
     },
     { headers: { "Cache-Control": "no-store, max-age=0" } }
   );
+}
+
+interface PairingIdentity {
+  userId: string;
+  username: string;
+  displayName?: string;
+  role: string;
+  authProvider?: "local" | "google" | "password";
+  authSubject?: string;
+  userGeneration?: number;
+  authIdentityGeneration?: number;
+}
+
+function resolvePairingIdentity(consumed: ConsumedPairingCode): PairingIdentity | null {
+  const mode = getAuthMode();
+  const snapshotValues = [
+    consumed.authProvider,
+    consumed.authSubject,
+    consumed.userGeneration,
+    consumed.authIdentityGeneration,
+  ];
+  const snapshotFieldCount = snapshotValues.filter((value) => value !== undefined).length;
+
+  if (snapshotFieldCount > 0) {
+    if (
+      snapshotFieldCount !== snapshotValues.length ||
+      consumed.authProvider !== mode ||
+      !consumed.authSubject ||
+      !Number.isSafeInteger(consumed.userGeneration) ||
+      consumed.userGeneration! < 1 ||
+      !Number.isSafeInteger(consumed.authIdentityGeneration) ||
+      consumed.authIdentityGeneration! < 1
+    ) {
+      return null;
+    }
+    const resolved = withCanonicalIdentityAuthority((authority) =>
+      authority.resolveAuthenticationIdentity({
+        userId: consumed.userId,
+        userGeneration: consumed.userGeneration!,
+        provider: consumed.authProvider!,
+        subject: consumed.authSubject!,
+        identityGeneration: consumed.authIdentityGeneration!,
+      })
+    );
+    if (!resolved) return null;
+    return {
+      userId: resolved.user.id,
+      username: resolved.user.username,
+      displayName: resolved.user.displayName,
+      role: resolved.user.legacyRole,
+      authProvider: resolved.identity.provider,
+      authSubject: resolved.identity.subject,
+      userGeneration: resolved.user.generation,
+      authIdentityGeneration: resolved.identity.generation,
+    };
+  }
+
+  if (mode === "none" && consumed.userId === "single-user") {
+    return {
+      userId: consumed.userId,
+      username: consumed.username,
+      ...(consumed.displayName ? { displayName: consumed.displayName } : {}),
+      role: consumed.role,
+    };
+  }
+  if (
+    mode !== "local" ||
+    consumed.userId === "single-user" ||
+    consumed.userId.startsWith("google-")
+  ) {
+    return null;
+  }
+  const user = getUserById(consumed.userId);
+  if (!user) return null;
+  return {
+    userId: user.id,
+    username: user.username,
+    displayName: user.username,
+    role: user.role,
+  };
 }

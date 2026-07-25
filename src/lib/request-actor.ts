@@ -16,6 +16,12 @@ export interface RequestActor {
   username: string;
   displayName: string;
   legacyRole: string;
+  authentication?: {
+    provider: "local" | "google" | "password";
+    subject: string;
+    userGeneration: number;
+    identityGeneration: number;
+  };
 }
 
 function bearerToken(headers: RequestHeaders): string | undefined {
@@ -65,11 +71,25 @@ export async function resolveRequestActor(headers: RequestHeaders): Promise<Requ
   const payload = await verifyJwt(token);
   if (!payload?.userId || !payload.username) return null;
 
+  const authentication =
+    payload.authProvider &&
+    payload.authSubject &&
+    payload.userGeneration !== undefined &&
+    payload.authIdentityGeneration !== undefined
+      ? {
+          provider: payload.authProvider,
+          subject: payload.authSubject,
+          userGeneration: payload.userGeneration,
+          identityGeneration: payload.authIdentityGeneration,
+        }
+      : undefined;
+
   return {
     kind: "human",
     userId: payload.userId,
     username: payload.username,
-    displayName: payload.username,
+    displayName: payload.displayName || payload.username,
     legacyRole: payload.role,
+    ...(authentication ? { authentication } : {}),
   };
 }

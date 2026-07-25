@@ -16,7 +16,16 @@ export async function POST(req: NextRequest) {
   const { code, expiresAt } = await createPairingCode({
     userId: actor.userId,
     username: actor.username,
+    displayName: actor.displayName,
     role: actor.legacyRole,
+    ...(actor.authentication
+      ? {
+          authProvider: actor.authentication.provider,
+          authSubject: actor.authentication.subject,
+          userGeneration: actor.authentication.userGeneration,
+          authIdentityGeneration: actor.authentication.identityGeneration,
+        }
+      : {}),
   });
 
   audit("pairing_code_created", { username: actor.username, userId: actor.userId });
