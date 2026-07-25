@@ -6,6 +6,57 @@ import { InputFile } from "grammy";
 import { assertNotSensitivePath, resolveSafePath } from "@/lib/file-service";
 import { getTelegramConfig } from "./config";
 
+/**
+ * Descriptor-relative ("openat"-style) exclusive creation.
+ *
+ * The legacy download path validates the destination directory, then creates a
+ * file inside it. A same-host actor with the TerminalX OS user's filesystem
+ * rights could otherwise rename the parent directory between validation and
+ * creation, redirecting the write at an authority store. We close that race by
+ * opening the parent directory to pin its inode, then creating the file relative
+ * to that descriptor (`O_CREAT|O_EXCL|O_NOFOLLOW`) via `/proc/self/fd/<dirfd>`,
+ * which resolves against the pinned inode, not a re-resolved path. `O_EXCL`
+ * rejects an existing file or symlink; the `nlink`/regular-file re-check after
+ * open rejects a hardlink swap.
+ *
+ * `fileName` must be a single sanitized path component (no separators); callers
+ * pass values already reduced by {@link safeFileName}.
+ */
+function createExclusiveInPinnedDirectory(safeDir: string, fileName: string, data: Buffer): void {
+  if (fileName.length === 0 || fileName.includes("/") || fileName === "." || fileName === "..") {
+    throw new Error("unsafe destination file name");
+  }
+  const directoryFlag = fs.constants.O_DIRECTORY ?? 0;
+  const noFollowFlag = fs.constants.O_NOFOLLOW ?? 0;
+  const dirFd = fs.openSync(safeDir, fs.constants.O_RDONLY | directoryFlag | noFollowFlag);
+  try {
+    if (!fs.fstatSync(dirFd).isDirectory()) throw new Error("destination is not a directory");
+    // On Linux, /proc/self/fd/<dirfd> is the pinned directory inode; appending
+    // the component resolves inside it regardless of a concurrent parent rename.
+    const relativePath =
+      process.platform === "linux"
+        ? `/proc/self/fd/${dirFd}/${fileName}`
+        : path.join(safeDir, fileName);
+    const fileFd = fs.openSync(
+      relativePath,
+      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | noFollowFlag,
+      0o600
+    );
+    try {
+      const stat = fs.fstatSync(fileFd);
+      if (!stat.isFile() || stat.nlink !== 1) throw new Error("unsafe destination");
+      let offset = 0;
+      while (offset < data.length) {
+        offset += fs.writeSync(fileFd, data, offset, data.length - offset, offset);
+      }
+    } finally {
+      fs.closeSync(fileFd);
+    }
+  } finally {
+    fs.closeSync(dirFd);
+  }
+}
+
 const MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024; // 50 MB — Telegram bot file limit
 const IMAGE_EXTS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"]);
 
@@ -70,9 +121,9 @@ export async function downloadFromTelegram(
   const filename = safeFileName(preferredName ?? name);
   const dest = path.join(safeDir, filename);
   assertNotSensitivePath(dest);
-  // Exclusive creation rejects both existing files and symlinks, closing the
-  // check/write race where an allowed name points at an authority store.
-  fs.writeFileSync(dest, buf, { mode: 0o600, flag: "wx" });
+  // Descriptor-relative exclusive creation closes the parent-directory rename
+  // race that plain path-based `wx` creation leaves open (see helper above).
+  createExclusiveInPinnedDirectory(safeDir, filename, buf);
   const root = path.resolve(process.env.TERMINUS_ROOT || process.env.HOME || "/");
   return { savedTo: path.relative(root, dest) || filename, bytes: buf.length };
 }

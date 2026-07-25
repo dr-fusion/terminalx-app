@@ -32,6 +32,7 @@ export const BROKER_DATABASE_FILE = "broker.sqlite";
 export const BROKER_SOCKET_FILE = "broker.sock";
 export const BROKER_PROXY_SOCKET_FILE = "proxy.sock";
 export const BROKER_PROXY_ACCOUNTING_FILE = "proxy-accounting.sqlite";
+export const BROKER_WEBHOOK_SECRETS_FILE = "webhook-secrets.sqlite";
 export const BROKER_VERIFICATION_KEY_FILE = VERIFICATION_KEY_FILE;
 const SIGNING_KEY_ID_DOMAIN = "terminalx/secret-broker-signing-key/v1\0";
 const MAX_KEY_FILE_BYTES = 64 * 1024;
@@ -49,6 +50,7 @@ export interface BrokerRootContext {
   readonly socketPath: string;
   readonly proxySocketPath: string;
   readonly proxyAccountingPath: string;
+  readonly webhookSecretsPath: string;
 }
 
 export interface EstablishBrokerRootOptions {
@@ -86,6 +88,7 @@ export function establishBrokerRoot(options: EstablishBrokerRootOptions): Broker
     socketPath: join(rootDir, BROKER_SOCKET_FILE),
     proxySocketPath: join(rootDir, BROKER_PROXY_SOCKET_FILE),
     proxyAccountingPath: join(rootDir, BROKER_PROXY_ACCOUNTING_FILE),
+    webhookSecretsPath: join(rootDir, BROKER_WEBHOOK_SECRETS_FILE),
   });
 }
 

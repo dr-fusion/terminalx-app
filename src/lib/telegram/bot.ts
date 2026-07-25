@@ -29,7 +29,7 @@ import {
   type BotIdentity,
 } from "./auth";
 import { getConfiguredMaxSessions, isReadOnlyMode } from "@/lib/security-config";
-import { getTelegramConfig } from "./config";
+import { getTelegramConfig, legacyTelegramIntegrationEnabled } from "./config";
 import { sessionsKeyboard, CB } from "./keyboard";
 import {
   setTopic,
@@ -1540,6 +1540,12 @@ function botIdFromToken(token: string): number | undefined {
 }
 
 export async function startTelegramBot(): Promise<Bot | null> {
+  if (!legacyTelegramIntegrationEnabled()) {
+    console.warn(
+      "[telegram] legacy Telegram integration disabled via TERMINALX_LEGACY_TELEGRAM=false"
+    );
+    return null;
+  }
   if (!botIsConfigured()) {
     if (telegramHasPartialConfig() || telegramAllowedUserCount() > 0) {
       console.error(
@@ -1549,6 +1555,11 @@ export async function startTelegramBot(): Promise<Bot | null> {
     return null;
   }
   if (bot) return bot;
+  console.warn(
+    "[telegram] starting DEPRECATED legacy host-global Telegram integration " +
+      "(trusted LocalTmux only; not part of the Phase 8 connection authority). " +
+      "Retirement lands with Slice 8F; set TERMINALX_LEGACY_TELEGRAM=false to disable."
+  );
   const config = getTelegramConfig();
   const token = config.botToken;
   const candidate = new Bot(token);

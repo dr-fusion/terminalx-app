@@ -19,7 +19,7 @@ describe("connection authority schema", () => {
   it("creates an additive v13 authority without secret-bearing columns", () => {
     database = openTeamSessionDatabase({ filename: ":memory:" });
 
-    expect(database.db.pragma("user_version", { simple: true })).toBe(13);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(14);
     const tables = [
       "credential_handles",
       "channel_installations",
@@ -27,6 +27,7 @@ describe("connection authority schema", () => {
       "identity_connections",
       "channel_bindings",
       "connection_authority_ledger",
+      "provider_webhook_deliveries",
       "mobile_pairing_codes",
       "paired_devices",
       "mobile_auth_migrations",
@@ -57,6 +58,7 @@ describe("connection authority schema", () => {
         .prepare("INSERT INTO teams (id, name, created_at_ms) VALUES ('team-1', 'Team', 100)")
         .run();
       database.db.exec(`
+        DROP TABLE provider_webhook_deliveries;
         DROP TABLE mobile_auth_migrations;
         DROP TABLE paired_devices;
         DROP TABLE mobile_pairing_codes;
@@ -77,7 +79,7 @@ describe("connection authority schema", () => {
       );
       database = openTeamSessionDatabase({ filename });
 
-      expect(database.db.pragma("user_version", { simple: true })).toBe(13);
+      expect(database.db.pragma("user_version", { simple: true })).toBe(14);
       expect(database.db.prepare("SELECT id, name FROM teams").all()).toEqual([
         { id: "team-1", name: "Team" },
       ]);
@@ -88,6 +90,7 @@ describe("connection authority schema", () => {
         "identity_connections",
         "channel_bindings",
         "connection_authority_ledger",
+        "provider_webhook_deliveries",
         "mobile_pairing_codes",
         "paired_devices",
         "mobile_auth_migrations",
