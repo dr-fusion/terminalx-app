@@ -15,6 +15,10 @@ export interface StartupValidationResult {
 
 const MIN_SECRET_LENGTH = 32;
 const MIN_PASSWORD_LENGTH = 8;
+const TERMINALX_DATABASE_APPLICATION_ID = 0x54585331;
+const CANONICAL_IDENTITY_SCHEMA_VERSION = 11;
+const CANONICAL_IDENTITY_DATABASE_ERROR =
+  "Canonical identity database failed validation; refusing local-auth startup.";
 
 function dataPath(cwd = process.cwd(), file: string): string {
   return path.join(cwd, "data", file);
@@ -36,12 +40,32 @@ function hasCanonicalLocalUser(cwd = process.cwd()): boolean {
   const filename = configured
     ? path.resolve(cwd, configured)
     : dataPath(cwd, "team-sessions.sqlite");
-  if (!fs.existsSync(filename)) return false;
+  try {
+    fs.lstatSync(filename);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
   let database: Database.Database | undefined;
   try {
     database = new Database(filename, { readonly: true, fileMustExist: true });
     const applicationId = database.pragma("application_id", { simple: true }) as number;
-    if (applicationId !== 0x54585331) return false;
+    if (applicationId !== TERMINALX_DATABASE_APPLICATION_ID) {
+      throw new Error("Unexpected TerminalX database application ID.");
+    }
+    const schemaVersion = database.pragma("user_version", { simple: true }) as number;
+    if (
+      !Number.isSafeInteger(schemaVersion) ||
+      schemaVersion < 1 ||
+      schemaVersion > CANONICAL_IDENTITY_SCHEMA_VERSION
+    ) {
+      throw new Error("Unsupported TerminalX database schema version.");
+    }
+    // Startup validation runs before openTeamSessionDatabase performs its
+    // transactional migration. A recognized v1-v10 database legitimately has
+    // no canonical identity tables yet, so defer to the legacy source here;
+    // the database opener remains responsible for validating and migrating it.
+    if (schemaVersion < CANONICAL_IDENTITY_SCHEMA_VERSION) return false;
     return Boolean(
       database
         .prepare(
@@ -57,8 +81,6 @@ function hasCanonicalLocalUser(cwd = process.cwd()): boolean {
         )
         .get()
     );
-  } catch {
-    return false;
   } finally {
     database?.close();
   }
@@ -104,11 +126,21 @@ export function validateStartupConfiguration(
   }
 
   if (authMode === "local") {
-    const hasUsers = hasCanonicalLocalUser(cwd) || hasLegacyLocalUser(cwd);
-    if (!hasUsers && !hasLongEnoughPassword(process.env.TERMINALX_ADMIN_PASSWORD)) {
-      errors.push(
-        `TERMINALX_ADMIN_PASSWORD must be set and at least ${MIN_PASSWORD_LENGTH} characters for first local-auth startup.`
-      );
+    let canonicalIdentityDatabaseValid = true;
+    let hasCanonicalUsers = false;
+    try {
+      hasCanonicalUsers = hasCanonicalLocalUser(cwd);
+    } catch {
+      canonicalIdentityDatabaseValid = false;
+      errors.push(CANONICAL_IDENTITY_DATABASE_ERROR);
+    }
+    if (canonicalIdentityDatabaseValid) {
+      const hasUsers = hasCanonicalUsers || hasLegacyLocalUser(cwd);
+      if (!hasUsers && !hasLongEnoughPassword(process.env.TERMINALX_ADMIN_PASSWORD)) {
+        errors.push(
+          `TERMINALX_ADMIN_PASSWORD must be set and at least ${MIN_PASSWORD_LENGTH} characters for first local-auth startup.`
+        );
+      }
     }
   }
 
