@@ -809,7 +809,9 @@ function captureCapabilityActivation(value: unknown): {
   if (value === undefined) return null;
   const receiver = objectValue(value);
   const verify = captureDataMethod(receiver, "verify");
-  const source = objectValue(runtimeSupervisorDataField(receiver, "source"));
+  const source = objectValue(
+    runtimeSupervisorDataField(receiver as Record<string, unknown>, "source")
+  );
   const resolveMethod = captureDataMethod(source, "resolve");
   return Object.freeze({
     source: Object.freeze({

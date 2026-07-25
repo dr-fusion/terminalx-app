@@ -16,7 +16,6 @@ import type {
   ProxyResultClass,
 } from "../../packages/secret-broker/src/proxy/proxy-protocol";
 import type { ProxyOutboundRequest } from "../../packages/secret-broker/src/proxy/network-client";
-import { ProxyNetworkError } from "../../packages/secret-broker/src/proxy/network-client";
 
 const TELEGRAM_EXPECTATION = "a".repeat(64);
 const SANDBOX_DIGEST_A = "c".repeat(64);
