@@ -61,14 +61,12 @@ export function createWebhookDeliveryDedup(db: Database.Database): WebhookDelive
      WHERE installation_id = ? AND provider = ? AND monotonic_ordinal IS NOT NULL`
   );
 
-  return Object.freeze({
-    hasDelivery({ installationId, provider, replayId }): boolean {
+  const impl: WebhookDeliveryDedup = {
+    hasDelivery({ installationId, provider, replayId }) {
       const digest = deliveryDigest(provider, installationId, replayId);
       return selectByDigest.get(installationId, digest) !== undefined;
     },
-    recordDelivery({ installationId, provider, replayId, monotonicOrdinal, receivedAtMs }): {
-      recorded: boolean;
-    } {
+    recordDelivery({ installationId, provider, replayId, monotonicOrdinal, receivedAtMs }) {
       const digest = deliveryDigest(provider, installationId, replayId);
       const result = insert.run(
         installationId,
@@ -79,9 +77,10 @@ export function createWebhookDeliveryDedup(db: Database.Database): WebhookDelive
       );
       return { recorded: result.changes === 1 };
     },
-    latestOrdinal(installationId, provider): number | null {
+    latestOrdinal(installationId, provider) {
       const row = selectLatest.get(installationId, provider) as { ordinal: number | null };
       return row.ordinal ?? null;
     },
-  });
+  };
+  return Object.freeze(impl);
 }
