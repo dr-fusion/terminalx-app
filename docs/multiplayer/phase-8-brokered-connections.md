@@ -274,9 +274,13 @@ enforcement evidence (8F/8G), and Gate 5 reservation math (Phase 9) remain out o
 
 ## Slice 8E — Telegram/Slack provider adapters and end-to-end flow
 
-Status: complete. Slice 8E turns the local authority, broker, and proxy into a usable connection
-flow for Telegram and Slack, without importing any legacy plaintext provider state into the authority
-model. The credential-acquisition design and its rationale are recorded in
+Status: complete, landed in two stages. The first 8E slice shipped the broker exchange operations,
+provider adapters, replay dedup, and the inbound/outbound pipelines, but **deferred** the
+installation-acquisition and webhook-ingress HTTP routes plus main-process persistence of the
+Telegram webhook auth digest; a follow-up slice completed exactly that deferred scope (schema v15 and
+the route matrix below). Slice 8E turns the local authority, broker, and proxy into a usable
+connection flow for Telegram and Slack, without importing any legacy plaintext provider state into
+the authority model. The credential-acquisition design and its rationale are recorded in
 [`ADR 0004`](../adr/0004-provider-credential-acquisition-in-broker.md).
 
 - **Credential acquisition inside the broker.** Three new closed-response operations on the broker
@@ -312,9 +316,27 @@ model. The credential-acquisition design and its rationale are recorded in
   attribution. Outbound: a per-message delivery step resolves the Binding outbound policy (fencing
   disabled/mentions-only, artifact gating, and stale revisions), sends through the 8D proxy, and
   retries only on `retryable` within a bounded budget, never on `denied` (a rotation/revocation
-  mid-flight resolves to `authority-mismatch` and is terminal). An integration test exercises install
+  mid-flight resolves to `authority-mismatch` and is terminal). Integration tests exercise install
   → link → bind → inbound comment → outbound delivery across the real broker child process with fake
-  Slack + Telegram servers.
+  Slack + Telegram servers, including the same flow driven through the real HTTP route handlers with
+  a mid-flow rotation (the old webhook secret token stops authenticating; the new one takes over).
+- **HTTP routes (follow-up slice).** Installation acquisition:
+  `POST /api/connections/installations` (Telegram: operator token INPUT-ONLY, never
+  echoed/logged/persisted, per-User rolling-hour rate limit and secret-free audit events; Slack:
+  redirect flow returning a signed single-use `state` bound to the initiating actor with a 10-minute
+  expiry, the app signing secret held only in a bounded TTL'd single-use in-memory pending store),
+  `GET /api/connections/installations/slack/callback` (state verified against the live actor before
+  the in-broker code exchange), and `POST /api/connections/installations/[installationId]/rotate`
+  (Telegram rotation through the exchange with the broker `rotation.prepare` linkage; Slack rotation
+  restarts the redirect flow with `intent=rotate` in the signed state). Webhook ingress
+  (unauthenticated, hostile-input, bounded bodies, fail-closed):
+  `POST /api/connections/webhooks/telegram/[installationId]` authenticates by constant-time
+  comparison against the schema-v15 `installation_webhook_auth_digests` state (the raw
+  `secret_token` never exists in main-process state; unknown installation and bad header are one
+  uniform 401), and `POST /api/connections/webhooks/slack` verifies the v0 HMAC inside the broker
+  with the ±300s window, resolving the installation from the signed payload tenant and echoing
+  `url_verification` only when signed. Both feed the same dedup + ingest pipeline into idempotent
+  kernel commands via the registered Team Session kernel.
 
 Deliberately closed in 8E: `brokeredCredentials` and `proxyOnlyEgress` remain `false`, Release Gate 3
 stays open, and no provider network call in CI touches a real provider. Full retirement of the legacy
