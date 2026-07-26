@@ -54,6 +54,17 @@ import {
 } from "./sqlite-runtime-write-state-source";
 import { createLimitLedgerStore, type LimitLedgerStore } from "./sqlite-limit-ledger-store";
 import {
+  createCircuitBreakerStateStore,
+  type CircuitBreakerStateStore,
+} from "./sqlite-circuit-breaker-store";
+import {
+  createRuntimeCircuitBreaker,
+  type RuntimeCircuitBreaker,
+  type RuntimeFailureFingerprintInput,
+  type RuntimeFailureDecision,
+  type RuntimeCircuitBreakerStatus,
+} from "../runtime/circuit-breaker";
+import {
   digestSessionEvent,
   previousChainHash,
   SESSION_EVENT_CHAIN_SCHEMA,
@@ -409,6 +420,8 @@ class SqliteTeamSessions implements TeamSessions {
   private readonly runtimeLifecycleCommandTtlMs: number;
   private readonly runtimeWriteStateSnapshotSource: RuntimeWriteStateSnapshotSource;
   private readonly limitLedger: LimitLedgerStore;
+  private readonly circuitBreaker: RuntimeCircuitBreaker;
+  private readonly circuitBreakerStore: CircuitBreakerStateStore;
   private readonly sessionEventChain: SessionEventChainStore;
   private readonly runtimeLifecycle: SqliteRuntimeLifecycleJournal;
   private readonly runtimeReceiptFollow: SqliteRuntimeReceiptFollowJournal;
@@ -507,6 +520,26 @@ class SqliteTeamSessions implements TeamSessions {
       db: this.db,
     });
     this.limitLedger = createLimitLedgerStore(this.db);
+    // Gate 5 durable circuit breaker: compose the in-process guard onto its
+    // SQLite mirror and rehydrate any open circuit / denied-proposal set left by
+    // a previous process so a restart cannot silently reopen a fenced Runtime
+    // scope. The failure/success source that drives this at real receipt volume
+    // is the Phase 12 hosted-Daytona effect executor; the composition, the
+    // persist-on-mutate seam, and the rehydrate-on-open lifecycle are wired and
+    // hermetically tested here.
+    this.circuitBreakerStore = createCircuitBreakerStateStore(this.db);
+    this.circuitBreaker = createRuntimeCircuitBreaker();
+    {
+      const persistedScopes = this.circuitBreakerStore.loadAll();
+      // Only read the clock when there is durable state to rehydrate, so a fresh
+      // kernel does not consume a clock tick (tests use deterministic clocks).
+      if (persistedScopes.length > 0) {
+        const rehydrateNow = this.clock();
+        for (const snapshot of persistedScopes) {
+          this.circuitBreaker.loadScope(snapshot, rehydrateNow);
+        }
+      }
+    }
     this.sessionEventChain = createSessionEventChainStore(this.db, {
       ...(options.sessionEventCheckpointSigningKey === undefined
         ? {}
@@ -1149,6 +1182,53 @@ class SqliteTeamSessions implements TeamSessions {
     if (this.closed) return;
     this.closed = true;
     this.database.close();
+  }
+
+  /**
+   * Record a Runtime failure against the durable circuit breaker and mirror the
+   * affected scope to SQLite in the same tick. Returns the breaker's decision
+   * (open/closed) so the caller can fail closed on an open circuit. This is the
+   * kernel-owned seam that composes {@link RuntimeCircuitBreaker} with its
+   * durable store; the hosted-Daytona effect executor is the Phase 12 caller
+   * that will drive it at real receipt volume.
+   */
+  recordRuntimeCircuitFailure(
+    scope: string,
+    failure: RuntimeFailureFingerprintInput,
+    nowMs: number
+  ): RuntimeFailureDecision {
+    const decision = this.circuitBreaker.recordFailure(scope, failure, nowMs);
+    this.persistCircuitScope(scope, nowMs);
+    return decision;
+  }
+
+  /**
+   * Record a Runtime success against the durable circuit breaker (clearing
+   * failure counters and any open circuit for the scope) and mirror the scope to
+   * SQLite in the same tick.
+   */
+  recordRuntimeCircuitSuccess(scope: string, nowMs: number): RuntimeCircuitBreakerStatus {
+    const status = this.circuitBreaker.recordSuccess(scope, nowMs);
+    this.persistCircuitScope(scope, nowMs);
+    return status;
+  }
+
+  /** Read the durable circuit breaker's current state for a scope. */
+  runtimeCircuitStatus(scope: string, nowMs: number): RuntimeCircuitBreakerStatus {
+    return this.circuitBreaker.status(scope, nowMs);
+  }
+
+  /**
+   * Upsert one scope's live snapshot, or delete the durable row when the scope
+   * holds no live state, so the SQLite mirror never accumulates empty entries.
+   */
+  private persistCircuitScope(scope: string, nowMs: number): void {
+    const snapshot = this.circuitBreaker.snapshotScope(scope, nowMs);
+    if (snapshot === null) {
+      this.circuitBreakerStore.deleteScope(scope);
+      return;
+    }
+    this.circuitBreakerStore.persistScope(snapshot, nowMs);
   }
 
   private applyCommand(command: SessionCommand, now: number): CommandResult {
