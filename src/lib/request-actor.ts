@@ -108,3 +108,25 @@ export async function resolveRequestActor(headers: RequestHeaders): Promise<Requ
     ...(authentication ? { authentication } : {}),
   };
 }
+
+/**
+ * Defense-in-depth admin check for privilege GRANT decisions.
+ *
+ * Re-derives the actor straight from the session cookie / bearer credential —
+ * running the full JWT verification path via {@link resolveRequestActor} — rather
+ * than trusting the middleware-projected `x-user-role` header. Callers should AND
+ * this with their existing header-derived gate so the decision fails closed if the
+ * proxy middleware is ever bypassed, removed, or renamed: a spoofed
+ * `x-user-role: admin` header without a valid session can no longer grant admin.
+ *
+ * Mirrors the pattern already used by the metrics endpoint (see
+ * `src/lib/ops/http.ts`). Never throws; any error resolves to `false`.
+ */
+export async function requireVerifiedAdmin(headers: RequestHeaders): Promise<boolean> {
+  try {
+    const actor = await resolveRequestActor(headers);
+    return actor !== null && actor.legacyRole === "admin";
+  } catch {
+    return false;
+  }
+}

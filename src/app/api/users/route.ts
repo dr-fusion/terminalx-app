@@ -10,10 +10,14 @@ import {
 import { getAuthMode } from "@/lib/auth-config";
 import { audit } from "@/lib/audit-log";
 import { getUserScoping } from "@/lib/session-scope";
+import { requireVerifiedAdmin } from "@/lib/request-actor";
 
-function isAdmin(req: NextRequest): boolean {
+// Defense-in-depth: the header-derived scoping role must agree AND the identity
+// must re-verify from the session JWT. A spoofed x-user-role header alone (e.g.
+// if the proxy middleware were ever bypassed) can no longer grant admin.
+async function isAdmin(req: NextRequest): Promise<boolean> {
   const { role, hasIdentity } = getUserScoping(req.headers);
-  return hasIdentity && role === "admin";
+  return hasIdentity && role === "admin" && (await requireVerifiedAdmin(req.headers));
 }
 
 const USERNAME_REGEX = /^[a-zA-Z0-9_.]+$/;
@@ -27,7 +31,7 @@ export async function GET(req: NextRequest) {
     );
   }
 
-  if (!isAdmin(req)) {
+  if (!(await isAdmin(req))) {
     return NextResponse.json({ error: "Admin access required" }, { status: 403 });
   }
 
@@ -44,7 +48,7 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  if (!isAdmin(req)) {
+  if (!(await isAdmin(req))) {
     return NextResponse.json({ error: "Admin access required" }, { status: 403 });
   }
 
@@ -98,7 +102,7 @@ export async function DELETE(req: NextRequest) {
     );
   }
 
-  if (!isAdmin(req)) {
+  if (!(await isAdmin(req))) {
     return NextResponse.json({ error: "Admin access required" }, { status: 403 });
   }
 
@@ -150,7 +154,7 @@ export async function PATCH(req: NextRequest) {
     );
   }
 
-  if (!isAdmin(req)) {
+  if (!(await isAdmin(req))) {
     return NextResponse.json({ error: "Admin access required" }, { status: 403 });
   }
 

@@ -15,11 +15,15 @@ import {
   writeUserSettings,
 } from "@/lib/settings/store";
 import { resolveModelSettings } from "@/lib/settings/resolve";
+import { requireVerifiedAdmin } from "@/lib/request-actor";
 import { validateModelsPatch } from "@/lib/settings/validate";
 import type { ScopedSettings, SettingsScope } from "@/lib/settings/types";
 
-function isAdmin(req: NextRequest): boolean {
-  return req.headers.get("x-user-role") === "admin";
+// Defense-in-depth: the middleware-projected x-user-role header must say admin
+// AND the identity must re-verify from the session JWT. A spoofed header alone
+// (e.g. if the proxy middleware were ever bypassed) can no longer grant admin.
+async function isAdmin(req: NextRequest): Promise<boolean> {
+  return req.headers.get("x-user-role") === "admin" && (await requireVerifiedAdmin(req.headers));
 }
 
 /**
@@ -117,7 +121,7 @@ export async function PUT(req: NextRequest) {
   }
 
   // repo scope: admin-gated, repoRoot required.
-  if (!isAdmin(req)) {
+  if (!(await isAdmin(req))) {
     return NextResponse.json({ error: "admin required" }, { status: 403 });
   }
   const session = typeof body.session === "string" ? body.session : null;

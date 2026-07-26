@@ -6,9 +6,13 @@ import {
 } from "@/lib/telegram/config";
 import { listTopics } from "@/lib/telegram/state";
 import { audit } from "@/lib/audit-log";
+import { requireVerifiedAdmin } from "@/lib/request-actor";
 
-function isAdmin(req: NextRequest): boolean {
-  return req.headers.get("x-user-role") === "admin";
+// Defense-in-depth: the middleware-projected x-user-role header must say admin
+// AND the identity must re-verify from the session JWT. A spoofed header alone
+// (e.g. if the proxy middleware were ever bypassed) can no longer grant admin.
+async function isAdmin(req: NextRequest): Promise<boolean> {
+  return req.headers.get("x-user-role") === "admin" && (await requireVerifiedAdmin(req.headers));
 }
 
 function parseBody(body: Record<string, unknown>): TelegramConfig {
@@ -36,7 +40,7 @@ function parseBody(body: Record<string, unknown>): TelegramConfig {
 }
 
 export async function GET(req: NextRequest) {
-  if (!isAdmin(req)) {
+  if (!(await isAdmin(req))) {
     return NextResponse.json({ error: "admin required" }, { status: 403 });
   }
 
@@ -53,7 +57,7 @@ export async function GET(req: NextRequest) {
 }
 
 export async function PATCH(req: NextRequest) {
-  if (!isAdmin(req)) {
+  if (!(await isAdmin(req))) {
     return NextResponse.json({ error: "admin required" }, { status: 403 });
   }
 
