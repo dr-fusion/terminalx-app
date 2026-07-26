@@ -212,12 +212,14 @@ export function snapshotCheckpointPayload(value: unknown): SessionEventCheckpoin
     typeof sessionId !== "string" ||
     sessionId.length < 1 ||
     sessionId.length > 300 ||
+    typeof headSequence !== "number" ||
     !Number.isSafeInteger(headSequence) ||
     headSequence < 1 ||
     typeof headHash !== "string" ||
     !SHA256.test(headHash) ||
     typeof genesisRoot !== "string" ||
     !SHA256.test(genesisRoot) ||
+    typeof issuedAtMs !== "number" ||
     !Number.isSafeInteger(issuedAtMs) ||
     issuedAtMs < 0
   ) {
@@ -335,7 +337,7 @@ export function verifySessionEventChain(
     previous = record.hash;
     expectedSequence += 1;
   }
-  return { ok: true, headSequence: records[records.length - 1].sequence, headHash: previous };
+  return { ok: true, headSequence: expectedSequence - 1, headHash: previous };
 }
 
 /** Export format version for a self-verifying chain bundle. */

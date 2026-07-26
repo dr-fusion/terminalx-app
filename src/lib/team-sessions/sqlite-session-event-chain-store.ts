@@ -184,7 +184,11 @@ export function createSessionEventChainStore(
     verifyChain(sessionId: string): ChainVerificationResult {
       return verifySessionEventChain(readChain(sessionId));
     },
-    emitCheckpoint(input): SessionEventCheckpointProof {
+    emitCheckpoint(input: {
+      sessionId: string;
+      checkpointId: string;
+      nowMs: number;
+    }): SessionEventCheckpointProof {
       return emitTx.immediate(input);
     },
     readCheckpoints(sessionId: string): SessionEventCheckpointProof[] {

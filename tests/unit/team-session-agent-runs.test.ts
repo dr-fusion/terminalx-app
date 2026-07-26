@@ -762,6 +762,197 @@ describe("Team Session Agent Runs", () => {
     }
   });
 
+  it("ends a Team Session under a version fence, retires the runtime, and stays chain-verifiable", async () => {
+    await enforceNextRuntime("runtime.session.ensure");
+    // Seed a ready Runtime Assignment so end has a runtime to retire.
+    const seed = new Database(filename);
+    try {
+      seed
+        .prepare(
+          `INSERT INTO runtime_assignments
+             (id, session_id, team_id, project_id, generation, runtime_kind, sandbox_id,
+              sandbox_generation, runtime_principal_id, runtime_authorization_generation,
+              status, created_at_ms, retired_at_ms)
+           VALUES ('assign-end', ?, ?, ?, 1, 'local-tmux', 'sandbox-end', 1, 'principal-end',
+                   1, 'ready', ?, NULL)`
+        )
+        .run(SESSION_ID, TEAM_ID, PROJECT_ID, now);
+    } finally {
+      seed.close();
+    }
+
+    await expect(
+      dispatch({
+        type: "session.end",
+        sessionId: SESSION_ID,
+        expectedAccessRevision: 99,
+        reason: "stale",
+      })
+    ).rejects.toThrow(/refresh and retry|changed/);
+
+    const ended = await dispatch({
+      type: "session.end",
+      sessionId: SESSION_ID,
+      expectedAccessRevision: 1,
+      reason: "engagement complete",
+      retentionMs: 1_000,
+    });
+    expect(ended.events.map((event) => event.type)).toEqual(["session.ended"]);
+    expect(ended.data).toMatchObject({
+      status: "ended",
+      retentionExpiresAtMs: now + 1_000,
+      checkpointSigned: false,
+    });
+
+    const audit = new Database(filename);
+    try {
+      expect(
+        audit
+          .prepare(
+            `SELECT status, ended_at_ms, archived_at_ms, retention_expires_at_ms, terminal_reason
+             FROM sessions WHERE id = ?`
+          )
+          .get(SESSION_ID)
+      ).toEqual({
+        status: "ended",
+        ended_at_ms: now,
+        archived_at_ms: now,
+        retention_expires_at_ms: now + 1_000,
+        terminal_reason: "engagement complete",
+      });
+      expect(
+        audit
+          .prepare(`SELECT status, retired_at_ms FROM runtime_assignments WHERE id = 'assign-end'`)
+          .get()
+      ).toEqual({ status: "retired", retired_at_ms: now });
+    } finally {
+      audit.close();
+    }
+
+    expect(sessions.verifySessionEventChain(SESSION_ID).ok).toBe(true);
+
+    // Ending again is rejected; racing terminal commands resolve to one state.
+    await expect(
+      dispatch({
+        type: "session.end",
+        sessionId: SESSION_ID,
+        expectedAccessRevision: 2,
+        reason: "again",
+      })
+    ).rejects.toThrow(/already ended/);
+  });
+
+  it("quarantines, retires, and retries a Runtime Assignment before a Run", async () => {
+    const seed = new Database(filename);
+    try {
+      seed
+        .prepare(
+          `INSERT INTO runtime_assignments
+             (id, session_id, team_id, project_id, generation, runtime_kind, sandbox_id,
+              sandbox_generation, runtime_principal_id, runtime_authorization_generation,
+              status, created_at_ms, retired_at_ms)
+           VALUES ('assign-ps', ?, ?, ?, 1, 'local-tmux', 'sandbox-ps', 1, 'principal-ps',
+                   1, 'ready', ?, NULL)`
+        )
+        .run(SESSION_ID, TEAM_ID, PROJECT_ID, now);
+    } finally {
+      seed.close();
+    }
+
+    // Fence: a stale observed generation is rejected.
+    await expect(
+      dispatch({
+        type: "session.platform-security.act",
+        sessionId: SESSION_ID,
+        runtimeAssignmentId: "assign-ps",
+        action: "quarantine",
+        reason: "seeded-canary tripped",
+        observedRuntimeAuthorizationGeneration: 99,
+        idempotencyKey: "ps-bad-fence",
+      })
+    ).rejects.toThrow(/changed; refresh and retry/);
+
+    const quarantined = await dispatch({
+      type: "session.platform-security.act",
+      sessionId: SESSION_ID,
+      runtimeAssignmentId: "assign-ps",
+      action: "quarantine",
+      reason: "seeded-canary tripped",
+      observedRuntimeAuthorizationGeneration: 1,
+      idempotencyKey: "ps-quarantine-1",
+    });
+    expect(quarantined.data).toMatchObject({
+      action: "quarantine",
+      idempotent: false,
+      runtimeAuthorizationGeneration: 2,
+      assignmentStatus: "quarantined",
+    });
+
+    // Idempotent replay returns the recorded outcome without a second effect.
+    const replay = await dispatch({
+      type: "session.platform-security.act",
+      sessionId: SESSION_ID,
+      runtimeAssignmentId: "assign-ps",
+      action: "quarantine",
+      reason: "seeded-canary tripped",
+      observedRuntimeAuthorizationGeneration: 1,
+      idempotencyKey: "ps-quarantine-1",
+    });
+    expect(replay.data).toMatchObject({ idempotent: true, runtimeAuthorizationGeneration: 2 });
+
+    const retried = await dispatch({
+      type: "session.platform-security.act",
+      sessionId: SESSION_ID,
+      runtimeAssignmentId: "assign-ps",
+      action: "retry",
+      reason: "reprovision after containment",
+      observedRuntimeAuthorizationGeneration: 2,
+      idempotencyKey: "ps-retry-1",
+    });
+    expect(retried.data).toMatchObject({
+      action: "retry",
+      assignmentStatus: "provisioning",
+      runtimeAuthorizationGeneration: 3,
+    });
+    const replacementId = retried.data.replacementAssignmentId as string;
+
+    const audit = new Database(filename);
+    try {
+      expect(
+        audit.prepare(`SELECT status FROM runtime_assignments WHERE id = 'assign-ps'`).get()
+      ).toEqual({ status: "retired" });
+      expect(
+        audit.prepare(`SELECT status FROM runtime_assignments WHERE id = ?`).get(replacementId)
+      ).toEqual({ status: "provisioning" });
+      expect(
+        audit
+          .prepare(
+            `SELECT action, assignment_status_before, assignment_status_after
+             FROM session_platform_security_actions
+             WHERE session_id = ? ORDER BY created_at_ms ASC, id ASC`
+          )
+          .all(SESSION_ID)
+      ).toEqual([
+        {
+          action: "quarantine",
+          assignment_status_before: "ready",
+          assignment_status_after: "quarantined",
+        },
+        {
+          action: "retry",
+          assignment_status_before: "quarantined",
+          assignment_status_after: "provisioning",
+        },
+      ]);
+      // The action history is append-only.
+      expect(() => audit.prepare(`DELETE FROM session_platform_security_actions`).run()).toThrow(
+        /append-only/
+      );
+    } finally {
+      audit.close();
+    }
+  });
+
   it("uses fenced lifecycle versions for pause, resume, and stop", async () => {
     const started = await startRun();
     const agentRunId = started.data.agentRunId as string;
