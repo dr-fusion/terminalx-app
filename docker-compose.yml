@@ -29,9 +29,42 @@ services:
     security_opt:
       - no-new-privileges:true
     pids_limit: 512
-    stop_grace_period: 15s
+    # Resource ceilings so one node cannot exhaust the host. Tune to the host.
+    mem_limit: 2g
+    memswap_limit: 2g
+    cpus: "2.0"
+    # Container healthcheck uses the readiness probe (not liveness) so an
+    # orchestrator holds traffic until SQLite is migrated and the broker is ready.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:3000/api/health/ready"]
+      interval: 30s
+      timeout: 5s
+      start_period: 25s
+      retries: 3
+    # Allow the graceful drain to finish before SIGKILL.
+    stop_grace_period: 345s
     restart: unless-stopped
+
+  # Optional Secret Broker, supervised as a sibling service. It publishes its
+  # verification key and sockets under a shared volume; TerminalX fails closed
+  # (connection surfaces disabled) until the key is present. Uncomment and set
+  # TERMINALX_SECRET_BROKER_ROOT on the terminalx service to enable brokered
+  # credentials. See packages/secret-broker/README.md.
+  #
+  # secret-broker:
+  #   build:
+  #     context: .
+  #     dockerfile: packages/secret-broker/Dockerfile
+  #   volumes:
+  #     - terminalx-broker:/run/terminalx-secret-broker
+  #   read_only: true
+  #   cap_drop:
+  #     - ALL
+  #   security_opt:
+  #     - no-new-privileges:true
+  #   restart: unless-stopped
 
 volumes:
   terminalx-data:
   terminalx-workspaces:
+  # terminalx-broker:

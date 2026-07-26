@@ -1,0 +1,52 @@
+# TerminalX production systemd unit.
+#
+# CRITICAL — KillMode=process: on stop/restart systemd sends SIGTERM to the main
+# TerminalX web-server process ONLY, never to the whole control group. Live tmux
+# sessions and node-pty children live in the same cgroup; killing the cgroup would
+# destroy running agent work. The server drains gracefully on SIGTERM (finish
+# in-flight, refuse new, flush workers) via server/graceful-shutdown.ts.
+#
+# Verify after install:
+#   systemctl show terminalx.service -p KillMode -p ExecStop -p TimeoutStopSec
+#   # then, after a restart:
+#   tmux list-sessions   # existing sessions must still be present
+#
+# Install:
+#   sudo cp deploy/terminalx.service /etc/systemd/system/terminalx.service
+#   sudo install -m 600 deploy/terminalx.env.example /etc/terminalx/terminalx.env  # then edit
+#   sudo systemctl daemon-reload && sudo systemctl enable --now terminalx.service
+
+[Unit]
+Description=TerminalX multiplayer control plane
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=terminalx
+Group=terminalx
+WorkingDirectory=/opt/terminalx
+EnvironmentFile=/etc/terminalx/terminalx.env
+ExecStart=/usr/bin/node ./node_modules/.bin/tsx server/index.ts
+
+# Stop ONLY the web server; never the tmux/pty children in this cgroup.
+KillMode=process
+KillSignal=SIGTERM
+# Allow the graceful drain to complete (local-tmux shutdown budget + auxiliary).
+TimeoutStopSec=345
+
+# Restart on crash, not on a clean operator stop.
+Restart=on-failure
+RestartSec=2s
+
+# Hardening. NoNewPrivileges and a private tmp reduce blast radius; the data
+# directory must remain writable for SQLite and backups.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=false
+ReadWritePaths=/opt/terminalx/data
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
