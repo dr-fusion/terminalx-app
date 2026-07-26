@@ -48,6 +48,41 @@ _Avoid_: Editor, driver
 The single active Steerer whose control epoch admits live terminal input at a given moment.
 _Avoid_: Session owner, assignee
 
+## Integrity and recovery
+
+**Session Event Chain**:
+The append-only hash chain over a Team Session's events. Each event commits to its
+attributable content and to its predecessor's hash from a fixed genesis root, so any
+tamper, gap, reorder, or deletion is detectable by recomputing the chain.
+_Avoid_: Audit log, event log
+
+**Session Event Checkpoint**:
+An Ed25519-signed attestation over a Session Event Chain head (session, head sequence,
+head hash) that lets an external retainer prove the head without holding the signing
+key. It is evidence of the chain's state, not an authorization.
+_Avoid_: Snapshot, backup
+
+**Evidence Review History**:
+The immutable, append-only record of who reviewed exactly which evidence at which Goal
+version, with what disposition. It is attribution evidence, not the evidence itself.
+_Avoid_: Review log, audit entry
+
+**Goal Version Lineage**:
+The immutable, append-only record binding each Goal version to its predecessor version
+and the command that produced it.
+_Avoid_: Goal history, changelog
+
+**Platform-Security Action**:
+An authenticated, generation-fenced, single-use quarantine, retire, or retry applied to
+a Runtime Assignment for platform-security reasons, including before any Run has bound
+it. It is recorded in an append-only history.
+_Avoid_: Kill switch, admin override
+
+**Session Archive**:
+The terminal, immutable, still-integrity-verifiable state of an ended Team Session,
+carrying its end and archive times and a retention horizon.
+_Avoid_: Deleted session, backup
+
 ## Execution
 
 **Run**:

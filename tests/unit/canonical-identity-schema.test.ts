@@ -16,7 +16,7 @@ describe("canonical identity schema", () => {
   it("creates the versioned User and authentication identity authority", () => {
     database = openTeamSessionDatabase({ filename: ":memory:" });
 
-    expect(database.db.pragma("user_version", { simple: true })).toBe(16);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(17);
     expect(
       database.db
         .prepare(
@@ -309,6 +309,13 @@ describe("canonical identity schema", () => {
         DROP TABLE auth_identities;
         DROP TABLE users;
         DROP TABLE identity_migrations;
+        DROP TRIGGER IF EXISTS session_events_hash_chain_insert;
+        DROP TRIGGER IF EXISTS session_events_append_only_update;
+        DROP TRIGGER IF EXISTS session_events_append_only_delete;
+        DROP TABLE IF EXISTS session_platform_security_actions;
+        DROP TABLE IF EXISTS evidence_review_history;
+        DROP TABLE IF EXISTS goal_version_lineage;
+        DROP TABLE IF EXISTS session_event_checkpoints;
         DROP TABLE IF EXISTS yolo_challenges;
         DROP TABLE IF EXISTS circuit_breaker_state;
         DROP TABLE IF EXISTS limit_settlements;
@@ -323,7 +330,7 @@ describe("canonical identity schema", () => {
 
       database = openTeamSessionDatabase({ filename });
 
-      expect(database.db.pragma("user_version", { simple: true })).toBe(16);
+      expect(database.db.pragma("user_version", { simple: true })).toBe(17);
       expect(database.db.prepare("SELECT id, name FROM teams").all()).toEqual([
         { id: "team-1", name: "Team" },
       ]);
@@ -404,6 +411,13 @@ describe("canonical identity schema", () => {
         DROP TABLE channel_installations;
         DROP TABLE credential_handles;
         DROP TABLE legacy_google_identity_bridges;
+        DROP TRIGGER IF EXISTS session_events_hash_chain_insert;
+        DROP TRIGGER IF EXISTS session_events_append_only_update;
+        DROP TRIGGER IF EXISTS session_events_append_only_delete;
+        DROP TABLE IF EXISTS session_platform_security_actions;
+        DROP TABLE IF EXISTS evidence_review_history;
+        DROP TABLE IF EXISTS goal_version_lineage;
+        DROP TABLE IF EXISTS session_event_checkpoints;
         DROP TABLE IF EXISTS yolo_challenges;
         DROP TABLE IF EXISTS circuit_breaker_state;
         DROP TABLE IF EXISTS limit_settlements;
@@ -418,7 +432,7 @@ describe("canonical identity schema", () => {
 
       database = openTeamSessionDatabase({ filename });
 
-      expect(database.db.pragma("user_version", { simple: true })).toBe(16);
+      expect(database.db.pragma("user_version", { simple: true })).toBe(17);
       expect(database.db.prepare("SELECT * FROM legacy_google_identity_bridges").all()).toEqual([
         {
           google_subject: "compatible-subject",
@@ -466,6 +480,13 @@ describe("canonical identity schema", () => {
         DROP TABLE channel_installations;
         DROP TABLE credential_handles;
         DROP TABLE legacy_google_identity_bridges;
+        DROP TRIGGER IF EXISTS session_events_hash_chain_insert;
+        DROP TRIGGER IF EXISTS session_events_append_only_update;
+        DROP TRIGGER IF EXISTS session_events_append_only_delete;
+        DROP TABLE IF EXISTS session_platform_security_actions;
+        DROP TABLE IF EXISTS evidence_review_history;
+        DROP TABLE IF EXISTS goal_version_lineage;
+        DROP TABLE IF EXISTS session_event_checkpoints;
         DROP TABLE IF EXISTS yolo_challenges;
         DROP TABLE IF EXISTS circuit_breaker_state;
         DROP TABLE IF EXISTS limit_settlements;

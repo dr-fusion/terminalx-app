@@ -131,13 +131,36 @@ YOLO consumption through this exact machinery at real receipt volume.
 
 Close release Gates 7 and 8.
 
-- Add platform-security quarantine/retire/retry before a Run exists.
-- Add version-fenced `session.end`, runtime retirement, cancellation, archive, and retention.
-- Persist monotonic Runtime cursors and reject conflicting replay.
-- Make Session events and evidence append-only, hash-chained, signed, attributable, and externally
-  retainable.
-- Add immutable evidence-review history and Goal version lineage.
-- Test end/stop/ensure/resume/handoff/approval races and crash recovery.
+Status: **mechanism + hermetic evidence complete; real crash/restart at
+hosted-runtime volume pending Phase 12.** The mechanisms and their verification
+run against the real modules and the real SQLite database. The scope and key
+management are recorded in
+[ADR 0007](../adr/0007-event-hash-chain-signed-checkpoints-and-recovery-lifecycle.md).
+
+- Make Session events append-only, hash-chained, signed, attributable, and
+  externally retainable — done: the `session_events` hash chain (v17, fixed
+  domain-separated genesis, deterministic migration backfill, append-only +
+  chain-insert triggers), Ed25519-signed `session_event_checkpoints`, and the
+  self-verifying `exportSessionEventChain`/`verifyExportedSessionEventChain`
+  bundle.
+- Add immutable evidence-review history and Goal version lineage — done:
+  append-only `evidence_review_history` and `goal_version_lineage`,
+  trigger-enforced.
+- Add platform-security quarantine/retire/retry before a Run exists — done:
+  `session.platform-security.act`, generation-fenced, idempotent by single-use
+  key, and recorded in the append-only `session_platform_security_actions`.
+- Add version-fenced `session.end`, runtime retirement, cancellation, archive,
+  and retention — done: `session.end` retires the assignment and archives the
+  session with a retention horizon under an exact access-revision fence; racing
+  end/stop/resume/handoff resolve to one terminal state.
+- Persist monotonic Runtime cursors and reject conflicting replay — the durable
+  `runtime_receipt_follow_streams` cursor chain (monotonic `receipt_sequence` +
+  signed observation chain, no gap/fork/duplicate/regression) landed in Phase 6
+  and is reused unchanged.
+
+Gates 7/8 CLOSE when Phase 12's real hosted Daytona Runtime drives the terminal
+lifecycle, platform-security actions, and cursor replay through this exact
+machinery across a real crash/restart at real receipt volume.
 
 ### Phase 11 — Production product and operations
 
@@ -175,8 +198,8 @@ Complete the externally usable application around the closed gates.
 | 4. Approval provenance      | 9             | Mechanism + hermetic evidence complete; real-runtime evidence pending Phase 12 |
 | 5. Authoritative limits     | 9             | Mechanism + hermetic evidence complete; real-runtime evidence pending Phase 12 |
 | 6. YOLO challenge           | 9             | Mechanism complete and unexposed; real-runtime evidence pending Phase 12       |
-| 7. Emergency recovery       | 10            | Partial foundation; open                                                       |
-| 8. Event/evidence integrity | 10            | Open                                                                           |
+| 7. Emergency recovery       | 10            | Mechanism + hermetic evidence complete; real crash/restart pending Phase 12    |
+| 8. Event/evidence integrity | 10            | Mechanism + hermetic evidence complete; real-runtime evidence pending Phase 12 |
 
 External-pilot readiness additionally requires Phase 11 operations and Phase 12 release evidence.
 No development adapter, warning, feature flag, or manual operating procedure can substitute for a

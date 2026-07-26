@@ -1,5 +1,10 @@
 import type * as Phase4Contracts from "./contracts";
 import type { RuntimeBinding } from "./contracts";
+import type {
+  ChainVerificationResult,
+  SessionEventChainExport,
+  SessionEventCheckpointProof,
+} from "./session-event-chain";
 
 export const TEAM_SESSION_SCHEMA_VERSION = 1 as const;
 
@@ -215,6 +220,25 @@ export type SessionCommand =
       sessionId: string;
       handoffId: string;
       expectedHandoffVersion: number;
+    })
+  | (CommandBase & {
+      type: "session.end";
+      sessionId: string;
+      expectedAccessRevision: number;
+      reason: string;
+      /** Retention horizon in ms from now; omitted means unlimited retention. */
+      retentionMs?: number;
+    })
+  | (CommandBase & {
+      type: "session.platform-security.act";
+      sessionId: string;
+      runtimeAssignmentId: string;
+      action: "quarantine" | "retire" | "retry";
+      reason: string;
+      /** Fence: the runtime authorization generation the caller observed. */
+      observedRuntimeAuthorizationGeneration: number;
+      /** Single-use audit/idempotency key for this platform-security action. */
+      idempotencyKey: string;
     })
   | (CommandBase & {
       type: "comment.add";
@@ -1141,6 +1165,14 @@ export interface TeamSessions {
       sandboxGeneration: number;
     };
   }): boolean;
+  /** Recompute and verify a Team Session's append-only event hash chain. */
+  verifySessionEventChain(sessionId: string): ChainVerificationResult;
+  /** Emit a signed checkpoint over the chain head; fails closed without a signing key. */
+  emitSessionEventCheckpoint(sessionId: string, nowMs?: number): SessionEventCheckpointProof;
+  /** Read the stored signed checkpoints for a Team Session in head order. */
+  readSessionEventCheckpoints(sessionId: string): SessionEventCheckpointProof[];
+  /** Export the ordered event chain + signed checkpoints as externally-retainable evidence. */
+  exportSessionEventChain(sessionId: string): SessionEventChainExport;
   close(): void;
 }
 

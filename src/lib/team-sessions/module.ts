@@ -53,6 +53,19 @@ import {
 } from "./sqlite-runtime-write-state-source";
 import { createLimitLedgerStore, type LimitLedgerStore } from "./sqlite-limit-ledger-store";
 import {
+  digestSessionEvent,
+  previousChainHash,
+  SESSION_EVENT_CHAIN_SCHEMA,
+  type SessionEventChainExport,
+  type SessionEventCheckpointProof,
+  type ChainVerificationResult,
+} from "./session-event-chain";
+import {
+  createSessionEventChainStore,
+  SessionEventChainStoreError,
+  type SessionEventChainStore,
+} from "./sqlite-session-event-chain-store";
+import {
   assertValidRunPolicyCommit,
   isRunPolicyWidening,
   validateInitialGoals,
@@ -166,6 +179,17 @@ export interface CreateTeamSessionsOptions {
   runtimeCompensationPolicySource?: RuntimeCompensationPolicySource;
   /** Synchronously authenticates every containment-enforcer acknowledgement. */
   runtimeCompensationEnforcementProofVerifier?: SynchronousRuntimeCompensationEnforcementProofVerifier;
+  /**
+   * Dedicated Ed25519 session-event-checkpoint signing key (see
+   * `session-event-chain.ts` key management). When configured, `session.end`
+   * emits a signed checkpoint over the chain head and `emitSessionEventCheckpoint`
+   * becomes available; when absent, the hash chain is still maintained but
+   * checkpoint signing fails closed.
+   */
+  sessionEventCheckpointSigningKey?: crypto.KeyObject;
+  sessionEventCheckpointSigningKeyId?: string;
+  /** Trusted verification keys by key id for authenticating stored checkpoints. */
+  sessionEventCheckpointVerificationKeys?: ReadonlyMap<string, crypto.KeyObject>;
 }
 
 export interface HostedRuntimeObservationProvisioningRequest {
@@ -370,6 +394,7 @@ class SqliteTeamSessions implements TeamSessions {
   private readonly runtimeLifecycleCommandTtlMs: number;
   private readonly runtimeWriteStateSnapshotSource: RuntimeWriteStateSnapshotSource;
   private readonly limitLedger: LimitLedgerStore;
+  private readonly sessionEventChain: SessionEventChainStore;
   private readonly runtimeLifecycle: SqliteRuntimeLifecycleJournal;
   private readonly runtimeReceiptFollow: SqliteRuntimeReceiptFollowJournal;
   private readonly runtimeCompensation?: SqliteRuntimeCompensationJournal;
@@ -467,6 +492,17 @@ class SqliteTeamSessions implements TeamSessions {
       db: this.db,
     });
     this.limitLedger = createLimitLedgerStore(this.db);
+    this.sessionEventChain = createSessionEventChainStore(this.db, {
+      ...(options.sessionEventCheckpointSigningKey === undefined
+        ? {}
+        : { signingKey: options.sessionEventCheckpointSigningKey }),
+      ...(options.sessionEventCheckpointSigningKeyId === undefined
+        ? {}
+        : { signingKeyId: options.sessionEventCheckpointSigningKeyId }),
+      ...(options.sessionEventCheckpointVerificationKeys === undefined
+        ? {}
+        : { verificationKeys: options.sessionEventCheckpointVerificationKeys }),
+    });
     this.hostedAssignmentPlanSource = Object.freeze({
       resolve: (lookup: HostedAssignmentLookup) => this.resolveHostedAssignmentPlan(lookup),
       isCurrent: (lookup: HostedAssignmentLookup) => this.isHostedAssignmentLookupCurrent(lookup),
@@ -1046,6 +1082,26 @@ class SqliteTeamSessions implements TeamSessions {
     return false;
   }
 
+  verifySessionEventChain(sessionId: string): ChainVerificationResult {
+    return this.sessionEventChain.verifyChain(sessionId);
+  }
+
+  emitSessionEventCheckpoint(sessionId: string, nowMs?: number): SessionEventCheckpointProof {
+    return this.sessionEventChain.emitCheckpoint({
+      sessionId,
+      checkpointId: this.nextId("checkpoint"),
+      nowMs: nowMs ?? this.clock(),
+    });
+  }
+
+  readSessionEventCheckpoints(sessionId: string): SessionEventCheckpointProof[] {
+    return this.sessionEventChain.readCheckpoints(sessionId);
+  }
+
+  exportSessionEventChain(sessionId: string): SessionEventChainExport {
+    return this.sessionEventChain.exportChain(sessionId);
+  }
+
   close(): void {
     if (this.closed) return;
     this.closed = true;
@@ -1100,6 +1156,10 @@ class SqliteTeamSessions implements TeamSessions {
         return this.acceptHandoff(command, now);
       case "session.handoff.cancel":
         return this.cancelHandoff(command, now);
+      case "session.end":
+        return this.endSession(command, now);
+      case "session.platform-security.act":
+        return this.actSessionPlatformSecurity(command, now);
       case "comment.add":
         return this.addComment(command, now);
       case "suggestion.add":
@@ -5004,6 +5064,22 @@ class SqliteTeamSessions implements TeamSessions {
         disposition: command.disposition,
       });
     }
+    // Immutable evidence-review history: who reviewed exactly which evidence, at
+    // which Goal version, with what disposition. Keyed by the reviewed version so
+    // a given (Goal, version) review is recorded exactly once.
+    this.recordEvidenceReviewHistory({
+      sessionId: command.sessionId,
+      agentRunId: command.agentRunId,
+      goalSetId: current.goalSetId,
+      goalSetRevision: current.revision,
+      goalId: command.goalId,
+      goalVersion: command.expectedGoalVersion,
+      disposition: command.disposition,
+      evidenceDigests: evidence.map((row) => row.evidence_digest as string),
+      reviewer: command.actor,
+      directiveId: directive?.payload.directiveId as string | undefined,
+      now,
+    });
     return this.commitGoalSetMutation(command, run, current, goals, now, directive, {
       change: "goal-evidence-reviewed",
       goalId: command.goalId,
@@ -6135,6 +6211,8 @@ class SqliteTeamSessions implements TeamSessions {
       case "goal.reorder":
       case "goal.evidence.review":
       case "run.final-review.resolve":
+      case "session.end":
+      case "session.platform-security.act":
         return this.hasSessionAccess(command.sessionId, actorUserId);
       case "runtime.outbox.acknowledge":
       case "runtime.outbox.fail":
@@ -6155,6 +6233,395 @@ class SqliteTeamSessions implements TeamSessions {
         this.hasSessionAccess(event.sessionId, actor.userId)
       ),
     };
+  }
+
+  /**
+   * Gate 7 — version-fenced terminal lifecycle. A Supervisor ends the Team
+   * Session under an exact access-revision fence: outstanding Runtime work must
+   * already be resolved (so end cannot race a live dispatch to a torn state),
+   * the current Runtime Assignment is retired, and the session becomes an
+   * immutable, still-integrity-verifiable archive with a retention horizon. A
+   * signed checkpoint over the final chain head is emitted when a checkpoint
+   * signing key is configured. Once ended, every other steering/lifecycle
+   * command fails closed, so racing end/stop/resume/handoff/approval resolve to
+   * one consistent terminal state.
+   */
+  private endSession(
+    command: Extract<SessionCommand, { type: "session.end" }>,
+    now: number
+  ): CommandResult {
+    const session = this.requireSession(command.sessionId);
+    if (
+      !this.hasSessionAccess(command.sessionId, command.actor.userId) ||
+      !this.hasResponsibility(command.sessionId, command.actor.userId, "supervisor")
+    ) {
+      deny();
+    }
+    assertExpectedRevision(
+      session.access_revision as number,
+      command.expectedAccessRevision,
+      "Session access"
+    );
+    if (session.status === "ended") {
+      throw new TeamSessionError("conflict", "Team Session is already ended");
+    }
+    const reason = requiredText(command.reason, "Team Session end reason", 300);
+    let retentionExpiresAtMs: number | null = null;
+    if (command.retentionMs !== undefined) {
+      if (!Number.isSafeInteger(command.retentionMs) || command.retentionMs < 0) {
+        throw new TeamSessionError("invalid-command", "Retention window is invalid");
+      }
+      retentionExpiresAtMs = now + command.retentionMs;
+      if (!Number.isSafeInteger(retentionExpiresAtMs)) {
+        throw new TeamSessionError("invalid-command", "Retention window is invalid");
+      }
+    }
+    const activeRun = this.db
+      .prepare(
+        `SELECT id FROM agent_runs
+         WHERE session_id = ?
+           AND lifecycle IN ('starting', 'active', 'pausing', 'paused', 'agent-work-finished')
+         LIMIT 1`
+      )
+      .get(command.sessionId);
+    if (activeRun) {
+      throw new TeamSessionError(
+        "conflict",
+        "Stop or complete every Run before ending the Team Session"
+      );
+    }
+    const pendingRuntimeWork = this.db
+      .prepare(
+        `SELECT id FROM runtime_outbox
+         WHERE session_id = ? AND status IN ('pending', 'processing') LIMIT 1`
+      )
+      .get(command.sessionId);
+    if (pendingRuntimeWork) {
+      throw new TeamSessionError(
+        "conflict",
+        "Resolve outstanding Runtime work before ending the Team Session"
+      );
+    }
+    const assignment = this.db
+      .prepare(
+        `SELECT id, status FROM runtime_assignments
+         WHERE session_id = ?
+           AND status IN ('provisioning', 'ready', 'checkpointing', 'recovering', 'quarantined')
+         ORDER BY generation DESC LIMIT 1`
+      )
+      .get(command.sessionId) as SqlRow | undefined;
+    if (assignment) {
+      const retired = this.db
+        .prepare(
+          `UPDATE runtime_assignments SET status = 'retired', retired_at_ms = ?
+           WHERE id = ? AND session_id = ? AND status = ?`
+        )
+        .run(now, assignment.id, command.sessionId, assignment.status);
+      if (retired.changes !== 1) {
+        throw new TeamSessionError(
+          "conflict",
+          "Runtime Assignment changed while ending the Team Session"
+        );
+      }
+    }
+    const terminated = this.db
+      .prepare(
+        `UPDATE sessions
+         SET status = 'ended', access_revision = access_revision + 1,
+             ended_at_ms = ?, archived_at_ms = ?, retention_expires_at_ms = ?, terminal_reason = ?
+         WHERE id = ? AND access_revision = ? AND status <> 'ended'`
+      )
+      .run(
+        now,
+        now,
+        retentionExpiresAtMs,
+        reason,
+        command.sessionId,
+        session.access_revision as number
+      );
+    if (terminated.changes !== 1) {
+      throw new TeamSessionError("stale-revision", "Team Session changed; refresh and retry");
+    }
+    const event = this.appendEvent(command.sessionId, command, now, "session.ended", {
+      sessionId: command.sessionId,
+      reason,
+      accessRevision: (session.access_revision as number) + 1,
+      endedAtMs: now,
+      archivedAtMs: now,
+      retentionExpiresAtMs,
+      retiredRuntimeAssignmentId: assignment?.id ?? null,
+    });
+    // Attest the final chain head. The checkpoint is signed when a key is
+    // configured; otherwise the chain remains verifiable and the head is still
+    // recorded in the event payload for external retention.
+    let checkpoint: SessionEventCheckpointProof | undefined;
+    try {
+      checkpoint = this.sessionEventChain.emitCheckpoint({
+        sessionId: command.sessionId,
+        checkpointId: this.nextId("checkpoint"),
+        nowMs: now,
+      });
+    } catch (error) {
+      if (!(error instanceof SessionEventChainStoreError) || error.code !== "signing-unavailable") {
+        throw error;
+      }
+    }
+    return result(
+      command,
+      {
+        sessionId: command.sessionId,
+        status: "ended",
+        endedAtMs: now,
+        retentionExpiresAtMs,
+        headSequence: event.sequence,
+        checkpointSigned: checkpoint !== undefined,
+        checkpointHeadHash: checkpoint?.payload.headHash,
+      },
+      [event]
+    );
+  }
+
+  /**
+   * Gate 7 — platform-security quarantine / retire / retry BEFORE a Run exists.
+   * Contains, retires, or re-provisions a Runtime Assignment for platform-security
+   * reasons even when no Run has bound it. Every action is version/generation
+   * fenced against the observed runtime authorization generation, idempotent by a
+   * single-use key (a replay returns the recorded outcome), and recorded in the
+   * append-only platform-security action history.
+   */
+  private actSessionPlatformSecurity(
+    command: Extract<SessionCommand, { type: "session.platform-security.act" }>,
+    now: number
+  ): CommandResult {
+    const session = this.requireSession(command.sessionId);
+    if (
+      !this.hasSessionAccess(command.sessionId, command.actor.userId) ||
+      !this.hasResponsibility(command.sessionId, command.actor.userId, "supervisor")
+    ) {
+      deny();
+    }
+    if (session.status === "ended") {
+      throw new TeamSessionError("conflict", "Team Session is already ended");
+    }
+    const reason = requiredText(command.reason, "Platform-security reason", 300);
+    const idempotencyKey = requiredText(command.idempotencyKey, "Platform-security key", 500);
+    const prior = this.db
+      .prepare(
+        `SELECT action, resulting_runtime_authorization_generation AS gen,
+                assignment_status_after AS status_after
+         FROM session_platform_security_actions
+         WHERE session_id = ? AND idempotency_key = ?`
+      )
+      .get(command.sessionId, idempotencyKey) as SqlRow | undefined;
+    if (prior) {
+      if (prior.action !== command.action) {
+        throw new TeamSessionError(
+          "idempotency-conflict",
+          "Platform-security key already recorded a different action"
+        );
+      }
+      return result(
+        command,
+        {
+          sessionId: command.sessionId,
+          action: command.action,
+          idempotent: true,
+          runtimeAuthorizationGeneration: prior.gen as number,
+          assignmentStatus: prior.status_after as string,
+        },
+        []
+      );
+    }
+    const observed = session.runtime_authorization_generation as number;
+    assertExpectedVersion(
+      observed,
+      command.observedRuntimeAuthorizationGeneration,
+      "Runtime authorization generation"
+    );
+    const assignment = this.requireRuntimeAssignment(command.runtimeAssignmentId);
+    if (assignment.session_id !== command.sessionId) {
+      throw new TeamSessionError("conflict", "Runtime Assignment does not belong to this session");
+    }
+    const statusBefore = assignment.status as string;
+    let statusAfter = statusBefore;
+    let resultingGeneration = observed;
+    let replacementAssignmentId: string | null = null;
+
+    if (command.action === "quarantine") {
+      if (!["provisioning", "ready", "checkpointing", "recovering"].includes(statusBefore)) {
+        throw new TeamSessionError(
+          "conflict",
+          `Runtime Assignment cannot be quarantined from ${statusBefore}`
+        );
+      }
+      const quarantined = this.db
+        .prepare(
+          `UPDATE runtime_assignments SET status = 'quarantined'
+           WHERE id = ? AND session_id = ? AND status = ?`
+        )
+        .run(assignment.id, command.sessionId, statusBefore);
+      if (quarantined.changes !== 1) {
+        throw new TeamSessionError("conflict", "Runtime Assignment changed during quarantine");
+      }
+      statusAfter = "quarantined";
+      resultingGeneration = observed + 1;
+      this.setRuntimeAuthorizationForPlatformSecurity(
+        command.sessionId,
+        observed,
+        resultingGeneration,
+        "quarantined"
+      );
+    } else if (command.action === "retire") {
+      const retired = this.db
+        .prepare(
+          `UPDATE runtime_assignments SET status = 'retired', retired_at_ms = ?
+           WHERE id = ? AND session_id = ? AND status = ?`
+        )
+        .run(now, assignment.id, command.sessionId, statusBefore);
+      if (retired.changes !== 1) {
+        throw new TeamSessionError("conflict", "Runtime Assignment changed during retirement");
+      }
+      statusAfter = "retired";
+    } else {
+      // retry: retire the contained assignment and provision a fresh replacement
+      // under an advanced authorization generation.
+      if (statusBefore !== "quarantined" && statusBefore !== "retired") {
+        throw new TeamSessionError(
+          "conflict",
+          `Runtime Assignment cannot be retried from ${statusBefore}`
+        );
+      }
+      if (statusBefore === "quarantined") {
+        this.db
+          .prepare(
+            `UPDATE runtime_assignments SET status = 'retired', retired_at_ms = ?
+             WHERE id = ? AND session_id = ? AND status = 'quarantined'`
+          )
+          .run(now, assignment.id, command.sessionId);
+      }
+      resultingGeneration = observed + 1;
+      replacementAssignmentId = this.provisionReplacementRuntimeAssignment(
+        session,
+        assignment,
+        resultingGeneration,
+        now
+      );
+      statusAfter = "provisioning";
+      // A re-provisioned binding awaits enforcement; it becomes 'enforced' only
+      // once the normal ensure/fence flow completes, never on the bump itself.
+      this.setRuntimeAuthorizationForPlatformSecurity(
+        command.sessionId,
+        observed,
+        resultingGeneration,
+        "pending"
+      );
+    }
+
+    this.db
+      .prepare(
+        `INSERT INTO session_platform_security_actions (
+           id, session_id, runtime_assignment_id, action, idempotency_key, reason,
+           observed_runtime_authorization_generation, resulting_runtime_authorization_generation,
+           assignment_status_before, assignment_status_after, actor_kind, actor_ref, created_at_ms
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        this.nextId("platform-security"),
+        command.sessionId,
+        command.runtimeAssignmentId,
+        command.action,
+        idempotencyKey,
+        reason,
+        observed,
+        resultingGeneration,
+        statusBefore,
+        statusAfter,
+        command.actor.kind,
+        command.actor.userId,
+        now
+      );
+    const event = this.appendEvent(
+      command.sessionId,
+      command,
+      now,
+      `session.platform-security.${command.action}`,
+      {
+        sessionId: command.sessionId,
+        runtimeAssignmentId: command.runtimeAssignmentId,
+        action: command.action,
+        reason,
+        observedRuntimeAuthorizationGeneration: observed,
+        runtimeAuthorizationGeneration: resultingGeneration,
+        assignmentStatusBefore: statusBefore,
+        assignmentStatusAfter: statusAfter,
+        replacementAssignmentId,
+      }
+    );
+    return result(
+      command,
+      {
+        sessionId: command.sessionId,
+        action: command.action,
+        idempotent: false,
+        runtimeAuthorizationGeneration: resultingGeneration,
+        assignmentStatus: statusAfter,
+        replacementAssignmentId,
+      },
+      [event]
+    );
+  }
+
+  private setRuntimeAuthorizationForPlatformSecurity(
+    sessionId: string,
+    expectedGeneration: number,
+    nextGeneration: number,
+    state: "pending" | "enforced" | "quarantined"
+  ): void {
+    const updated = this.db
+      .prepare(
+        `UPDATE sessions
+         SET runtime_authorization_generation = ?, runtime_authorization_state = ?
+         WHERE id = ? AND runtime_authorization_generation = ?`
+      )
+      .run(nextGeneration, state, sessionId, expectedGeneration);
+    if (updated.changes !== 1) {
+      throw new TeamSessionError("conflict", "Runtime authorization generation changed");
+    }
+  }
+
+  private provisionReplacementRuntimeAssignment(
+    session: SqlRow,
+    previous: SqlRow,
+    runtimeAuthorizationGeneration: number,
+    now: number
+  ): string {
+    const assignmentId = this.nextId("runtime-assignment");
+    const sandboxId = this.nextId("sandbox");
+    const runtimePrincipalId = this.nextId("runtime-principal");
+    const generation = (previous.generation as number) + 1;
+    // The replacement is provisioning and awaits the normal enforcement flow; no
+    // authorization epoch is recorded until the binding is actually enforced.
+    this.db
+      .prepare(
+        `INSERT INTO runtime_assignments
+           (id, session_id, team_id, project_id, generation, runtime_kind,
+            sandbox_id, sandbox_generation, runtime_principal_id,
+            runtime_authorization_generation, status, created_at_ms, retired_at_ms)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 'provisioning', ?, NULL)`
+      )
+      .run(
+        assignmentId,
+        session.id,
+        session.team_id,
+        session.project_id,
+        generation,
+        session.runtime_kind,
+        sandboxId,
+        runtimePrincipalId,
+        runtimeAuthorizationGeneration,
+        now
+      );
+    return assignmentId;
   }
 
   private appendEvent(
@@ -6186,13 +6653,37 @@ class SqliteTeamSessions implements TeamSessions {
       source: { ...command.idempotency },
       payload,
     };
+    // Bind this event into the append-only hash chain. `prev_hash` links to the
+    // predecessor's hash (or the fixed genesis root for the first event) and the
+    // hash commits to the exact, attributable content, so any tamper, gap, or
+    // reorder is detectable by recomputing the chain. Hashing the JSON-round-
+    // tripped payload guarantees the live hash matches the migration backfill.
+    const payloadJson = JSON.stringify(event.payload);
+    const priorRow =
+      sequence === 1
+        ? undefined
+        : (this.db
+            .prepare(`SELECT hash FROM session_events WHERE session_id = ? AND sequence = ?`)
+            .get(sessionId, sequence - 1) as { hash: string } | undefined);
+    const prevHash = previousChainHash(sequence, priorRow?.hash ?? null);
+    const hash = digestSessionEvent({
+      schema: SESSION_EVENT_CHAIN_SCHEMA,
+      sessionId: event.sessionId,
+      sequence: event.sequence,
+      type: event.type,
+      occurredAtMs: event.occurredAtMs,
+      actor: event.actor,
+      source: event.source,
+      payload: JSON.parse(payloadJson),
+      prevHash,
+    });
     this.db
       .prepare(
         `INSERT INTO session_events (
            session_id, sequence, event_id, type, occurred_at_ms,
            actor_kind, actor_user_id, actor_display_name,
-           source_scope, source_key, payload_json
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+           source_scope, source_key, payload_json, prev_hash, hash
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         event.sessionId,
@@ -6205,7 +6696,9 @@ class SqliteTeamSessions implements TeamSessions {
         event.actor.displayName,
         event.source.scope,
         event.source.key,
-        JSON.stringify(event.payload)
+        payloadJson,
+        prevHash,
+        hash
       );
     return event;
   }
@@ -8381,6 +8874,25 @@ class SqliteTeamSessions implements TeamSessions {
       | undefined;
     if (!updated) throw new TeamSessionError("stale-revision", "Goal Set changed concurrently");
     const runStateRevision = this.advanceRunStateRevision(command.sessionId);
+    // Immutable Goal version lineage: when a specific Goal's version advanced,
+    // record the new version, its predecessor, and the command that produced it.
+    if (typeof change.goalId === "string") {
+      const touched = goals.find((goal) => goal.goalId === change.goalId);
+      if (touched) {
+        this.recordGoalVersionLineage({
+          sessionId: command.sessionId,
+          agentRunId: command.agentRunId,
+          goalSetId: current.goalSetId,
+          goalSetRevision: revision,
+          goalId: touched.goalId,
+          version: touched.version,
+          producingCommandType: command.type,
+          changeKind: String(change.change),
+          actor: command.actor,
+          now,
+        });
+      }
+    }
     const event = this.appendEvent(command.sessionId, command, now, "goal-set.revised", {
       agentRunId: command.agentRunId,
       previousGoalSetRevision: current.revision,
@@ -8406,6 +8918,84 @@ class SqliteTeamSessions implements TeamSessions {
       },
       events
     );
+  }
+
+  private recordGoalVersionLineage(input: {
+    sessionId: string;
+    agentRunId: string;
+    goalSetId: string;
+    goalSetRevision: number;
+    goalId: string;
+    version: number;
+    producingCommandType: string;
+    changeKind: string;
+    actor: ActorContext;
+    now: number;
+  }): void {
+    this.db
+      .prepare(
+        `INSERT INTO goal_version_lineage (
+           id, session_id, agent_run_id, goal_set_id, goal_set_revision, goal_id,
+           version, previous_version, producing_command_type, change_kind,
+           actor_kind, actor_ref, created_at_ms
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        this.nextId("goal-lineage"),
+        input.sessionId,
+        input.agentRunId,
+        input.goalSetId,
+        input.goalSetRevision,
+        input.goalId,
+        input.version,
+        input.version === 1 ? null : input.version - 1,
+        input.producingCommandType,
+        input.changeKind,
+        input.actor.kind,
+        input.actor.userId,
+        input.now
+      );
+  }
+
+  private recordEvidenceReviewHistory(input: {
+    sessionId: string;
+    agentRunId: string;
+    goalSetId: string;
+    goalSetRevision: number;
+    goalId: string;
+    goalVersion: number;
+    disposition: "validate" | "request-more-work";
+    evidenceDigests: string[];
+    reviewer: ActorContext;
+    directiveId: string | undefined;
+    now: number;
+  }): void {
+    const reviewedEvidenceDigest = sha256(canonicalRuntimeJson(input.evidenceDigests));
+    this.db
+      .prepare(
+        `INSERT INTO evidence_review_history (
+           id, session_id, agent_run_id, goal_set_id, goal_set_revision, goal_id,
+           goal_version, disposition, reviewed_evidence_count, reviewed_evidence_digest,
+           reviewer_kind, reviewer_ref, directive_id, reviewed_at_ms, created_at_ms
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        this.nextId("evidence-review"),
+        input.sessionId,
+        input.agentRunId,
+        input.goalSetId,
+        input.goalSetRevision,
+        input.goalId,
+        input.goalVersion,
+        input.disposition,
+        input.evidenceDigests.length,
+        reviewedEvidenceDigest,
+        input.reviewer.kind,
+        input.reviewer.userId,
+        input.directiveId ?? null,
+        input.now,
+        input.now
+      );
   }
 
   private requestRuntimeLifecycleTransition(
@@ -9420,6 +10010,28 @@ function validateCommandPayload(command: SessionCommand): void {
       requiredIdentifier(command.sessionId, "Session id");
       requiredIdentifier(command.handoffId, "Handoff id");
       requiredVersion(command.expectedHandoffVersion, "Handoff");
+      return;
+    case "session.end":
+      requiredIdentifier(command.sessionId, "Session id");
+      requiredRevision(command.expectedAccessRevision, "Session access");
+      requiredText(command.reason, "Team Session end reason", 300);
+      if (
+        command.retentionMs !== undefined &&
+        (!Number.isSafeInteger(command.retentionMs) || command.retentionMs < 0)
+      ) {
+        throw new TeamSessionError("invalid-command", "Retention window is invalid");
+      }
+      return;
+    case "session.platform-security.act":
+      requiredIdentifier(command.sessionId, "Session id");
+      requiredIdentifier(command.runtimeAssignmentId, "Runtime Assignment id");
+      assertEnum(command.action, ["quarantine", "retire", "retry"], "Platform-security action");
+      requiredText(command.reason, "Platform-security reason", 300);
+      requiredRevision(
+        command.observedRuntimeAuthorizationGeneration,
+        "Runtime authorization generation"
+      );
+      requiredText(command.idempotencyKey, "Platform-security key", 500);
       return;
     case "comment.add":
       requiredIdentifier(command.sessionId, "Session id");

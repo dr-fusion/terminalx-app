@@ -9,6 +9,7 @@ import {
   canonicalRuntimeJson,
   digestRuntimeCommandClaims,
 } from "../runtime/runtime-command-canonical";
+import { chainedSessionEventHashes, SESSION_EVENT_CHAIN_SCHEMA } from "./session-event-chain";
 import {
   RuntimeCommandExecutionError,
   snapshotRuntimeReceiptForCommand,
@@ -1517,14 +1518,37 @@ export class SqliteRuntimeLifecycleJournal implements RuntimeLifecycleJournal {
       )
       .run(sessionId, sequence);
     if (advanced.changes !== 1) fail("journal_conflict");
+    const actorUserId = safeIdentifier(actorRef, MAX_WORKER_ID_LENGTH);
+    const boundedSourceKey = safeIdentifier(sourceKey, 1_000);
+    const payloadJson = JSON.stringify(payload);
+    const priorRow =
+      sequence === 1
+        ? undefined
+        : (this.db
+            .prepare(`SELECT hash FROM session_events WHERE session_id = ? AND sequence = ?`)
+            .get(sessionId, sequence - 1) as { hash: string } | undefined);
+    const { prevHash, hash } = chainedSessionEventHashes(priorRow?.hash ?? null, {
+      schema: SESSION_EVENT_CHAIN_SCHEMA,
+      sessionId,
+      sequence,
+      type,
+      occurredAtMs,
+      actor: {
+        kind: "system",
+        userId: actorUserId,
+        displayName: "Runtime Lifecycle Supervisor",
+      },
+      source: { scope: "runtime-lifecycle", key: boundedSourceKey },
+      payload: JSON.parse(payloadJson),
+    });
     this.db
       .prepare(
         `INSERT INTO session_events
            (session_id, sequence, event_id, type, occurred_at_ms,
             actor_kind, actor_user_id, actor_display_name,
-            source_scope, source_key, payload_json)
+            source_scope, source_key, payload_json, prev_hash, hash)
          VALUES (?, ?, ?, ?, ?, 'system', ?, 'Runtime Lifecycle Supervisor',
-                 'runtime-lifecycle', ?, ?)`
+                 'runtime-lifecycle', ?, ?, ?, ?)`
       )
       .run(
         sessionId,
@@ -1532,9 +1556,11 @@ export class SqliteRuntimeLifecycleJournal implements RuntimeLifecycleJournal {
         this.nextId(),
         type,
         occurredAtMs,
-        safeIdentifier(actorRef, MAX_WORKER_ID_LENGTH),
-        safeIdentifier(sourceKey, 1_000),
-        JSON.stringify(payload)
+        actorUserId,
+        boundedSourceKey,
+        payloadJson,
+        prevHash,
+        hash
       );
     return sequence;
   }

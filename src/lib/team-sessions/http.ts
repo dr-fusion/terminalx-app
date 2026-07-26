@@ -32,6 +32,10 @@ type HumanCommandType = Exclude<
   SessionCommand["type"],
   | "runtime.outbox.acknowledge"
   | "runtime.outbox.fail"
+  // Sensitive terminal-lifecycle and platform-security commands stay off the
+  // generic HTTP command surface (Phase 10); exposure is a Phase 11 decision.
+  | "session.end"
+  | "session.platform-security.act"
   | Extract<SessionCommand["type"], `run.${string}` | `goal.${string}`>
 >;
 

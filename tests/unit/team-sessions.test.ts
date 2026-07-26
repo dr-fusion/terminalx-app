@@ -590,6 +590,13 @@ describe("Team Session kernel", () => {
     try {
       database.exec(`
         PRAGMA foreign_keys = OFF;
+        DROP TRIGGER IF EXISTS session_events_hash_chain_insert;
+        DROP TRIGGER IF EXISTS session_events_append_only_update;
+        DROP TRIGGER IF EXISTS session_events_append_only_delete;
+        DROP TABLE session_platform_security_actions;
+        DROP TABLE evidence_review_history;
+        DROP TABLE goal_version_lineage;
+        DROP TABLE session_event_checkpoints;
         DROP TABLE yolo_challenges;
         DROP TABLE circuit_breaker_state;
         DROP TABLE limit_settlements;
@@ -2832,7 +2839,7 @@ describe("Team Session kernel", () => {
 
     const database = new Database(filename, { readonly: true });
     try {
-      expect(database.pragma("user_version", { simple: true })).toBe(16);
+      expect(database.pragma("user_version", { simple: true })).toBe(17);
       expect(database.pragma("foreign_key_check")).toEqual([]);
       expect(
         database
@@ -2907,6 +2914,10 @@ describe("Team Session kernel", () => {
         .get(SESSION_ID) as { sequence: number; payload_json: string };
       const payload = JSON.parse(second.payload_json) as Record<string, unknown>;
       payload.suggestionId = first.data.suggestionId;
+      // Simulate out-of-band, on-disk tampering (which does not run SQLite
+      // triggers) by dropping the Phase 10 append-only guard on this raw
+      // connection before planting the ambiguous legacy payload.
+      corrupt.prepare(`DROP TRIGGER session_events_append_only_update`).run();
       corrupt
         .prepare(`UPDATE session_events SET payload_json = ? WHERE session_id = ? AND sequence = ?`)
         .run(JSON.stringify(payload), SESSION_ID, second.sequence);

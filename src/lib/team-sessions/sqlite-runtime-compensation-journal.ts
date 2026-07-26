@@ -10,6 +10,7 @@ import {
   canonicalRuntimeJson,
   digestRuntimeCommandClaims,
 } from "../runtime/runtime-command-canonical";
+import { chainedSessionEventHashes, SESSION_EVENT_CHAIN_SCHEMA } from "./session-event-chain";
 import {
   RUNTIME_COMPENSATION_RECEIPT_DIGEST_DOMAIN,
   digestNonDuplicateRuntimeCompensationReceipt,
@@ -1088,15 +1089,37 @@ export class SqliteRuntimeCompensationJournal
       agentRunId: row.agent_run_id,
       enforcedSafetyFence: effective.enforcedSafetyFence,
     };
+    const compensationSourceKey = safeIdentifier(`receipt:${row.id}:${receiptDigest}`, 1_000);
+    const compensationPayloadJson = canonicalRuntimeJson(payload);
+    const compensationPriorRow =
+      sequence === 1
+        ? undefined
+        : (this.db
+            .prepare(`SELECT hash FROM session_events WHERE session_id = ? AND sequence = ?`)
+            .get(row.session_id, sequence - 1) as { hash: string } | undefined);
+    const compensationChain = chainedSessionEventHashes(compensationPriorRow?.hash ?? null, {
+      schema: SESSION_EVENT_CHAIN_SCHEMA,
+      sessionId: row.session_id as string,
+      sequence,
+      type: "run.runtime-command.compensated",
+      occurredAtMs: settlement.observedAtMs,
+      actor: {
+        kind: "system",
+        userId: settlement.actorRef,
+        displayName: "Runtime Compensation Supervisor",
+      },
+      source: { scope: "runtime-compensation", key: compensationSourceKey },
+      payload: JSON.parse(compensationPayloadJson),
+    });
     this.db
       .prepare(
         `INSERT INTO session_events (
            session_id, sequence, event_id, type, occurred_at_ms,
            actor_kind, actor_user_id, actor_display_name,
-           source_scope, source_key, payload_json
+           source_scope, source_key, payload_json, prev_hash, hash
          ) VALUES (?, ?, ?, 'run.runtime-command.compensated', ?,
            'system', ?, 'Runtime Compensation Supervisor',
-           'runtime-compensation', ?, ?)`
+           'runtime-compensation', ?, ?, ?, ?)`
       )
       .run(
         row.session_id,
@@ -1104,8 +1127,10 @@ export class SqliteRuntimeCompensationJournal
         this.nextId(),
         settlement.observedAtMs,
         settlement.actorRef,
-        safeIdentifier(`receipt:${row.id}:${receiptDigest}`, 1_000),
-        canonicalRuntimeJson(payload)
+        compensationSourceKey,
+        compensationPayloadJson,
+        compensationChain.prevHash,
+        compensationChain.hash
       );
     this.db
       .prepare(

@@ -150,7 +150,7 @@ describe("hosted Team Session Runtime", () => {
     expect(projected?.runtime).not.toHaveProperty("tmuxName");
 
     const database = new Database(filename, { readonly: true });
-    expect(database.pragma("user_version", { simple: true })).toBe(16);
+    expect(database.pragma("user_version", { simple: true })).toBe(17);
     expect(
       database
         .prepare(
@@ -380,6 +380,13 @@ describe("hosted Team Session Runtime", () => {
 
     const v8 = new Database(filename);
     v8.exec(`
+      DROP TRIGGER IF EXISTS session_events_hash_chain_insert;
+      DROP TRIGGER IF EXISTS session_events_append_only_update;
+      DROP TRIGGER IF EXISTS session_events_append_only_delete;
+      DROP TABLE IF EXISTS session_platform_security_actions;
+      DROP TABLE IF EXISTS evidence_review_history;
+      DROP TABLE IF EXISTS goal_version_lineage;
+      DROP TABLE IF EXISTS session_event_checkpoints;
       DROP TABLE IF EXISTS yolo_challenges;
       DROP TABLE IF EXISTS circuit_breaker_state;
       DROP TABLE IF EXISTS limit_settlements;
@@ -482,6 +489,13 @@ describe("hosted Team Session Runtime", () => {
       CREATE INDEX migration_probe_sessions_status ON sessions(status);
       CREATE TRIGGER migration_probe_assignment_insert
       AFTER INSERT ON runtime_assignments BEGIN SELECT 1; END;
+      DROP TRIGGER IF EXISTS session_events_hash_chain_insert;
+      DROP TRIGGER IF EXISTS session_events_append_only_update;
+      DROP TRIGGER IF EXISTS session_events_append_only_delete;
+      DROP TABLE IF EXISTS session_platform_security_actions;
+      DROP TABLE IF EXISTS evidence_review_history;
+      DROP TABLE IF EXISTS goal_version_lineage;
+      DROP TABLE IF EXISTS session_event_checkpoints;
       DROP TABLE IF EXISTS yolo_challenges;
       DROP TABLE IF EXISTS circuit_breaker_state;
       DROP TABLE IF EXISTS limit_settlements;
@@ -497,7 +511,7 @@ describe("hosted Team Session Runtime", () => {
     createTeamSessionKernel({ filename: artifactFilename }).teamSessions.close();
     const migrated = new Database(artifactFilename, { readonly: true });
     try {
-      expect(migrated.pragma("user_version", { simple: true })).toBe(16);
+      expect(migrated.pragma("user_version", { simple: true })).toBe(17);
       expect(migrated.pragma("foreign_key_check")).toEqual([]);
       expect(migrated.pragma("quick_check", { simple: true })).toBe("ok");
       expect(
@@ -542,6 +556,13 @@ describe("hosted Team Session Runtime", () => {
     poisoned.exec(`
       DROP TABLE hosted_runtime_assignment_plans;
       DROP TRIGGER runtime_outbox_immutable_update;
+      DROP TRIGGER IF EXISTS session_events_hash_chain_insert;
+      DROP TRIGGER IF EXISTS session_events_append_only_update;
+      DROP TRIGGER IF EXISTS session_events_append_only_delete;
+      DROP TABLE IF EXISTS session_platform_security_actions;
+      DROP TABLE IF EXISTS evidence_review_history;
+      DROP TABLE IF EXISTS goal_version_lineage;
+      DROP TABLE IF EXISTS session_event_checkpoints;
       DROP TABLE IF EXISTS yolo_challenges;
       DROP TABLE IF EXISTS circuit_breaker_state;
       DROP TABLE IF EXISTS limit_settlements;

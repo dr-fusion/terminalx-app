@@ -11,6 +11,7 @@ import type {
   RuntimeCompensationReceipt,
 } from "@/lib/runtime/contracts";
 import { digestRuntimeCommandClaims } from "@/lib/runtime/runtime-command-canonical";
+import { insertChainedSessionEvent } from "../helpers/session-events";
 import { digestRuntimeCompensationEnforcementSubject } from "@/lib/runtime/runtime-compensation-enforcement-proof";
 import { digestNonDuplicateRuntimeCompensationReceipt } from "@/lib/runtime/runtime-compensation-execution";
 import {
@@ -1042,25 +1043,26 @@ function seedVerifiedCompensationIncident(db: Database.Database): void {
     binding,
     reason: "human",
   });
-  db.prepare(
-    `INSERT INTO session_events (
-       session_id, sequence, event_id, type, occurred_at_ms,
-       actor_kind, actor_user_id, actor_display_name,
-       source_scope, source_key, payload_json
-     ) VALUES (?, 1, 'event:pause-requested', 'run.runtime-command.requested', 100,
-       'human', 'user-alice', 'Alice', 'vitest:runtime-command',
-       'event:pause-requested', ?)`
-  ).run(
-    SESSION_ID,
-    JSON.stringify({
+  insertChainedSessionEvent(db, {
+    sessionId: SESSION_ID,
+    sequence: 1,
+    eventId: "event:pause-requested",
+    type: "run.runtime-command.requested",
+    occurredAtMs: 100,
+    actorKind: "human",
+    actorUserId: "user-alice",
+    actorDisplayName: "Alice",
+    sourceScope: "vitest:runtime-command",
+    sourceKey: "event:pause-requested",
+    payloadJson: JSON.stringify({
       commandId: SOURCE_COMMAND_ID,
       agentRunId: "run-1",
       operation: "run.pause",
       fromRunStateVersion: 1,
       toRunStateVersion: 2,
       targetLifecycle: "paused",
-    })
-  );
+    }),
+  });
   db.prepare(`UPDATE sessions SET next_sequence = 2 WHERE id = ?`).run(SESSION_ID);
 
   db.transaction(() => {
