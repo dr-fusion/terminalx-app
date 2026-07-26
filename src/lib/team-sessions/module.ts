@@ -4,6 +4,7 @@ import { isIP } from "node:net";
 import { types as nodeTypes } from "node:util";
 import type Database from "better-sqlite3";
 import { openTeamSessionDatabase } from "./sqlite";
+import { AttentionInboxStore } from "../attention/store";
 import { isValidTmuxSessionName } from "../tmux";
 import { projectPublicSessionRunState } from "./public-run-state";
 import type {
@@ -240,6 +241,8 @@ export interface RuntimeAuthorizationSnapshotSource {
 /** Security-sensitive composition result used only by the Runtime worker root. */
 export interface TeamSessionKernel {
   readonly teamSessions: TeamSessions;
+  /** Phase 11A global attention inbox authority bound to this kernel's SQLite handle. */
+  readonly attentionInbox: AttentionInboxStore;
   /** Exact private alias consumed by the portable assignment supervisor graph. */
   readonly runtimeAssignmentKernel: TeamSessions;
   /** Private restart seam used before Runtime transports accept mutations. */
@@ -365,6 +368,7 @@ export function createTeamSessionKernel(
   const runtimeCompensationMaterializer = teamSessions.runtimeCompensationMaterializerForWorker();
   return Object.freeze({
     teamSessions,
+    attentionInbox: teamSessions.attentionInboxForKernel(),
     runtimeAssignmentKernel: teamSessions,
     runtimeWriteStateSnapshotSource: teamSessions.runtimeWriteStateSnapshotSourceForKernel(),
     runtimeLifecycleJournal: teamSessions.runtimeJournalForSupervisor(),
@@ -564,6 +568,18 @@ class SqliteTeamSessions implements TeamSessions {
 
   hostedAssignmentPlanSourceForKernel(): HostedAssignmentPlanSource {
     return this.hostedAssignmentPlanSource;
+  }
+
+  /**
+   * The Phase 11A global attention inbox authority, bound to this kernel's exact
+   * SQLite handle and clock. It is a read/cursor/escalation/delivery capability
+   * over durable kernel state; it never opens a competing database handle.
+   */
+  attentionInboxForKernel(): AttentionInboxStore {
+    return new AttentionInboxStore(this.db, {
+      clock: this.clock,
+      idGenerator: () => this.nextId("attention"),
+    });
   }
 
   runtimeCompensationJournalForSupervisor(): SqliteRuntimeCompensationJournal | undefined {
