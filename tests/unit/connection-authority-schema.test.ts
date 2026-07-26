@@ -19,7 +19,7 @@ describe("connection authority schema", () => {
   it("creates an additive v13 authority without secret-bearing columns", () => {
     database = openTeamSessionDatabase({ filename: ":memory:" });
 
-    expect(database.db.pragma("user_version", { simple: true })).toBe(16);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(17);
     const tables = [
       "credential_handles",
       "channel_installations",
@@ -70,6 +70,13 @@ describe("connection authority schema", () => {
         DROP TABLE link_challenges;
         DROP TABLE channel_installations;
         DROP TABLE credential_handles;
+        DROP TRIGGER IF EXISTS session_events_hash_chain_insert;
+        DROP TRIGGER IF EXISTS session_events_append_only_update;
+        DROP TRIGGER IF EXISTS session_events_append_only_delete;
+        DROP TABLE IF EXISTS session_platform_security_actions;
+        DROP TABLE IF EXISTS evidence_review_history;
+        DROP TABLE IF EXISTS goal_version_lineage;
+        DROP TABLE IF EXISTS session_event_checkpoints;
         DROP TABLE IF EXISTS yolo_challenges;
         DROP TABLE IF EXISTS circuit_breaker_state;
         DROP TABLE IF EXISTS limit_settlements;
@@ -88,7 +95,7 @@ describe("connection authority schema", () => {
       );
       database = openTeamSessionDatabase({ filename });
 
-      expect(database.db.pragma("user_version", { simple: true })).toBe(16);
+      expect(database.db.pragma("user_version", { simple: true })).toBe(17);
       expect(database.db.prepare("SELECT id, name FROM teams").all()).toEqual([
         { id: "team-1", name: "Team" },
       ]);
@@ -131,6 +138,13 @@ describe("connection authority schema", () => {
         DROP TABLE channel_installations;
         DROP TABLE credential_handles;
         CREATE TABLE link_challenges (injected_failure_marker TEXT) STRICT;
+        DROP TRIGGER IF EXISTS session_events_hash_chain_insert;
+        DROP TRIGGER IF EXISTS session_events_append_only_update;
+        DROP TRIGGER IF EXISTS session_events_append_only_delete;
+        DROP TABLE IF EXISTS session_platform_security_actions;
+        DROP TABLE IF EXISTS evidence_review_history;
+        DROP TABLE IF EXISTS goal_version_lineage;
+        DROP TABLE IF EXISTS session_event_checkpoints;
         DROP TABLE IF EXISTS yolo_challenges;
         DROP TABLE IF EXISTS circuit_breaker_state;
         DROP TABLE IF EXISTS limit_settlements;

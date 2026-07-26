@@ -5,6 +5,7 @@ import {
   canonicalRuntimeJson,
   digestRuntimeCommandClaims,
 } from "../runtime/runtime-command-canonical";
+import { chainedSessionEventHashes, SESSION_EVENT_CHAIN_SCHEMA } from "./session-event-chain";
 import {
   RuntimeReceiptObservationError,
   createRuntimeReceiptObservationVerifier,
@@ -1143,28 +1144,52 @@ export class SqliteRuntimeReceiptFollowJournal {
 
     if (quarantinedSession) {
       const eventSequence = positiveInteger(quarantinedSession.event_sequence);
+      const quarantineSourceKey = `enforcement-proof-containment:${command.command_digest}`;
+      const quarantinePayloadJson = JSON.stringify({
+        commandDigest: command.command_digest,
+        requiredEffectEnforcerSetDigest: command.required_effect_enforcer_set_digest,
+        runtimeAuthorizationGeneration: stream.runtime_authorization_generation,
+        safeErrorCode: safeCode,
+      });
+      const quarantinePriorRow =
+        eventSequence === 1
+          ? undefined
+          : (this.db
+              .prepare(`SELECT hash FROM session_events WHERE session_id = ? AND sequence = ?`)
+              .get(stream.session_id, eventSequence - 1) as { hash: string } | undefined);
+      const quarantineChain = chainedSessionEventHashes(quarantinePriorRow?.hash ?? null, {
+        schema: SESSION_EVENT_CHAIN_SCHEMA,
+        sessionId: stream.session_id as string,
+        sequence: eventSequence,
+        type: "session.runtime-authorization.quarantined",
+        occurredAtMs: options.receivedAtMs,
+        actor: {
+          kind: "system",
+          userId: "team-session-kernel",
+          displayName: "Team Session Kernel",
+        },
+        source: { scope: "runtime-worker:receipt-follow", key: quarantineSourceKey },
+        payload: JSON.parse(quarantinePayloadJson),
+      });
       this.db
         .prepare(
           `INSERT INTO session_events
              (session_id, sequence, event_id, type, occurred_at_ms,
               actor_kind, actor_user_id, actor_display_name,
-              source_scope, source_key, payload_json)
+              source_scope, source_key, payload_json, prev_hash, hash)
            VALUES (?, ?, ?, 'session.runtime-authorization.quarantined', ?,
                    'system', 'team-session-kernel', 'Team Session Kernel',
-                   'runtime-worker:receipt-follow', ?, ?)`
+                   'runtime-worker:receipt-follow', ?, ?, ?, ?)`
         )
         .run(
           stream.session_id,
           eventSequence,
           this.nextId(),
           options.receivedAtMs,
-          `enforcement-proof-containment:${command.command_digest}`,
-          JSON.stringify({
-            commandDigest: command.command_digest,
-            requiredEffectEnforcerSetDigest: command.required_effect_enforcer_set_digest,
-            runtimeAuthorizationGeneration: stream.runtime_authorization_generation,
-            safeErrorCode: safeCode,
-          })
+          quarantineSourceKey,
+          quarantinePayloadJson,
+          quarantineChain.prevHash,
+          quarantineChain.hash
         );
     }
 

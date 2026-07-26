@@ -10,6 +10,7 @@ import {
 } from "@/lib/team-sessions";
 import { openTeamSessionDatabase, type TeamSessionDatabase } from "@/lib/team-sessions/sqlite";
 import { createSqliteRuntimeLifecycleJournal } from "@/lib/team-sessions/sqlite-runtime-lifecycle-journal";
+import { insertChainedSessionEvent } from "../helpers/session-events";
 
 const TEAM_ID = "11111111-1111-4111-8111-111111111111";
 const PROJECT_ID = "22222222-2222-4222-8222-222222222222";
@@ -42,7 +43,7 @@ describe("Team Session Agent Run schema", () => {
   it("initializes Runtime records and the canonical identity authority at schema v12", () => {
     database = openTeamSessionDatabase({ filename });
 
-    expect(database.db.pragma("user_version", { simple: true })).toBe(16);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(17);
     const tables = database.db
       .prepare(
         `SELECT name FROM sqlite_schema
@@ -145,7 +146,7 @@ describe("Team Session Agent Run schema", () => {
 
     database = openTeamSessionDatabase({ filename });
 
-    expect(database.db.pragma("user_version", { simple: true })).toBe(16);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(17);
     expect(
       database.db
         .prepare(`SELECT name FROM sqlite_schema WHERE type = 'table' AND name = 'agent_runs'`)
@@ -180,7 +181,7 @@ describe("Team Session Agent Run schema", () => {
           peerAdvanceStarted = true;
           const peer = openTeamSessionDatabase({ filename });
           try {
-            expect(peer.db.pragma("user_version", { simple: true })).toBe(16);
+            expect(peer.db.pragma("user_version", { simple: true })).toBe(17);
             peerAdvanced = true;
           } finally {
             peer.close();
@@ -197,7 +198,7 @@ describe("Team Session Agent Run schema", () => {
 
     expect(peerAdvanceStarted).toBe(true);
     expect(peerAdvanced).toBe(true);
-    expect(database.db.pragma("user_version", { simple: true })).toBe(16);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(17);
     expect(database.db.pragma("foreign_key_check")).toEqual([]);
     expect(database.db.pragma("quick_check", { simple: true })).toBe("ok");
   });
@@ -216,7 +217,7 @@ describe("Team Session Agent Run schema", () => {
           if (versionReads === 2) {
             const peer = openTeamSessionDatabase({ filename });
             try {
-              expect(peer.db.pragma("user_version", { simple: true })).toBe(16);
+              expect(peer.db.pragma("user_version", { simple: true })).toBe(17);
               peerAdvanced = true;
             } finally {
               peer.close();
@@ -233,7 +234,7 @@ describe("Team Session Agent Run schema", () => {
     }
 
     expect(peerAdvanced).toBe(true);
-    expect(database.db.pragma("user_version", { simple: true })).toBe(16);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(17);
     expect(database.db.pragma("foreign_key_check")).toEqual([]);
   });
 
@@ -288,7 +289,7 @@ describe("Team Session Agent Run schema", () => {
 
     database = openTeamSessionDatabase({ filename });
 
-    expect(database.db.pragma("user_version", { simple: true })).toBe(16);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(17);
     expect(
       database.db
         .prepare(
@@ -700,17 +701,19 @@ describe("Team Session Agent Run schema", () => {
     database = openTeamSessionDatabase({ filename });
     seedSessionAndAssignment(database.db, { runtimeAuthorizationState: "pending" });
     const duplicateSourceJson = `{"sessionId":"${SESSION_ID}","runtimeKind":"local-tmux","runtimeAuthorizationGeneration":1,"runtimeAuthorizationGeneration":1}`;
-    database.db
-      .prepare(
-        `INSERT INTO session_events
-           (session_id, sequence, event_id, type, occurred_at_ms,
-            actor_kind, actor_user_id, actor_display_name,
-            source_scope, source_key, payload_json)
-         VALUES (?, 1, 'event:fresh-duplicate-source', 'session.started', 100,
-                 'system', 'source-fixture', 'Source Fixture',
-                 'vitest:source-fixture', 'fresh-duplicate-source', ?)`
-      )
-      .run(SESSION_ID, duplicateSourceJson);
+    insertChainedSessionEvent(database.db, {
+      sessionId: SESSION_ID,
+      sequence: 1,
+      eventId: "event:fresh-duplicate-source",
+      type: "session.started",
+      occurredAtMs: 100,
+      actorKind: "system",
+      actorUserId: "source-fixture",
+      actorDisplayName: "Source Fixture",
+      sourceScope: "vitest:source-fixture",
+      sourceKey: "fresh-duplicate-source",
+      payloadJson: duplicateSourceJson,
+    });
     const payloadJson = JSON.stringify({
       sessionId: SESSION_ID,
       runtimeKind: "local-tmux",
@@ -886,7 +889,7 @@ describe("Team Session Agent Run schema", () => {
            WHERE session_id = ? AND sequence = 1`
         )
         .run(SESSION_ID)
-    ).toThrow(/Runtime outbox source events are immutable/);
+    ).toThrow(/Session events are append-only/);
     expect(() =>
       db.prepare(`DELETE FROM runtime_outbox WHERE id = 'outbox-state-1'`).run()
     ).toThrow(/Runtime outbox rows are immutable/);
@@ -1703,7 +1706,7 @@ describe("Team Session Agent Run schema", () => {
             peerAdvanceStarted = true;
             const peer = openTeamSessionDatabase({ filename });
             try {
-              expect(peer.db.pragma("user_version", { simple: true })).toBe(16);
+              expect(peer.db.pragma("user_version", { simple: true })).toBe(17);
               peerAdvanced = true;
             } finally {
               peer.close();
@@ -1721,7 +1724,7 @@ describe("Team Session Agent Run schema", () => {
 
     expect(peerAdvanceStarted).toBe(true);
     expect(peerAdvanced).toBe(true);
-    expect(database.db.pragma("user_version", { simple: true })).toBe(16);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(17);
     expect(database.db.pragma("foreign_key_check")).toEqual([]);
     expect(database.db.pragma("quick_check", { simple: true })).toBe("ok");
   });
@@ -1744,7 +1747,7 @@ describe("Team Session Agent Run schema", () => {
     }
 
     database = openTeamSessionDatabase({ filename });
-    expect(database.db.pragma("user_version", { simple: true })).toBe(16);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(17);
     expect(
       database.db.prepare(`SELECT COUNT(*) AS count FROM runtime_principal_observation_keys`).get()
     ).toEqual({ count: 0 });
@@ -1775,7 +1778,7 @@ describe("Team Session Agent Run schema", () => {
     }
 
     database = openTeamSessionDatabase({ filename });
-    expect(database.db.pragma("user_version", { simple: true })).toBe(16);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(17);
     expect(
       database.db
         .prepare(
@@ -2441,7 +2444,7 @@ describe("Team Session Agent Run schema", () => {
 
     database = openTeamSessionDatabase({ filename });
 
-    expect(database.db.pragma("user_version", { simple: true })).toBe(16);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(17);
     expect(
       database.db
         .prepare(`SELECT name FROM sqlite_schema WHERE type = 'table' AND name = ?`)
@@ -2484,7 +2487,7 @@ describe("Team Session Agent Run schema", () => {
 
     database = openTeamSessionDatabase({ filename });
 
-    expect(database.db.pragma("user_version", { simple: true })).toBe(16);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(17);
     expect(
       database.db
         .prepare(`SELECT * FROM runtime_run_commands WHERE id = ?`)
@@ -2532,7 +2535,7 @@ describe("Team Session Agent Run schema", () => {
 
       database = openTeamSessionDatabase({ filename });
 
-      expect(database.db.pragma("user_version", { simple: true })).toBe(16);
+      expect(database.db.pragma("user_version", { simple: true })).toBe(17);
       expect(
         database.db
           .prepare(
@@ -3201,25 +3204,31 @@ describe("Team Session Agent Run schema", () => {
     ).toThrow(/Runtime Run commands are immutable/);
   });
 
-  it("freezes source and applied Session events only after the Runtime journal references them", () => {
+  it("keeps every Session event append-only, referenced by the Runtime journal or not", () => {
     database = openTeamSessionDatabase({ filename });
     seedRuntimeRunCommand(database.db);
 
+    // The Phase 10 unconditional append-only chain guard covers every event,
+    // whether or not a Runtime journal row references it, so no session event
+    // can be rewritten or removed after it is appended (Gate 8).
     expect(() =>
       database!.db.prepare(`UPDATE session_events SET payload_json = '{}' WHERE sequence = 1`).run()
-    ).toThrow(/Runtime Run journal events are immutable/);
+    ).toThrow(/Session events are append-only/);
     expect(() =>
       database!.db.prepare(`DELETE FROM session_events WHERE sequence = 1`).run()
-    ).toThrow(/Runtime Run journal events are immutable/);
+    ).toThrow(/Session events are append-only/);
 
     insertRuntimeRequestEvent(database.db, 2, "event:not-yet-applied", { type: "run.paused" });
-    expect(
-      database.db
+    expect(() =>
+      database!.db
         .prepare(
           `UPDATE session_events SET actor_display_name = 'Alice Updated' WHERE sequence = 2`
         )
-        .run().changes
-    ).toBe(1);
+        .run()
+    ).toThrow(/Session events are append-only/);
+    expect(() =>
+      database!.db.prepare(`DELETE FROM session_events WHERE sequence = 2`).run()
+    ).toThrow(/Session events are append-only/);
 
     claimRuntimeRunDispatch(database.db, "runtime-command-1");
     insertRuntimeRunReceipt(database.db);
@@ -3227,10 +3236,10 @@ describe("Team Session Agent Run schema", () => {
 
     expect(() =>
       database!.db.prepare(`UPDATE session_events SET payload_json = '{}' WHERE sequence = 2`).run()
-    ).toThrow(/Runtime Run journal events are immutable/);
+    ).toThrow(/Session events are append-only/);
     expect(() =>
       database!.db.prepare(`DELETE FROM session_events WHERE sequence = 2`).run()
-    ).toThrow(/Runtime Run journal events are immutable/);
+    ).toThrow(/Session events are append-only/);
   });
 
   it("allows only one unresolved Runtime Run command and never revives terminal dispatch", () => {
@@ -3663,14 +3672,19 @@ function insertRuntimeRequestEvent(
       toRunStateVersion,
       targetLifecycle,
     } satisfies Record<string, unknown>);
-  db.prepare(
-    `INSERT INTO session_events
-       (session_id, sequence, event_id, type, occurred_at_ms,
-        actor_kind, actor_user_id, actor_display_name,
-        source_scope, source_key, payload_json)
-     VALUES (?, ?, ?, ?, 100,
-             'human', 'user-alice', 'Alice', 'vitest:runtime-command', ?, ?)`
-  ).run(SESSION_ID, sequence, eventId, eventType, eventId, JSON.stringify(payload));
+  insertChainedSessionEvent(db, {
+    sessionId: SESSION_ID,
+    sequence,
+    eventId,
+    type: eventType,
+    occurredAtMs: 100,
+    actorKind: "human",
+    actorUserId: "user-alice",
+    actorDisplayName: "Alice",
+    sourceScope: "vitest:runtime-command",
+    sourceKey: eventId,
+    payloadJson: JSON.stringify(payload),
+  });
 }
 
 function insertAcceptedRuntimeOutboxCommand(
@@ -4723,27 +4737,26 @@ function insertRuntimeCompensationReceiptAndEffect(
         );
       expect(advanced.changes).toBe(1);
     }
-    db.prepare(
-      `INSERT INTO session_events (
-         session_id, sequence, event_id, type, occurred_at_ms,
-         actor_kind, actor_user_id, actor_display_name,
-         source_scope, source_key, payload_json
-       ) VALUES (
-         ?, 2, 'event:compensation-enforced', 'run.runtime-command.compensated', 140,
-         'system', 'platform-security', 'Platform Security',
-         'runtime-compensation', 'compensation-1', ?
-       )`
-    ).run(
-      SESSION_ID,
-      JSON.stringify({
+    insertChainedSessionEvent(db, {
+      sessionId: SESSION_ID,
+      sequence: 2,
+      eventId: "event:compensation-enforced",
+      type: "run.runtime-command.compensated",
+      occurredAtMs: 140,
+      actorKind: "system",
+      actorUserId: "platform-security",
+      actorDisplayName: "Platform Security",
+      sourceScope: "runtime-compensation",
+      sourceKey: "compensation-1",
+      payloadJson: JSON.stringify({
         compensationId: command.compensation_id,
         sourceCommandId: command.source_command_id,
         compensationCommandId: command.id,
         receiptId: "compensation-receipt-1",
         effectDigest,
         agentRunId: command.agent_run_id,
-      })
-    );
+      }),
+    });
     db.prepare(
       `INSERT INTO runtime_compensation_effects (
          compensation_id, source_command_id, compensation_command_id,
@@ -5331,6 +5344,13 @@ function createAgentRunSchemaV2Fixture(filename: string): void {
       ) STRICT;
 
       PRAGMA application_id = 1415074609;
+      DROP TRIGGER IF EXISTS session_events_hash_chain_insert;
+      DROP TRIGGER IF EXISTS session_events_append_only_update;
+      DROP TRIGGER IF EXISTS session_events_append_only_delete;
+      DROP TABLE IF EXISTS session_platform_security_actions;
+      DROP TABLE IF EXISTS evidence_review_history;
+      DROP TABLE IF EXISTS goal_version_lineage;
+      DROP TABLE IF EXISTS session_event_checkpoints;
       DROP TABLE IF EXISTS yolo_challenges;
       DROP TABLE IF EXISTS circuit_breaker_state;
       DROP TABLE IF EXISTS limit_settlements;
@@ -5474,6 +5494,13 @@ function createRuntimeRunSchemaV3Fixture(filename: string): {
       DROP TABLE runtime_run_command_receipts;
       DROP TABLE runtime_run_command_dispatch;
       DROP TABLE runtime_run_commands;
+      DROP TRIGGER IF EXISTS session_events_hash_chain_insert;
+      DROP TRIGGER IF EXISTS session_events_append_only_update;
+      DROP TRIGGER IF EXISTS session_events_append_only_delete;
+      DROP TABLE IF EXISTS session_platform_security_actions;
+      DROP TABLE IF EXISTS evidence_review_history;
+      DROP TABLE IF EXISTS goal_version_lineage;
+      DROP TABLE IF EXISTS session_event_checkpoints;
       DROP TABLE IF EXISTS yolo_challenges;
       DROP TABLE IF EXISTS circuit_breaker_state;
       DROP TABLE IF EXISTS limit_settlements;

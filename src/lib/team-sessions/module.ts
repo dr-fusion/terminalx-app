@@ -53,6 +53,11 @@ import {
 } from "./sqlite-runtime-write-state-source";
 import { createLimitLedgerStore, type LimitLedgerStore } from "./sqlite-limit-ledger-store";
 import {
+  digestSessionEvent,
+  previousChainHash,
+  SESSION_EVENT_CHAIN_SCHEMA,
+} from "./session-event-chain";
+import {
   assertValidRunPolicyCommit,
   isRunPolicyWidening,
   validateInitialGoals,
@@ -6186,13 +6191,37 @@ class SqliteTeamSessions implements TeamSessions {
       source: { ...command.idempotency },
       payload,
     };
+    // Bind this event into the append-only hash chain. `prev_hash` links to the
+    // predecessor's hash (or the fixed genesis root for the first event) and the
+    // hash commits to the exact, attributable content, so any tamper, gap, or
+    // reorder is detectable by recomputing the chain. Hashing the JSON-round-
+    // tripped payload guarantees the live hash matches the migration backfill.
+    const payloadJson = JSON.stringify(event.payload);
+    const priorRow =
+      sequence === 1
+        ? undefined
+        : (this.db
+            .prepare(`SELECT hash FROM session_events WHERE session_id = ? AND sequence = ?`)
+            .get(sessionId, sequence - 1) as { hash: string } | undefined);
+    const prevHash = previousChainHash(sequence, priorRow?.hash ?? null);
+    const hash = digestSessionEvent({
+      schema: SESSION_EVENT_CHAIN_SCHEMA,
+      sessionId: event.sessionId,
+      sequence: event.sequence,
+      type: event.type,
+      occurredAtMs: event.occurredAtMs,
+      actor: event.actor,
+      source: event.source,
+      payload: JSON.parse(payloadJson),
+      prevHash,
+    });
     this.db
       .prepare(
         `INSERT INTO session_events (
            session_id, sequence, event_id, type, occurred_at_ms,
            actor_kind, actor_user_id, actor_display_name,
-           source_scope, source_key, payload_json
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+           source_scope, source_key, payload_json, prev_hash, hash
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         event.sessionId,
@@ -6205,7 +6234,9 @@ class SqliteTeamSessions implements TeamSessions {
         event.actor.displayName,
         event.source.scope,
         event.source.key,
-        JSON.stringify(event.payload)
+        payloadJson,
+        prevHash,
+        hash
       );
     return event;
   }

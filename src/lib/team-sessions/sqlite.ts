@@ -13,9 +13,15 @@ import {
 } from "../connections/contracts";
 import { digestRuntimeCompensationIncident } from "../runtime/runtime-compensation-incident";
 import { RUNTIME_RECEIPT_OBSERVATION_MAX_CURSOR_CODE_POINTS } from "../runtime/runtime-receipt-observation-contract";
+import {
+  digestSessionEvent,
+  previousChainHash,
+  SESSION_EVENT_CHAIN_GENESIS,
+  SESSION_EVENT_CHAIN_SCHEMA,
+} from "./session-event-chain";
 import { isValidTmuxSessionName } from "../tmux";
 
-const SCHEMA_VERSION = 16;
+const SCHEMA_VERSION = 17;
 const PRE_RUNTIME_START_SCHEMA_VERSION = 4;
 const RUNTIME_START_SCHEMA_VERSION = 5;
 const RUNTIME_RECEIPT_FOLLOW_SCHEMA_VERSION = 6;
@@ -29,6 +35,7 @@ const CONNECTION_AUTHORITY_SCHEMA_VERSION = 13;
 const WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION = 14;
 const WEBHOOK_AUTH_SCHEMA_VERSION = 15;
 const PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION = 16;
+const PHASE10_RECOVERY_EVIDENCE_SCHEMA_VERSION = 17;
 const APPLICATION_ID = 0x54585331; // "TXS1"
 
 const CANONICAL_IDENTITY_SCHEMA_V11 = `
@@ -1931,6 +1938,218 @@ WHEN NOT (
 )
 BEGIN
   SELECT RAISE(ABORT, 'Invalid YOLO challenge transition');
+END;
+`;
+
+/**
+ * Phase 10 Gate 7/8 additive tables and columns. The session-event hash columns
+ * are added by ALTER (the base `session_events` table predates the chain); their
+ * values are backfilled deterministically in TypeScript before the chain and
+ * append-only triggers are installed (see {@link migratePhase10RecoveryEvidenceSchemaV17}).
+ * Every other table here is empty at migration time and immutable-by-trigger.
+ */
+/**
+ * The additive columns v17 adds by ALTER. Applied idempotently (skipped when a
+ * column already exists) so a migration-replay that resets `user_version` below
+ * 17 without dropping these columns re-migrates cleanly.
+ */
+const PHASE10_ADDED_COLUMNS_V17: ReadonlyArray<{
+  readonly table: string;
+  readonly column: string;
+  readonly definition: string;
+}> = [
+  { table: "session_events", column: "prev_hash", definition: "TEXT" },
+  { table: "session_events", column: "hash", definition: "TEXT" },
+  { table: "sessions", column: "ended_at_ms", definition: "INTEGER" },
+  { table: "sessions", column: "archived_at_ms", definition: "INTEGER" },
+  { table: "sessions", column: "retention_expires_at_ms", definition: "INTEGER" },
+  { table: "sessions", column: "terminal_reason", definition: "TEXT" },
+];
+
+const PHASE10_RECOVERY_EVIDENCE_TABLES_SCHEMA_V17 = `
+CREATE TABLE session_event_checkpoints (
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE RESTRICT,
+  head_sequence INTEGER NOT NULL CHECK (head_sequence >= 1),
+  head_hash TEXT NOT NULL CHECK (length(head_hash) = 64 AND head_hash NOT GLOB '*[^0-9a-f]*'),
+  genesis_root TEXT NOT NULL CHECK (length(genesis_root) = 64 AND genesis_root NOT GLOB '*[^0-9a-f]*'),
+  signing_key_id TEXT NOT NULL CHECK (length(signing_key_id) BETWEEN 1 AND 300),
+  checkpoint_digest TEXT NOT NULL UNIQUE CHECK (
+    length(checkpoint_digest) = 64 AND checkpoint_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  signature TEXT NOT NULL CHECK (length(signature) BETWEEN 1 AND 4000),
+  issued_at_ms INTEGER NOT NULL CHECK (issued_at_ms >= 0),
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  UNIQUE (session_id, head_sequence),
+  FOREIGN KEY (session_id, head_sequence)
+    REFERENCES session_events(session_id, sequence) ON DELETE RESTRICT
+) STRICT;
+
+CREATE INDEX session_event_checkpoints_by_session
+  ON session_event_checkpoints(session_id, head_sequence);
+
+CREATE TRIGGER session_event_checkpoints_immutable_update
+BEFORE UPDATE ON session_event_checkpoints
+BEGIN
+  SELECT RAISE(ABORT, 'Session event checkpoints are immutable');
+END;
+
+CREATE TRIGGER session_event_checkpoints_immutable_delete
+BEFORE DELETE ON session_event_checkpoints
+BEGIN
+  SELECT RAISE(ABORT, 'Session event checkpoints are immutable');
+END;
+
+CREATE TABLE goal_version_lineage (
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  agent_run_id TEXT NOT NULL,
+  goal_set_id TEXT NOT NULL,
+  goal_set_revision INTEGER NOT NULL CHECK (goal_set_revision >= 1),
+  goal_id TEXT NOT NULL,
+  version INTEGER NOT NULL CHECK (version >= 1),
+  previous_version INTEGER CHECK (previous_version IS NULL OR previous_version >= 1),
+  producing_command_type TEXT NOT NULL CHECK (length(producing_command_type) BETWEEN 1 AND 120),
+  change_kind TEXT NOT NULL CHECK (length(change_kind) BETWEEN 1 AND 120),
+  actor_kind TEXT NOT NULL CHECK (actor_kind IN ('human', 'system')),
+  actor_ref TEXT NOT NULL CHECK (length(actor_ref) BETWEEN 1 AND 300),
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  CHECK (
+    (version = 1 AND previous_version IS NULL) OR
+    (version > 1 AND previous_version = version - 1)
+  ),
+  UNIQUE (agent_run_id, goal_id, version),
+  FOREIGN KEY (goal_set_id, goal_set_revision, goal_id)
+    REFERENCES goals(goal_set_id, goal_set_revision, goal_id) ON DELETE RESTRICT,
+  FOREIGN KEY (agent_run_id, session_id)
+    REFERENCES agent_runs(id, session_id) ON DELETE RESTRICT
+) STRICT;
+
+CREATE INDEX goal_version_lineage_by_goal ON goal_version_lineage(agent_run_id, goal_id);
+
+CREATE TRIGGER goal_version_lineage_immutable_update
+BEFORE UPDATE ON goal_version_lineage
+BEGIN
+  SELECT RAISE(ABORT, 'Goal version lineage is append-only');
+END;
+
+CREATE TRIGGER goal_version_lineage_immutable_delete
+BEFORE DELETE ON goal_version_lineage
+BEGIN
+  SELECT RAISE(ABORT, 'Goal version lineage is append-only');
+END;
+
+CREATE TABLE evidence_review_history (
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  agent_run_id TEXT NOT NULL,
+  goal_set_id TEXT NOT NULL,
+  goal_set_revision INTEGER NOT NULL CHECK (goal_set_revision >= 1),
+  goal_id TEXT NOT NULL,
+  goal_version INTEGER NOT NULL CHECK (goal_version >= 1),
+  disposition TEXT NOT NULL CHECK (disposition IN ('validate', 'request-more-work')),
+  reviewed_evidence_count INTEGER NOT NULL CHECK (reviewed_evidence_count >= 1),
+  reviewed_evidence_digest TEXT NOT NULL CHECK (
+    length(reviewed_evidence_digest) = 64 AND reviewed_evidence_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  reviewer_kind TEXT NOT NULL CHECK (reviewer_kind IN ('human', 'system')),
+  reviewer_ref TEXT NOT NULL CHECK (length(reviewer_ref) BETWEEN 1 AND 300),
+  directive_id TEXT,
+  reviewed_at_ms INTEGER NOT NULL CHECK (reviewed_at_ms >= 0),
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  UNIQUE (agent_run_id, goal_id, goal_version),
+  FOREIGN KEY (agent_run_id, session_id)
+    REFERENCES agent_runs(id, session_id) ON DELETE RESTRICT
+) STRICT;
+
+CREATE INDEX evidence_review_history_by_goal
+  ON evidence_review_history(agent_run_id, goal_id, goal_version);
+
+CREATE TRIGGER evidence_review_history_immutable_update
+BEFORE UPDATE ON evidence_review_history
+BEGIN
+  SELECT RAISE(ABORT, 'Evidence review history is append-only');
+END;
+
+CREATE TRIGGER evidence_review_history_immutable_delete
+BEFORE DELETE ON evidence_review_history
+BEGIN
+  SELECT RAISE(ABORT, 'Evidence review history is append-only');
+END;
+
+CREATE TABLE session_platform_security_actions (
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  runtime_assignment_id TEXT NOT NULL,
+  action TEXT NOT NULL CHECK (action IN ('quarantine', 'retire', 'retry')),
+  idempotency_key TEXT NOT NULL CHECK (length(idempotency_key) BETWEEN 1 AND 500),
+  reason TEXT NOT NULL CHECK (length(reason) BETWEEN 1 AND 300),
+  observed_runtime_authorization_generation INTEGER NOT NULL
+    CHECK (observed_runtime_authorization_generation >= 1),
+  resulting_runtime_authorization_generation INTEGER NOT NULL
+    CHECK (resulting_runtime_authorization_generation >= 1),
+  assignment_status_before TEXT NOT NULL CHECK (length(assignment_status_before) BETWEEN 1 AND 40),
+  assignment_status_after TEXT NOT NULL CHECK (length(assignment_status_after) BETWEEN 1 AND 40),
+  actor_kind TEXT NOT NULL CHECK (actor_kind IN ('human', 'system')),
+  actor_ref TEXT NOT NULL CHECK (length(actor_ref) BETWEEN 1 AND 300),
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  UNIQUE (session_id, idempotency_key),
+  FOREIGN KEY (runtime_assignment_id, session_id)
+    REFERENCES runtime_assignments(id, session_id) ON DELETE RESTRICT
+) STRICT;
+
+CREATE INDEX session_platform_security_actions_by_session
+  ON session_platform_security_actions(session_id, created_at_ms);
+
+CREATE TRIGGER session_platform_security_actions_immutable_update
+BEFORE UPDATE ON session_platform_security_actions
+BEGIN
+  SELECT RAISE(ABORT, 'Platform-security action history is append-only');
+END;
+
+CREATE TRIGGER session_platform_security_actions_immutable_delete
+BEFORE DELETE ON session_platform_security_actions
+BEGIN
+  SELECT RAISE(ABORT, 'Platform-security action history is append-only');
+END;
+`;
+
+/**
+ * Installed AFTER the session-event hash backfill so the append-only guard does
+ * not block the one-time UPDATE that writes the backfilled hashes. The genesis
+ * root is embedded verbatim from the shared TypeScript constant so the trigger
+ * and the {@link digestSessionEvent} hasher agree on the chain root.
+ */
+const PHASE10_SESSION_EVENT_CHAIN_TRIGGERS_SCHEMA_V17 = `
+CREATE TRIGGER session_events_append_only_update
+BEFORE UPDATE ON session_events
+BEGIN
+  SELECT RAISE(ABORT, 'Session events are append-only');
+END;
+
+CREATE TRIGGER session_events_append_only_delete
+BEFORE DELETE ON session_events
+BEGIN
+  SELECT RAISE(ABORT, 'Session events are append-only');
+END;
+
+CREATE TRIGGER session_events_hash_chain_insert
+BEFORE INSERT ON session_events
+WHEN NOT (
+  NEW.prev_hash IS NOT NULL AND NEW.hash IS NOT NULL
+  AND length(NEW.prev_hash) = 64 AND NEW.prev_hash NOT GLOB '*[^0-9a-f]*'
+  AND length(NEW.hash) = 64 AND NEW.hash NOT GLOB '*[^0-9a-f]*'
+  AND (
+    (NEW.sequence = 1 AND NEW.prev_hash = '${SESSION_EVENT_CHAIN_GENESIS}')
+    OR
+    (NEW.sequence > 1 AND NEW.prev_hash = (
+      SELECT hash FROM session_events
+      WHERE session_id = NEW.session_id AND sequence = NEW.sequence - 1
+    ))
+  )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Session event breaks the append-only hash chain');
 END;
 `;
 
@@ -8956,7 +9175,8 @@ export function openTeamSessionDatabase(
         migratedVersion !== CONNECTION_AUTHORITY_SCHEMA_VERSION &&
         migratedVersion !== WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION &&
         migratedVersion !== WEBHOOK_AUTH_SCHEMA_VERSION &&
-        migratedVersion !== PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION
+        migratedVersion !== PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION &&
+        migratedVersion !== PHASE10_RECOVERY_EVIDENCE_SCHEMA_VERSION
       ) {
         throw new Error(
           `Unsupported Team Session database schema ${currentVersion}; expected ${SCHEMA_VERSION}`
@@ -9024,6 +9244,10 @@ export function openTeamSessionDatabase(
     const phase9PreparedVersion = db.pragma("user_version", { simple: true }) as number;
     if (phase9PreparedVersion === WEBHOOK_AUTH_SCHEMA_VERSION) {
       migratePhase9ProvenanceLimitsYoloSchemaV16(db);
+    }
+    const phase10PreparedVersion = db.pragma("user_version", { simple: true }) as number;
+    if (phase10PreparedVersion === PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION) {
+      migratePhase10RecoveryEvidenceSchemaV17(db);
     }
 
     const applicationId = db.pragma("application_id", { simple: true }) as number;
@@ -9114,7 +9338,8 @@ function migrateRuntimeStartSchemaV5(db: Database.Database): void {
         currentVersion === CONNECTION_AUTHORITY_SCHEMA_VERSION ||
         currentVersion === WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION ||
         currentVersion === WEBHOOK_AUTH_SCHEMA_VERSION ||
-        currentVersion === PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION
+        currentVersion === PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION ||
+        currentVersion === PHASE10_RECOVERY_EVIDENCE_SCHEMA_VERSION
       ) {
         return;
       }
@@ -9159,7 +9384,8 @@ function migrateRuntimeReceiptFollowSchemaV6(db: Database.Database): void {
       currentVersion === CONNECTION_AUTHORITY_SCHEMA_VERSION ||
       currentVersion === WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION ||
       currentVersion === WEBHOOK_AUTH_SCHEMA_VERSION ||
-      currentVersion === PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION
+      currentVersion === PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION ||
+      currentVersion === PHASE10_RECOVERY_EVIDENCE_SCHEMA_VERSION
     ) {
       return;
     }
@@ -9197,7 +9423,8 @@ function migrateRuntimeCompensationSchemaV7(db: Database.Database): void {
       currentVersion === CONNECTION_AUTHORITY_SCHEMA_VERSION ||
       currentVersion === WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION ||
       currentVersion === WEBHOOK_AUTH_SCHEMA_VERSION ||
-      currentVersion === PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION
+      currentVersion === PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION ||
+      currentVersion === PHASE10_RECOVERY_EVIDENCE_SCHEMA_VERSION
     ) {
       return;
     }
@@ -9238,7 +9465,8 @@ function migrateRuntimeAssignmentOutboxInterlockSchemaV8(db: Database.Database):
       currentVersion === CONNECTION_AUTHORITY_SCHEMA_VERSION ||
       currentVersion === WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION ||
       currentVersion === WEBHOOK_AUTH_SCHEMA_VERSION ||
-      currentVersion === PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION
+      currentVersion === PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION ||
+      currentVersion === PHASE10_RECOVERY_EVIDENCE_SCHEMA_VERSION
     )
       return;
     if (currentVersion !== RUNTIME_COMPENSATION_SCHEMA_VERSION) {
@@ -9285,7 +9513,8 @@ function migrateHostedRuntimeAssignmentSchemaV9(db: Database.Database): void {
         currentVersion === CONNECTION_AUTHORITY_SCHEMA_VERSION ||
         currentVersion === WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION ||
         currentVersion === WEBHOOK_AUTH_SCHEMA_VERSION ||
-        currentVersion === PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION
+        currentVersion === PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION ||
+        currentVersion === PHASE10_RECOVERY_EVIDENCE_SCHEMA_VERSION
       )
         return;
       if (currentVersion !== RUNTIME_ASSIGNMENT_OUTBOX_INTERLOCK_SCHEMA_VERSION) {
@@ -9384,7 +9613,8 @@ function migrateProviderBoundEffectActivationSchemaV10(db: Database.Database): v
       currentVersion === CONNECTION_AUTHORITY_SCHEMA_VERSION ||
       currentVersion === WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION ||
       currentVersion === WEBHOOK_AUTH_SCHEMA_VERSION ||
-      currentVersion === PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION
+      currentVersion === PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION ||
+      currentVersion === PHASE10_RECOVERY_EVIDENCE_SCHEMA_VERSION
     ) {
       return;
     }
@@ -9621,7 +9851,8 @@ function migrateCanonicalIdentitySchemaV11(db: Database.Database): void {
       currentVersion === CONNECTION_AUTHORITY_SCHEMA_VERSION ||
       currentVersion === WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION ||
       currentVersion === WEBHOOK_AUTH_SCHEMA_VERSION ||
-      currentVersion === PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION
+      currentVersion === PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION ||
+      currentVersion === PHASE10_RECOVERY_EVIDENCE_SCHEMA_VERSION
     )
       return;
     if (currentVersion !== PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION) {
@@ -9654,7 +9885,8 @@ function migrateGoogleIdentityContinuitySchemaV12(db: Database.Database): void {
       currentVersion === CONNECTION_AUTHORITY_SCHEMA_VERSION ||
       currentVersion === WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION ||
       currentVersion === WEBHOOK_AUTH_SCHEMA_VERSION ||
-      currentVersion === PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION
+      currentVersion === PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION ||
+      currentVersion === PHASE10_RECOVERY_EVIDENCE_SCHEMA_VERSION
     )
       return;
     if (currentVersion !== CANONICAL_IDENTITY_SCHEMA_VERSION) {
@@ -9717,7 +9949,8 @@ function migrateConnectionAuthoritySchemaV13(db: Database.Database): void {
       currentVersion === CONNECTION_AUTHORITY_SCHEMA_VERSION ||
       currentVersion === WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION ||
       currentVersion === WEBHOOK_AUTH_SCHEMA_VERSION ||
-      currentVersion === PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION
+      currentVersion === PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION ||
+      currentVersion === PHASE10_RECOVERY_EVIDENCE_SCHEMA_VERSION
     ) {
       return;
     }
@@ -9747,7 +9980,8 @@ function migrateWebhookReplayDedupSchemaV14(db: Database.Database): void {
     if (
       currentVersion === WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION ||
       currentVersion === WEBHOOK_AUTH_SCHEMA_VERSION ||
-      currentVersion === PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION
+      currentVersion === PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION ||
+      currentVersion === PHASE10_RECOVERY_EVIDENCE_SCHEMA_VERSION
     ) {
       return;
     }
@@ -9773,7 +10007,8 @@ function migrateWebhookAuthSchemaV15(db: Database.Database): void {
     const currentVersion = db.pragma("user_version", { simple: true }) as number;
     if (
       currentVersion === WEBHOOK_AUTH_SCHEMA_VERSION ||
-      currentVersion === PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION
+      currentVersion === PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION ||
+      currentVersion === PHASE10_RECOVERY_EVIDENCE_SCHEMA_VERSION
     )
       return;
     if (currentVersion !== WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION) {
@@ -9796,7 +10031,11 @@ function migrateWebhookAuthSchemaV15(db: Database.Database): void {
 function migratePhase9ProvenanceLimitsYoloSchemaV16(db: Database.Database): void {
   const migrate = db.transaction(() => {
     const currentVersion = db.pragma("user_version", { simple: true }) as number;
-    if (currentVersion === PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION) return;
+    if (
+      currentVersion === PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION ||
+      currentVersion === PHASE10_RECOVERY_EVIDENCE_SCHEMA_VERSION
+    )
+      return;
     if (currentVersion !== WEBHOOK_AUTH_SCHEMA_VERSION) {
       throw new Error(
         `Unsupported Team Session database schema ${currentVersion}; expected ${WEBHOOK_AUTH_SCHEMA_VERSION}`
@@ -9813,6 +10052,117 @@ function migratePhase9ProvenanceLimitsYoloSchemaV16(db: Database.Database): void
     db.pragma(`user_version = ${PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION}`);
   });
   migrate.exclusive();
+}
+
+function migratePhase10RecoveryEvidenceSchemaV17(db: Database.Database): void {
+  const migrate = db.transaction(() => {
+    const currentVersion = db.pragma("user_version", { simple: true }) as number;
+    if (currentVersion === PHASE10_RECOVERY_EVIDENCE_SCHEMA_VERSION) return;
+    if (currentVersion !== PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION) {
+      throw new Error(
+        `Unsupported Team Session database schema ${currentVersion}; expected ${PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION}`
+      );
+    }
+    // Additive Gate 7/8 tables + the session-event hash columns. The columns
+    // are added idempotently, then the chain is backfilled deterministically
+    // over existing events BEFORE the append-only and chain-insert triggers are
+    // installed, so the one-time backfill UPDATE is not blocked by its own
+    // guard. A fresh install replays this with an empty session_events table,
+    // making the backfill a no-op.
+    addPhase10ColumnsV17(db);
+    db.exec(PHASE10_RECOVERY_EVIDENCE_TABLES_SCHEMA_V17);
+    // Existing conditional immutability triggers (added in v5/v7/v8) freeze any
+    // referenced session_events row, which would block the one-time backfill
+    // UPDATE. Capture their exact definitions, drop them, backfill, then restore
+    // them verbatim and install the new unconditional append-only + chain guards.
+    const priorTriggers = db
+      .prepare(
+        `SELECT name, sql FROM sqlite_master
+         WHERE type = 'trigger' AND tbl_name = 'session_events' AND sql IS NOT NULL`
+      )
+      .all() as Array<{ name: string; sql: string }>;
+    for (const trigger of priorTriggers) {
+      db.exec(`DROP TRIGGER ${trigger.name}`);
+    }
+    backfillSessionEventHashChainV17(db);
+    for (const trigger of priorTriggers) {
+      db.exec(trigger.sql);
+    }
+    db.exec(PHASE10_SESSION_EVENT_CHAIN_TRIGGERS_SCHEMA_V17);
+    const violations = db.pragma("foreign_key_check") as unknown[];
+    if (violations.length > 0) {
+      throw new Error("Team Session v17 migration failed its foreign key check");
+    }
+    db.pragma(`user_version = ${PHASE10_RECOVERY_EVIDENCE_SCHEMA_VERSION}`);
+  });
+  migrate.exclusive();
+}
+
+/** Add the v17 columns, skipping any that already exist (idempotent replay). */
+function addPhase10ColumnsV17(db: Database.Database): void {
+  for (const { table, column, definition } of PHASE10_ADDED_COLUMNS_V17) {
+    const columns = db.pragma(`table_info(${table})`) as Array<{ name: string }>;
+    if (columns.some((entry) => entry.name === column)) continue;
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
+}
+
+/**
+ * Deterministically bind every existing `session_events` row into the hash chain.
+ * Iterates each session in ascending sequence order, recomputing `prev_hash`
+ * (genesis for sequence 1) and `hash` with the exact {@link digestSessionEvent}
+ * hasher used at append time. The payload is re-hydrated from the stored JSON so
+ * the backfilled hash matches what a live append would produce, and any
+ * non-contiguous sequence aborts the migration rather than forging a link.
+ */
+function backfillSessionEventHashChainV17(db: Database.Database): void {
+  const sessionRows = db
+    .prepare(`SELECT DISTINCT session_id FROM session_events ORDER BY session_id ASC`)
+    .all() as Array<{ session_id: string }>;
+  const selectEvents = db.prepare<[string]>(
+    `SELECT session_id, sequence, type, occurred_at_ms, actor_kind, actor_user_id,
+            actor_display_name, source_scope, source_key, payload_json
+       FROM session_events WHERE session_id = ? ORDER BY sequence ASC`
+  );
+  const updateEvent = db.prepare(
+    `UPDATE session_events SET prev_hash = ?, hash = ? WHERE session_id = ? AND sequence = ?`
+  );
+  for (const { session_id: sessionId } of sessionRows) {
+    const events = selectEvents.all(sessionId) as Array<Record<string, unknown>>;
+    let priorHash: string | null = null;
+    let expectedSequence = 1;
+    for (const event of events) {
+      const sequence = event.sequence as number;
+      if (sequence !== expectedSequence) {
+        throw new Error("Team Session v17 migration found a non-contiguous session event sequence");
+      }
+      const prevHash = previousChainHash(sequence, priorHash);
+      let payload: unknown;
+      try {
+        payload = JSON.parse(event.payload_json as string);
+      } catch {
+        throw new Error("Team Session v17 migration found an unparsable session event payload");
+      }
+      const hash = digestSessionEvent({
+        schema: SESSION_EVENT_CHAIN_SCHEMA,
+        sessionId: event.session_id as string,
+        sequence,
+        type: event.type as string,
+        occurredAtMs: event.occurred_at_ms as number,
+        actor: {
+          kind: event.actor_kind as "human" | "system",
+          userId: event.actor_user_id as string,
+          displayName: event.actor_display_name as string,
+        },
+        source: { scope: event.source_scope as string, key: event.source_key as string },
+        payload,
+        prevHash,
+      });
+      updateEvent.run(prevHash, hash, event.session_id, sequence);
+      priorHash = hash;
+      expectedSequence += 1;
+    }
+  }
 }
 
 function assertHostedRuntimeParentRowsAreSafeForV9(db: Database.Database): void {
