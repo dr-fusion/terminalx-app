@@ -120,7 +120,7 @@ export default function LoginPage() {
             style={{ height: "0.75em", width: "0.5em", marginLeft: 4 }}
           />
         </div>
-        <p className="text-center text-[12px] text-[#6b7569] mb-8">your terminal, in a tab.</p>
+        <p className="text-center text-[12px] text-[#899384] mb-8">your terminal, in a tab.</p>
 
         <div className="bg-[#0f1117] border border-[#1a1d24] rounded p-5">
           {authMode === "google" ? (
@@ -156,11 +156,11 @@ export default function LoginPage() {
               <button
                 disabled
                 className="w-full flex items-center justify-center gap-3 px-3 py-2.5 rounded
-                  bg-[#0a0b10] border border-[#1a1d24] text-[#6b7569] text-[13px] cursor-not-allowed"
+                  bg-[#0a0b10] border border-[#1a1d24] text-[#899384] text-[13px] cursor-not-allowed"
                 title="coming soon"
               >
                 sign in with tailscale
-                <span className="text-[9px] uppercase tracking-wider bg-[#1a1d24] text-[#6b7569] px-1 py-0.5 rounded">
+                <span className="text-[9px] uppercase tracking-wider bg-[#1a1d24] text-[#899384] px-1 py-0.5 rounded">
                   soon
                 </span>
               </button>
@@ -171,7 +171,7 @@ export default function LoginPage() {
                 <div className="flex flex-col gap-1.5">
                   <label
                     htmlFor="username"
-                    className="text-[10px] uppercase tracking-wider text-[#6b7569]"
+                    className="text-[10px] uppercase tracking-wider text-[#899384]"
                   >
                     username
                   </label>
@@ -182,7 +182,7 @@ export default function LoginPage() {
                     onChange={(e) => setUsername(e.target.value)}
                     autoComplete="username"
                     className="px-2.5 py-1.5 rounded bg-[#07080c] border border-[#252933]
-                      text-[13px] text-[#e6f0e4] placeholder:text-[#6b7569]/50
+                      text-[13px] text-[#e6f0e4] placeholder:text-[#899384]/50
                       focus:outline-none focus:border-[#00ff88] transition-colors"
                   />
                 </div>
@@ -190,7 +190,7 @@ export default function LoginPage() {
               <div className="flex flex-col gap-1.5">
                 <label
                   htmlFor="password"
-                  className="text-[10px] uppercase tracking-wider text-[#6b7569]"
+                  className="text-[10px] uppercase tracking-wider text-[#899384]"
                 >
                   password
                 </label>
@@ -201,7 +201,7 @@ export default function LoginPage() {
                   onChange={(e) => setPassword(e.target.value)}
                   autoComplete="current-password"
                   className="px-2.5 py-1.5 rounded bg-[#07080c] border border-[#252933]
-                    text-[13px] text-[#e6f0e4] placeholder:text-[#6b7569]/50
+                    text-[13px] text-[#e6f0e4] placeholder:text-[#899384]/50
                     focus:outline-none focus:border-[#00ff88] transition-colors"
                 />
               </div>
@@ -235,7 +235,7 @@ export default function LoginPage() {
           )}
         </div>
 
-        <p className="text-center text-[10px] text-[#6b7569] mt-6">
+        <p className="text-center text-[10px] text-[#899384] mt-6">
           sessions live in tmux · auth via sso · no state in the browser
         </p>
       </div>

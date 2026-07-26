@@ -49,7 +49,7 @@ function Section({
     <div className="bg-[#0f1117] border border-[#1a1d24] rounded p-4 mb-3">
       <div className="flex items-baseline gap-3 mb-3">
         <h2 className="text-[13px] font-medium text-[#e6f0e4]">{title}</h2>
-        {desc && <span className="text-[10px] text-[#6b7569]">{desc}</span>}
+        {desc && <span className="text-[10px] text-[#899384]">{desc}</span>}
       </div>
       {children}
     </div>
@@ -59,7 +59,7 @@ function Section({
 function Row({ label, value, mono }: { label: string; value: React.ReactNode; mono?: boolean }) {
   return (
     <div className="flex items-center gap-4 py-1.5 text-[11px]">
-      <span className="text-[#6b7569] w-32 shrink-0 uppercase tracking-wider text-[10px]">
+      <span className="text-[#899384] w-32 shrink-0 uppercase tracking-wider text-[10px]">
         {label}
       </span>
       <span className={`text-[#e6f0e4] ${mono ? "font-mono" : ""} truncate`}>{value}</span>
@@ -244,7 +244,7 @@ function ProvidersPage({ scope, session }: { scope: SettingsScope; session?: str
             onRefresh={() => {}}
           />
         ) : (
-          <p className="text-[11px] text-[#6b7569]">loading providers…</p>
+          <p className="text-[11px] text-[#899384]">loading providers…</p>
         )}
       </Section>
     </div>
@@ -278,7 +278,7 @@ function AppearancePage() {
       <PageHeader title="Appearance" />
       <Section title="theme" desc="terminalx ships a single dark theme">
         <Row label="theme" value="dark" />
-        <p className="mt-2 text-[11px] text-[#6b7569] leading-relaxed">
+        <p className="mt-2 text-[11px] text-[#899384] leading-relaxed">
           terminalx uses a fixed dark theme tuned for long terminal sessions. A light theme is not
           available yet.
         </p>
@@ -312,7 +312,7 @@ function AdvancedPage() {
             sessions survive browser reloads; they live in tmux until you{" "}
             <code className="text-[#00cc6e] bg-transparent border-0 px-0">kill</code> them.
           </p>
-          <p className="mt-2 text-[#6b7569]">
+          <p className="mt-2 text-[#899384]">
             shortcut hints:{" "}
             <kbd className="px-1 py-0.5 bg-[#0a0b10] border border-[#252933] border-b-2 rounded-[2px] text-[10px] text-[#e6f0e4]">
               ⌘

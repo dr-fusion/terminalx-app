@@ -69,7 +69,7 @@ export function ChecksEmptyState({ rollup, reason, onRetry }: ChecksEmptyStatePr
       className="flex flex-col items-center justify-center gap-2 px-6 py-10 text-center"
     >
       <div className="text-[13px] text-[#e6f0e4]">{copy.title}</div>
-      <div className="max-w-xs text-[12px] text-[#6b7569]">{copy.body}</div>
+      <div className="max-w-xs text-[12px] text-[#899384]">{copy.body}</div>
       {copy.retryable && onRetry ? (
         <button
           data-testid="checks-empty-retry"

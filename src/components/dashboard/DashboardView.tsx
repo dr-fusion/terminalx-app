@@ -47,7 +47,7 @@ function KindIcon({ kind }: { kind?: SessionKind }) {
   if (kind === "codex") return <Bot size={14} className="text-[#5ccfe6] shrink-0" />;
   if (kind === "cursor") return <Code size={14} className="text-[#7dd3fc] shrink-0" />;
   if (kind === "opencode") return <Boxes size={14} className="text-[#ffa657] shrink-0" />;
-  return <Terminal size={14} className="text-[#6b7569] shrink-0" />;
+  return <Terminal size={14} className="text-[#899384] shrink-0" />;
 }
 
 interface DirectoryEntry {
@@ -156,7 +156,7 @@ function SessionRow({
             </span>
           )}
         </div>
-        <div className="text-[10px] text-[#6b7569] mt-1 truncate">
+        <div className="text-[10px] text-[#899384] mt-1 truncate">
           {s.windows} window{s.windows !== 1 ? "s" : ""} · {s.attached ? "live" : "idle"}
           <span className="hidden sm:inline">
             {" "}
@@ -164,7 +164,7 @@ function SessionRow({
           </span>
         </div>
       </div>
-      <span className="hidden sm:inline text-[10px] text-[#6b7569] tabular-nums shrink-0">
+      <span className="hidden sm:inline text-[10px] text-[#899384] tabular-nums shrink-0">
         {s.attached ? "live" : "idle"}
       </span>
       <button
@@ -174,7 +174,7 @@ function SessionRow({
           onKill(s.name);
         }}
         className={`hidden sm:block p-1.5 opacity-0 group-hover:opacity-100 transition-all shrink-0 ${
-          canKill ? "text-[#6b7569] hover:text-[#ff5c5c]" : "text-[#3f4742] cursor-not-allowed"
+          canKill ? "text-[#899384] hover:text-[#ff5c5c]" : "text-[#3f4742] cursor-not-allowed"
         }`}
         title={canKill ? "kill session" : "unmanaged tmux session"}
         aria-label={`kill session ${s.name}`}
@@ -400,7 +400,7 @@ export function DashboardView() {
       <div className="max-w-[960px] mx-auto px-4 sm:px-6 py-6 sm:py-8">
         <div className="flex items-baseline gap-4 mb-1">
           <h1 className="text-[26px] font-bold tracking-tight text-[#e6f0e4]">sessions</h1>
-          <span className="text-[11px] text-[#6b7569]">
+          <span className="text-[11px] text-[#899384]">
             {sessions.length} total · <span className="text-[#00ff88]">{live} live</span> · {idle}{" "}
             idle
           </span>
@@ -424,7 +424,7 @@ export function DashboardView() {
             <RefreshCw size={12} /> refresh
           </button>
           <div className="flex-1" />
-          <div className="flex items-center gap-1.5 text-[10px] text-[#6b7569]">
+          <div className="flex items-center gap-1.5 text-[10px] text-[#899384]">
             <kbd className="px-1 py-0.5 bg-[#0a0b10] border border-[#252933] border-b-2 rounded-[2px] text-[10px] text-[#e6f0e4]">
               ⌘
             </kbd>
@@ -436,7 +436,7 @@ export function DashboardView() {
         </div>
 
         {isLoading && sessions.length === 0 ? (
-          <div className="mt-10 p-10 text-center text-[11px] text-[#6b7569] border border-dashed border-[#252933] rounded">
+          <div className="mt-10 p-10 text-center text-[11px] text-[#899384] border border-dashed border-[#252933] rounded">
             resurrecting tmux…
           </div>
         ) : sessions.length === 0 ? (
@@ -466,18 +466,18 @@ export function DashboardView() {
         )}
 
         <div className="mt-10">
-          <span className="text-[9px] uppercase tracking-wider text-[#6b7569] font-medium">
+          <span className="text-[9px] uppercase tracking-wider text-[#899384] font-medium">
             attach from cli
           </span>
           <div className="mt-2 flex items-center gap-3 px-3 py-2.5 rounded bg-[#07080c] border border-[#1a1d24] text-[10px]">
-            <span className="text-[#6b7569]">$</span>
+            <span className="text-[#899384]">$</span>
             <code className="flex-1 bg-transparent border-0 px-0 text-[#00cc6e]">
               ssh {typeof window !== "undefined" ? window.location.hostname : "<host>"} -t tmux
               attach -t &lt;session&gt;
             </code>
             <button
               onClick={copyAttachUrl}
-              className="text-[10px] text-[#6b7569] hover:text-[#00ff88] flex items-center gap-1 transition-colors"
+              className="text-[10px] text-[#899384] hover:text-[#00ff88] flex items-center gap-1 transition-colors"
             >
               <Copy size={10} /> {copied ? "copied" : "copy"}
             </button>
@@ -497,12 +497,12 @@ export function DashboardView() {
             style={{ boxShadow: "0 8px 24px rgba(0, 0, 0, 0.6)" }}
           >
             <div className="flex items-center justify-between mb-3">
-              <span className="text-[10px] uppercase tracking-wider font-medium text-[#6b7569]">
+              <span className="text-[10px] uppercase tracking-wider font-medium text-[#899384]">
                 new session
               </span>
               <button
                 onClick={() => setShowDialog(false)}
-                className="p-0.5 text-[#6b7569] hover:text-[#e6f0e4] transition-colors"
+                className="p-0.5 text-[#899384] hover:text-[#e6f0e4] transition-colors"
               >
                 <X size={12} />
               </button>
@@ -527,12 +527,12 @@ export function DashboardView() {
               }}
               placeholder="my-project"
               className="w-full px-2 py-1.5 rounded bg-[#07080c] border border-[#252933]
-                text-[#e6f0e4] text-[13px] placeholder:text-[#6b7569]/50
+                text-[#e6f0e4] text-[13px] placeholder:text-[#899384]/50
                 focus:outline-none focus:border-[#00ff88] transition-colors"
               style={{ boxShadow: "none" }}
             />
             {name.trim() && (
-              <p className="text-[10px] text-[#6b7569] mt-1">
+              <p className="text-[10px] text-[#899384] mt-1">
                 →{" "}
                 <code className="text-[#00cc6e] bg-transparent border-0 px-0">
                   {preview || "—"}
@@ -541,7 +541,7 @@ export function DashboardView() {
             )}
 
             <div className="mt-3">
-              <span className="block text-[10px] uppercase tracking-wider text-[#6b7569] mb-1.5">
+              <span className="block text-[10px] uppercase tracking-wider text-[#899384] mb-1.5">
                 session kind
               </span>
               {/* Issue #4: registry-driven harness toggle (bash/claude/codex/cursor/opencode). */}
@@ -562,7 +562,7 @@ export function DashboardView() {
                     className={`flex-1 inline-flex items-center justify-center gap-1 px-2 py-1 rounded text-[11px] transition-colors ${
                       kind === h.id
                         ? "text-[#05060a] font-medium"
-                        : "text-[#6b7569] hover:text-[#e6f0e4]"
+                        : "text-[#899384] hover:text-[#e6f0e4]"
                     }`}
                     style={{ background: kind === h.id ? h.color : "transparent" }}
                   >
@@ -583,7 +583,7 @@ export function DashboardView() {
               </div>
               {workspaceConfig?.hasRepoConfig &&
                 workspaceConfig.provenance.defaultKind === "repo" && (
-                  <span className="mt-1 block text-[9px] text-[#6b7569]">
+                  <span className="mt-1 block text-[9px] text-[#899384]">
                     default kind from repo settings.toml
                   </span>
                 )}
@@ -595,7 +595,7 @@ export function DashboardView() {
                 data-testid="workspace-config-summary"
                 className="mt-3 rounded border border-[#1a1d24] bg-[#07080c] px-2.5 py-2 text-[10px] text-[#a8b3a6] space-y-1.5"
               >
-                <div className="flex items-center gap-1.5 text-[#6b7569]">
+                <div className="flex items-center gap-1.5 text-[#899384]">
                   <span className="uppercase tracking-wider">workspace</span>
                   {workspaceConfig.hasRepoConfig ? (
                     <span className="text-[#00ff88]">.terminalx/settings.toml</span>
@@ -622,7 +622,7 @@ export function DashboardView() {
                   </label>
                 )}
                 {workspaceConfig.scripts.length > 0 && (
-                  <div className="text-[#6b7569]" data-testid="workspace-summary-scripts">
+                  <div className="text-[#899384]" data-testid="workspace-summary-scripts">
                     run scripts: {workspaceConfig.scripts.map((s) => s.name).join(" · ")}
                   </div>
                 )}
@@ -631,13 +631,13 @@ export function DashboardView() {
 
             <div className="mt-3">
               <div className="flex items-center justify-between mb-1.5">
-                <span className="block text-[10px] uppercase tracking-wider text-[#6b7569]">
+                <span className="block text-[10px] uppercase tracking-wider text-[#899384]">
                   start directory
                 </span>
                 <button
                   type="button"
                   onClick={() => loadDirectories(".")}
-                  className="text-[10px] text-[#6b7569] hover:text-[#00ff88] transition-colors"
+                  className="text-[10px] text-[#899384] hover:text-[#00ff88] transition-colors"
                 >
                   root
                 </button>
@@ -650,7 +650,7 @@ export function DashboardView() {
                     directoryLoading || Boolean(directoryRoot && directoryPath === directoryRoot)
                   }
                   className="shrink-0 h-[30px] w-[30px] grid place-items-center rounded bg-[#07080c] border border-[#252933]
-                    text-[#6b7569] hover:text-[#00ff88] hover:border-[#00cc6e] disabled:opacity-40 disabled:hover:text-[#6b7569]
+                    text-[#899384] hover:text-[#00ff88] hover:border-[#00cc6e] disabled:opacity-40 disabled:hover:text-[#899384]
                     disabled:hover:border-[#252933] transition-colors"
                   title="parent directory"
                   aria-label="parent directory"
@@ -665,7 +665,7 @@ export function DashboardView() {
                     if (e.key === "Escape") setShowDialog(false);
                   }}
                   className="flex-1 min-w-0 px-2 py-1.5 rounded bg-[#07080c] border border-[#252933]
-                    text-[#e6f0e4] text-[12px] placeholder:text-[#6b7569]/50 font-mono
+                    text-[#e6f0e4] text-[12px] placeholder:text-[#899384]/50 font-mono
                     focus:outline-none focus:border-[#00ff88] transition-colors"
                   placeholder="select a directory"
                 />
@@ -681,11 +681,11 @@ export function DashboardView() {
               </div>
               <div className="mt-2 max-h-[150px] overflow-y-auto rounded border border-[#1a1d24] bg-[#07080c]">
                 {directoryLoading ? (
-                  <div className="px-2 py-3 text-[11px] text-[#6b7569]">loading directories…</div>
+                  <div className="px-2 py-3 text-[11px] text-[#899384]">loading directories…</div>
                 ) : directoryError ? (
                   <div className="px-2 py-3 text-[11px] text-[#ff5c5c]">{directoryError}</div>
                 ) : directoryEntries.length === 0 ? (
-                  <div className="px-2 py-3 text-[11px] text-[#6b7569]">no child directories</div>
+                  <div className="px-2 py-3 text-[11px] text-[#899384]">no child directories</div>
                 ) : (
                   directoryEntries.map((entry) => (
                     <button
@@ -701,7 +701,7 @@ export function DashboardView() {
                   ))
                 )}
               </div>
-              <div className="mt-1 flex items-center gap-1.5 text-[10px] text-[#6b7569] min-w-0">
+              <div className="mt-1 flex items-center gap-1.5 text-[10px] text-[#899384] min-w-0">
                 <FolderOpen size={11} className="shrink-0 text-[#00cc6e]" />
                 <code className="min-w-0 truncate bg-transparent border-0 px-0 text-[#00cc6e]">
                   {directoryPath}
@@ -748,10 +748,10 @@ export function DashboardView() {
                       }}
                       placeholder={defaultBranchName(preview)}
                       className="w-full px-2 py-1.5 rounded bg-[#0f1117] border border-[#252933]
-                        text-[#e6f0e4] text-[12px] placeholder:text-[#6b7569]/50 font-mono
+                        text-[#e6f0e4] text-[12px] placeholder:text-[#899384]/50 font-mono
                         focus:outline-none focus:border-[#00ff88] transition-colors"
                     />
-                    <p className="mt-1 text-[10px] text-[#6b7569] leading-tight">
+                    <p className="mt-1 text-[10px] text-[#899384] leading-tight">
                       starts from the selected repo HEAD and opens the new session in that worktree.
                     </p>
 
@@ -772,7 +772,7 @@ export function DashboardView() {
                       <div className="mt-2">
                         <label
                           htmlFor="worktree-symlink-paths"
-                          className="block text-[10px] uppercase tracking-wider text-[#6b7569] mb-1.5"
+                          className="block text-[10px] uppercase tracking-wider text-[#899384] mb-1.5"
                         >
                           shared paths
                         </label>
@@ -794,10 +794,10 @@ export function DashboardView() {
                           autoCorrect="off"
                           autoCapitalize="off"
                           className="w-full px-2 py-1.5 rounded bg-[#0f1117] border border-[#252933]
-                            text-[#e6f0e4] text-[12px] placeholder:text-[#6b7569]/50 font-mono
+                            text-[#e6f0e4] text-[12px] placeholder:text-[#899384]/50 font-mono
                             focus:outline-none focus:border-[#00ff88] transition-colors"
                         />
-                        <p className="mt-1 text-[10px] text-[#6b7569] leading-tight">
+                        <p className="mt-1 text-[10px] text-[#899384] leading-tight">
                           comma-separated, repo-relative. heavy dirs like{" "}
                           <code className="text-[#e6f0e4] bg-transparent border-0 px-0">
                             node_modules

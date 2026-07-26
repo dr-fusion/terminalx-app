@@ -115,7 +115,7 @@ function AccountTable({ status }: { status?: HarnessStatusApi }) {
         ] as const
       ).map(([label, value]) => (
         <div key={label} className="flex items-center gap-4 py-1 text-[11px]">
-          <span className="text-[#6b7569] w-24 shrink-0 uppercase tracking-wider text-[10px]">
+          <span className="text-[#899384] w-24 shrink-0 uppercase tracking-wider text-[10px]">
             {label}
           </span>
           <span className="text-[#e6f0e4] truncate">{cell(value)}</span>
@@ -210,7 +210,7 @@ export function HarnessTabs() {
             className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded text-[11px] transition-colors ${
               selected === h.id
                 ? "bg-[#1a1d24] text-[#e6f0e4] font-medium"
-                : "text-[#6b7569] hover:text-[#e6f0e4]"
+                : "text-[#899384] hover:text-[#e6f0e4]"
             }`}
           >
             {h.label}
@@ -239,7 +239,7 @@ export function HarnessTabs() {
           ) : (
             <div>
               <div className="flex items-center gap-2 mb-3">
-                <span className="text-[10px] uppercase tracking-wider text-[#6b7569]">
+                <span className="text-[10px] uppercase tracking-wider text-[#899384]">
                   Authentication
                 </span>
                 <StatusPill status={current.status} />
@@ -255,7 +255,7 @@ export function HarnessTabs() {
                   >
                     <Play size={11} /> Run {current.status.loginCommand}
                   </button>
-                  {loginMsg && <span className="text-[10px] text-[#6b7569]">{loginMsg}</span>}
+                  {loginMsg && <span className="text-[10px] text-[#899384]">{loginMsg}</span>}
                 </div>
               )}
             </div>

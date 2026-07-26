@@ -15,7 +15,7 @@ function ProvenanceBadge({ scope }: { scope: ConfigScope }) {
       ? "bg-[#00ff88]/20 text-[#00ff88]"
       : scope === "user"
         ? "bg-[#5ccfe6]/20 text-[#5ccfe6]"
-        : "bg-[#6b7569]/20 text-[#6b7569]";
+        : "bg-[#899384]/20 text-[#899384]";
   return (
     <span
       data-testid="workspace-provenance-badge"
@@ -95,7 +95,7 @@ export function WorkspaceSettings() {
       <div className="flex items-center justify-between mb-3">
         <div className="flex items-baseline gap-3">
           <h2 className="text-[13px] font-medium text-[#e6f0e4]">project</h2>
-          <span className="text-[10px] text-[#6b7569]">setup · run scripts · injected port</span>
+          <span className="text-[10px] text-[#899384]">setup · run scripts · injected port</span>
         </div>
         {scope === "repo" && repoSession && (
           <button
@@ -120,7 +120,7 @@ export function WorkspaceSettings() {
             className={`px-3 py-1 text-[10px] uppercase tracking-wider rounded ${
               scope === s
                 ? "bg-[#002a17] text-[#00ff88] border border-[#00cc6e]"
-                : "text-[#6b7569] border border-[#1a1d24] hover:text-[#a8b3a6]"
+                : "text-[#899384] border border-[#1a1d24] hover:text-[#a8b3a6]"
             }`}
           >
             {s}
@@ -129,7 +129,7 @@ export function WorkspaceSettings() {
       </div>
 
       {!repoSession && (
-        <p className="text-[11px] text-[#6b7569]">
+        <p className="text-[11px] text-[#899384]">
           open a worktree-backed session to resolve its repo config.
         </p>
       )}
@@ -148,7 +148,7 @@ export function WorkspaceSettings() {
           )}
 
           <div className="flex items-center gap-3 py-1 text-[11px]">
-            <span className="text-[#6b7569] w-28 shrink-0 uppercase tracking-wider text-[10px]">
+            <span className="text-[#899384] w-28 shrink-0 uppercase tracking-wider text-[10px]">
               default kind
             </span>
             <span className="text-[#e6f0e4] font-mono" data-testid="workspace-default-kind">
@@ -158,7 +158,7 @@ export function WorkspaceSettings() {
           </div>
 
           <div className="flex items-center gap-3 py-1 text-[11px]">
-            <span className="text-[#6b7569] w-28 shrink-0 uppercase tracking-wider text-[10px]">
+            <span className="text-[#899384] w-28 shrink-0 uppercase tracking-wider text-[10px]">
               copy files
             </span>
             <span className="text-[#e6f0e4] font-mono truncate">
@@ -168,7 +168,7 @@ export function WorkspaceSettings() {
           </div>
 
           <div className="flex items-center gap-3 py-1 text-[11px]">
-            <span className="text-[#6b7569] w-28 shrink-0 uppercase tracking-wider text-[10px]">
+            <span className="text-[#899384] w-28 shrink-0 uppercase tracking-wider text-[10px]">
               env keys
             </span>
             <span className="text-[#e6f0e4] font-mono truncate">
@@ -178,7 +178,7 @@ export function WorkspaceSettings() {
           </div>
 
           <div className="flex items-center gap-3 py-1 text-[11px]">
-            <span className="text-[#6b7569] w-28 shrink-0 uppercase tracking-wider text-[10px]">
+            <span className="text-[#899384] w-28 shrink-0 uppercase tracking-wider text-[10px]">
               setup
             </span>
             <span
@@ -192,14 +192,14 @@ export function WorkspaceSettings() {
 
           <div className="pt-1">
             <div className="flex items-center gap-3 py-1 text-[11px]">
-              <span className="text-[#6b7569] w-28 shrink-0 uppercase tracking-wider text-[10px]">
+              <span className="text-[#899384] w-28 shrink-0 uppercase tracking-wider text-[10px]">
                 run scripts
               </span>
               <ProvenanceBadge scope={config.provenance.scripts} />
             </div>
             <div className="mt-1 space-y-1" data-testid="workspace-run-scripts">
               {config.scripts.length === 0 && (
-                <div className="text-[11px] text-[#6b7569]">no run scripts configured.</div>
+                <div className="text-[11px] text-[#899384]">no run scripts configured.</div>
               )}
               {config.scripts.map((s) => (
                 <div
@@ -208,7 +208,7 @@ export function WorkspaceSettings() {
                   className="flex items-center gap-2 rounded border border-[#1a1d24] bg-[#07080c] px-2 py-1.5 text-[11px]"
                 >
                   <span className="text-[#00ff88] font-mono">run · {s.name}</span>
-                  <span className="text-[#6b7569] truncate">{s.description ?? s.command}</span>
+                  <span className="text-[#899384] truncate">{s.description ?? s.command}</span>
                 </div>
               ))}
             </div>
@@ -225,13 +225,13 @@ export function WorkspaceSettings() {
             </code>
             . the committed repo config always wins where present.
           </p>
-          <p className="text-[11px] text-[#6b7569]">
+          <p className="text-[11px] text-[#899384]">
             stored at <span className="font-mono">data/workspace-config.json</span>.
           </p>
         </div>
       )}
 
-      {saveStatus && <span className="mt-2 block text-[11px] text-[#6b7569]">{saveStatus}</span>}
+      {saveStatus && <span className="mt-2 block text-[11px] text-[#899384]">{saveStatus}</span>}
 
       {/* Raw settings.toml editor (Edit / Create affordance) */}
       {editorOpen && (
@@ -248,7 +248,7 @@ export function WorkspaceSettings() {
           >
             <div className="flex items-center justify-between px-3 py-2 border-b border-[#1a1d24]">
               <span className="text-[11px] text-[#e6f0e4] font-mono truncate">{rawPath}</span>
-              <span className="text-[9px] uppercase tracking-wider text-[#6b7569]">
+              <span className="text-[9px] uppercase tracking-wider text-[#899384]">
                 {rawExists ? "edit" : "create"}
               </span>
             </div>

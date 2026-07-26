@@ -157,7 +157,7 @@ export default function AdminPage() {
           <div className="flex items-center gap-3">
             <Link
               href="/"
-              className="p-1.5 text-[#6b7569] hover:text-[#e6f0e4] transition-colors"
+              className="p-1.5 text-[#899384] hover:text-[#e6f0e4] transition-colors"
               title="Back to workspace"
               aria-label="Back to workspace"
             >
@@ -189,7 +189,7 @@ export default function AdminPage() {
                     value={newUsername}
                     onChange={(e) => setNewUsername(e.target.value)}
                     placeholder="Enter username"
-                    className="border-[#1a1d24] bg-[#0a0b10] text-[#e6f0e4] placeholder:text-[#6b7569]"
+                    className="border-[#1a1d24] bg-[#0a0b10] text-[#e6f0e4] placeholder:text-[#899384]"
                   />
                 </div>
                 <div className="flex flex-col gap-2">
@@ -202,7 +202,7 @@ export default function AdminPage() {
                     value={newPassword}
                     onChange={(e) => setNewPassword(e.target.value)}
                     placeholder="Enter password"
-                    className="border-[#1a1d24] bg-[#0a0b10] text-[#e6f0e4] placeholder:text-[#6b7569]"
+                    className="border-[#1a1d24] bg-[#0a0b10] text-[#e6f0e4] placeholder:text-[#899384]"
                   />
                 </div>
                 <div className="flex flex-col gap-2">
@@ -241,18 +241,18 @@ export default function AdminPage() {
         <div className="rounded-lg border border-[#1a1d24] bg-[#0f1117] overflow-hidden">
           {isLoadingUsers ? (
             <div className="flex items-center justify-center py-12">
-              <Loader2 className="h-5 w-5 animate-spin text-[#6b7569]" />
+              <Loader2 className="h-5 w-5 animate-spin text-[#899384]" />
             </div>
           ) : users.length === 0 ? (
-            <div className="py-12 text-center text-[#6b7569]">No users found</div>
+            <div className="py-12 text-center text-[#899384]">No users found</div>
           ) : (
             <Table>
               <TableHeader>
                 <TableRow className="border-[#1a1d24] hover:bg-transparent">
-                  <TableHead className="text-[#6b7569]">Username</TableHead>
-                  <TableHead className="text-[#6b7569]">Role</TableHead>
-                  <TableHead className="text-[#6b7569]">Created</TableHead>
-                  <TableHead className="text-right text-[#6b7569]">Actions</TableHead>
+                  <TableHead className="text-[#899384]">Username</TableHead>
+                  <TableHead className="text-[#899384]">Role</TableHead>
+                  <TableHead className="text-[#899384]">Created</TableHead>
+                  <TableHead className="text-right text-[#899384]">Actions</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -265,20 +265,20 @@ export default function AdminPage() {
                         className={
                           u.role === "admin"
                             ? "bg-[#00cc6e]/20 text-[#00cc6e]"
-                            : "bg-[#6b7569]/20 text-[#6b7569]"
+                            : "bg-[#899384]/20 text-[#899384]"
                         }
                       >
                         {u.role}
                       </Badge>
                     </TableCell>
-                    <TableCell className="text-[#6b7569]">
+                    <TableCell className="text-[#899384]">
                       {u.createdAt ? new Date(u.createdAt).toLocaleDateString() : "-"}
                     </TableCell>
                     <TableCell className="text-right">
                       <DropdownMenu>
                         <DropdownMenuTrigger
                           render={
-                            <button className="p-1.5 text-[#6b7569] hover:text-[#e6f0e4] transition-colors rounded">
+                            <button className="p-1.5 text-[#899384] hover:text-[#e6f0e4] transition-colors rounded">
                               <MoreHorizontal size={16} />
                             </button>
                           }

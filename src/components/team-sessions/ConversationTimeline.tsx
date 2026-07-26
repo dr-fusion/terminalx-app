@@ -253,6 +253,8 @@ export function ConversationTimeline({
       }}
       aria-live="polite"
       aria-label="Session conversation"
+      role="log"
+      tabIndex={0}
     >
       {historyTruncated || hiddenBefore > 0 ? (
         <p className="mx-auto mb-4 max-w-3xl rounded-md border border-border bg-muted/40 px-3 py-2 text-xs leading-5 text-muted-foreground">

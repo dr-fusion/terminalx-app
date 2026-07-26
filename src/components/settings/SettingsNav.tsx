@@ -49,7 +49,7 @@ export function SettingsNav({
       className={`w-full text-left px-2.5 py-1.5 rounded text-[11px] transition-colors ${
         active === entry.key
           ? "bg-[#1a1d24] text-[#e6f0e4] font-medium"
-          : "text-[#6b7569] hover:text-[#e6f0e4] hover:bg-[#1a1d24]/50"
+          : "text-[#899384] hover:text-[#e6f0e4] hover:bg-[#1a1d24]/50"
       }`}
     >
       {entry.label}

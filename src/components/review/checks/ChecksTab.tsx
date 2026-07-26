@@ -25,7 +25,7 @@ export function ChecksTab({ sessionName, view, isLoading, error, onRefresh }: Ch
       <div
         data-testid="checks-tab"
         data-state="loading"
-        className="flex h-full items-center justify-center text-[12px] text-[#6b7569]"
+        className="flex h-full items-center justify-center text-[12px] text-[#899384]"
       >
         Loading checks…
       </div>

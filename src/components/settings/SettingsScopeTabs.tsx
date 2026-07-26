@@ -38,7 +38,7 @@ export function SettingsScopeTabs({
                   ? "bg-[#1a1d24] text-[#e6f0e4] font-medium"
                   : disabled
                     ? "text-[#3a3f3a] cursor-not-allowed"
-                    : "text-[#6b7569] hover:text-[#e6f0e4]"
+                    : "text-[#899384] hover:text-[#e6f0e4]"
               }`}
             >
               {s}
@@ -50,7 +50,7 @@ export function SettingsScopeTabs({
         <button
           data-testid="settings-edit-toml"
           onClick={onEditToml}
-          className="inline-flex items-center gap-1 text-[10px] text-[#6b7569] hover:text-[#e6f0e4]"
+          className="inline-flex items-center gap-1 text-[10px] text-[#899384] hover:text-[#e6f0e4]"
           title=".terminalx/settings.toml"
         >
           Edit{" "}

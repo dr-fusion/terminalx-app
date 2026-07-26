@@ -70,7 +70,7 @@ export function OpenCodePanel({
       <div className="flex items-center justify-between mb-3">
         <div className="min-w-0">
           <div className="text-[13px] font-medium text-[#e6f0e4]">OpenCode</div>
-          <div className="text-[10px] text-[#6b7569]">The open source AI coding agent</div>
+          <div className="text-[10px] text-[#899384]">The open source AI coding agent</div>
         </div>
         {harness.docsUrl && (
           <a
@@ -92,7 +92,7 @@ export function OpenCodePanel({
       >
         <div className="min-w-0">
           <div className="text-[11px] text-[#e6f0e4]">Providers</div>
-          <div data-testid="opencode-providers-count" className="text-[10px] text-[#6b7569]">
+          <div data-testid="opencode-providers-count" className="text-[10px] text-[#899384]">
             {configuredCount} configured
           </div>
         </div>
@@ -112,7 +112,7 @@ export function OpenCodePanel({
       >
         <div className="min-w-0">
           <div className="text-[11px] text-[#e6f0e4]">Models</div>
-          <div data-testid="opencode-models-count" className="text-[10px] text-[#6b7569]">
+          <div data-testid="opencode-models-count" className="text-[10px] text-[#899384]">
             {selectedModelCount} selected
           </div>
         </div>
@@ -164,7 +164,7 @@ export function OpenCodePanel({
               <button
                 data-testid="opencode-refresh"
                 onClick={onRefresh}
-                className="inline-flex items-center gap-1 text-[11px] text-[#6b7569] hover:text-[#00ff88] transition-colors"
+                className="inline-flex items-center gap-1 text-[11px] text-[#899384] hover:text-[#00ff88] transition-colors"
               >
                 <RefreshCw size={11} /> Refresh
               </button>
@@ -173,7 +173,7 @@ export function OpenCodePanel({
             <div>
               <label
                 htmlFor="opencode-exec-path"
-                className="block text-[10px] uppercase tracking-wider text-[#6b7569] mb-1.5"
+                className="block text-[10px] uppercase tracking-wider text-[#899384] mb-1.5"
               >
                 OpenCode executable path
               </label>
@@ -186,10 +186,10 @@ export function OpenCodePanel({
                 spellCheck={false}
                 autoComplete="off"
                 className="w-full px-2 py-1.5 rounded bg-[#0f1117] border border-[#252933]
-                  text-[#e6f0e4] text-[12px] placeholder:text-[#6b7569]/50 font-mono
+                  text-[#e6f0e4] text-[12px] placeholder:text-[#899384]/50 font-mono
                   focus:outline-none focus:border-[#ffa657] transition-colors"
               />
-              <p className="mt-1 text-[10px] text-[#6b7569] leading-tight">
+              <p className="mt-1 text-[10px] text-[#899384] leading-tight">
                 Override the bundled OpenCode executable with a custom one. Leave empty to use the
                 bundled version (recommended).
               </p>

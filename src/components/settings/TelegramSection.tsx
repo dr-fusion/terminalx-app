@@ -44,7 +44,7 @@ function Section({
     <div className="bg-[#0f1117] border border-[#1a1d24] rounded p-4 mb-3">
       <div className="flex items-baseline gap-3 mb-3">
         <h2 className="text-[13px] font-medium text-[#e6f0e4]">{title}</h2>
-        {desc && <span className="text-[10px] text-[#6b7569]">{desc}</span>}
+        {desc && <span className="text-[10px] text-[#899384]">{desc}</span>}
       </div>
       {children}
     </div>
@@ -151,7 +151,7 @@ export function TelegramSection() {
           />
           enabled
           {telegram?.config.botTokenPreview && (
-            <span className="text-[#6b7569]">token {telegram.config.botTokenPreview}</span>
+            <span className="text-[#899384]">token {telegram.config.botTokenPreview}</span>
           )}
         </label>
         <input
@@ -209,7 +209,7 @@ export function TelegramSection() {
           <Save size={12} /> save telegram
         </button>
       )}
-      {telegramStatus && <span className="ml-3 text-[11px] text-[#6b7569]">{telegramStatus}</span>}
+      {telegramStatus && <span className="ml-3 text-[11px] text-[#899384]">{telegramStatus}</span>}
 
       <div className="mt-4 space-y-1">
         {telegram?.topics.map((topic) => (

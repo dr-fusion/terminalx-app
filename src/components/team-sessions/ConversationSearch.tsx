@@ -118,7 +118,7 @@ export function ConversationSearch({ sessionId, viewerUserId }: ConversationSear
             value={text}
             maxLength={200}
             placeholder="Search comments in this session"
-            aria-controls={resultsId}
+            {...(submitted ? { "aria-controls": resultsId } : {})}
             className="min-h-10 w-full rounded-md border border-input bg-background pl-9 pr-3 text-sm focus-visible:ring-2 focus-visible:ring-ring"
             onChange={(event) => setText(event.target.value)}
           />

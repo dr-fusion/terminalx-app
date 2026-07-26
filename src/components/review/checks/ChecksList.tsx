@@ -25,7 +25,7 @@ export function ChecksList({ items }: ChecksListProps) {
       {hidden > 0 && (
         <div
           data-testid="checks-list-overflow"
-          className="px-3 py-2 text-center text-[11px] text-[#6b7569]"
+          className="px-3 py-2 text-center text-[11px] text-[#899384]"
         >
           + {hidden} more check{hidden === 1 ? "" : "s"} not shown
         </div>

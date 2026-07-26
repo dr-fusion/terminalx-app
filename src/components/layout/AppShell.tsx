@@ -63,7 +63,7 @@ function LeftSidebar({
         <div className="flex-1" />
         <button
           onClick={onOpenPalette}
-          className="flex h-6 w-6 items-center justify-center rounded text-[#6b7569] transition-colors hover:bg-[#14161e] hover:text-[#e6f0e4]"
+          className="flex h-6 w-6 items-center justify-center rounded text-[#899384] transition-colors hover:bg-[#14161e] hover:text-[#e6f0e4]"
           aria-label="open command palette"
         >
           <Plus size={14} />
@@ -82,16 +82,16 @@ function LeftSidebar({
               : "text-[#a8b3a6] hover:bg-[#14161e] hover:text-[#e6f0e4]"
           }`}
         >
-          <History size={14} className="text-[#6b7569]" />
+          <History size={14} className="text-[#899384]" />
           <span>History</span>
         </Link>
 
-        <div className="mt-5 flex items-center px-1 text-[10px] uppercase tracking-wider text-[#6b7569]">
+        <div className="mt-5 flex items-center px-1 text-[10px] uppercase tracking-wider text-[#899384]">
           <span>Projects</span>
           <span className="flex-1" />
           <button
             onClick={() => router.push("/dashboard")}
-            className="rounded p-1 text-[#6b7569] transition-colors hover:bg-[#14161e] hover:text-[#e6f0e4]"
+            className="rounded p-1 text-[#899384] transition-colors hover:bg-[#14161e] hover:text-[#e6f0e4]"
             aria-label="new project"
             data-testid="sidebar-new-project"
           >
@@ -103,7 +103,7 @@ function LeftSidebar({
         <ProjectSidebar activeSession={activeSession} />
 
         <div className="mt-5 border-t border-[#1a1d24] pt-3" data-testid="sidebar-tools">
-          <div className="px-1 text-[10px] uppercase tracking-wider text-[#6b7569]">Tools</div>
+          <div className="px-1 text-[10px] uppercase tracking-wider text-[#899384]">Tools</div>
           <div className="mt-1 space-y-0.5">
             {SIDEBAR_LINKS.map(({ href, label, icon: Icon }) => {
               const active = path === href || path.startsWith(`${href}/`);
@@ -118,7 +118,7 @@ function LeftSidebar({
                       : "text-[#a8b3a6] hover:bg-[#14161e] hover:text-[#e6f0e4]"
                   }`}
                 >
-                  <Icon size={14} className={active ? "text-[#00ff88]" : "text-[#6b7569]"} />
+                  <Icon size={14} className={active ? "text-[#00ff88]" : "text-[#899384]"} />
                   <span>{label}</span>
                   {href === "/inbox" ? <InboxBadge /> : null}
                 </Link>
@@ -135,7 +135,7 @@ function InspectorTerminal({ activeSession }: { activeSession: string | null }) 
   return (
     <div className="h-[260px] shrink-0 border-t border-[#1a1d24] bg-[#0a0b10]">
       <div className="p-4 font-mono text-[12px] leading-6 text-[#a8b3a6]">
-        <div className="text-[#6b7569]">
+        <div className="text-[#899384]">
           terminalx <ChevronRight size={12} className="inline align-[-2px]" />{" "}
           {activeSession ?? "no-session"}
         </div>

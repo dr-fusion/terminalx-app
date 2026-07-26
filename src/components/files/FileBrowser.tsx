@@ -164,9 +164,9 @@ export function FileBrowser() {
             {isDir(node) ? (
               <>
                 {node.expanded ? (
-                  <ChevronDown size={12} className="text-[#6b7569] shrink-0" />
+                  <ChevronDown size={12} className="text-[#899384] shrink-0" />
                 ) : (
-                  <ChevronRight size={12} className="text-[#6b7569] shrink-0" />
+                  <ChevronRight size={12} className="text-[#899384] shrink-0" />
                 )}
                 {node.expanded ? (
                   <FolderOpen size={14} className="text-[#00cc6e] shrink-0" />
@@ -177,7 +177,7 @@ export function FileBrowser() {
             ) : (
               <>
                 <span className="w-3 shrink-0" />
-                <File size={14} className="text-[#6b7569] shrink-0" />
+                <File size={14} className="text-[#899384] shrink-0" />
               </>
             )}
             <span className="truncate text-[#e6f0e4]">{node.name}</span>
@@ -197,10 +197,10 @@ export function FileBrowser() {
       <div className="flex items-center gap-0.5 px-2 py-2 border-b border-[#1a1d24] overflow-x-auto">
         {pathParts.map((part, i) => (
           <span key={i} className="flex items-center gap-0.5 whitespace-nowrap">
-            {i > 0 && <span className="text-[#6b7569]">/</span>}
+            {i > 0 && <span className="text-[#899384]">/</span>}
             <button
               onClick={() => navigateBreadcrumb(i)}
-              className="text-[#6b7569] hover:text-[#e6f0e4] transition-colors"
+              className="text-[#899384] hover:text-[#e6f0e4] transition-colors"
             >
               {part}
             </button>
@@ -218,7 +218,7 @@ export function FileBrowser() {
                 setPreviewContent(null);
                 setPreviewName(null);
               }}
-              className="text-[#6b7569] hover:text-[#e6f0e4] transition-colors text-xs"
+              className="text-[#899384] hover:text-[#e6f0e4] transition-colors text-xs"
             >
               Close
             </button>
@@ -230,9 +230,9 @@ export function FileBrowser() {
       ) : (
         <div className="flex-1 overflow-y-auto py-1">
           {isLoading ? (
-            <div className="px-3 py-4 text-[#6b7569] text-center">Loading...</div>
+            <div className="px-3 py-4 text-[#899384] text-center">Loading...</div>
           ) : entries.length === 0 ? (
-            <div className="px-3 py-4 text-[#6b7569] text-center">Empty directory</div>
+            <div className="px-3 py-4 text-[#899384] text-center">Empty directory</div>
           ) : (
             renderTree(entries, 0, [])
           )}

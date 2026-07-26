@@ -582,7 +582,7 @@ export function TerminalViewXterm({
           <div className="flex flex-col items-center gap-2 text-[#00cc6e]">
             <Upload size={32} />
             <span className="text-[14px] font-medium">Drop files to upload</span>
-            <span className="text-[12px] text-[#6b7569]">
+            <span className="text-[12px] text-[#899384]">
               File path will be pasted into terminal
             </span>
           </div>

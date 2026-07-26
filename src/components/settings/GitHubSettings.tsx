@@ -87,7 +87,7 @@ export function GitHubSettings() {
           data-testid="github-connection-status"
           data-connected={connected ? "true" : "false"}
           className={`px-1.5 py-0.5 text-[9px] rounded uppercase tracking-wider font-medium ${
-            connected ? "bg-[#00ff88]/20 text-[#00ff88]" : "bg-[#6b7569]/20 text-[#6b7569]"
+            connected ? "bg-[#00ff88]/20 text-[#00ff88]" : "bg-[#899384]/20 text-[#899384]"
           }`}
         >
           {connected ? "connected" : "not connected"}
@@ -132,7 +132,7 @@ export function GitHubSettings() {
           <span
             data-testid="github-status-message"
             className={`text-[11px] ${
-              status.kind === "error" ? "text-[#ff5c5c]" : "text-[#6b7569]"
+              status.kind === "error" ? "text-[#ff5c5c]" : "text-[#899384]"
             }`}
           >
             {status.msg}
@@ -149,7 +149,7 @@ export function GitHubSettings() {
           >
             <Link2 size={12} className="text-[#5ccfe6]" />
             <span className="min-w-0 flex-1 truncate text-[#e6f0e4]">{it.displayName}</span>
-            <span className="text-[#6b7569]">{it.githubServerUrl}</span>
+            <span className="text-[#899384]">{it.githubServerUrl}</span>
             <span className="px-1 py-0.5 rounded bg-[#5ccfe6]/15 text-[9px] uppercase tracking-wider text-[#5ccfe6]">
               {it.authType}
             </span>

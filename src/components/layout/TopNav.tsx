@@ -38,7 +38,7 @@ export function TopNav({ hostname, activeSession, onOpenPalette, onOpenMobileNav
         type="button"
         onClick={onOpenMobileNav}
         aria-label="Open navigation menu"
-        className="flex size-9 items-center justify-center rounded text-[#6b7569] transition-colors hover:bg-[#14161e] hover:text-[#e6f0e4] focus-visible:ring-2 focus-visible:ring-[#00cc6e] lg:hidden"
+        className="flex size-9 items-center justify-center rounded text-[#899384] transition-colors hover:bg-[#14161e] hover:text-[#e6f0e4] focus-visible:ring-2 focus-visible:ring-[#00cc6e] lg:hidden"
       >
         <Menu size={18} aria-hidden="true" />
       </button>
@@ -66,7 +66,7 @@ export function TopNav({ hostname, activeSession, onOpenPalette, onOpenMobileNav
 
       <div className="flex-1" />
 
-      <span className="hidden text-[11px] text-[#6b7569] lg:inline">{hostname}</span>
+      <span className="hidden text-[11px] text-[#899384] lg:inline">{hostname}</span>
 
       <div className="hidden items-center gap-1 rounded border border-[#252933] bg-[#0a0b10] px-2 py-1 text-[11px] text-[#a8b3a6] md:flex">
         <Terminal size={12} className="text-[#5ccfe6]" />
@@ -76,7 +76,7 @@ export function TopNav({ hostname, activeSession, onOpenPalette, onOpenMobileNav
       <button
         onClick={onOpenPalette}
         className="flex shrink-0 items-center gap-2 rounded border border-[#252933] bg-[#14161e] px-2 py-1.5 text-[10px]
-          text-[#6b7569] transition-colors hover:border-[#363b47] hover:text-[#e6f0e4] sm:px-2.5"
+          text-[#899384] transition-colors hover:border-[#363b47] hover:text-[#e6f0e4] sm:px-2.5"
         title="command palette (⌘K)"
         aria-label="command palette"
       >
@@ -102,13 +102,13 @@ export function TopNav({ hostname, activeSession, onOpenPalette, onOpenMobileNav
           </span>
           <button
             onClick={logout}
-            className="text-[10px] text-[#6b7569] hover:text-[#ff5c5c] transition-colors hidden sm:inline"
+            className="text-[10px] text-[#899384] hover:text-[#ff5c5c] transition-colors hidden sm:inline"
           >
             sign out
           </button>
           <button
             onClick={logout}
-            className="p-1 text-[#6b7569] hover:text-[#ff5c5c] transition-colors sm:hidden"
+            className="p-1 text-[#899384] hover:text-[#ff5c5c] transition-colors sm:hidden"
             aria-label="sign out"
           >
             <LogOut size={12} />
@@ -116,7 +116,7 @@ export function TopNav({ hostname, activeSession, onOpenPalette, onOpenMobileNav
         </div>
       )}
 
-      <PanelRight size={14} className="hidden text-[#6b7569] xl:block" />
+      <PanelRight size={14} className="hidden text-[#899384] xl:block" />
     </div>
   );
 }

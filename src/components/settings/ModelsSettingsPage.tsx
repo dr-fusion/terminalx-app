@@ -38,7 +38,7 @@ function SourceHint({ source }: { source: "user" | "repo" | "default" }) {
   if (source === "repo") return null; // value set at the current (highest) scope
   const text = source === "user" ? "inherited from User" : "default";
   return (
-    <span data-testid="models-source-hint" className="text-[10px] text-[#6b7569] ml-2">
+    <span data-testid="models-source-hint" className="text-[10px] text-[#899384] ml-2">
       {text}
     </span>
   );
@@ -63,7 +63,7 @@ function Section({
     <div className="bg-[#0f1117] border border-[#1a1d24] rounded p-4 mb-3">
       <div className="flex items-baseline gap-3 mb-3">
         <h2 className="text-[13px] font-medium text-[#e6f0e4]">{title}</h2>
-        {desc && <span className="text-[10px] text-[#6b7569]">{desc}</span>}
+        {desc && <span className="text-[10px] text-[#899384]">{desc}</span>}
       </div>
       {children}
     </div>
@@ -167,7 +167,7 @@ function ToggleRow({
             <span className="text-[13px] font-medium text-[#e6f0e4]">{label}</span>
             <SourceHint source={source} />
           </div>
-          {sublabel && <p className="text-[10px] text-[#6b7569] mt-0.5">{sublabel}</p>}
+          {sublabel && <p className="text-[10px] text-[#899384] mt-0.5">{sublabel}</p>}
           {children}
         </div>
         <button
@@ -257,7 +257,7 @@ export function ModelsSettingsPage({
 
   if (!resolved || !options) {
     return (
-      <div data-testid="models-page-loading" className="text-[11px] text-[#6b7569] p-4">
+      <div data-testid="models-page-loading" className="text-[11px] text-[#899384] p-4">
         loading models…
       </div>
     );
@@ -443,7 +443,7 @@ export function ModelsSettingsPage({
             <Save size={12} /> Save
           </button>
           {status && (
-            <span data-testid="models-save-status" className="text-[11px] text-[#6b7569]">
+            <span data-testid="models-save-status" className="text-[11px] text-[#899384]">
               {status}
             </span>
           )}

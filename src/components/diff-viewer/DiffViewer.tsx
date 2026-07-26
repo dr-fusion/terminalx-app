@@ -101,7 +101,7 @@ export function DiffViewer({ session }: { session: string | null }) {
             <span className="text-[#ff5050]">-{data.summary.deletions}</span>
           </span>
         ) : (
-          <span className="text-[#6b7569]">—</span>
+          <span className="text-[#899384]">—</span>
         )}
         <span className="flex-1" />
         <button
@@ -112,7 +112,7 @@ export function DiffViewer({ session }: { session: string | null }) {
           className={`flex h-6 w-6 items-center justify-center rounded transition-colors ${
             prefs.wordWrap
               ? "bg-[#14161e] text-[#e6f0e4]"
-              : "text-[#6b7569] hover:bg-[#14161e] hover:text-[#e6f0e4]"
+              : "text-[#899384] hover:bg-[#14161e] hover:text-[#e6f0e4]"
           }`}
         >
           <WrapText size={13} />
@@ -128,7 +128,7 @@ export function DiffViewer({ session }: { session: string | null }) {
           className={`flex h-6 w-6 items-center justify-center rounded transition-colors disabled:opacity-40 ${
             effectiveLayout === "split"
               ? "bg-[#14161e] text-[#e6f0e4]"
-              : "text-[#6b7569] hover:bg-[#14161e] hover:text-[#e6f0e4]"
+              : "text-[#899384] hover:bg-[#14161e] hover:text-[#e6f0e4]"
           }`}
         >
           {effectiveLayout === "split" ? <Columns2 size={13} /> : <Rows3 size={13} />}
@@ -137,7 +137,7 @@ export function DiffViewer({ session }: { session: string | null }) {
           data-testid="diff-refresh"
           onClick={refresh}
           title="Refresh diff"
-          className="flex h-6 w-6 items-center justify-center rounded text-[#6b7569] transition-colors hover:bg-[#14161e] hover:text-[#e6f0e4]"
+          className="flex h-6 w-6 items-center justify-center rounded text-[#899384] transition-colors hover:bg-[#14161e] hover:text-[#e6f0e4]"
         >
           <RefreshCw size={13} className={loading ? "animate-spin" : ""} />
         </button>
@@ -145,13 +145,13 @@ export function DiffViewer({ session }: { session: string | null }) {
 
       <div className="min-h-0 flex-1 overflow-y-auto">
         {loading && !data ? (
-          <div className="px-4 py-6 text-[12px] text-[#6b7569]">Loading changes…</div>
+          <div className="px-4 py-6 text-[12px] text-[#899384]">Loading changes…</div>
         ) : error ? (
           <div data-testid="diff-error" className="px-4 py-6 text-[12px] text-[#ff5050]">
             {error}
           </div>
         ) : !data || data.files.length === 0 ? (
-          <div data-testid="diff-empty" className="px-4 py-6 text-[12px] text-[#6b7569]">
+          <div data-testid="diff-empty" className="px-4 py-6 text-[12px] text-[#899384]">
             No changes in this workspace.
           </div>
         ) : (

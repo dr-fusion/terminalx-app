@@ -107,14 +107,14 @@ export function LogViewer() {
 
         <div className="flex items-center gap-1.5">
           <div className="flex items-center flex-1 gap-1 bg-[#14161e] border border-[#1a1d24] rounded px-2">
-            <Search size={12} className="text-[#6b7569] shrink-0" />
+            <Search size={12} className="text-[#899384] shrink-0" />
             <input
               type="text"
               value={filter}
               onChange={(e) => setFilter(e.target.value)}
               placeholder="Filter lines (or use Ctrl+F in page)…"
               className="flex-1 bg-transparent text-[#e6f0e4] text-[12px] py-1
-                outline-none placeholder:text-[#6b7569]"
+                outline-none placeholder:text-[#899384]"
             />
           </div>
         </div>
@@ -133,20 +133,20 @@ export function LogViewer() {
                     : "#ff5c5c",
             }}
           />
-          <span className="text-[#6b7569]">
+          <span className="text-[#899384]">
             {readyState === "open"
               ? "Streaming · ANSI rendered"
               : readyState === "connecting"
                 ? "Connecting..."
                 : "Disconnected"}
           </span>
-          <span className="text-[#6b7569] ml-auto">{lineCount} lines</span>
+          <span className="text-[#899384] ml-auto">{lineCount} lines</span>
         </div>
       )}
 
       <div className="flex-1 overflow-hidden bg-[#0a0b10]">
         {!selectedLog ? (
-          <div className="px-3 py-4 text-[#6b7569] text-center font-sans">
+          <div className="px-3 py-4 text-[#899384] text-center font-sans">
             Select a log file to start tailing
           </div>
         ) : (

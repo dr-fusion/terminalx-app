@@ -32,7 +32,7 @@ export function ChecksHeader({
             {sha ? (
               <>
                 {" "}
-                @ <span className="font-mono text-[#6b7569]">{sha}</span>
+                @ <span className="font-mono text-[#899384]">{sha}</span>
               </>
             ) : null}
           </>
@@ -50,7 +50,7 @@ export function ChecksHeader({
         onClick={onRefresh}
         disabled={isRefreshing}
         aria-label="Refresh checks"
-        className="flex h-6 w-6 items-center justify-center rounded text-[#6b7569] transition-colors hover:bg-[#14161e] hover:text-[#e6f0e4] disabled:opacity-50"
+        className="flex h-6 w-6 items-center justify-center rounded text-[#899384] transition-colors hover:bg-[#14161e] hover:text-[#e6f0e4] disabled:opacity-50"
       >
         <RefreshCw size={13} className={isRefreshing ? "animate-spin" : undefined} />
       </button>

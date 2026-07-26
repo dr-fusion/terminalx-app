@@ -30,7 +30,7 @@ const TITLE_SOFT_LIMIT = 72;
 const TITLE_HARD_LIMIT = 256;
 
 const inputClass =
-  "w-full rounded border border-[#1a1d24] bg-[#0a0b10] px-2.5 py-1.5 text-[12px] text-[#e6f0e4] outline-none placeholder:text-[#6b7569] focus:border-[#5ccfe6]";
+  "w-full rounded border border-[#1a1d24] bg-[#0a0b10] px-2.5 py-1.5 text-[12px] text-[#e6f0e4] outline-none placeholder:text-[#899384] focus:border-[#5ccfe6]";
 
 function deriveTitle(branch: string): string {
   const tail = branch.split("/").pop() ?? branch;
@@ -100,7 +100,7 @@ export function CreatePrDialog({
             <GitPullRequest size={14} className="text-[#00ff88]" />
             Create pull request
           </DialogTitle>
-          <DialogDescription className="text-[11px] text-[#6b7569]">
+          <DialogDescription className="text-[11px] text-[#899384]">
             Open a PR for this session&apos;s branch.
           </DialogDescription>
         </DialogHeader>
@@ -112,7 +112,7 @@ export function CreatePrDialog({
             className="flex items-center gap-2 text-[12px] text-[#a8b3a6]"
           >
             <div className="flex-1">
-              <label className="mb-1 block text-[10px] uppercase tracking-wide text-[#6b7569]">
+              <label className="mb-1 block text-[10px] uppercase tracking-wide text-[#899384]">
                 base
               </label>
               <input
@@ -123,16 +123,16 @@ export function CreatePrDialog({
                 placeholder="main"
               />
             </div>
-            <span className="mt-4 text-[#6b7569]">⇽</span>
+            <span className="mt-4 text-[#899384]">⇽</span>
             <div className="flex-1">
-              <label className="mb-1 block text-[10px] uppercase tracking-wide text-[#6b7569]">
+              <label className="mb-1 block text-[10px] uppercase tracking-wide text-[#899384]">
                 head
               </label>
               <input
                 data-testid="create-pr-head"
                 value={headBranch}
                 readOnly
-                className={`${inputClass} cursor-not-allowed text-[#6b7569]`}
+                className={`${inputClass} cursor-not-allowed text-[#899384]`}
               />
             </div>
           </div>
@@ -150,11 +150,11 @@ export function CreatePrDialog({
           {/* title with soft counter */}
           <div>
             <div className="mb-1 flex items-center justify-between">
-              <label className="text-[10px] uppercase tracking-wide text-[#6b7569]">title</label>
+              <label className="text-[10px] uppercase tracking-wide text-[#899384]">title</label>
               <span
                 data-testid="create-pr-title-counter"
                 className={`text-[10px] ${
-                  title.length > TITLE_SOFT_LIMIT ? "text-[#ffb454]" : "text-[#6b7569]"
+                  title.length > TITLE_SOFT_LIMIT ? "text-[#ffb454]" : "text-[#899384]"
                 }`}
               >
                 {title.length}/{TITLE_SOFT_LIMIT}
@@ -177,7 +177,7 @@ export function CreatePrDialog({
 
           {/* body */}
           <div>
-            <label className="mb-1 block text-[10px] uppercase tracking-wide text-[#6b7569]">
+            <label className="mb-1 block text-[10px] uppercase tracking-wide text-[#899384]">
               description <span className="text-[#3f4a3d]">(markdown)</span>
             </label>
             <textarea
@@ -192,7 +192,7 @@ export function CreatePrDialog({
 
           {/* reviewers */}
           <div>
-            <label className="mb-1 block text-[10px] uppercase tracking-wide text-[#6b7569]">
+            <label className="mb-1 block text-[10px] uppercase tracking-wide text-[#899384]">
               reviewers <span className="text-[#3f4a3d]">(optional, comma-separated)</span>
             </label>
             <input

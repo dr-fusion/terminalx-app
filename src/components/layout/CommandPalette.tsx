@@ -143,7 +143,7 @@ export function CommandPalette({ open, onClose }: CommandPaletteProps) {
               }
             }}
             placeholder="search commands…"
-            className="flex-1 bg-transparent outline-none text-[13px] text-[#e6f0e4] placeholder:text-[#6b7569]"
+            className="flex-1 bg-transparent outline-none text-[13px] text-[#e6f0e4] placeholder:text-[#899384]"
           />
           <kbd className="px-1.5 py-0.5 bg-[#0a0b10] border border-[#252933] border-b-2 rounded-[2px] text-[10px] text-[#e6f0e4]">
             ESC
@@ -151,7 +151,7 @@ export function CommandPalette({ open, onClose }: CommandPaletteProps) {
         </div>
         <div className="max-h-[360px] overflow-y-auto p-1">
           {filtered.length === 0 ? (
-            <div className="px-3 py-4 text-center text-[11px] text-[#6b7569]">
+            <div className="px-3 py-4 text-center text-[11px] text-[#899384]">
               no matches. the void is quiet.
             </div>
           ) : (
@@ -166,12 +166,12 @@ export function CommandPalette({ open, onClose }: CommandPaletteProps) {
                     active ? "bg-[#002a17] text-[#00ff88]" : "text-[#e6f0e4]"
                   }`}
                 >
-                  <span className={`mr-2.5 ${active ? "text-[#00ff88]" : "text-[#6b7569]"}`}>
+                  <span className={`mr-2.5 ${active ? "text-[#00ff88]" : "text-[#899384]"}`}>
                     →
                   </span>
                   <span className="flex-1 truncate">{it.label}</span>
                   {it.hint && (
-                    <span className="ml-auto text-[9px] uppercase tracking-wider text-[#6b7569]">
+                    <span className="ml-auto text-[9px] uppercase tracking-wider text-[#899384]">
                       {it.hint}
                     </span>
                   )}

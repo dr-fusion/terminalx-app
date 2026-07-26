@@ -41,11 +41,11 @@ export function StatusBar({ hostname, session, tabCount }: StatusBarProps) {
       <span className="hidden sm:inline">{SEP}</span>
       <span className="text-[#e6f0e4] truncate min-w-0 flex-shrink">{session ?? "no session"}</span>
       <span className="hidden sm:inline">{SEP}</span>
-      <span className="text-[#6b7569] whitespace-nowrap shrink-0 hidden sm:inline">
+      <span className="text-[#899384] whitespace-nowrap shrink-0 hidden sm:inline">
         {tabCount} {tabCount === 1 ? "pane" : "panes"}
       </span>
       <span className="flex-1" />
-      <span className="text-[#6b7569] hidden md:inline shrink-0">
+      <span className="text-[#899384] hidden md:inline shrink-0">
         <kbd className="px-1 py-0.5 bg-[#0f1117] border border-[#252933] border-b-2 rounded-[2px] text-[10px] text-[#e6f0e4]">
           ⌃
         </kbd>

@@ -10,8 +10,8 @@ export const STATE_PRESENTATION: Record<
   success: { glyph: "✓", color: "#00ff88", label: "passed" },
   failure: { glyph: "✗", color: "#ff5050", label: "failed" },
   pending: { glyph: "⏳", color: "#5ccfe6", label: "running" },
-  neutral: { glyph: "◷", color: "#6b7569", label: "neutral" },
-  skipped: { glyph: "⊘", color: "#6b7569", label: "skipped" },
+  neutral: { glyph: "◷", color: "#899384", label: "neutral" },
+  skipped: { glyph: "⊘", color: "#899384", label: "skipped" },
 };
 
 /** Tab-strip badge glyph for an aggregate rollup (§5.1). null => no badge. */
