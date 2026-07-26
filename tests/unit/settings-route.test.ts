@@ -16,6 +16,13 @@ vi.mock("@/lib/ai-sessions", () => ({
 vi.mock("@/lib/git-worktree", () => ({
   getGitDirectoryInfo: mocks.getGitDirectoryInfo,
 }));
+// This suite exercises the settings-store / repo-write logic, not the admin
+// gate. Treat the JWT re-verification as satisfied so the existing admin-path
+// tests (which set x-user-role: admin) keep testing what they were written for.
+// The defense-in-depth gate itself is covered in admin-auth-gates.test.ts.
+vi.mock("@/lib/request-actor", () => ({
+  requireVerifiedAdmin: vi.fn(async () => true),
+}));
 
 function mockReq(opts: { url?: string; body?: unknown; headers?: Record<string, string> }) {
   const headers = opts.headers ?? {};

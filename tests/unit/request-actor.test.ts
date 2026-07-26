@@ -23,7 +23,11 @@ vi.mock("@/lib/auth", () => ({
   verifyJwt: mocks.verifyJwt,
 }));
 
-import { resolveRequestActor, type RequestHeaders } from "@/lib/request-actor";
+import {
+  requireVerifiedAdmin,
+  resolveRequestActor,
+  type RequestHeaders,
+} from "@/lib/request-actor";
 
 function headers(values: Record<string, string> = {}): RequestHeaders {
   const normalized = new Map(
@@ -178,5 +182,77 @@ describe("resolveRequestActor", () => {
 
     expect(actor?.userId).toBe("single-user");
     expect(mocks.verifyJwt).not.toHaveBeenCalled();
+  });
+});
+
+describe("requireVerifiedAdmin", () => {
+  beforeEach(() => {
+    mocks.authMode = "local";
+    mocks.verifyJwt.mockReset();
+    delete process.env.TERMINALX_AUTH_MODE;
+    delete process.env.TERMINALX_ALLOW_AUTH_NONE;
+  });
+
+  it("rejects a spoofed x-user-role header when no session credential is present", async () => {
+    const granted = await requireVerifiedAdmin(
+      headers({ "x-user-role": "admin", "x-username": "attacker" })
+    );
+
+    expect(granted).toBe(false);
+    expect(mocks.verifyJwt).not.toHaveBeenCalled();
+  });
+
+  it("grants admin for a JWT-verified admin credential", async () => {
+    mocks.verifyJwt.mockResolvedValue({ userId: "user-1", username: "root", role: "admin" });
+
+    expect(await requireVerifiedAdmin(headers({ cookie: "terminalx-session=admin-token" }))).toBe(
+      true
+    );
+  });
+
+  it("denies a JWT-verified non-admin credential", async () => {
+    mocks.verifyJwt.mockResolvedValue({ userId: "user-2", username: "alice", role: "user" });
+
+    expect(await requireVerifiedAdmin(headers({ cookie: "terminalx-session=user-token" }))).toBe(
+      false
+    );
+  });
+
+  it("denies even when a real non-admin session carries a spoofed admin header", async () => {
+    mocks.verifyJwt.mockResolvedValue({ userId: "user-2", username: "alice", role: "user" });
+
+    const granted = await requireVerifiedAdmin(
+      headers({ cookie: "terminalx-session=user-token", "x-user-role": "admin" })
+    );
+
+    expect(granted).toBe(false);
+  });
+
+  it("denies when full JWT verification rejects the credential", async () => {
+    mocks.verifyJwt.mockResolvedValue(null);
+
+    expect(await requireVerifiedAdmin(headers({ cookie: "terminalx-session=revoked-token" }))).toBe(
+      false
+    );
+  });
+
+  it("fails closed when verification throws", async () => {
+    mocks.verifyJwt.mockRejectedValue(new Error("verify exploded"));
+
+    expect(await requireVerifiedAdmin(headers({ cookie: "terminalx-session=boom" }))).toBe(false);
+  });
+
+  it("preserves auth-none semantics: the opted-in single-user actor is admin", async () => {
+    mocks.authMode = "none";
+    process.env.TERMINALX_AUTH_MODE = "none";
+    process.env.TERMINALX_ALLOW_AUTH_NONE = "true";
+
+    expect(await requireVerifiedAdmin(headers({}))).toBe(true);
+  });
+
+  it("fails closed in auth-none without the explicit opt-in", async () => {
+    mocks.authMode = "none";
+
+    expect(await requireVerifiedAdmin(headers({ "x-user-role": "admin" }))).toBe(false);
   });
 });
