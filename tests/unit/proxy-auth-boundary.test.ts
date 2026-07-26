@@ -28,6 +28,27 @@ describe("proxy authentication boundary", () => {
     expect(issuance.status).toBe(401);
   });
 
+  it("lets the readiness probe and metrics through middleware for their own gates", async () => {
+    const ready = await proxy(
+      new NextRequest("https://terminalx.example/api/health/ready", { method: "GET" })
+    );
+    const metrics = await proxy(
+      new NextRequest("https://terminalx.example/api/metrics", { method: "GET" })
+    );
+    // Both must reach their route handlers (not be 401'd by the auth
+    // middleware): readiness is public, metrics enforces its own bearer/admin
+    // gate downstream. An unauthenticated load balancer / scraper has no session.
+    expect(ready.headers.get("x-middleware-next")).toBe("1");
+    expect(metrics.headers.get("x-middleware-next")).toBe("1");
+  });
+
+  it("still gates a non-allowlisted health-prefixed route", async () => {
+    const response = await proxy(
+      new NextRequest("https://terminalx.example/api/health/secret", { method: "GET" })
+    );
+    expect(response.status).toBe(401);
+  });
+
   it("does not allow a public-path prefix to expose another route", async () => {
     const response = await proxy(
       new NextRequest("https://terminalx.example/api/auth/pairing-codes/anything", {
