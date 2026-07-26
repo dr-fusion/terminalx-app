@@ -105,6 +105,74 @@ export function conversationActivityLabel(event: ConversationEvent): string {
   }
 }
 
+/**
+ * Client virtualization for long timelines: keep the DOM bounded by rendering
+ * only the most recent `max` events (the tail the user is reading), reporting
+ * how many older events were withheld so the UI can show a stable notice.
+ * Combined with per-item `content-visibility:auto`, this keeps very long
+ * conversations responsive without a heavyweight windowing dependency.
+ */
+export const MAX_RENDERED_CONVERSATION_EVENTS = 200;
+
+export function windowConversation<T>(
+  events: readonly T[],
+  max: number = MAX_RENDERED_CONVERSATION_EVENTS
+): { visible: T[]; hiddenBefore: number } {
+  if (!Number.isSafeInteger(max) || max < 1 || events.length <= max) {
+    return { visible: [...events], hiddenBefore: 0 };
+  }
+  return { visible: events.slice(events.length - max), hiddenBefore: events.length - max };
+}
+
+export interface CommentSegment {
+  kind: "text" | "mention";
+  value: string;
+}
+
+/**
+ * Split a comment body into plain-text and `@mention` segments so mentions can
+ * render as highlighted chips. Purely syntactic (an `@token`); resolution to a
+ * canonical User happens server-side when the mention is recorded.
+ */
+export function splitMentionSegments(body: string): CommentSegment[] {
+  const segments: CommentSegment[] = [];
+  const pattern = /@([A-Za-z0-9][A-Za-z0-9._:-]{0,127})/g;
+  let lastIndex = 0;
+  for (const match of body.matchAll(pattern)) {
+    const start = match.index ?? 0;
+    if (start > lastIndex) {
+      segments.push({ kind: "text", value: body.slice(lastIndex, start) });
+    }
+    segments.push({ kind: "mention", value: match[0] });
+    lastIndex = start + match[0].length;
+  }
+  if (lastIndex < body.length) {
+    segments.push({ kind: "text", value: body.slice(lastIndex) });
+  }
+  return segments;
+}
+
+function CommentBody({ body }: { body: string }) {
+  const segments = useMemo(() => splitMentionSegments(body), [body]);
+  return (
+    <p className="whitespace-pre-wrap break-words text-sm leading-6 text-foreground">
+      {segments.map((segment, index) =>
+        segment.kind === "mention" ? (
+          <span
+            key={index}
+            className="rounded bg-primary/10 px-1 font-medium text-primary"
+            data-mention
+          >
+            {segment.value}
+          </span>
+        ) : (
+          <span key={index}>{segment.value}</span>
+        )
+      )}
+    </p>
+  );
+}
+
 function TimelineSkeleton() {
   return (
     <div className="space-y-5 p-5" aria-label="Loading conversation">
@@ -154,6 +222,8 @@ export function ConversationTimeline({
     container.scrollTop = container.scrollHeight;
   }, [events.length]);
 
+  const { visible: windowedEvents, hiddenBefore } = windowConversation(events);
+
   if (isLoading) return <TimelineSkeleton />;
 
   if (events.length === 0) {
@@ -184,14 +254,16 @@ export function ConversationTimeline({
       aria-live="polite"
       aria-label="Session conversation"
     >
-      {historyTruncated ? (
+      {historyTruncated || hiddenBefore > 0 ? (
         <p className="mx-auto mb-4 max-w-3xl rounded-md border border-border bg-muted/40 px-3 py-2 text-xs leading-5 text-muted-foreground">
-          Showing the latest {events.length.toLocaleString()} events. Earlier canonical history
-          remains safely stored on the server.
+          {hiddenBefore > 0
+            ? `Showing the latest ${windowedEvents.length.toLocaleString()} of ${events.length.toLocaleString()} loaded events for a responsive view. `
+            : `Showing the latest ${events.length.toLocaleString()} events. `}
+          Earlier canonical history remains safely stored on the server.
         </p>
       ) : null}
       <ol className="mx-auto max-w-3xl space-y-5">
-        {events.map((event) => {
+        {windowedEvents.map((event) => {
           const own = event.actor.userId === viewerUserId;
           const body = text(event.payload, "body");
 
@@ -228,9 +300,7 @@ export function ConversationTimeline({
                       </span>
                     ) : null}
                   </header>
-                  <p className="whitespace-pre-wrap break-words text-sm leading-6 text-foreground">
-                    {body}
-                  </p>
+                  <CommentBody body={body} />
                 </article>
               </li>
             );

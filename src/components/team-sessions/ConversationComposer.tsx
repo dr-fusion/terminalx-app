@@ -20,6 +20,17 @@ interface ConversationComposerProps {
 }
 
 const MAX_BODY_BYTES = 16 * 1024;
+
+/**
+ * The in-progress `@mention` token immediately preceding the caret, or null.
+ * Used to surface a live mention hint while composing. Pure; unit-tested.
+ */
+export function activeMentionQuery(text: string, caretIndex: number): string | null {
+  const clamped = Math.max(0, Math.min(caretIndex, text.length));
+  const before = text.slice(0, clamped);
+  const match = /(^|\s)@([A-Za-z0-9][A-Za-z0-9._:-]{0,127})$/.exec(before);
+  return match?.[2] ?? null;
+}
 const INTENTS: Array<{
   value: ConversationIntent;
   label: string;
@@ -80,6 +91,7 @@ export function ConversationComposer({
 }: ConversationComposerProps) {
   const [intent, setIntent] = useState<ConversationIntent>("comment");
   const [body, setBody] = useState("");
+  const [caret, setCaret] = useState(0);
   const inputId = useId();
   const errorId = `${inputId}-error`;
   const hintId = `${inputId}-hint`;
@@ -104,6 +116,7 @@ export function ConversationComposer({
 
   const current =
     INTENTS.find((candidate) => candidate.value === effectiveIntent) ?? DEFAULT_INTENT;
+  const mentionQuery = effectiveIntent === "comment" ? activeMentionQuery(body, caret) : null;
 
   return (
     <form
@@ -179,7 +192,11 @@ export function ConversationComposer({
                     ? "Propose a change or next step…"
                     : "Share context with everyone in this session…"
               }
-              onChange={(event) => setBody(event.target.value)}
+              onChange={(event) => {
+                setBody(event.target.value);
+                setCaret(event.target.selectionStart ?? event.target.value.length);
+              }}
+              onSelect={(event) => setCaret(event.currentTarget.selectionStart ?? 0)}
               onKeyDown={(event) => {
                 if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
                   event.preventDefault();
@@ -202,6 +219,18 @@ export function ConversationComposer({
                 {byteLength.toLocaleString()}/{MAX_BODY_BYTES.toLocaleString()} bytes
               </span>
             </div>
+            {mentionQuery !== null ? (
+              <p
+                className="border-t border-border px-3 py-2 text-xs text-muted-foreground"
+                aria-live="polite"
+              >
+                Mentioning{" "}
+                <span className="rounded bg-primary/10 px-1 font-medium text-primary">
+                  @{mentionQuery}
+                </span>{" "}
+                will notify them if they are a Participant of this session.
+              </p>
+            ) : null}
           </div>
           {isTooLong || error ? (
             <p id={errorId} role="alert" className="text-xs text-destructive">
