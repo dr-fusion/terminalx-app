@@ -51,6 +51,7 @@ import {
   createSqliteRuntimeWriteStateSnapshotSource,
   type RuntimeWriteStateSnapshotSource,
 } from "./sqlite-runtime-write-state-source";
+import { createLimitLedgerStore, type LimitLedgerStore } from "./sqlite-limit-ledger-store";
 import {
   assertValidRunPolicyCommit,
   isRunPolicyWidening,
@@ -92,6 +93,7 @@ import {
   type SessionInboxQuery,
   type SessionListQuery,
   type SessionParticipantView,
+  type RunLimits,
   type SessionResponsibility,
   type SessionRunStateQuery,
   type SessionRunStateView,
@@ -248,6 +250,13 @@ const MAX_CONVERSATION_BODY_BYTES = 16 * 1_024;
 const MAX_PENDING_DIRECTIVES_PER_AUTHOR = 64;
 const MAX_PENDING_DIRECTIVES_PER_SESSION = 256;
 const DEFAULT_RUNTIME_LIFECYCLE_COMMAND_TTL_MS = 30_000;
+/**
+ * Currency used only to aggregate the reservation ledger when the run's model
+ * spend limit is unconfigured (unlimited). Money never affects the utilisation
+ * band in that case, so the choice is inert; it exists because the ledger keys
+ * money by an ISO-4217 code.
+ */
+const DEFAULT_LIMIT_LEDGER_CURRENCY = "USD";
 const MAX_RUNTIME_LIFECYCLE_COMMAND_TTL_MS = 5 * 60_000;
 const MIN_RUNTIME_OUTBOX_LEASE_DURATION_MS = 1_000;
 const MAX_RUNTIME_OUTBOX_LEASE_DURATION_MS = 300_000;
@@ -360,6 +369,7 @@ class SqliteTeamSessions implements TeamSessions {
   private readonly runtimeEnforcementProofVerifier?: SynchronousRuntimeEnforcementProofVerifier;
   private readonly runtimeLifecycleCommandTtlMs: number;
   private readonly runtimeWriteStateSnapshotSource: RuntimeWriteStateSnapshotSource;
+  private readonly limitLedger: LimitLedgerStore;
   private readonly runtimeLifecycle: SqliteRuntimeLifecycleJournal;
   private readonly runtimeReceiptFollow: SqliteRuntimeReceiptFollowJournal;
   private readonly runtimeCompensation?: SqliteRuntimeCompensationJournal;
@@ -456,6 +466,7 @@ class SqliteTeamSessions implements TeamSessions {
     this.runtimeWriteStateSnapshotSource = createSqliteRuntimeWriteStateSnapshotSource({
       db: this.db,
     });
+    this.limitLedger = createLimitLedgerStore(this.db);
     this.hostedAssignmentPlanSource = Object.freeze({
       resolve: (lookup: HostedAssignmentLookup) => this.resolveHostedAssignmentPlan(lookup),
       isCurrent: (lookup: HostedAssignmentLookup) => this.isHostedAssignmentLookupCurrent(lookup),
@@ -7273,9 +7284,10 @@ class SqliteTeamSessions implements TeamSessions {
           (row) => row.independent_work_may_continue === 1
         ),
       },
-      // Phase 4 has immutable configured limits but no authoritative usage ledger yet.
-      // Never claim compliance until Runtime receipts drive durable accounting.
-      limitStatus: "accounting-unavailable",
+      // Gate 5: derive the status from the durable reservation/accounting ledger.
+      // Fail closed to "accounting-unavailable" if the ledger cannot be read, so
+      // compliance is never claimed without authoritative accounting.
+      limitStatus: this.deriveLimitStatus(run.id as string, policy.limits),
       sandboxState: assignment.status as SessionRunStateView["sandboxState"],
       finalReviewState:
         lifecycle === "completed"
@@ -7304,6 +7316,23 @@ class SqliteTeamSessions implements TeamSessions {
         evidence: evidenceByGoal.get(goal.goalId) ?? [],
       })),
     };
+  }
+
+  /**
+   * Gate 5 read-model status. Derives the utilisation band from the durable
+   * reservation/accounting ledger and fails closed to `accounting-unavailable`
+   * if the ledger cannot be read, so compliance is never asserted without
+   * authoritative accounting.
+   */
+  private deriveLimitStatus(
+    agentRunId: string,
+    limits: RunLimits
+  ): SessionRunStateView["limitStatus"] {
+    try {
+      return this.limitLedger.limitStatus(agentRunId, limits, DEFAULT_LIMIT_LEDGER_CURRENCY);
+    } catch {
+      return "accounting-unavailable";
+    }
   }
 
   private projectSession(sessionId: string): SessionView {
