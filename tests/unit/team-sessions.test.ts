@@ -2839,7 +2839,7 @@ describe("Team Session kernel", () => {
 
     const database = new Database(filename, { readonly: true });
     try {
-      expect(database.pragma("user_version", { simple: true })).toBe(17);
+      expect(database.pragma("user_version", { simple: true })).toBe(18);
       expect(database.pragma("foreign_key_check")).toEqual([]);
       expect(
         database

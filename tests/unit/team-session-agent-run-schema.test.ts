@@ -43,7 +43,7 @@ describe("Team Session Agent Run schema", () => {
   it("initializes Runtime records and the canonical identity authority at schema v12", () => {
     database = openTeamSessionDatabase({ filename });
 
-    expect(database.db.pragma("user_version", { simple: true })).toBe(17);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(18);
     const tables = database.db
       .prepare(
         `SELECT name FROM sqlite_schema
@@ -146,7 +146,7 @@ describe("Team Session Agent Run schema", () => {
 
     database = openTeamSessionDatabase({ filename });
 
-    expect(database.db.pragma("user_version", { simple: true })).toBe(17);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(18);
     expect(
       database.db
         .prepare(`SELECT name FROM sqlite_schema WHERE type = 'table' AND name = 'agent_runs'`)
@@ -181,7 +181,7 @@ describe("Team Session Agent Run schema", () => {
           peerAdvanceStarted = true;
           const peer = openTeamSessionDatabase({ filename });
           try {
-            expect(peer.db.pragma("user_version", { simple: true })).toBe(17);
+            expect(peer.db.pragma("user_version", { simple: true })).toBe(18);
             peerAdvanced = true;
           } finally {
             peer.close();
@@ -198,7 +198,7 @@ describe("Team Session Agent Run schema", () => {
 
     expect(peerAdvanceStarted).toBe(true);
     expect(peerAdvanced).toBe(true);
-    expect(database.db.pragma("user_version", { simple: true })).toBe(17);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(18);
     expect(database.db.pragma("foreign_key_check")).toEqual([]);
     expect(database.db.pragma("quick_check", { simple: true })).toBe("ok");
   });
@@ -217,7 +217,7 @@ describe("Team Session Agent Run schema", () => {
           if (versionReads === 2) {
             const peer = openTeamSessionDatabase({ filename });
             try {
-              expect(peer.db.pragma("user_version", { simple: true })).toBe(17);
+              expect(peer.db.pragma("user_version", { simple: true })).toBe(18);
               peerAdvanced = true;
             } finally {
               peer.close();
@@ -234,7 +234,7 @@ describe("Team Session Agent Run schema", () => {
     }
 
     expect(peerAdvanced).toBe(true);
-    expect(database.db.pragma("user_version", { simple: true })).toBe(17);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(18);
     expect(database.db.pragma("foreign_key_check")).toEqual([]);
   });
 
@@ -289,7 +289,7 @@ describe("Team Session Agent Run schema", () => {
 
     database = openTeamSessionDatabase({ filename });
 
-    expect(database.db.pragma("user_version", { simple: true })).toBe(17);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(18);
     expect(
       database.db
         .prepare(
@@ -1706,7 +1706,7 @@ describe("Team Session Agent Run schema", () => {
             peerAdvanceStarted = true;
             const peer = openTeamSessionDatabase({ filename });
             try {
-              expect(peer.db.pragma("user_version", { simple: true })).toBe(17);
+              expect(peer.db.pragma("user_version", { simple: true })).toBe(18);
               peerAdvanced = true;
             } finally {
               peer.close();
@@ -1724,7 +1724,7 @@ describe("Team Session Agent Run schema", () => {
 
     expect(peerAdvanceStarted).toBe(true);
     expect(peerAdvanced).toBe(true);
-    expect(database.db.pragma("user_version", { simple: true })).toBe(17);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(18);
     expect(database.db.pragma("foreign_key_check")).toEqual([]);
     expect(database.db.pragma("quick_check", { simple: true })).toBe("ok");
   });
@@ -1747,7 +1747,7 @@ describe("Team Session Agent Run schema", () => {
     }
 
     database = openTeamSessionDatabase({ filename });
-    expect(database.db.pragma("user_version", { simple: true })).toBe(17);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(18);
     expect(
       database.db.prepare(`SELECT COUNT(*) AS count FROM runtime_principal_observation_keys`).get()
     ).toEqual({ count: 0 });
@@ -1778,7 +1778,7 @@ describe("Team Session Agent Run schema", () => {
     }
 
     database = openTeamSessionDatabase({ filename });
-    expect(database.db.pragma("user_version", { simple: true })).toBe(17);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(18);
     expect(
       database.db
         .prepare(
@@ -2444,7 +2444,7 @@ describe("Team Session Agent Run schema", () => {
 
     database = openTeamSessionDatabase({ filename });
 
-    expect(database.db.pragma("user_version", { simple: true })).toBe(17);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(18);
     expect(
       database.db
         .prepare(`SELECT name FROM sqlite_schema WHERE type = 'table' AND name = ?`)
@@ -2487,7 +2487,7 @@ describe("Team Session Agent Run schema", () => {
 
     database = openTeamSessionDatabase({ filename });
 
-    expect(database.db.pragma("user_version", { simple: true })).toBe(17);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(18);
     expect(
       database.db
         .prepare(`SELECT * FROM runtime_run_commands WHERE id = ?`)
@@ -2535,7 +2535,7 @@ describe("Team Session Agent Run schema", () => {
 
       database = openTeamSessionDatabase({ filename });
 
-      expect(database.db.pragma("user_version", { simple: true })).toBe(17);
+      expect(database.db.pragma("user_version", { simple: true })).toBe(18);
       expect(
         database.db
           .prepare(
@@ -5357,6 +5357,11 @@ function createAgentRunSchemaV2Fixture(filename: string): void {
       DROP TABLE IF EXISTS limit_reservations;
       DROP TABLE IF EXISTS grant_consumptions;
       DROP TABLE IF EXISTS grant_lineage;
+      DROP TABLE IF EXISTS attention_deliveries;
+      DROP TABLE IF EXISTS attention_escalations;
+      DROP TABLE IF EXISTS user_attention_reads;
+      DROP TABLE IF EXISTS comment_attachments;
+      DROP TABLE IF EXISTS comment_mentions;
       DROP TABLE IF EXISTS approval_provenance;
       PRAGMA user_version = 2;
     `);
@@ -5507,6 +5512,11 @@ function createRuntimeRunSchemaV3Fixture(filename: string): {
       DROP TABLE IF EXISTS limit_reservations;
       DROP TABLE IF EXISTS grant_consumptions;
       DROP TABLE IF EXISTS grant_lineage;
+      DROP TABLE IF EXISTS attention_deliveries;
+      DROP TABLE IF EXISTS attention_escalations;
+      DROP TABLE IF EXISTS user_attention_reads;
+      DROP TABLE IF EXISTS comment_attachments;
+      DROP TABLE IF EXISTS comment_mentions;
       DROP TABLE IF EXISTS approval_provenance;
       PRAGMA user_version = 3;
     `);

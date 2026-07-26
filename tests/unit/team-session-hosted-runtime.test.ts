@@ -150,7 +150,7 @@ describe("hosted Team Session Runtime", () => {
     expect(projected?.runtime).not.toHaveProperty("tmuxName");
 
     const database = new Database(filename, { readonly: true });
-    expect(database.pragma("user_version", { simple: true })).toBe(17);
+    expect(database.pragma("user_version", { simple: true })).toBe(18);
     expect(
       database
         .prepare(
@@ -393,6 +393,11 @@ describe("hosted Team Session Runtime", () => {
       DROP TABLE IF EXISTS limit_reservations;
       DROP TABLE IF EXISTS grant_consumptions;
       DROP TABLE IF EXISTS grant_lineage;
+      DROP TABLE IF EXISTS attention_deliveries;
+      DROP TABLE IF EXISTS attention_escalations;
+      DROP TABLE IF EXISTS user_attention_reads;
+      DROP TABLE IF EXISTS comment_attachments;
+      DROP TABLE IF EXISTS comment_mentions;
       DROP TABLE IF EXISTS approval_provenance;
       DROP TABLE installation_webhook_auth_digests;
       DROP TABLE provider_webhook_deliveries;
@@ -502,6 +507,11 @@ describe("hosted Team Session Runtime", () => {
       DROP TABLE IF EXISTS limit_reservations;
       DROP TABLE IF EXISTS grant_consumptions;
       DROP TABLE IF EXISTS grant_lineage;
+      DROP TABLE IF EXISTS attention_deliveries;
+      DROP TABLE IF EXISTS attention_escalations;
+      DROP TABLE IF EXISTS user_attention_reads;
+      DROP TABLE IF EXISTS comment_attachments;
+      DROP TABLE IF EXISTS comment_mentions;
       DROP TABLE IF EXISTS approval_provenance;
       PRAGMA user_version = 8;
     `);
@@ -511,7 +521,7 @@ describe("hosted Team Session Runtime", () => {
     createTeamSessionKernel({ filename: artifactFilename }).teamSessions.close();
     const migrated = new Database(artifactFilename, { readonly: true });
     try {
-      expect(migrated.pragma("user_version", { simple: true })).toBe(17);
+      expect(migrated.pragma("user_version", { simple: true })).toBe(18);
       expect(migrated.pragma("foreign_key_check")).toEqual([]);
       expect(migrated.pragma("quick_check", { simple: true })).toBe("ok");
       expect(
@@ -569,6 +579,11 @@ describe("hosted Team Session Runtime", () => {
       DROP TABLE IF EXISTS limit_reservations;
       DROP TABLE IF EXISTS grant_consumptions;
       DROP TABLE IF EXISTS grant_lineage;
+      DROP TABLE IF EXISTS attention_deliveries;
+      DROP TABLE IF EXISTS attention_escalations;
+      DROP TABLE IF EXISTS user_attention_reads;
+      DROP TABLE IF EXISTS comment_attachments;
+      DROP TABLE IF EXISTS comment_mentions;
       DROP TABLE IF EXISTS approval_provenance;
       PRAGMA user_version = 8;
     `);
