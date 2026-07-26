@@ -101,7 +101,7 @@ export function ReviewPanel({ session, pr, defaultTab = "changes" }: ReviewPanel
             className={`relative flex h-8 items-center gap-1.5 rounded px-2 text-[12px] transition-colors ${
               activeTab === tab.id
                 ? "bg-[#14161e] text-[#e6f0e4]"
-                : "text-[#6b7569] hover:bg-[#14161e] hover:text-[#e6f0e4]"
+                : "text-[#899384] hover:bg-[#14161e] hover:text-[#e6f0e4]"
             }`}
           >
             <tab.icon size={13} />

@@ -85,7 +85,7 @@ export function WorkspaceView({ activeSession }: WorkspaceViewProps) {
 
   if (activeSession && hasLoadedSuccessfully && !activeSessionExists) {
     return (
-      <div className="flex h-full items-center justify-center text-[13px] text-[#6b7569]">
+      <div className="flex h-full items-center justify-center text-[13px] text-[#899384]">
         session no longer exists; returning to a live workspace…
       </div>
     );
@@ -93,7 +93,7 @@ export function WorkspaceView({ activeSession }: WorkspaceViewProps) {
 
   if (!activeSession) {
     return (
-      <div className="h-full flex items-center justify-center text-[13px] text-[#6b7569]">
+      <div className="h-full flex items-center justify-center text-[13px] text-[#899384]">
         <div className="text-center">
           <p className="mb-3">no session attached.</p>
           <button
@@ -125,7 +125,7 @@ export function WorkspaceView({ activeSession }: WorkspaceViewProps) {
                   border-r border-[#1a1d24] transition-colors whitespace-nowrap ${
                     active
                       ? "bg-[#0a0b10] text-[#e6f0e4]"
-                      : "bg-[#0f1117] text-[#6b7569] hover:text-[#e6f0e4] hover:bg-[#14161e]"
+                      : "bg-[#0f1117] text-[#899384] hover:text-[#e6f0e4] hover:bg-[#14161e]"
                   }`}
               >
                 {active && (
@@ -151,7 +151,7 @@ export function WorkspaceView({ activeSession }: WorkspaceViewProps) {
         </div>
         <button
           onClick={() => router.push("/dashboard")}
-          className="flex items-center justify-center w-8 h-8 text-[#6b7569]
+          className="flex items-center justify-center w-8 h-8 text-[#899384]
             hover:text-[#e6f0e4] hover:bg-[#14161e] transition-colors shrink-0"
           title="new session (dashboard)"
           aria-label="new session"

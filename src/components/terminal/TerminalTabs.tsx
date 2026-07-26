@@ -31,7 +31,7 @@ export function TerminalTabs({ tabs, activeTab, onSelect, onClose, onNew }: Term
                 ${
                   isActive
                     ? "bg-[#0a0b10] text-[#e6f0e4]"
-                    : "bg-[#0f1117] text-[#6b7569] hover:text-[#e6f0e4] hover:bg-[#14161e]"
+                    : "bg-[#0f1117] text-[#899384] hover:text-[#e6f0e4] hover:bg-[#14161e]"
                 }
               `}
             >
@@ -58,7 +58,7 @@ export function TerminalTabs({ tabs, activeTab, onSelect, onClose, onNew }: Term
       </div>
       <button
         onClick={onNew}
-        className="flex items-center justify-center w-9 h-9 text-[#6b7569]
+        className="flex items-center justify-center w-9 h-9 text-[#899384]
           hover:text-[#e6f0e4] hover:bg-[#14161e] transition-colors shrink-0"
         title="New terminal"
         aria-label="New terminal"

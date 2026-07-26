@@ -28,7 +28,7 @@ export function ScopeTabs({
             className={`px-3 py-1 rounded text-[11px] capitalize transition-colors ${
               scope === s
                 ? "bg-[#1a1d24] text-[#e6f0e4] font-medium"
-                : "text-[#6b7569] hover:text-[#e6f0e4]"
+                : "text-[#899384] hover:text-[#e6f0e4]"
             }`}
           >
             {s}
@@ -38,7 +38,7 @@ export function ScopeTabs({
       {scope === "repo" && (
         <span
           data-testid="harness-edit-settings-toml"
-          className="inline-flex items-center gap-1 text-[10px] text-[#6b7569]"
+          className="inline-flex items-center gap-1 text-[10px] text-[#899384]"
           title=".terminalx/settings.toml"
         >
           Edit{" "}

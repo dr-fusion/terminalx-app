@@ -64,11 +64,11 @@ export function ProviderConfigForm({
       className="border-t border-[#1a1d24] bg-[#0a0c12] px-3 py-3 space-y-3"
     >
       {isBundled ? (
-        <p className="text-[10px] text-[#6b7569] leading-tight">
+        <p className="text-[10px] text-[#899384] leading-tight">
           Uses the bundled OpenCode binary. Override the executable path in Advanced if needed.
         </p>
       ) : (
-        <p className="text-[10px] text-[#6b7569] leading-tight">
+        <p className="text-[10px] text-[#899384] leading-tight">
           Authentication is handled by OpenCode (its own login / <code>.env</code>). No credentials
           are stored here.
         </p>
@@ -78,7 +78,7 @@ export function ProviderConfigForm({
         <div>
           <label
             htmlFor={`endpoint-${entry.id}`}
-            className="block text-[10px] uppercase tracking-wider text-[#6b7569] mb-1.5"
+            className="block text-[10px] uppercase tracking-wider text-[#899384] mb-1.5"
           >
             Endpoint URL
           </label>
@@ -91,10 +91,10 @@ export function ProviderConfigForm({
             spellCheck={false}
             autoComplete="off"
             className="w-full px-2 py-1.5 rounded bg-[#0f1117] border border-[#252933]
-              text-[#e6f0e4] text-[12px] placeholder:text-[#6b7569]/50 font-mono
+              text-[#e6f0e4] text-[12px] placeholder:text-[#899384]/50 font-mono
               focus:outline-none focus:border-[#ffa657] transition-colors"
           />
-          <p className="mt-1 text-[10px] text-[#6b7569] leading-tight">
+          <p className="mt-1 text-[10px] text-[#899384] leading-tight">
             Written into OpenCode&apos;s config so it can target this gateway. Must be https:// (or
             http://localhost for development).
           </p>
@@ -105,7 +105,7 @@ export function ProviderConfigForm({
         <div>
           <label
             htmlFor={`models-${entry.id}`}
-            className="block text-[10px] uppercase tracking-wider text-[#6b7569] mb-1.5"
+            className="block text-[10px] uppercase tracking-wider text-[#899384] mb-1.5"
           >
             Model{isGateway ? "(s)" : ""}
           </label>
@@ -118,10 +118,10 @@ export function ProviderConfigForm({
             spellCheck={false}
             autoComplete="off"
             className="w-full px-2 py-1.5 rounded bg-[#0f1117] border border-[#252933]
-              text-[#e6f0e4] text-[12px] placeholder:text-[#6b7569]/50 font-mono
+              text-[#e6f0e4] text-[12px] placeholder:text-[#899384]/50 font-mono
               focus:outline-none focus:border-[#ffa657] transition-colors"
           />
-          <p className="mt-1 text-[10px] text-[#6b7569] leading-tight">
+          <p className="mt-1 text-[10px] text-[#899384] leading-tight">
             Comma-separated models to enable in OpenCode. Drives the &quot;Models · N selected&quot;
             count.
           </p>

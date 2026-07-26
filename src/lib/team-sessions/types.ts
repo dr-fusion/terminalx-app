@@ -1,6 +1,11 @@
 import type * as Phase4Contracts from "./contracts";
 import type { RuntimeBinding } from "./contracts";
 import type {
+  RuntimeFailureFingerprintInput,
+  RuntimeFailureDecision,
+  RuntimeCircuitBreakerStatus,
+} from "../runtime/circuit-breaker";
+import type {
   ChainVerificationResult,
   SessionEventChainExport,
   SessionEventCheckpointProof,
@@ -1228,6 +1233,20 @@ export interface TeamSessions {
   readSessionEventCheckpoints(sessionId: string): SessionEventCheckpointProof[];
   /** Export the ordered event chain + signed checkpoints as externally-retainable evidence. */
   exportSessionEventChain(sessionId: string): SessionEventChainExport;
+  /**
+   * Gate 5 durable circuit breaker: record a Runtime failure and mirror the
+   * affected scope to durable state in the same tick. Returns the open/closed
+   * decision so the caller can fail closed on an open circuit.
+   */
+  recordRuntimeCircuitFailure(
+    scope: string,
+    failure: RuntimeFailureFingerprintInput,
+    nowMs: number
+  ): RuntimeFailureDecision;
+  /** Record a Runtime success (clearing failure counters + open circuit) and mirror the scope. */
+  recordRuntimeCircuitSuccess(scope: string, nowMs: number): RuntimeCircuitBreakerStatus;
+  /** Read the durable circuit breaker's current state for a scope. */
+  runtimeCircuitStatus(scope: string, nowMs: number): RuntimeCircuitBreakerStatus;
   close(): void;
 }
 

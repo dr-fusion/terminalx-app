@@ -166,7 +166,7 @@ export function ReplayView({ id }: ReplayViewProps) {
       <div className="flex items-center gap-3 h-11 px-3 bg-[#0f1117] border-b border-[#1a1d24]">
         <button
           onClick={rewind}
-          className="p-1.5 text-[#6b7569] hover:text-[#e6f0e4] transition-colors"
+          className="p-1.5 text-[#899384] hover:text-[#e6f0e4] transition-colors"
           title="Rewind"
           aria-label="Rewind"
         >
@@ -182,7 +182,7 @@ export function ReplayView({ id }: ReplayViewProps) {
           <span className="text-[12px]">{playing ? "Pause" : "Play"}</span>
         </button>
         <div className="flex items-center gap-1">
-          <FastForward size={12} className="text-[#6b7569]" />
+          <FastForward size={12} className="text-[#899384]" />
           <select
             value={speed}
             onChange={(e) => setSpeed(parseFloat(e.target.value))}
@@ -202,7 +202,7 @@ export function ReplayView({ id }: ReplayViewProps) {
           />
         </div>
         <span
-          className="text-[11px] text-[#6b7569] tabular-nums"
+          className="text-[11px] text-[#899384] tabular-nums"
           style={{ fontFamily: "var(--font-jetbrains-mono), monospace" }}
         >
           {formatMs(position)} / {formatMs(totalDuration)}
@@ -210,7 +210,7 @@ export function ReplayView({ id }: ReplayViewProps) {
       </div>
 
       {header && (
-        <div className="flex items-center gap-3 px-3 py-1.5 text-[11px] text-[#6b7569] border-b border-[#1a1d24]">
+        <div className="flex items-center gap-3 px-3 py-1.5 text-[11px] text-[#899384] border-b border-[#1a1d24]">
           <span>{header.sessionId}</span>
           <span>·</span>
           <span>{header.startedAt}</span>

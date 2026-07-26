@@ -16,7 +16,7 @@ export interface ReviewStatusBarPr {
 
 const PILL_CLASSES: Record<ReviewStatusBarPr["status"], string> = {
   open: "bg-[#002a17] text-[#00ff88] border-[#00cc6e]",
-  draft: "bg-[#14161e] text-[#6b7569] border-[#1a1d24]",
+  draft: "bg-[#14161e] text-[#899384] border-[#1a1d24]",
   merged: "bg-[#1e1430] text-[#d58fff] border-[#7a4fb8]",
   closed: "bg-[#2a0a0a] text-[#ff5050] border-[#a13d3d]",
 };

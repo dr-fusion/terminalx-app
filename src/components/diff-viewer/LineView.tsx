@@ -81,10 +81,10 @@ export function LineView({
         data-line-type={line.type}
         className={`group/line flex font-mono text-[12px] leading-5 ${cls.row}`}
       >
-        <span className="w-10 shrink-0 select-none px-1 text-right text-[#6b7569]" aria-hidden>
+        <span className="w-10 shrink-0 select-none px-1 text-right text-[#899384]" aria-hidden>
           {gutterNum(line.oldLineNum)}
         </span>
-        <span className="relative w-10 shrink-0 select-none px-1 text-right text-[#6b7569]">
+        <span className="relative w-10 shrink-0 select-none px-1 text-right text-[#899384]">
           {comments && anchor && !open && (
             <button
               type="button"
@@ -164,14 +164,14 @@ function LineCommentComposer({
             save();
           }
         }}
-        className="w-full resize-none rounded border border-[#1a1d24] bg-[#0a0b10] px-2 py-1 font-sans text-[11px] text-[#e6f0e4] outline-none placeholder:text-[#6b7569] focus:border-[#5ccfe6]"
+        className="w-full resize-none rounded border border-[#1a1d24] bg-[#0a0b10] px-2 py-1 font-sans text-[11px] text-[#e6f0e4] outline-none placeholder:text-[#899384] focus:border-[#5ccfe6]"
       />
       <div className="flex justify-end gap-1.5">
         <button
           type="button"
           data-testid="line-comment-cancel"
           onClick={onCancel}
-          className="rounded px-2 py-0.5 text-[10px] text-[#6b7569] hover:text-[#e6f0e4]"
+          className="rounded px-2 py-0.5 text-[10px] text-[#899384] hover:text-[#e6f0e4]"
         >
           Cancel
         </button>
@@ -221,7 +221,7 @@ export function SplitCell({
         data-line-type={line.type}
         className={`group/line flex min-w-0 font-mono text-[12px] leading-5 ${cls.row}`}
       >
-        <span className="relative w-10 shrink-0 select-none px-1 text-right text-[#6b7569]">
+        <span className="relative w-10 shrink-0 select-none px-1 text-right text-[#899384]">
           {comments && anchor && !open && (
             <button
               type="button"

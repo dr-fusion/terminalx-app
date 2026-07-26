@@ -34,7 +34,7 @@ const DECISION_PILL: Record<ReviewDecision, { label: string; cls: string }> = {
   },
   review_required: {
     label: "Review required",
-    cls: "border-[#1a1d24] bg-[#14161e] text-[#6b7569]",
+    cls: "border-[#1a1d24] bg-[#14161e] text-[#899384]",
   },
   pending: { label: "Pending", cls: "border-[#2f6f80] bg-[#06212a] text-[#5ccfe6]" },
 };
@@ -206,7 +206,7 @@ export function ReviewTab({
       {!hasActivity ? (
         <div
           data-testid="review-no-activity"
-          className="flex flex-col items-start gap-2 px-4 py-6 text-[12px] text-[#6b7569]"
+          className="flex flex-col items-start gap-2 px-4 py-6 text-[12px] text-[#899384]"
         >
           No review activity yet.
         </div>
@@ -335,11 +335,11 @@ function FileThreadGroup({
         className="flex w-full items-center gap-1.5 px-4 py-2 text-left text-[12px] hover:bg-[#0f1117]"
       >
         {open ? (
-          <ChevronDown size={12} className="text-[#6b7569]" />
+          <ChevronDown size={12} className="text-[#899384]" />
         ) : (
-          <ChevronRight size={12} className="text-[#6b7569]" />
+          <ChevronRight size={12} className="text-[#899384]" />
         )}
-        <span className="text-[#6b7569]">{group.dir}</span>
+        <span className="text-[#899384]">{group.dir}</span>
         <span className="font-medium text-[#e6f0e4]">{group.filename}</span>
         <span className="ml-auto rounded-full bg-[#14161e] px-1.5 text-[10px] text-[#a8b3a6]">
           {group.threads.length}
@@ -389,7 +389,7 @@ function ThreadCard({
         thread.resolved ? "opacity-60" : ""
       }`}
     >
-      <div className="flex items-center justify-between gap-2 border-b border-[#14161e] px-2.5 py-1.5 text-[10px] text-[#6b7569]">
+      <div className="flex items-center justify-between gap-2 border-b border-[#14161e] px-2.5 py-1.5 text-[10px] text-[#899384]">
         <span>
           line {thread.line}
           {outdated && (
@@ -414,7 +414,7 @@ function ThreadCard({
       {root?.diff_hunk && (
         <pre
           data-testid="review-diff-hunk"
-          className="overflow-x-auto border-b border-[#14161e] bg-[#0a0b10] px-2.5 py-1.5 font-mono text-[10px] leading-4 text-[#6b7569]"
+          className="overflow-x-auto border-b border-[#14161e] bg-[#0a0b10] px-2.5 py-1.5 font-mono text-[10px] leading-4 text-[#899384]"
         >
           {root.diff_hunk}
         </pre>
@@ -425,7 +425,7 @@ function ThreadCard({
           <div key={c.id} data-testid="review-comment" className="text-[11px]">
             <div className="mb-0.5 flex items-center gap-1.5">
               <span className="text-[#d58fff]">@{c.user.login}</span>
-              <span className="text-[#6b7569]">{relativeTime(c.created_at)}</span>
+              <span className="text-[#899384]">{relativeTime(c.created_at)}</span>
             </div>
             <p className="whitespace-pre-wrap text-[#a8b3a6]">{c.body}</p>
           </div>
@@ -443,7 +443,7 @@ function ThreadCard({
               <button
                 data-testid="review-discard-draft"
                 onClick={() => onDiscardDraft(d.id)}
-                className="text-[#6b7569] hover:text-[#ff5050]"
+                className="text-[#899384] hover:text-[#ff5050]"
               >
                 Discard
               </button>
@@ -462,7 +462,7 @@ function ThreadCard({
               onChange={(e) => setReplyText(e.target.value)}
               rows={2}
               placeholder="Reply…"
-              className="w-full resize-none rounded border border-[#1a1d24] bg-[#0a0b10] px-2 py-1 text-[11px] text-[#e6f0e4] outline-none placeholder:text-[#6b7569] focus:border-[#5ccfe6]"
+              className="w-full resize-none rounded border border-[#1a1d24] bg-[#0a0b10] px-2 py-1 text-[11px] text-[#e6f0e4] outline-none placeholder:text-[#899384] focus:border-[#5ccfe6]"
             />
             <div className="flex justify-end gap-1.5">
               <button
@@ -470,7 +470,7 @@ function ThreadCard({
                   setReplyOpen(false);
                   setReplyText("");
                 }}
-                className="rounded px-2 py-0.5 text-[10px] text-[#6b7569] hover:text-[#e6f0e4]"
+                className="rounded px-2 py-0.5 text-[10px] text-[#899384] hover:text-[#e6f0e4]"
               >
                 Cancel
               </button>
@@ -492,7 +492,7 @@ function ThreadCard({
           <button
             data-testid="review-reply-open"
             onClick={() => setReplyOpen(true)}
-            className="flex items-center gap-1 text-[10px] text-[#6b7569] hover:text-[#5ccfe6]"
+            className="flex items-center gap-1 text-[10px] text-[#899384] hover:text-[#5ccfe6]"
           >
             <MessageSquarePlus size={11} />
             Reply
@@ -539,7 +539,7 @@ function ReviewComposer({
         onChange={(e) => setBody(e.target.value)}
         rows={2}
         placeholder="Leave an overall review comment…"
-        className="w-full resize-none rounded border border-[#1a1d24] bg-[#0a0b10] px-2 py-1.5 text-[11px] text-[#e6f0e4] outline-none placeholder:text-[#6b7569] focus:border-[#5ccfe6]"
+        className="w-full resize-none rounded border border-[#1a1d24] bg-[#0a0b10] px-2 py-1.5 text-[11px] text-[#e6f0e4] outline-none placeholder:text-[#899384] focus:border-[#5ccfe6]"
       />
       {err && (
         <p data-testid="review-composer-error" className="text-[11px] text-[#ff5050]">
@@ -595,7 +595,7 @@ function Empty({
       className="flex h-full flex-col items-center justify-center gap-1 px-6 text-center"
     >
       <p className="text-[12px] text-[#a8b3a6]">{title}</p>
-      <p className="text-[11px] text-[#6b7569]">{children}</p>
+      <p className="text-[11px] text-[#899384]">{children}</p>
     </div>
   );
 }

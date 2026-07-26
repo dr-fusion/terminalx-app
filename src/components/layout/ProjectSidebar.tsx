@@ -45,7 +45,7 @@ function StatusIcon({ status }: { status: WorkspaceStatus }) {
     return (
       <Loader2
         size={13}
-        className="shrink-0 animate-spin text-[#6b7569]"
+        className="shrink-0 animate-spin text-[#899384]"
         data-testid="wt-icon-loading"
       />
     );
@@ -59,7 +59,7 @@ function StatusIcon({ status }: { status: WorkspaceStatus }) {
     );
   }
   return (
-    <GitBranch size={13} className="shrink-0 text-[#6b7569]" data-testid="wt-icon-in-progress" />
+    <GitBranch size={13} className="shrink-0 text-[#899384]" data-testid="wt-icon-in-progress" />
   );
 }
 
@@ -89,11 +89,11 @@ function StandaloneSessionRow({
         active ? "bg-[#14161e] text-[#e6f0e4]" : "text-[#a8b3a6] hover:bg-[#14161e]"
       }`}
     >
-      <Terminal size={13} className={`shrink-0 ${active ? "text-[#00ff88]" : "text-[#6b7569]"}`} />
+      <Terminal size={13} className={`shrink-0 ${active ? "text-[#00ff88]" : "text-[#899384]"}`} />
       <span className="min-w-0 flex-1 truncate" title={session.name}>
         {session.name}
       </span>
-      <span className="shrink-0 rounded border border-[#1a1d24] px-1.5 py-0.5 text-[10px] text-[#6b7569] group-hover:text-[#a8b3a6]">
+      <span className="shrink-0 rounded border border-[#1a1d24] px-1.5 py-0.5 text-[10px] text-[#899384] group-hover:text-[#a8b3a6]">
         {kind}
       </span>
     </button>
@@ -120,7 +120,7 @@ function StandaloneSessionsSection({
 
   if (isLoading && standalone.length === 0) {
     return (
-      <div className="mt-3 border-t border-[#1a1d24] px-2 py-3 text-[11px] text-[#6b7569]">
+      <div className="mt-3 border-t border-[#1a1d24] px-2 py-3 text-[11px] text-[#899384]">
         loading sessions...
       </div>
     );
@@ -130,7 +130,7 @@ function StandaloneSessionsSection({
 
   return (
     <div data-testid="standalone-sessions-section" className="mt-3 border-t border-[#1a1d24] pt-2">
-      <div className="flex items-center gap-1.5 px-1 py-1.5 text-[12px] text-[#6b7569]">
+      <div className="flex items-center gap-1.5 px-1 py-1.5 text-[12px] text-[#899384]">
         <Terminal size={12} />
         <span className="font-medium">Sessions</span>
         <span
@@ -343,7 +343,7 @@ function WorkspaceRow({
       {stat && (
         <span
           data-testid="workspace-diffstat"
-          className="shrink-0 font-mono text-[10px] tabular-nums text-[#6b7569]"
+          className="shrink-0 font-mono text-[10px] tabular-nums text-[#899384]"
         >
           {workspace.diffStat.additions > 0 && (
             <span className="text-[#00cc6e]">+{workspace.diffStat.additions}</span>
@@ -360,7 +360,7 @@ function WorkspaceRow({
           data-testid="workspace-menu-trigger"
           aria-label="workspace menu"
           onClick={() => setMenuOpen((o) => !o)}
-          className="flex h-5 w-5 items-center justify-center rounded text-[#6b7569] opacity-0 transition-colors hover:bg-[#1a1d24] hover:text-[#e6f0e4] group-hover:opacity-100 data-[open=true]:opacity-100"
+          className="flex h-5 w-5 items-center justify-center rounded text-[#899384] opacity-0 transition-colors hover:bg-[#1a1d24] hover:text-[#e6f0e4] group-hover:opacity-100 data-[open=true]:opacity-100"
           data-open={menuOpen}
         >
           <MoreVertical size={13} />
@@ -419,7 +419,7 @@ function ProjectGroup({
           data-testid="project-toggle"
           aria-label={expanded ? "collapse project" : "expand project"}
           onClick={() => setExpanded((e) => !e)}
-          className="flex h-4 w-4 items-center justify-center rounded text-[#6b7569] hover:text-[#e6f0e4]"
+          className="flex h-4 w-4 items-center justify-center rounded text-[#899384] hover:text-[#e6f0e4]"
         >
           {expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
         </button>
@@ -437,7 +437,7 @@ function ProjectGroup({
           data-testid="project-add-workspace"
           aria-label="new workspace"
           onClick={() => onAddWorkspace(project.repoRoot)}
-          className="flex h-5 w-5 items-center justify-center rounded text-[#6b7569] transition-colors hover:bg-[#14161e] hover:text-[#e6f0e4]"
+          className="flex h-5 w-5 items-center justify-center rounded text-[#899384] transition-colors hover:bg-[#14161e] hover:text-[#e6f0e4]"
         >
           <Plus size={13} />
         </button>
@@ -446,7 +446,7 @@ function ProjectGroup({
             data-testid="project-menu-trigger"
             aria-label="project menu"
             onClick={() => setMenuOpen((o) => !o)}
-            className="flex h-5 w-5 items-center justify-center rounded text-[#6b7569] transition-colors hover:bg-[#14161e] hover:text-[#e6f0e4]"
+            className="flex h-5 w-5 items-center justify-center rounded text-[#899384] transition-colors hover:bg-[#14161e] hover:text-[#e6f0e4]"
           >
             <MoreVertical size={13} />
           </button>
@@ -469,7 +469,7 @@ function ProjectGroup({
       {expanded && (
         <div className="mt-0.5 space-y-0.5 pl-3" data-testid="project-workspaces">
           {visible.length === 0 ? (
-            <div className="px-2 py-1.5 text-[11px] text-[#6b7569]">no workspaces</div>
+            <div className="px-2 py-1.5 text-[11px] text-[#899384]">no workspaces</div>
           ) : (
             visible.map((ws) => (
               <WorkspaceRow
@@ -500,9 +500,9 @@ function ArchivedRow({
     <div
       data-testid="archived-workspace-row"
       data-session={workspace.sessionName}
-      className="group flex h-8 w-full items-center gap-2 rounded px-2 text-[12px] text-[#6b7569] hover:bg-[#14161e]"
+      className="group flex h-8 w-full items-center gap-2 rounded px-2 text-[12px] text-[#899384] hover:bg-[#14161e]"
     >
-      <Archive size={13} className="shrink-0 text-[#6b7569]" />
+      <Archive size={13} className="shrink-0 text-[#899384]" />
       <span className="min-w-0 flex-1 truncate" data-testid="archived-workspace-name">
         {workspace.branch}
       </span>
@@ -540,7 +540,7 @@ function ArchivedSection({
         data-testid="archived-toggle"
         aria-label={expanded ? "collapse archived" : "expand archived"}
         onClick={() => setExpanded((e) => !e)}
-        className="flex w-full items-center gap-1.5 rounded px-1 py-1.5 text-[12px] text-[#6b7569] hover:text-[#a8b3a6]"
+        className="flex w-full items-center gap-1.5 rounded px-1 py-1.5 text-[12px] text-[#899384] hover:text-[#a8b3a6]"
       >
         {expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
         <Archive size={12} />
@@ -627,9 +627,9 @@ export function ProjectSidebar({ activeSession }: { activeSession: string | null
   return (
     <div className="mt-1 space-y-1" data-testid="project-sidebar">
       {isLoading && projects.length === 0 ? (
-        <div className="px-2 py-3 text-[11px] text-[#6b7569]">loading projects…</div>
+        <div className="px-2 py-3 text-[11px] text-[#899384]">loading projects…</div>
       ) : projects.length === 0 ? (
-        <div className="px-2 py-3 text-[11px] text-[#6b7569]" data-testid="project-empty">
+        <div className="px-2 py-3 text-[11px] text-[#899384]" data-testid="project-empty">
           no projects yet
         </div>
       ) : (

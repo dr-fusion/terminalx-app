@@ -92,7 +92,7 @@ export function MobileNav({ open, onClose }: MobileNavProps) {
             type="button"
             onClick={onClose}
             aria-label="Close navigation"
-            className="flex size-9 items-center justify-center rounded text-[#6b7569] transition-colors hover:bg-[#14161e] hover:text-[#e6f0e4] focus-visible:ring-2 focus-visible:ring-[#00cc6e]"
+            className="flex size-9 items-center justify-center rounded text-[#899384] transition-colors hover:bg-[#14161e] hover:text-[#e6f0e4] focus-visible:ring-2 focus-visible:ring-[#00cc6e]"
           >
             <X size={16} aria-hidden="true" />
           </button>
@@ -117,7 +117,7 @@ export function MobileNav({ open, onClose }: MobileNavProps) {
               >
                 <Icon
                   size={16}
-                  className={active ? "text-[#00ff88]" : "text-[#6b7569]"}
+                  className={active ? "text-[#00ff88]" : "text-[#899384]"}
                   aria-hidden="true"
                 />
                 <span className="flex-1">{label}</span>

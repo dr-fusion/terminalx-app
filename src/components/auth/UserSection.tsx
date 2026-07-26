@@ -39,7 +39,7 @@ export function UserSection() {
             className={`w-fit text-[10px] px-1.5 py-0 h-4 ${
               user.role === "admin"
                 ? "bg-[#00cc6e]/20 text-[#00cc6e]"
-                : "bg-[#6b7569]/20 text-[#6b7569]"
+                : "bg-[#899384]/20 text-[#899384]"
             }`}
           >
             {user.role}
@@ -51,7 +51,7 @@ export function UserSection() {
           {user.role === "admin" && (
             <Link
               href="/admin"
-              className="p-1.5 text-[#6b7569] hover:text-[#00cc6e] transition-colors"
+              className="p-1.5 text-[#899384] hover:text-[#00cc6e] transition-colors"
               title="Admin panel"
               aria-label="Admin panel"
             >
@@ -60,7 +60,7 @@ export function UserSection() {
           )}
           <button
             onClick={logout}
-            className="p-1.5 text-[#6b7569] hover:text-[#ff5c5c] transition-colors"
+            className="p-1.5 text-[#899384] hover:text-[#ff5c5c] transition-colors"
             title="Sign out"
             aria-label="Sign out"
           >

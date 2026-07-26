@@ -25,7 +25,7 @@ function StatusIcon({ status }: { status: FileStatus }) {
     case "copied":
       return <FileSymlink size={13} className="shrink-0 text-[#d58fff]" aria-label="renamed" />;
     case "mode-change":
-      return <FileText size={13} className="shrink-0 text-[#6b7569]" aria-label="mode change" />;
+      return <FileText size={13} className="shrink-0 text-[#899384]" aria-label="mode change" />;
     case "modified":
     default:
       return <FilePen size={13} className="shrink-0 text-[#5ccfe6]" aria-label="modified" />;
@@ -92,19 +92,19 @@ export function FileDiff({
         className="flex h-9 w-full items-center gap-2 px-3 text-left text-[12px] hover:bg-[#14161e]"
       >
         {collapsed ? (
-          <ChevronRight size={13} className="shrink-0 text-[#6b7569]" />
+          <ChevronRight size={13} className="shrink-0 text-[#899384]" />
         ) : (
-          <ChevronDown size={13} className="shrink-0 text-[#6b7569]" />
+          <ChevronDown size={13} className="shrink-0 text-[#899384]" />
         )}
         <StatusIcon status={file.status} />
         <span className="min-w-0 truncate" data-testid="diff-file-path">
           {file.oldPath && (file.status === "renamed" || file.status === "copied") ? (
             <>
-              <span className="text-[#6b7569]">{file.oldPath}</span>
-              <span className="px-1 text-[#6b7569]">→</span>
+              <span className="text-[#899384]">{file.oldPath}</span>
+              <span className="px-1 text-[#899384]">→</span>
             </>
           ) : null}
-          <span className="text-[#6b7569]">{file.dir}</span>
+          <span className="text-[#899384]">{file.dir}</span>
           <span className="font-medium text-[#e6f0e4]">{file.filename}</span>
         </span>
         <span className="flex-1" />
@@ -123,17 +123,17 @@ export function FileDiff({
       {!collapsed && (
         <div data-testid="diff-file-body" className="bg-[#0a0b10]">
           {file.isBinary ? (
-            <div className="px-4 py-2 text-[12px] text-[#6b7569]">Binary file changed</div>
+            <div className="px-4 py-2 text-[12px] text-[#899384]">Binary file changed</div>
           ) : file.truncated ? (
-            <div className="px-4 py-2 text-[12px] text-[#6b7569]">
+            <div className="px-4 py-2 text-[12px] text-[#899384]">
               File too large to display — open externally
             </div>
           ) : file.status === "mode-change" ? (
-            <div className="px-4 py-2 font-mono text-[12px] text-[#6b7569]">
+            <div className="px-4 py-2 font-mono text-[12px] text-[#899384]">
               Mode change {file.oldMode ?? ""} → {file.newMode ?? ""}
             </div>
           ) : loading ? (
-            <div className="px-4 py-2 text-[12px] text-[#6b7569]">Loading diff…</div>
+            <div className="px-4 py-2 text-[12px] text-[#899384]">Loading diff…</div>
           ) : hunks && hunks.length > 0 ? (
             hunks.map((hunk) => (
               <HunkView
@@ -145,7 +145,7 @@ export function FileDiff({
               />
             ))
           ) : (
-            <div className="px-4 py-2 text-[12px] text-[#6b7569]">No textual changes</div>
+            <div className="px-4 py-2 text-[12px] text-[#899384]">No textual changes</div>
           )}
         </div>
       )}

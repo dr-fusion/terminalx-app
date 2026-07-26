@@ -128,7 +128,7 @@ export function ProvidersPickerModal({
           <button
             data-testid="opencode-providers-close"
             onClick={onClose}
-            className="p-0.5 text-[#6b7569] hover:text-[#e6f0e4] transition-colors"
+            className="p-0.5 text-[#899384] hover:text-[#e6f0e4] transition-colors"
             aria-label="close providers"
           >
             <X size={12} />
@@ -136,13 +136,13 @@ export function ProvidersPickerModal({
         </div>
 
         <div className="flex items-center gap-2 rounded bg-[#07080c] border border-[#252933] px-2 py-1.5 mb-3">
-          <Search size={12} className="text-[#6b7569] shrink-0" />
+          <Search size={12} className="text-[#899384] shrink-0" />
           <input
             data-testid="opencode-providers-search"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder="Search providers"
-            className="flex-1 bg-transparent text-[12px] text-[#e6f0e4] placeholder:text-[#6b7569]/60 outline-none"
+            className="flex-1 bg-transparent text-[12px] text-[#e6f0e4] placeholder:text-[#899384]/60 outline-none"
           />
         </div>
 
@@ -157,7 +157,7 @@ export function ProvidersPickerModal({
 
         <div className="max-h-[320px] overflow-y-auto rounded border border-[#1a1d24] bg-[#07080c]">
           {rows.length === 0 ? (
-            <div className="px-2 py-3 text-[11px] text-[#6b7569]">no matching providers</div>
+            <div className="px-2 py-3 text-[11px] text-[#899384]">no matching providers</div>
           ) : (
             rows.map((p) => {
               const isOpen = expanded === p.id;
@@ -182,9 +182,9 @@ export function ProvidersPickerModal({
                     </span>
                     <span className="min-w-0 truncate flex-1">{p.label}</span>
                     {isOpen ? (
-                      <ChevronDown size={12} className="shrink-0 text-[#6b7569]" />
+                      <ChevronDown size={12} className="shrink-0 text-[#899384]" />
                     ) : (
-                      <ChevronRight size={12} className="shrink-0 text-[#6b7569]" />
+                      <ChevronRight size={12} className="shrink-0 text-[#899384]" />
                     )}
                   </button>
                   {isOpen && (

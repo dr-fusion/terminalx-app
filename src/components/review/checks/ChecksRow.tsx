@@ -30,7 +30,7 @@ export function ChecksRow({ item }: ChecksRowProps) {
         {pres.glyph}
       </span>
       <span className="min-w-0 flex-1 truncate text-[#e6f0e4]">{item.name}</span>
-      <span className="hidden shrink-0 text-[#6b7569] sm:inline">{item.source}</span>
+      <span className="hidden shrink-0 text-[#899384] sm:inline">{item.source}</span>
       <span className="w-20 shrink-0 text-right text-[#a8b3a6]">{duration}</span>
       {item.detailsUrl ? (
         <a

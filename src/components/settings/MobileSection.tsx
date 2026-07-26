@@ -145,12 +145,12 @@ export function MobileSection() {
             <div className="rounded bg-white p-3">
               <QRCodeSVG value={qrPayload} size={192} level="M" />
             </div>
-            <div className="text-[10px] text-[#6b7569]">expires in {secondsLeft}s · single use</div>
+            <div className="text-[10px] text-[#899384]">expires in {secondsLeft}s · single use</div>
             <div className="flex items-center gap-2">
               <code className="font-mono text-[10px] text-[#a8b3a6] break-all">{code!.code}</code>
               <button
                 onClick={copyCode}
-                className="inline-flex items-center gap-1 rounded border border-[#252933] bg-[#07080c] px-1.5 py-0.5 text-[10px] text-[#6b7569] hover:text-[#e6f0e4]"
+                className="inline-flex items-center gap-1 rounded border border-[#252933] bg-[#07080c] px-1.5 py-0.5 text-[10px] text-[#899384] hover:text-[#e6f0e4]"
                 title="copy code"
               >
                 <Copy size={10} />
@@ -159,7 +159,7 @@ export function MobileSection() {
             </div>
             <button
               onClick={generate}
-              className="mt-1 inline-flex items-center gap-1.5 text-[10px] text-[#6b7569] hover:text-[#e6f0e4]"
+              className="mt-1 inline-flex items-center gap-1.5 text-[10px] text-[#899384] hover:text-[#e6f0e4]"
             >
               <RefreshCw size={10} /> new code
             </button>
@@ -172,10 +172,10 @@ export function MobileSection() {
             <Smartphone size={12} /> generate pairing code
           </button>
         )}
-        {status && <span className="text-[11px] text-[#6b7569]">{status}</span>}
+        {status && <span className="text-[11px] text-[#899384]">{status}</span>}
       </div>
 
-      <p className="mt-2 text-[10px] leading-relaxed text-[#6b7569]">
+      <p className="mt-2 text-[10px] leading-relaxed text-[#899384]">
         open the TerminalX mobile app, point it at this server, and scan the QR. the paired token
         lasts 24h and can be revoked below.
       </p>
@@ -183,16 +183,16 @@ export function MobileSection() {
       {devices !== null && (
         <div className="mt-4 border-t border-[#1a1d24] pt-3">
           <div className="mb-2 flex items-baseline justify-between">
-            <h3 className="text-[11px] uppercase tracking-wider text-[#6b7569]">paired devices</h3>
+            <h3 className="text-[11px] uppercase tracking-wider text-[#899384]">paired devices</h3>
             <button
               onClick={handleRefresh}
-              className="text-[10px] text-[#6b7569] hover:text-[#e6f0e4]"
+              className="text-[10px] text-[#899384] hover:text-[#e6f0e4]"
             >
               refresh
             </button>
           </div>
           {activeDevices.length === 0 && revokedDevices.length === 0 ? (
-            <div className="text-[11px] text-[#6b7569]">no devices paired yet.</div>
+            <div className="text-[11px] text-[#899384]">no devices paired yet.</div>
           ) : (
             <div className="space-y-1">
               {activeDevices.map((d) => (
@@ -202,7 +202,7 @@ export function MobileSection() {
                 >
                   <Smartphone size={12} className="text-[#5ccfe6]" />
                   <span className="min-w-0 flex-1 truncate text-[#e6f0e4]">{d.name}</span>
-                  <span className="text-[10px] text-[#6b7569]">
+                  <span className="text-[10px] text-[#899384]">
                     last seen {formatRelative(d.lastSeenAt)}
                   </span>
                   <button
@@ -219,11 +219,11 @@ export function MobileSection() {
                   key={d.id}
                   className="flex items-center gap-2 rounded border border-[#1a1d24] bg-[#07080c]/40 px-2 py-1.5 text-[11px] opacity-60"
                 >
-                  <Smartphone size={12} className="text-[#6b7569]" />
-                  <span className="min-w-0 flex-1 truncate text-[#6b7569] line-through">
+                  <Smartphone size={12} className="text-[#899384]" />
+                  <span className="min-w-0 flex-1 truncate text-[#899384] line-through">
                     {d.name}
                   </span>
-                  <span className="text-[10px] text-[#6b7569]">
+                  <span className="text-[10px] text-[#899384]">
                     revoked {formatRelative(d.revokedAt!)}
                   </span>
                 </div>

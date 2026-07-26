@@ -55,7 +55,7 @@ export function PlaygroundTerminal() {
           Playground · in-browser bash
         </span>
         <div className="flex items-center gap-2">
-          <label className="text-[11px] text-[#6b7569]">Theme</label>
+          <label className="text-[11px] text-[#899384]">Theme</label>
           <select
             value={themeLabel}
             onChange={(e) => setThemeLabel(e.target.value)}

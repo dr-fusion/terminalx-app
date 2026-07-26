@@ -64,7 +64,9 @@
   /* Foregrounds — slightly phosphor-tinted, never pure white */
   --fg-1: #e6f0e4;
   --fg-2: #a8b3a6;
-  --fg-3: #6b7569;
+  /* Muted foreground. Lightened to #899384 to meet WCAG AA (4.5:1) body-text
+     contrast against the raised/surface/base backgrounds (Phase 12 a11y pass). */
+  --fg-3: #899384;
   --fg-4: #3f4742;
   --fg-inverse: #05060a;
 
