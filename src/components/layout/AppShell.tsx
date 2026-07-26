@@ -7,6 +7,7 @@ import { useRouter } from "next/navigation";
 import {
   ChevronRight,
   History,
+  Inbox,
   Plus,
   RotateCcw,
   Settings,
@@ -14,6 +15,7 @@ import {
   UsersRound,
 } from "lucide-react";
 import { TopNav } from "./TopNav";
+import { InboxBadge } from "@/components/attention/InboxBadge";
 import { StatusBar } from "./StatusBar";
 // Project sidebar (#12): the left rail groups workspaces under their project
 // (repo) header. ProjectSidebar is boundary-clean (it only imports browser-safe
@@ -28,6 +30,7 @@ import { useSessions } from "@/hooks/useSessions";
 
 const SIDEBAR_LINKS = [
   { href: "/team-sessions", label: "Team sessions", icon: UsersRound },
+  { href: "/inbox", label: "Inbox", icon: Inbox },
   { href: "/playground", label: "Playground", icon: Terminal },
   { href: "/replay", label: "Replays", icon: RotateCcw },
   { href: "/settings", label: "Settings", icon: Settings },
@@ -110,6 +113,7 @@ function LeftSidebar({
                 >
                   <Icon size={14} className={active ? "text-[#00ff88]" : "text-[#6b7569]"} />
                   <span>{label}</span>
+                  {href === "/inbox" ? <InboxBadge /> : null}
                 </Link>
               );
             })}

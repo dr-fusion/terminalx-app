@@ -16,7 +16,7 @@ describe("canonical identity schema", () => {
   it("creates the versioned User and authentication identity authority", () => {
     database = openTeamSessionDatabase({ filename: ":memory:" });
 
-    expect(database.db.pragma("user_version", { simple: true })).toBe(17);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(18);
     expect(
       database.db
         .prepare(
@@ -322,6 +322,11 @@ describe("canonical identity schema", () => {
         DROP TABLE IF EXISTS limit_reservations;
         DROP TABLE IF EXISTS grant_consumptions;
         DROP TABLE IF EXISTS grant_lineage;
+        DROP TABLE IF EXISTS attention_deliveries;
+        DROP TABLE IF EXISTS attention_escalations;
+        DROP TABLE IF EXISTS user_attention_reads;
+        DROP TABLE IF EXISTS comment_attachments;
+        DROP TABLE IF EXISTS comment_mentions;
         DROP TABLE IF EXISTS approval_provenance;
         PRAGMA user_version = 10;
       `);
@@ -330,7 +335,7 @@ describe("canonical identity schema", () => {
 
       database = openTeamSessionDatabase({ filename });
 
-      expect(database.db.pragma("user_version", { simple: true })).toBe(17);
+      expect(database.db.pragma("user_version", { simple: true })).toBe(18);
       expect(database.db.prepare("SELECT id, name FROM teams").all()).toEqual([
         { id: "team-1", name: "Team" },
       ]);
@@ -424,6 +429,11 @@ describe("canonical identity schema", () => {
         DROP TABLE IF EXISTS limit_reservations;
         DROP TABLE IF EXISTS grant_consumptions;
         DROP TABLE IF EXISTS grant_lineage;
+        DROP TABLE IF EXISTS attention_deliveries;
+        DROP TABLE IF EXISTS attention_escalations;
+        DROP TABLE IF EXISTS user_attention_reads;
+        DROP TABLE IF EXISTS comment_attachments;
+        DROP TABLE IF EXISTS comment_mentions;
         DROP TABLE IF EXISTS approval_provenance;
         PRAGMA user_version = 11;
       `);
@@ -432,7 +442,7 @@ describe("canonical identity schema", () => {
 
       database = openTeamSessionDatabase({ filename });
 
-      expect(database.db.pragma("user_version", { simple: true })).toBe(17);
+      expect(database.db.pragma("user_version", { simple: true })).toBe(18);
       expect(database.db.prepare("SELECT * FROM legacy_google_identity_bridges").all()).toEqual([
         {
           google_subject: "compatible-subject",
@@ -493,6 +503,11 @@ describe("canonical identity schema", () => {
         DROP TABLE IF EXISTS limit_reservations;
         DROP TABLE IF EXISTS grant_consumptions;
         DROP TABLE IF EXISTS grant_lineage;
+        DROP TABLE IF EXISTS attention_deliveries;
+        DROP TABLE IF EXISTS attention_escalations;
+        DROP TABLE IF EXISTS user_attention_reads;
+        DROP TABLE IF EXISTS comment_attachments;
+        DROP TABLE IF EXISTS comment_mentions;
         DROP TABLE IF EXISTS approval_provenance;
         PRAGMA user_version = 11;
       `);

@@ -21,7 +21,7 @@ import {
 } from "./session-event-chain";
 import { isValidTmuxSessionName } from "../tmux";
 
-const SCHEMA_VERSION = 17;
+const SCHEMA_VERSION = 18;
 const PRE_RUNTIME_START_SCHEMA_VERSION = 4;
 const RUNTIME_START_SCHEMA_VERSION = 5;
 const RUNTIME_RECEIPT_FOLLOW_SCHEMA_VERSION = 6;
@@ -36,6 +36,7 @@ const WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION = 14;
 const WEBHOOK_AUTH_SCHEMA_VERSION = 15;
 const PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION = 16;
 const PHASE10_RECOVERY_EVIDENCE_SCHEMA_VERSION = 17;
+const PHASE11A_ATTENTION_INBOX_SCHEMA_VERSION = 18;
 const APPLICATION_ID = 0x54585331; // "TXS1"
 
 const CANONICAL_IDENTITY_SCHEMA_V11 = `
@@ -2150,6 +2151,173 @@ WHEN NOT (
 )
 BEGIN
   SELECT RAISE(ABORT, 'Session event breaks the append-only hash chain');
+END;
+`;
+
+/**
+ * Phase 11A — global attention inbox, delivery/read cursors, escalation, and
+ * chat-completion (mentions + attachments) tables.
+ *
+ * `comment_mentions` and `comment_attachments` are append-only evidence bound to
+ * a `comment.added` event: the mention FK to `session_participants` fences a
+ * mention to an actual Participant at write time (a User who cannot see the
+ * Session can never be mentioned into its inbox). `attention_escalations` and
+ * `attention_deliveries` are append-only, per-scope hash-chained logs that carry
+ * the same tamper-evident discipline as the Session Event Chain; each is
+ * idempotent by a natural key so a retry/restart cannot double-escalate or
+ * double-send. `user_attention_reads` is a durable, per-User/per-Session read
+ * cursor — a mutable projection, not evidence — guarded to never regress.
+ */
+const PHASE11A_ATTENTION_INBOX_SCHEMA_V18 = `
+CREATE TABLE comment_mentions (
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  comment_id TEXT NOT NULL,
+  comment_sequence INTEGER NOT NULL CHECK (comment_sequence >= 1),
+  mentioned_user_id TEXT NOT NULL CHECK (length(mentioned_user_id) BETWEEN 1 AND 300),
+  author_user_id TEXT NOT NULL CHECK (length(author_user_id) BETWEEN 1 AND 300),
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  UNIQUE (session_id, comment_sequence, mentioned_user_id),
+  FOREIGN KEY (comment_id, session_id)
+    REFERENCES conversation_identities(id, session_id) ON DELETE RESTRICT,
+  FOREIGN KEY (session_id, comment_sequence)
+    REFERENCES session_events(session_id, sequence) ON DELETE RESTRICT,
+  FOREIGN KEY (session_id, mentioned_user_id)
+    REFERENCES session_participants(session_id, user_id) ON DELETE RESTRICT
+) STRICT;
+
+CREATE INDEX comment_mentions_by_user
+  ON comment_mentions(mentioned_user_id, session_id, comment_sequence);
+
+CREATE TRIGGER comment_mentions_immutable_update
+BEFORE UPDATE ON comment_mentions
+BEGIN
+  SELECT RAISE(ABORT, 'Comment mentions are append-only');
+END;
+
+CREATE TRIGGER comment_mentions_immutable_delete
+BEFORE DELETE ON comment_mentions
+BEGIN
+  SELECT RAISE(ABORT, 'Comment mentions are append-only');
+END;
+
+CREATE TABLE comment_attachments (
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  comment_id TEXT NOT NULL,
+  comment_sequence INTEGER NOT NULL CHECK (comment_sequence >= 1),
+  attachment_index INTEGER NOT NULL CHECK (attachment_index >= 0),
+  artifact_ref TEXT NOT NULL CHECK (length(artifact_ref) BETWEEN 1 AND 500),
+  media_type TEXT NOT NULL CHECK (length(media_type) BETWEEN 1 AND 120),
+  byte_size INTEGER NOT NULL CHECK (byte_size >= 0),
+  author_user_id TEXT NOT NULL CHECK (length(author_user_id) BETWEEN 1 AND 300),
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  UNIQUE (session_id, comment_sequence, attachment_index),
+  FOREIGN KEY (comment_id, session_id)
+    REFERENCES conversation_identities(id, session_id) ON DELETE RESTRICT,
+  FOREIGN KEY (session_id, comment_sequence)
+    REFERENCES session_events(session_id, sequence) ON DELETE RESTRICT
+) STRICT;
+
+CREATE INDEX comment_attachments_by_comment
+  ON comment_attachments(session_id, comment_sequence, attachment_index);
+
+CREATE TRIGGER comment_attachments_immutable_update
+BEFORE UPDATE ON comment_attachments
+BEGIN
+  SELECT RAISE(ABORT, 'Comment attachments are append-only');
+END;
+
+CREATE TRIGGER comment_attachments_immutable_delete
+BEFORE DELETE ON comment_attachments
+BEGIN
+  SELECT RAISE(ABORT, 'Comment attachments are append-only');
+END;
+
+CREATE TABLE user_attention_reads (
+  user_id TEXT NOT NULL CHECK (length(user_id) BETWEEN 1 AND 300),
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE RESTRICT,
+  read_through_sequence INTEGER NOT NULL CHECK (read_through_sequence >= 0),
+  updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= 0),
+  PRIMARY KEY (user_id, session_id)
+) STRICT;
+
+CREATE TRIGGER user_attention_reads_no_regress
+BEFORE UPDATE ON user_attention_reads
+WHEN NEW.read_through_sequence < OLD.read_through_sequence
+BEGIN
+  SELECT RAISE(ABORT, 'Read cursor must not regress');
+END;
+
+CREATE TABLE attention_escalations (
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE RESTRICT,
+  sequence INTEGER NOT NULL CHECK (sequence >= 1),
+  item_kind TEXT NOT NULL CHECK (item_kind IN ('handoff-offer', 'assignee-required')),
+  item_sequence INTEGER NOT NULL CHECK (item_sequence >= 1),
+  responsible_user_id TEXT NOT NULL CHECK (length(responsible_user_id) BETWEEN 1 AND 300),
+  supervisor_user_id TEXT NOT NULL CHECK (length(supervisor_user_id) BETWEEN 1 AND 300),
+  deadline_at_ms INTEGER NOT NULL CHECK (deadline_at_ms >= 0),
+  escalated_at_ms INTEGER NOT NULL CHECK (escalated_at_ms >= 0),
+  prev_hash TEXT NOT NULL CHECK (length(prev_hash) = 64 AND prev_hash NOT GLOB '*[^0-9a-f]*'),
+  hash TEXT NOT NULL CHECK (length(hash) = 64 AND hash NOT GLOB '*[^0-9a-f]*'),
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  UNIQUE (session_id, sequence),
+  UNIQUE (session_id, item_kind, item_sequence, supervisor_user_id),
+  FOREIGN KEY (session_id, item_sequence)
+    REFERENCES session_events(session_id, sequence) ON DELETE RESTRICT
+) STRICT;
+
+CREATE INDEX attention_escalations_by_supervisor
+  ON attention_escalations(supervisor_user_id, session_id, item_sequence);
+
+CREATE TRIGGER attention_escalations_immutable_update
+BEFORE UPDATE ON attention_escalations
+BEGIN
+  SELECT RAISE(ABORT, 'Attention escalations are append-only');
+END;
+
+CREATE TRIGGER attention_escalations_immutable_delete
+BEFORE DELETE ON attention_escalations
+BEGIN
+  SELECT RAISE(ABORT, 'Attention escalations are append-only');
+END;
+
+CREATE TABLE attention_deliveries (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL CHECK (length(user_id) BETWEEN 1 AND 300),
+  sequence INTEGER NOT NULL CHECK (sequence >= 1),
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE RESTRICT,
+  item_kind TEXT NOT NULL CHECK (
+    item_kind IN ('mention', 'handoff-offer', 'assignee-required', 'escalation')
+  ),
+  item_sequence INTEGER NOT NULL CHECK (item_sequence >= 1),
+  binding_id TEXT NOT NULL CHECK (length(binding_id) BETWEEN 1 AND 300),
+  outcome TEXT NOT NULL CHECK (
+    outcome IN ('delivered', 'not-routed', 'denied', 'retries-exhausted')
+  ),
+  prev_hash TEXT NOT NULL CHECK (length(prev_hash) = 64 AND prev_hash NOT GLOB '*[^0-9a-f]*'),
+  hash TEXT NOT NULL CHECK (length(hash) = 64 AND hash NOT GLOB '*[^0-9a-f]*'),
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  UNIQUE (user_id, sequence),
+  UNIQUE (user_id, session_id, item_sequence, binding_id),
+  FOREIGN KEY (session_id, item_sequence)
+    REFERENCES session_events(session_id, sequence) ON DELETE RESTRICT
+) STRICT;
+
+CREATE INDEX attention_deliveries_by_user
+  ON attention_deliveries(user_id, sequence);
+
+CREATE TRIGGER attention_deliveries_immutable_update
+BEFORE UPDATE ON attention_deliveries
+BEGIN
+  SELECT RAISE(ABORT, 'Attention deliveries are append-only');
+END;
+
+CREATE TRIGGER attention_deliveries_immutable_delete
+BEFORE DELETE ON attention_deliveries
+BEGIN
+  SELECT RAISE(ABORT, 'Attention deliveries are append-only');
 END;
 `;
 
@@ -9176,7 +9344,8 @@ export function openTeamSessionDatabase(
         migratedVersion !== WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION &&
         migratedVersion !== WEBHOOK_AUTH_SCHEMA_VERSION &&
         migratedVersion !== PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION &&
-        migratedVersion !== PHASE10_RECOVERY_EVIDENCE_SCHEMA_VERSION
+        migratedVersion !== PHASE10_RECOVERY_EVIDENCE_SCHEMA_VERSION &&
+        migratedVersion !== PHASE11A_ATTENTION_INBOX_SCHEMA_VERSION
       ) {
         throw new Error(
           `Unsupported Team Session database schema ${currentVersion}; expected ${SCHEMA_VERSION}`
@@ -9248,6 +9417,10 @@ export function openTeamSessionDatabase(
     const phase10PreparedVersion = db.pragma("user_version", { simple: true }) as number;
     if (phase10PreparedVersion === PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION) {
       migratePhase10RecoveryEvidenceSchemaV17(db);
+    }
+    const phase11aPreparedVersion = db.pragma("user_version", { simple: true }) as number;
+    if (phase11aPreparedVersion === PHASE10_RECOVERY_EVIDENCE_SCHEMA_VERSION) {
+      migratePhase11aAttentionInboxSchemaV18(db);
     }
 
     const applicationId = db.pragma("application_id", { simple: true }) as number;
@@ -9339,7 +9512,8 @@ function migrateRuntimeStartSchemaV5(db: Database.Database): void {
         currentVersion === WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION ||
         currentVersion === WEBHOOK_AUTH_SCHEMA_VERSION ||
         currentVersion === PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION ||
-        currentVersion === PHASE10_RECOVERY_EVIDENCE_SCHEMA_VERSION
+        currentVersion === PHASE10_RECOVERY_EVIDENCE_SCHEMA_VERSION ||
+        currentVersion === PHASE11A_ATTENTION_INBOX_SCHEMA_VERSION
       ) {
         return;
       }
@@ -9385,7 +9559,8 @@ function migrateRuntimeReceiptFollowSchemaV6(db: Database.Database): void {
       currentVersion === WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION ||
       currentVersion === WEBHOOK_AUTH_SCHEMA_VERSION ||
       currentVersion === PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION ||
-      currentVersion === PHASE10_RECOVERY_EVIDENCE_SCHEMA_VERSION
+      currentVersion === PHASE10_RECOVERY_EVIDENCE_SCHEMA_VERSION ||
+      currentVersion === PHASE11A_ATTENTION_INBOX_SCHEMA_VERSION
     ) {
       return;
     }
@@ -9424,7 +9599,8 @@ function migrateRuntimeCompensationSchemaV7(db: Database.Database): void {
       currentVersion === WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION ||
       currentVersion === WEBHOOK_AUTH_SCHEMA_VERSION ||
       currentVersion === PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION ||
-      currentVersion === PHASE10_RECOVERY_EVIDENCE_SCHEMA_VERSION
+      currentVersion === PHASE10_RECOVERY_EVIDENCE_SCHEMA_VERSION ||
+      currentVersion === PHASE11A_ATTENTION_INBOX_SCHEMA_VERSION
     ) {
       return;
     }
@@ -9466,7 +9642,8 @@ function migrateRuntimeAssignmentOutboxInterlockSchemaV8(db: Database.Database):
       currentVersion === WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION ||
       currentVersion === WEBHOOK_AUTH_SCHEMA_VERSION ||
       currentVersion === PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION ||
-      currentVersion === PHASE10_RECOVERY_EVIDENCE_SCHEMA_VERSION
+      currentVersion === PHASE10_RECOVERY_EVIDENCE_SCHEMA_VERSION ||
+      currentVersion === PHASE11A_ATTENTION_INBOX_SCHEMA_VERSION
     )
       return;
     if (currentVersion !== RUNTIME_COMPENSATION_SCHEMA_VERSION) {
@@ -9514,7 +9691,8 @@ function migrateHostedRuntimeAssignmentSchemaV9(db: Database.Database): void {
         currentVersion === WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION ||
         currentVersion === WEBHOOK_AUTH_SCHEMA_VERSION ||
         currentVersion === PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION ||
-        currentVersion === PHASE10_RECOVERY_EVIDENCE_SCHEMA_VERSION
+        currentVersion === PHASE10_RECOVERY_EVIDENCE_SCHEMA_VERSION ||
+        currentVersion === PHASE11A_ATTENTION_INBOX_SCHEMA_VERSION
       )
         return;
       if (currentVersion !== RUNTIME_ASSIGNMENT_OUTBOX_INTERLOCK_SCHEMA_VERSION) {
@@ -9614,7 +9792,8 @@ function migrateProviderBoundEffectActivationSchemaV10(db: Database.Database): v
       currentVersion === WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION ||
       currentVersion === WEBHOOK_AUTH_SCHEMA_VERSION ||
       currentVersion === PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION ||
-      currentVersion === PHASE10_RECOVERY_EVIDENCE_SCHEMA_VERSION
+      currentVersion === PHASE10_RECOVERY_EVIDENCE_SCHEMA_VERSION ||
+      currentVersion === PHASE11A_ATTENTION_INBOX_SCHEMA_VERSION
     ) {
       return;
     }
@@ -9852,7 +10031,8 @@ function migrateCanonicalIdentitySchemaV11(db: Database.Database): void {
       currentVersion === WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION ||
       currentVersion === WEBHOOK_AUTH_SCHEMA_VERSION ||
       currentVersion === PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION ||
-      currentVersion === PHASE10_RECOVERY_EVIDENCE_SCHEMA_VERSION
+      currentVersion === PHASE10_RECOVERY_EVIDENCE_SCHEMA_VERSION ||
+      currentVersion === PHASE11A_ATTENTION_INBOX_SCHEMA_VERSION
     )
       return;
     if (currentVersion !== PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION) {
@@ -9886,7 +10066,8 @@ function migrateGoogleIdentityContinuitySchemaV12(db: Database.Database): void {
       currentVersion === WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION ||
       currentVersion === WEBHOOK_AUTH_SCHEMA_VERSION ||
       currentVersion === PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION ||
-      currentVersion === PHASE10_RECOVERY_EVIDENCE_SCHEMA_VERSION
+      currentVersion === PHASE10_RECOVERY_EVIDENCE_SCHEMA_VERSION ||
+      currentVersion === PHASE11A_ATTENTION_INBOX_SCHEMA_VERSION
     )
       return;
     if (currentVersion !== CANONICAL_IDENTITY_SCHEMA_VERSION) {
@@ -9950,7 +10131,8 @@ function migrateConnectionAuthoritySchemaV13(db: Database.Database): void {
       currentVersion === WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION ||
       currentVersion === WEBHOOK_AUTH_SCHEMA_VERSION ||
       currentVersion === PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION ||
-      currentVersion === PHASE10_RECOVERY_EVIDENCE_SCHEMA_VERSION
+      currentVersion === PHASE10_RECOVERY_EVIDENCE_SCHEMA_VERSION ||
+      currentVersion === PHASE11A_ATTENTION_INBOX_SCHEMA_VERSION
     ) {
       return;
     }
@@ -9981,7 +10163,8 @@ function migrateWebhookReplayDedupSchemaV14(db: Database.Database): void {
       currentVersion === WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION ||
       currentVersion === WEBHOOK_AUTH_SCHEMA_VERSION ||
       currentVersion === PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION ||
-      currentVersion === PHASE10_RECOVERY_EVIDENCE_SCHEMA_VERSION
+      currentVersion === PHASE10_RECOVERY_EVIDENCE_SCHEMA_VERSION ||
+      currentVersion === PHASE11A_ATTENTION_INBOX_SCHEMA_VERSION
     ) {
       return;
     }
@@ -10008,7 +10191,8 @@ function migrateWebhookAuthSchemaV15(db: Database.Database): void {
     if (
       currentVersion === WEBHOOK_AUTH_SCHEMA_VERSION ||
       currentVersion === PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION ||
-      currentVersion === PHASE10_RECOVERY_EVIDENCE_SCHEMA_VERSION
+      currentVersion === PHASE10_RECOVERY_EVIDENCE_SCHEMA_VERSION ||
+      currentVersion === PHASE11A_ATTENTION_INBOX_SCHEMA_VERSION
     )
       return;
     if (currentVersion !== WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION) {
@@ -10033,7 +10217,8 @@ function migratePhase9ProvenanceLimitsYoloSchemaV16(db: Database.Database): void
     const currentVersion = db.pragma("user_version", { simple: true }) as number;
     if (
       currentVersion === PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION ||
-      currentVersion === PHASE10_RECOVERY_EVIDENCE_SCHEMA_VERSION
+      currentVersion === PHASE10_RECOVERY_EVIDENCE_SCHEMA_VERSION ||
+      currentVersion === PHASE11A_ATTENTION_INBOX_SCHEMA_VERSION
     )
       return;
     if (currentVersion !== WEBHOOK_AUTH_SCHEMA_VERSION) {
@@ -10057,7 +10242,11 @@ function migratePhase9ProvenanceLimitsYoloSchemaV16(db: Database.Database): void
 function migratePhase10RecoveryEvidenceSchemaV17(db: Database.Database): void {
   const migrate = db.transaction(() => {
     const currentVersion = db.pragma("user_version", { simple: true }) as number;
-    if (currentVersion === PHASE10_RECOVERY_EVIDENCE_SCHEMA_VERSION) return;
+    if (
+      currentVersion === PHASE10_RECOVERY_EVIDENCE_SCHEMA_VERSION ||
+      currentVersion === PHASE11A_ATTENTION_INBOX_SCHEMA_VERSION
+    )
+      return;
     if (currentVersion !== PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION) {
       throw new Error(
         `Unsupported Team Session database schema ${currentVersion}; expected ${PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION}`
@@ -10094,6 +10283,30 @@ function migratePhase10RecoveryEvidenceSchemaV17(db: Database.Database): void {
       throw new Error("Team Session v17 migration failed its foreign key check");
     }
     db.pragma(`user_version = ${PHASE10_RECOVERY_EVIDENCE_SCHEMA_VERSION}`);
+  });
+  migrate.exclusive();
+}
+
+function migratePhase11aAttentionInboxSchemaV18(db: Database.Database): void {
+  const migrate = db.transaction(() => {
+    const currentVersion = db.pragma("user_version", { simple: true }) as number;
+    if (currentVersion === PHASE11A_ATTENTION_INBOX_SCHEMA_VERSION) return;
+    if (currentVersion !== PHASE10_RECOVERY_EVIDENCE_SCHEMA_VERSION) {
+      throw new Error(
+        `Unsupported Team Session database schema ${currentVersion}; expected ${PHASE10_RECOVERY_EVIDENCE_SCHEMA_VERSION}`
+      );
+    }
+    // Additive Phase 11A attention-inbox + chat-completion tables. Every new
+    // table is empty at migration time and either append-only-by-trigger
+    // (mentions, attachments, deliveries, escalations) or a mutable, monotonic
+    // read cursor, so no backfill is required. A fresh install replays this with
+    // empty parent tables, making the migration a no-op beyond the DDL.
+    db.exec(PHASE11A_ATTENTION_INBOX_SCHEMA_V18);
+    const violations = db.pragma("foreign_key_check") as unknown[];
+    if (violations.length > 0) {
+      throw new Error("Team Session v18 migration failed its foreign key check");
+    }
+    db.pragma(`user_version = ${PHASE11A_ATTENTION_INBOX_SCHEMA_VERSION}`);
   });
   migrate.exclusive();
 }

@@ -590,6 +590,11 @@ describe("Team Session kernel", () => {
     try {
       database.exec(`
         PRAGMA foreign_keys = OFF;
+        DROP TABLE attention_deliveries;
+        DROP TABLE attention_escalations;
+        DROP TABLE user_attention_reads;
+        DROP TABLE comment_attachments;
+        DROP TABLE comment_mentions;
         DROP TRIGGER IF EXISTS session_events_hash_chain_insert;
         DROP TRIGGER IF EXISTS session_events_append_only_update;
         DROP TRIGGER IF EXISTS session_events_append_only_delete;
@@ -2671,14 +2676,23 @@ describe("Team Session kernel", () => {
         .prepare(
           `SELECT name FROM sqlite_master
            WHERE type = 'table'
-             AND (name LIKE '%chat%' OR name LIKE '%comment%')`
+             AND (name LIKE '%chat%' OR name LIKE '%comment%')
+           ORDER BY name`
         )
         .all();
-      expect(conversationTables).toEqual([]);
+      // The only comment-scoped tables are the Phase 11A append-only evidence
+      // rows (mention resolutions and artifact attachments). Comment bodies
+      // themselves remain in the canonical event chain, never a chat table.
+      expect(conversationTables).toEqual([
+        { name: "comment_attachments" },
+        { name: "comment_mentions" },
+      ]);
       for (const normalizedTable of [
         "conversation_identities",
         "conversation_suggestion_resolutions",
         "conversation_directives",
+        "comment_mentions",
+        "comment_attachments",
       ]) {
         const columns = database.prepare(`PRAGMA table_info(${normalizedTable})`).all() as Array<{
           name: string;
@@ -2839,7 +2853,7 @@ describe("Team Session kernel", () => {
 
     const database = new Database(filename, { readonly: true });
     try {
-      expect(database.pragma("user_version", { simple: true })).toBe(17);
+      expect(database.pragma("user_version", { simple: true })).toBe(18);
       expect(database.pragma("foreign_key_check")).toEqual([]);
       expect(
         database

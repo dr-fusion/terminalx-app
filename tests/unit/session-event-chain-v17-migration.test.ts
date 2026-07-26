@@ -98,6 +98,11 @@ function seedV16Database(filename: string, sessions: readonly LegacySession[]): 
       db.exec(`DROP TRIGGER ${trigger}`);
     }
     db.exec(`
+      DROP TABLE attention_deliveries;
+      DROP TABLE attention_escalations;
+      DROP TABLE user_attention_reads;
+      DROP TABLE comment_attachments;
+      DROP TABLE comment_mentions;
       DROP TABLE session_platform_security_actions;
       DROP TABLE evidence_review_history;
       DROP TABLE goal_version_lineage;
@@ -254,7 +259,7 @@ describe("session event chain v16 -> v17 migration", () => {
     seedV16Database(filename, sessions);
 
     database = openTeamSessionDatabase({ filename });
-    expect(database.db.pragma("user_version", { simple: true })).toBe(17);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(18);
 
     // (a) every event has the exact deterministic prev_hash/hash: genesis root
     // at sequence 1, chained thereafter.
@@ -415,7 +420,7 @@ describe("session event chain v16 -> v17 migration", () => {
 
     // Reopening again is a clean no-op — no double-migrate error, hashes unchanged.
     database = openTeamSessionDatabase({ filename });
-    expect(database.db.pragma("user_version", { simple: true })).toBe(17);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(18);
     const after = database.db
       .prepare(
         `SELECT session_id, sequence, prev_hash, hash FROM session_events

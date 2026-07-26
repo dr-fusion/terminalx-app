@@ -1,0 +1,302 @@
+import { resolveRequestActor, type RequestActor } from "../request-actor";
+import { getPublicUrl, isReadOnlyMode, trustProxyHeaders } from "../security-config";
+import { getRegisteredAttentionInbox } from "../team-sessions/service";
+import { isMultiplayerTransportAvailable } from "../team-sessions/feature";
+import { AttentionInboxError, type AttentionInboxStore } from "./store";
+import { MAX_ATTENTION_PAGE } from "./contracts";
+
+const RESPONSE_HEADERS = {
+  "Cache-Control": "private, no-store",
+  Pragma: "no-cache",
+  Vary: "Cookie, Authorization",
+  "X-Content-Type-Options": "nosniff",
+} as const;
+
+const SAFE_IDENTIFIER_PATTERN = /^[^\u0000-\u001f\u007f]{1,300}$/;
+const CURSOR_PATTERN = /^[A-Za-z0-9_-]{1,512}$/;
+const DEFAULT_MAX_BODY_BYTES = 16 * 1024;
+
+class HttpProblem extends Error {
+  constructor(
+    readonly status: number,
+    readonly code: string,
+    readonly publicMessage: string
+  ) {
+    super(publicMessage);
+    this.name = "HttpProblem";
+  }
+}
+
+export interface AttentionHttpDependencies {
+  attentionInbox?: AttentionInboxStore;
+  resolveActor?: (headers: Headers) => Promise<RequestActor | null>;
+  isReadOnly?: () => boolean;
+  isMutationAvailable?: () => boolean;
+  reportInternalError?: (errorName: "InternalError") => void;
+}
+
+function jsonResponse(value: unknown, status = 200): Response {
+  return Response.json(value, { status, headers: RESPONSE_HEADERS });
+}
+
+function problemResponse(status: number, code: string, message: string): Response {
+  return jsonResponse({ error: { code, message } }, status);
+}
+
+function reportInternalError(dependencies: AttentionHttpDependencies): void {
+  if (dependencies.reportInternalError) {
+    dependencies.reportInternalError("InternalError");
+    return;
+  }
+  console.error("[attention/http] InternalError");
+}
+
+async function withHttpErrors(
+  dependencies: AttentionHttpDependencies,
+  work: () => Promise<Response>
+): Promise<Response> {
+  try {
+    return await work();
+  } catch (error) {
+    if (error instanceof HttpProblem) {
+      return problemResponse(error.status, error.code, error.publicMessage);
+    }
+    if (error instanceof AttentionInboxError) {
+      if (error.code === "not-authorized") {
+        return problemResponse(404, "resource-unavailable", "Resource is unavailable");
+      }
+      return problemResponse(400, "invalid-request", "Invalid request");
+    }
+    reportInternalError(dependencies);
+    return problemResponse(500, "internal-error", "Internal server error");
+  }
+}
+
+async function requireActor(
+  request: Request,
+  dependencies: AttentionHttpDependencies
+): Promise<RequestActor> {
+  const actor = await (dependencies.resolveActor ?? resolveRequestActor)(request.headers);
+  if (!actor) {
+    throw new HttpProblem(401, "authentication-required", "Authentication required");
+  }
+  return actor;
+}
+
+function inbox(dependencies: AttentionHttpDependencies): AttentionInboxStore {
+  if (dependencies.attentionInbox !== undefined) return dependencies.attentionInbox;
+  let registered: AttentionInboxStore | null;
+  try {
+    registered = getRegisteredAttentionInbox();
+  } catch {
+    throw unavailable();
+  }
+  if (registered === null) throw unavailable();
+  return registered;
+}
+
+function requireMutationAvailability(dependencies: AttentionHttpDependencies): void {
+  let available = false;
+  try {
+    available =
+      dependencies.isMutationAvailable?.() ??
+      (dependencies.attentionInbox !== undefined || isMultiplayerTransportAvailable());
+  } catch {
+    throw unavailable();
+  }
+  if (available !== true) throw unavailable();
+}
+
+function unavailable(): HttpProblem {
+  return new HttpProblem(503, "multiplayer-unavailable", "Multiplayer service is unavailable");
+}
+
+function singleSearchParam(request: Request, name: string): string | undefined {
+  const values = new URL(request.url).searchParams.getAll(name);
+  if (values.length > 1) {
+    throw new HttpProblem(400, "invalid-query", `${name} may only be supplied once`);
+  }
+  return values[0];
+}
+
+function optionalIdentifier(request: Request, name: string): string | undefined {
+  const value = singleSearchParam(request, name);
+  if (value === undefined) return undefined;
+  if (!SAFE_IDENTIFIER_PATTERN.test(value) || value.trim() !== value) {
+    throw new HttpProblem(400, "invalid-query", `${name} is invalid`);
+  }
+  return value;
+}
+
+function optionalLimit(request: Request): number | undefined {
+  const value = singleSearchParam(request, "limit");
+  if (value === undefined) return undefined;
+  if (!/^[1-9][0-9]*$/.test(value)) {
+    throw new HttpProblem(400, "invalid-query", "limit is invalid");
+  }
+  const limit = Number(value);
+  if (!Number.isSafeInteger(limit) || limit > MAX_ATTENTION_PAGE) {
+    throw new HttpProblem(400, "invalid-query", "limit is invalid");
+  }
+  return limit;
+}
+
+function optionalCursor(request: Request): string | undefined {
+  const value = singleSearchParam(request, "cursor");
+  if (value === undefined) return undefined;
+  if (!CURSOR_PATTERN.test(value)) {
+    throw new HttpProblem(400, "invalid-query", "cursor is invalid");
+  }
+  return value;
+}
+
+function optionalBoolean(request: Request, name: string): boolean {
+  const value = singleSearchParam(request, name);
+  if (value === undefined || value === "false" || value === "0") return false;
+  if (value === "true" || value === "1") return true;
+  throw new HttpProblem(400, "invalid-query", `${name} is invalid`);
+}
+
+/** Same-origin fence for cookie-authenticated browser mutations (CSRF). */
+function assertMutationOrigin(request: Request): void {
+  if (!/(?:^|;)\s*terminalx-session=/.test(request.headers.get("cookie") ?? "")) return;
+  const originValue = request.headers.get("origin");
+  if (!originValue || originValue === "null") {
+    throw new HttpProblem(403, "cross-origin-request", "Cross-origin request denied");
+  }
+  let origin: URL;
+  let requestUrl: URL;
+  try {
+    origin = new URL(originValue);
+    requestUrl = new URL(request.url);
+  } catch {
+    throw new HttpProblem(403, "cross-origin-request", "Cross-origin request denied");
+  }
+  if (
+    (origin.protocol !== "http:" && origin.protocol !== "https:") ||
+    originValue !== origin.origin
+  ) {
+    throw new HttpProblem(403, "cross-origin-request", "Cross-origin request denied");
+  }
+  let expectedOrigin: string;
+  const publicUrl = getPublicUrl();
+  if (publicUrl) {
+    expectedOrigin = new URL(publicUrl).origin;
+  } else {
+    let expectedHost = request.headers.get("host") ?? requestUrl.host;
+    let expectedProtocol = requestUrl.protocol;
+    if (trustProxyHeaders()) {
+      expectedHost =
+        request.headers.get("x-forwarded-host")?.split(",", 1)[0]?.trim() || expectedHost;
+      const forwardedProtocol = request.headers
+        .get("x-forwarded-proto")
+        ?.split(",", 1)[0]
+        ?.trim()
+        .toLowerCase();
+      if (forwardedProtocol === "http" || forwardedProtocol === "https") {
+        expectedProtocol = `${forwardedProtocol}:`;
+      }
+    }
+    try {
+      expectedOrigin = new URL(`${expectedProtocol}//${expectedHost}`).origin;
+    } catch {
+      throw new HttpProblem(403, "cross-origin-request", "Cross-origin request denied");
+    }
+  }
+  if (origin.origin !== expectedOrigin) {
+    throw new HttpProblem(403, "cross-origin-request", "Cross-origin request denied");
+  }
+}
+
+async function readJsonBody(request: Request): Promise<Record<string, unknown>> {
+  const contentType = request.headers.get("content-type") ?? "";
+  if (!/^application\/json(?:\s*;|$)/i.test(contentType)) {
+    throw new HttpProblem(415, "unsupported-media-type", "Content-Type must be application/json");
+  }
+  const contentLength = request.headers.get("content-length");
+  if (contentLength !== null && Number(contentLength) > DEFAULT_MAX_BODY_BYTES) {
+    throw new HttpProblem(413, "request-too-large", "Request body is too large");
+  }
+  let text: string;
+  try {
+    text = await request.text();
+  } catch {
+    throw new HttpProblem(400, "invalid-json", "Request body must be valid JSON");
+  }
+  if (text.length > DEFAULT_MAX_BODY_BYTES) {
+    throw new HttpProblem(413, "request-too-large", "Request body is too large");
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    throw new HttpProblem(400, "invalid-json", "Request body must be valid JSON");
+  }
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new HttpProblem(400, "invalid-json", "Request body must be a JSON object");
+  }
+  return value as Record<string, unknown>;
+}
+
+export async function handleAttentionInbox(
+  request: Request,
+  dependencies: AttentionHttpDependencies = {}
+): Promise<Response> {
+  return withHttpErrors(dependencies, async () => {
+    const actor = await requireActor(request, dependencies);
+    const teamId = optionalIdentifier(request, "teamId");
+    const page = inbox(dependencies).listInbox({
+      userId: actor.userId,
+      teamId,
+      limit: optionalLimit(request),
+      cursor: optionalCursor(request) ?? null,
+      unreadOnly: optionalBoolean(request, "unreadOnly"),
+    });
+    return jsonResponse({ inbox: page });
+  });
+}
+
+export async function handleAttentionUnreadCount(
+  request: Request,
+  dependencies: AttentionHttpDependencies = {}
+): Promise<Response> {
+  return withHttpErrors(dependencies, async () => {
+    const actor = await requireActor(request, dependencies);
+    const teamId = optionalIdentifier(request, "teamId");
+    const unreadCount = inbox(dependencies).unreadCount(actor.userId, teamId);
+    return jsonResponse({ unreadCount });
+  });
+}
+
+export async function handleAttentionRead(
+  request: Request,
+  dependencies: AttentionHttpDependencies = {}
+): Promise<Response> {
+  return withHttpErrors(dependencies, async () => {
+    const actor = await requireActor(request, dependencies);
+    assertMutationOrigin(request);
+    if ((dependencies.isReadOnly ?? isReadOnlyMode)()) {
+      throw new HttpProblem(403, "read-only", "Server is read-only");
+    }
+    requireMutationAvailability(dependencies);
+    const body = await readJsonBody(request);
+    const allowed = new Set(["sessionId", "throughSequence"]);
+    if (Object.keys(body).some((key) => !allowed.has(key))) {
+      throw new HttpProblem(400, "unknown-field", "Request contains an unknown field");
+    }
+    const sessionId = body.sessionId;
+    const throughSequence = body.throughSequence;
+    if (typeof sessionId !== "string" || !SAFE_IDENTIFIER_PATTERN.test(sessionId)) {
+      throw new HttpProblem(400, "invalid-request", "Invalid request");
+    }
+    if (
+      typeof throughSequence !== "number" ||
+      !Number.isSafeInteger(throughSequence) ||
+      throughSequence < 0
+    ) {
+      throw new HttpProblem(400, "invalid-request", "Invalid request");
+    }
+    const result = inbox(dependencies).markRead(actor.userId, sessionId, throughSequence);
+    return jsonResponse({ read: { sessionId, ...result } });
+  });
+}

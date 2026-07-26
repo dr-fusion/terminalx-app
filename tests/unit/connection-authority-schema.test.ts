@@ -19,7 +19,7 @@ describe("connection authority schema", () => {
   it("creates an additive v13 authority without secret-bearing columns", () => {
     database = openTeamSessionDatabase({ filename: ":memory:" });
 
-    expect(database.db.pragma("user_version", { simple: true })).toBe(17);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(18);
     const tables = [
       "credential_handles",
       "channel_installations",
@@ -83,6 +83,11 @@ describe("connection authority schema", () => {
         DROP TABLE IF EXISTS limit_reservations;
         DROP TABLE IF EXISTS grant_consumptions;
         DROP TABLE IF EXISTS grant_lineage;
+        DROP TABLE IF EXISTS attention_deliveries;
+        DROP TABLE IF EXISTS attention_escalations;
+        DROP TABLE IF EXISTS user_attention_reads;
+        DROP TABLE IF EXISTS comment_attachments;
+        DROP TABLE IF EXISTS comment_mentions;
         DROP TABLE IF EXISTS approval_provenance;
         PRAGMA user_version = 12;
       `);
@@ -95,7 +100,7 @@ describe("connection authority schema", () => {
       );
       database = openTeamSessionDatabase({ filename });
 
-      expect(database.db.pragma("user_version", { simple: true })).toBe(17);
+      expect(database.db.pragma("user_version", { simple: true })).toBe(18);
       expect(database.db.prepare("SELECT id, name FROM teams").all()).toEqual([
         { id: "team-1", name: "Team" },
       ]);
@@ -151,6 +156,11 @@ describe("connection authority schema", () => {
         DROP TABLE IF EXISTS limit_reservations;
         DROP TABLE IF EXISTS grant_consumptions;
         DROP TABLE IF EXISTS grant_lineage;
+        DROP TABLE IF EXISTS attention_deliveries;
+        DROP TABLE IF EXISTS attention_escalations;
+        DROP TABLE IF EXISTS user_attention_reads;
+        DROP TABLE IF EXISTS comment_attachments;
+        DROP TABLE IF EXISTS comment_mentions;
         DROP TABLE IF EXISTS approval_provenance;
         PRAGMA user_version = 12;
       `);

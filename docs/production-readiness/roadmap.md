@@ -164,14 +164,30 @@ machinery across a real crash/restart at real receipt volume.
 
 ### Phase 11 — Production product and operations
 
-Complete the externally usable application around the closed gates.
+Complete the externally usable application around the closed gates. Phase 11 is
+delivered in three sub-slices: 11A (product messaging), 11B (mobile/a11y/
+handoff), 11C (operations/deploy).
+
+Status: **11A landed; 11B and 11C pending.** The attention inbox authority,
+durable cursors, escalation, delivery, and chat completion are recorded in
+[ADR 0008](../adr/0008-attention-inbox-delivery-cursors-and-escalation.md).
 
 - Add the global attention inbox, durable read/delivery cursors, deadlines, escalation, and
-  Slack/Telegram notification delivery for unavailable steerers.
+  Slack/Telegram notification delivery for unavailable steerers. — **11A done**: schema v18
+  (`comment_mentions`, `comment_attachments`, `user_attention_reads`, and the hash-chained
+  append-only `attention_escalations`/`attention_deliveries`), the `AttentionInboxStore`
+  authority (cross-session aggregation fenced to active Participants, unread math from the read
+  cursor, idempotent Supervisor escalation of lapsed Handoff deadlines, and idempotent fail-closed
+  notification delivery through the existing outbound egress), and the `GET /api/attention`,
+  `GET /api/attention/unread-count`, `POST /api/attention/read` routes. A periodic maintenance
+  driver to run escalation/delivery on a schedule is deferred to 11C operations.
 - Complete chat pagination, search, unread/read state, mentions, artifact attachments, and
-  virtualization.
+  virtualization. — **11A done** for pagination (sequence-ordered `session.events`), unread/read
+  state (attention read cursor), `@mention` parsing/resolution feeding the inbox, bounded artifact
+  attachments, mention rendering, and client windowing/virtualization in `ConversationTimeline`.
+  **Pending:** server-side bounded conversation search.
 - Complete mobile navigation, accessibility, structured handoff artifacts/blockers, and operator
-  error states.
+  error states. — **11B pending.**
 - Add live/readiness probes, structured telemetry, metrics, SLOs, alerts, and incident runbooks.
 - Add online backup/restore, pre-migration snapshots, restore drills, retention, and capacity
   controls.

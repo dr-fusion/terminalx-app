@@ -92,7 +92,7 @@ const HUMAN_COMMAND_FIELDS = {
   ],
   "session.handoff.accept": ["sessionId", "handoffId", "expectedHandoffVersion"],
   "session.handoff.cancel": ["sessionId", "handoffId", "expectedHandoffVersion"],
-  "comment.add": ["sessionId", "body"],
+  "comment.add": ["sessionId", "body", "attachments"],
   "suggestion.add": ["sessionId", "body"],
   "suggestion.resolve": [
     "sessionId",
@@ -194,7 +194,7 @@ const PUBLIC_COMMAND_RESULT_FIELDS = {
     "controlEpoch",
   ],
   "session.handoff.cancel": ["sessionId", "handoffId", "handoffVersion", "reason"],
-  "comment.add": ["sessionId", "commentId", "sequence"],
+  "comment.add": ["sessionId", "commentId", "sequence", "attachmentCount"],
   "suggestion.add": ["sessionId", "suggestionId", "suggestionVersion", "sequence"],
   "suggestion.resolve": [
     "sessionId",

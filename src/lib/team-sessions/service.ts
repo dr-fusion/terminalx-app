@@ -1,4 +1,5 @@
 import { createTeamSessionKernel, type TeamSessionKernel } from "./module";
+import type { AttentionInboxStore } from "../attention/store";
 import type { TeamSessions } from "./types";
 import { types as nodeTypes } from "node:util";
 import type { DaytonaHostedMultiplayerService } from "../runtime/hosted-multiplayer-service";
@@ -153,6 +154,16 @@ export function getRegisteredTeamSessions(): TeamSessions | null {
 }
 
 /**
+ * Non-constructing seam for the Phase 11A attention-inbox HTTP routes. Returns
+ * null when no kernel is installed so production fails closed exactly like the
+ * Team Session routes.
+ */
+export function getRegisteredAttentionInbox(): AttentionInboxStore | null {
+  const kernel = getRegisteredTeamSessionKernel();
+  return kernel === null ? null : kernelAttentionInbox(kernel);
+}
+
+/**
  * Return the process-wide Team Session kernel.
  *
  * Next.js may evaluate a route module more than once during development. The
@@ -250,6 +261,18 @@ function readKernel(): TeamSessionKernel | undefined {
   }
   kernelTeamSessions(value as TeamSessionKernel);
   return value as TeamSessionKernel;
+}
+
+function kernelAttentionInbox(kernel: TeamSessionKernel): AttentionInboxStore {
+  const descriptor = Object.getOwnPropertyDescriptor(kernel, "attentionInbox");
+  if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) {
+    throw new TypeError("Invalid Team Session kernel registry");
+  }
+  const attentionInbox = descriptor.value;
+  if (typeof attentionInbox !== "object" || attentionInbox === null) {
+    throw new TypeError("Invalid Team Session kernel registry");
+  }
+  return attentionInbox as AttentionInboxStore;
 }
 
 function kernelTeamSessions(kernel: TeamSessionKernel): TeamSessions {
