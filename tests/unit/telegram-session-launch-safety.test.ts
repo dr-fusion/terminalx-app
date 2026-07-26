@@ -84,6 +84,31 @@ vi.mock("@/lib/ai-sessions", async (importOriginal) => {
   };
 });
 
+// Hermetic model resolution. `resolveSessionModelSettings` (server-only) reads a
+// mutable, gitignored settings store at `process.cwd()/data/settings/user.json`
+// shared across the whole process. Whether that file happens to carry an
+// explicit default model — set by a prior run or another test file — decides
+// whether a model-less session persists `modelId: undefined` or a resolved
+// default, which made the worktree assertion below order-dependent (green only
+// when some other file cleared the store first). Pin the resolver to the
+// "nothing explicitly configured" state so both tests exercise the intended
+// "no explicit model -> unchanged command, modelId undefined" path (issue #11)
+// regardless of ambient state or execution order.
+vi.mock("@/lib/settings/session-settings", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/settings/session-settings")>();
+  return {
+    ...actual,
+    resolveSessionModelSettings: vi.fn(() => ({
+      modelId: "claude:opus-4-8-1m",
+      effort: "high",
+      personality: "pragmatic",
+      planMode: false,
+      fastMode: false,
+      modelExplicit: false,
+    })),
+  };
+});
+
 vi.mock("@/lib/git-worktree", () => ({
   createGitWorktreeForSession: vi.fn((_directory: string, branch: string) => ({
     repoRoot: mocks.worktreeRoot,
