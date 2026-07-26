@@ -476,7 +476,9 @@ describe("Team Session kernel", () => {
     expiresAtMs?: number,
     briefing?: {
       summary: string;
+      currentState?: string;
       blockers?: string[];
+      nextSteps?: string[];
       artifactRefs?: string[];
     }
   ): Promise<CommandResult> {
@@ -1429,11 +1431,50 @@ describe("Team Session kernel", () => {
         version: 2,
         briefing: {
           summary: "Continue the deployment safety review.",
+          currentState: "",
           blockers: ["Production approval remains open."],
+          nextSteps: [],
           artifactRefs: ["event:latest"],
         },
       }),
     ]);
+  });
+
+  it("captures and bounds the full structured Handoff briefing", async () => {
+    await bootstrap({ steeringPolicy: "shared" });
+    await admitMember(BOB);
+
+    await offerHandoff(BOB, ALICE, undefined, {
+      summary: "Carry the deploy forward.",
+      currentState: "On branch release/1.2 with a paused run.",
+      blockers: ["Waiting on prod approval", "Flaky CI test"],
+      nextSteps: ["Re-run the migration", "Ask for a review"],
+      artifactRefs: ["run:agent-run-7", "https://example.test/evidence/1"],
+    });
+
+    const view = await requireSession(SESSION_ID, BOB);
+    expect(view.handoffs[0]?.briefing).toEqual({
+      summary: "Carry the deploy forward.",
+      currentState: "On branch release/1.2 with a paused run.",
+      blockers: ["Waiting on prod approval", "Flaky CI test"],
+      nextSteps: ["Re-run the migration", "Ask for a review"],
+      artifactRefs: ["run:agent-run-7", "https://example.test/evidence/1"],
+    });
+
+    // A second recipient with over-long / over-count structured fields is rejected.
+    await admitMember(CAROL);
+    await expect(
+      offerHandoff(CAROL, ALICE, undefined, {
+        summary: "ok",
+        blockers: ["x".repeat(501)],
+      })
+    ).rejects.toThrow();
+    await expect(
+      offerHandoff(CAROL, ALICE, undefined, {
+        summary: "ok",
+        nextSteps: Array.from({ length: 21 }, (_, index) => `step ${index}`),
+      })
+    ).rejects.toThrow();
   });
 
   it("allows an explicitly shared Guest Participant to accept a Handoff", async () => {

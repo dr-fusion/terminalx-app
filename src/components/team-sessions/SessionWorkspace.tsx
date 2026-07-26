@@ -13,6 +13,7 @@ import {
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ConversationComposer, type ConversationIntent } from "./ConversationComposer";
+import { ConversationSearch } from "./ConversationSearch";
 import { ConversationTimeline } from "./ConversationTimeline";
 import { InviteGuestDialog } from "./InviteGuestDialog";
 import { ParticipantsPanel, type GovernanceAction } from "./ParticipantsPanel";
@@ -502,6 +503,7 @@ export function SessionWorkspace({ sessionId, transportEnabled }: SessionWorkspa
             />
           ) : (
             <div className="flex h-full min-h-0 w-full flex-col">
+              <ConversationSearch sessionId={sessionId} viewerUserId={session.viewer.userId} />
               <div className="min-h-0 flex-1">
                 <ConversationTimeline
                   events={events}
