@@ -239,26 +239,51 @@ capabilities), so it adds no ADR.
 
 ### Phase 12 — Adversarial verification and release
 
-- Run local-auth multi-user browser tests across Chromium, WebKit, and mobile viewports.
-- Run real Daytona integration, destructive-race, escape, secret-exfiltration, and restart tests.
+Status: **in-repo portion complete; real-runtime evidence pending.** The verification + release
+machinery, the tests that do not require live external infra, and an honest release-readiness report
+are landed on `agent/phase12-verification-release`. Gate closure for 1/2/3 and full-volume validation
+of 4–8 still require a real hosted Daytona org + provider credentials — see
+[`release-readiness-2026-07.md`](./release-readiness-2026-07.md) for the itemized remainder.
+
+- Run local-auth multi-user browser tests across Chromium, WebKit, and mobile viewports. — **done
+  (in-repo)**: `tests/e2e/multiplayer/` (admission, steering-fence control handoff,
+  conversation+mentions+attention inbox, operator error states) + an axe-core accessibility pass over
+  the primary flows at desktop + mobile (serious/critical findings fixed). All green.
+- Run real Daytona integration, destructive-race, escape, secret-exfiltration, and restart tests. —
+  **harnesses authored**: `tests/adversarial/daytona-e2e/` reuse the Phase 8G canary scanner
+  unchanged, run against a real endpoint when `TERMINALX_DAYTONA_E2E=1` + creds are present, and SKIP
+  loudly otherwise (never vacuous). Real execution is real-runtime.
 - Complete OWASP/STRIDE, dependency/container, differential, accessibility, load, and maturity
-  reviews with no P0/P1 findings.
+  reviews with no P0/P1 findings. — **done (in-repo)** except load: OWASP/STRIDE, dependency scan
+  (`npm audit` = 0 findings), differential, accessibility, and an updated maturity re-assessment are
+  under `docs/production-readiness/`. Container image scan + load/SLO verification require real infra
+  (documented, itemized).
 - Verify signed images, SBOM/provenance, SemVer release artifacts, backup restore, canary, and
-  rollback.
-- Enable the production multiplayer profile only after every release gate is evidenced closed.
+  rollback. — **done (in-repo)**: SPDX SBOM + SLSA/in-toto provenance + cosign-style signing +
+  SemVer release scripts (`scripts/generate-sbom.mjs`, `generate-provenance.mjs`,
+  `sign-container-image.sh`, `release.sh`); 11C backup/restore-drill/rollback-guard verified
+  end-to-end in-repo. Real signed image + registry attestation is real-runtime.
+- Enable the production multiplayer profile only after every release gate is evidenced closed. —
+  **not enabled** (the honest boundary; unchanged).
 
 ## Release-gate ownership
 
-| Gate                        | Owning phases | Current state                                                                  |
-| --------------------------- | ------------- | ------------------------------------------------------------------------------ |
-| 1. Runtime truth            | 5–7           | Gate 1a complete; Gate 1 open                                                  |
-| 2. Hosted isolation         | 7             | Open                                                                           |
-| 3. Brokered secrets         | 8             | Mechanism + hermetic evidence complete; real-runtime evidence pending Phase 12 |
-| 4. Approval provenance      | 9             | Mechanism + hermetic evidence complete; real-runtime evidence pending Phase 12 |
-| 5. Authoritative limits     | 9             | Mechanism + hermetic evidence complete; real-runtime evidence pending Phase 12 |
-| 6. YOLO challenge           | 9             | Mechanism complete and unexposed; real-runtime evidence pending Phase 12       |
-| 7. Emergency recovery       | 10            | Mechanism + hermetic evidence complete; real crash/restart pending Phase 12    |
-| 8. Event/evidence integrity | 10            | Mechanism + hermetic evidence complete; real-runtime evidence pending Phase 12 |
+All eight gates remain **OPEN** for external-pilot release: gate closure requires real hosted-Daytona
+
+- provider evidence that Phase 12 does not fabricate. Phase 12 completed the in-repo verification +
+  release machinery; the itemized real-runtime remainder is in
+  [`release-readiness-2026-07.md`](./release-readiness-2026-07.md).
+
+| Gate                        | Owning phases | Current state                                                                                      |
+| --------------------------- | ------------- | -------------------------------------------------------------------------------------------------- |
+| 1. Runtime truth            | 5–7           | Gate 1a complete; Gate 1 open — real-runtime (Phase 7); integration/restart harnesses ready        |
+| 2. Hosted isolation         | 7             | Open — real hosted Daytona required; isolation/escape harness ready                                |
+| 3. Brokered secrets         | 8             | Mechanism + hermetic evidence complete; real measured evidence + canary rerun pending real-runtime |
+| 4. Approval provenance      | 9             | Mechanism + hermetic evidence complete; real receipt-volume pending real-runtime                   |
+| 5. Authoritative limits     | 9             | Mechanism complete; durable circuit breaker composed onto kernel (Phase 12); real volume pending   |
+| 6. YOLO challenge           | 9             | Mechanism complete and unexposed; real-runtime evidence pending                                    |
+| 7. Emergency recovery       | 10            | Mechanism + hermetic evidence complete; real crash/restart at volume pending real-runtime          |
+| 8. Event/evidence integrity | 10            | Mechanism + hermetic evidence complete; real-runtime evidence pending                              |
 
 External-pilot readiness additionally requires Phase 11 operations and Phase 12 release evidence.
 No development adapter, warning, feature flag, or manual operating procedure can substitute for a
