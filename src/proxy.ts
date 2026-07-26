@@ -22,6 +22,14 @@ const PUBLIC_EXACT_PATHS = new Set([
   "/api/auth/google/callback",
   "/api/auth/pair",
   "/api/health",
+  // Readiness probe must be reachable by an unauthenticated load balancer; it
+  // discloses only a bare, non-leaking ready/not-ready status.
+  "/api/health/ready",
+  // Metrics is scraped with the TERMINALX_METRICS_TOKEN bearer (no user
+  // session) or by an authenticated admin; the route handler enforces that and
+  // returns 404 when neither holds. It must pass middleware so its own
+  // access-control check can run.
+  "/api/metrics",
   // Telegram webhook is gated by its own secret-token header check inside
   // the route handler, so we let it through middleware.
   "/api/telegram/webhook",
