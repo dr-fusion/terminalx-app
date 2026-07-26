@@ -15,6 +15,7 @@ import {
   UsersRound,
 } from "lucide-react";
 import { TopNav } from "./TopNav";
+import { MobileNav } from "./MobileNav";
 import { InboxBadge } from "@/components/attention/InboxBadge";
 import { StatusBar } from "./StatusBar";
 // Project sidebar (#12): the left rail groups workspaces under their project
@@ -47,7 +48,10 @@ function LeftSidebar({
   const path = usePathname();
 
   return (
-    <aside className="hidden lg:flex h-full w-[286px] shrink-0 flex-col border-r border-[#1a1d24] bg-[#0f1117]">
+    <aside
+      aria-label="Sidebar"
+      className="hidden lg:flex h-full w-[286px] shrink-0 flex-col border-r border-[#1a1d24] bg-[#0f1117]"
+    >
       <div className="flex h-12 items-center gap-3 border-b border-[#1a1d24] px-3">
         <Link
           href="/dashboard"
@@ -66,7 +70,10 @@ function LeftSidebar({
         </button>
       </div>
 
-      <div className="flex min-h-0 flex-1 flex-col overflow-y-auto contain-scroll px-2 py-3">
+      <nav
+        aria-label="Primary"
+        className="flex min-h-0 flex-1 flex-col overflow-y-auto contain-scroll px-2 py-3"
+      >
         <Link
           href="/dashboard"
           className={`flex h-9 items-center gap-2 rounded px-2 text-[13px] transition-colors ${
@@ -119,7 +126,7 @@ function LeftSidebar({
             })}
           </div>
         </div>
-      </div>
+      </nav>
     </aside>
   );
 }
@@ -145,6 +152,7 @@ function InspectorTerminal({ activeSession }: { activeSession: string | null }) 
 
 export function AppShell({ children }: { children: React.ReactNode }) {
   const [paletteOpen, setPaletteOpen] = useState(false);
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [hostname, setHostname] = useState("…");
   const params = useParams();
   const path = usePathname();
@@ -198,16 +206,26 @@ export function AppShell({ children }: { children: React.ReactNode }) {
 
   return (
     <div className="flex h-dvh w-screen overflow-hidden bg-[#05060a] text-[#e6f0e4]">
+      <a
+        href="#main-content"
+        className="sr-only left-2 top-2 z-[100] rounded border border-[#252933] bg-[#14161e] px-3 py-2 text-sm text-[#e6f0e4] focus:not-sr-only focus:absolute focus:ring-2 focus:ring-[#00cc6e]"
+      >
+        Skip to main content
+      </a>
       {isTeamSessionsPath ? null : (
         <LeftSidebar activeSession={activeSession} onOpenPalette={() => setPaletteOpen(true)} />
       )}
+      <MobileNav open={mobileNavOpen} onClose={() => setMobileNavOpen(false)} />
       <section className="flex min-w-0 flex-1 flex-col border-r border-[#1a1d24] bg-[#0a0b10]">
         <TopNav
           hostname={hostname}
           activeSession={activeSession}
           onOpenPalette={() => setPaletteOpen(true)}
+          onOpenMobileNav={() => setMobileNavOpen(true)}
         />
-        <main className="min-h-0 flex-1 overflow-hidden">{children}</main>
+        <main id="main-content" tabIndex={-1} className="min-h-0 flex-1 overflow-hidden">
+          {children}
+        </main>
         <StatusBar hostname={hostname} session={activeSession} tabCount={tabs.length} />
       </section>
       {isTeamSessionsPath ? null : (

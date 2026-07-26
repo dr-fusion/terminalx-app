@@ -2,13 +2,14 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { ChevronRight, Command, LogOut, PanelRight, Terminal } from "lucide-react";
+import { ChevronRight, Command, LogOut, Menu, PanelRight, Terminal } from "lucide-react";
 import { useAuth } from "@/hooks/useAuth";
 
 interface TopNavProps {
   hostname: string;
   activeSession: string | null;
   onOpenPalette?: () => void;
+  onOpenMobileNav?: () => void;
 }
 
 function initials(name: string): string {
@@ -23,7 +24,7 @@ function sectionForPath(path: string): string {
   return "sessions";
 }
 
-export function TopNav({ hostname, activeSession, onOpenPalette }: TopNavProps) {
+export function TopNav({ hostname, activeSession, onOpenPalette, onOpenMobileNav }: TopNavProps) {
   const path = usePathname();
   const { user, logout } = useAuth();
   const section = sectionForPath(path);
@@ -33,6 +34,14 @@ export function TopNav({ hostname, activeSession, onOpenPalette }: TopNavProps) 
       className="flex h-12 shrink-0 items-center gap-3 border-b border-[#1a1d24] bg-[#0f1117] px-3"
       style={{ position: "sticky", top: 0, zIndex: 50 }}
     >
+      <button
+        type="button"
+        onClick={onOpenMobileNav}
+        aria-label="Open navigation menu"
+        className="flex size-9 items-center justify-center rounded text-[#6b7569] transition-colors hover:bg-[#14161e] hover:text-[#e6f0e4] focus-visible:ring-2 focus-visible:ring-[#00cc6e] lg:hidden"
+      >
+        <Menu size={18} aria-hidden="true" />
+      </button>
       <Link
         href="/dashboard"
         className="hidden items-center gap-2 text-[13px] font-medium text-[#a8b3a6] transition-colors hover:text-[#e6f0e4] sm:flex"

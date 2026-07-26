@@ -91,7 +91,7 @@ export default function LoginPage() {
   }
 
   return (
-    <div className="crt-scanlines relative h-dvh flex items-center justify-center bg-[#0a0b10] px-4 overflow-hidden">
+    <main className="crt-scanlines relative h-dvh flex items-center justify-center bg-[#0a0b10] px-4 overflow-hidden">
       {/* Radial vignette */}
       <div
         className="absolute inset-0 pointer-events-none"
@@ -102,8 +102,12 @@ export default function LoginPage() {
       />
 
       <div className="relative w-full max-w-[440px] z-10">
+        <h1 className="sr-only">Sign in to TerminalX</h1>
         {/* Big brand mark */}
-        <div className="flex items-baseline justify-center gap-0 text-[48px] md:text-[56px] font-bold tracking-tight text-[#e6f0e4] mb-3">
+        <div
+          aria-hidden="true"
+          className="flex items-baseline justify-center gap-0 text-[48px] md:text-[56px] font-bold tracking-tight text-[#e6f0e4] mb-3"
+        >
           <span
             className="text-[#00ff88]"
             style={{ textShadow: "0 0 20px rgba(0, 255, 136, 0.6)" }}
@@ -221,8 +225,11 @@ export default function LoginPage() {
           )}
 
           {error && (
-            <div className="mt-3 flex items-start gap-2 px-2.5 py-2 rounded bg-[#ff5c5c]/10 border border-[#ff5c5c]/30 text-[#ff5c5c] text-[11px]">
-              <AlertCircle size={12} className="mt-[1px] shrink-0" />
+            <div
+              role="alert"
+              className="mt-3 flex items-start gap-2 px-2.5 py-2 rounded bg-[#ff5c5c]/10 border border-[#ff5c5c]/30 text-[#ff5c5c] text-[11px]"
+            >
+              <AlertCircle size={12} className="mt-[1px] shrink-0" aria-hidden="true" />
               <span>{error}</span>
             </div>
           )}
@@ -232,6 +239,6 @@ export default function LoginPage() {
           sessions live in tmux · auth via sso · no state in the browser
         </p>
       </div>
-    </div>
+    </main>
   );
 }
