@@ -25,6 +25,7 @@ import {
   resolveCanonicalTmuxSessionRef,
   setMaxSessions,
   destroyAllPtys,
+  getActivePtyCount,
   type PtyInstance,
 } from "../src/lib/pty-manager";
 import { execFileSync } from "child_process";
@@ -46,9 +47,15 @@ import { getTelegramConfig, telegramConfigFingerprint } from "../src/lib/telegra
 import { getConfiguredMaxSessions } from "../src/lib/security-config";
 import { stampAuthoritativeDirectPeer } from "../src/lib/rate-limit";
 import { assertValidStartupConfiguration } from "../src/lib/startup-validation";
+import { assertRollbackGuard } from "../src/lib/ops/rollback-guard";
+import { publishPtySessions, recordHttpRequest } from "../src/lib/ops/metrics";
+import { createMaintenanceLoop, type MaintenanceLoop } from "../src/lib/ops/maintenance";
+import { createProductionAttentionDeliveryDeps } from "../src/lib/ops/attention-delivery-adapter";
+import { backupTeamSessionDatabase } from "../src/lib/ops/backup";
 import {
   closeTeamSessions,
   getHostedMultiplayerServiceFactory,
+  getRegisteredAttentionInbox,
   getTeamSessionKernel,
 } from "../src/lib/team-sessions/service";
 import {
@@ -127,6 +134,12 @@ assertValidStartupConfiguration({
   host: TERMINUS_HOST,
   cwd: path.resolve(__dirname, ".."),
 });
+
+// Migration-aware rollback guard: refuse to run this binary against a database
+// whose schema is newer than the binary understands. The opener already rejects
+// unknown versions; this gives the operator a clear message and the documented
+// recovery path (restore the pre-migration snapshot) before anything else runs.
+assertRollbackGuard();
 
 function warnIfReadableByGroupOrWorld(filePath: string): void {
   if (process.platform === "win32") return;
@@ -734,7 +747,41 @@ void app
       multiplayerServices?.runtimeStatus() ?? null
     );
 
+    // Periodic maintenance: Phase 11A attention escalation/delivery on a schedule,
+    // plus rotated online backups and expired-recording sweeps on a longer cadence.
+    // It runs only when a Team Session kernel (and thus its attention inbox + DB)
+    // is present; the delivery adapter fails closed without a Secret Broker.
+    let maintenanceLoop: MaintenanceLoop | undefined;
+    if (AUTH_MODE !== "none") {
+      try {
+        const attentionInbox = getRegisteredAttentionInbox();
+        if (attentionInbox) {
+          maintenanceLoop = createMaintenanceLoop({
+            attentionInbox,
+            deliveryDeps: createProductionAttentionDeliveryDeps(),
+            runBackup: () => backupTeamSessionDatabase(),
+            sweepRecordings: () => sweepExpiredRecordings(),
+          });
+        }
+      } catch {
+        // Maintenance is best-effort scheduling over durable capabilities; a
+        // composition failure must never prevent the server from listening.
+        maintenanceLoop = undefined;
+      }
+    }
+
     const server = createServer((req, res) => {
+      // Record request rate/latency/errors for the metrics surface. Method and
+      // status class only — never the URL or any header — so no identifier or
+      // secret can enter a metric label.
+      const startedNs = process.hrtime.bigint();
+      res.on("finish", () => {
+        const durationSeconds = Number(process.hrtime.bigint() - startedNs) / 1e9;
+        recordHttpRequest(req.method ?? "OTHER", res.statusCode, durationSeconds);
+        // Publish the live PTY count to the shared metrics state so the Next
+        // metrics route (a separate module graph) can report it.
+        publishPtySessions(getActivePtyCount());
+      });
       // Next route handlers do not expose Node's socket address. Replace any
       // attacker-supplied internal header with an authenticated direct-peer
       // value before request routing so default rate limits are not global.
@@ -928,6 +975,7 @@ void app
       console.log(`  Auth:       ${AUTH_MODE}`);
       console.log(`  Multiplayer:${MULTIPLAYER_ENABLED ? " enabled" : " disabled"}`);
       console.log(`  Mode:       ${dev ? "development" : "production"}`);
+      maintenanceLoop?.start();
     });
 
     // Graceful shutdown
@@ -937,6 +985,7 @@ void app
       shuttingDown = true;
       markMultiplayerTransportAvailable(false, multiplayerServices?.runtimeStatus() ?? null);
       console.log("\nShutting down...");
+      maintenanceLoop?.stop();
       clearInterval(telegramConfigPoll);
       void (async () => {
         try {
