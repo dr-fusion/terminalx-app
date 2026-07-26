@@ -46,6 +46,13 @@ interface CommandBase {
   occurredAtMs?: number;
 }
 
+/** One artifact/evidence attachment on a comment; bounded and validated server-side. */
+export interface CommentAttachmentInput {
+  artifactRef: string;
+  mediaType: string;
+  byteSize: number;
+}
+
 export type SessionCommand =
   | (CommandBase & {
       type: "team.create";
@@ -244,6 +251,12 @@ export type SessionCommand =
       type: "comment.add";
       sessionId: string;
       body: string;
+      /**
+       * Optional artifact/evidence references to attach. Bounded and validated
+       * server-side; any outbound mirror respects the Binding `allowArtifacts`
+       * policy. Mentions are parsed from `body` (`@userId`), not passed here.
+       */
+      attachments?: CommentAttachmentInput[];
     })
   | (CommandBase & {
       type: "suggestion.add";

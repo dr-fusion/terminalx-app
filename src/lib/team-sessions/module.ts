@@ -276,6 +276,13 @@ const DEFAULT_HANDOFF_TTL_MS = 24 * 60 * 60 * 1_000;
 const MAX_CONVERSATION_BODY_BYTES = 16 * 1_024;
 const MAX_PENDING_DIRECTIVES_PER_AUTHOR = 64;
 const MAX_PENDING_DIRECTIVES_PER_SESSION = 256;
+const MAX_COMMENT_MENTIONS = 32;
+const MAX_COMMENT_ATTACHMENTS = 16;
+const MAX_COMMENT_ARTIFACT_REF_LENGTH = 500;
+const MAX_COMMENT_MEDIA_TYPE_LENGTH = 120;
+const MAX_COMMENT_ATTACHMENT_BYTES = 8 * 1_024 * 1_024 * 1_024;
+/** `@userId` mention tokens: bounded, safe-charset, resolved against active Participants. */
+const MENTION_TOKEN_PATTERN = /@([A-Za-z0-9][A-Za-z0-9._:-]{0,127})/g;
 const DEFAULT_RUNTIME_LIFECYCLE_COMMAND_TTL_MS = 30_000;
 /**
  * Currency used only to aggregate the reservation ledger when the run's model
@@ -4153,15 +4160,124 @@ class SqliteTeamSessions implements TeamSessions {
   ): CommandResult {
     this.requireConversationParticipant(command.sessionId, command.actor.userId);
     const body = requiredConversationBody(command.body, "Comment body");
+    const attachments = validateCommentAttachments(command.attachments);
     const commentId = this.reserveConversationIdentity(command.sessionId, "comment", now);
     const event = this.appendEvent(command.sessionId, command, now, "comment.added", {
       commentId,
       body,
     });
     this.bindConversationIdentity(commentId, command.sessionId, "comment", event.sequence);
-    return result(command, { sessionId: command.sessionId, commentId, sequence: event.sequence }, [
-      event,
-    ]);
+    // Chat completion: resolve @mentions to canonical Users who are active
+    // Participants (never crossing the Session boundary) and record bounded
+    // artifact attachments. Both are append-only evidence anchored to this exact
+    // comment event, and both feed the global attention inbox.
+    const mentionedUserIds = this.recordCommentMentions(
+      command.sessionId,
+      commentId,
+      event.sequence,
+      command.actor.userId,
+      body,
+      now
+    );
+    this.recordCommentAttachments(
+      command.sessionId,
+      commentId,
+      event.sequence,
+      command.actor.userId,
+      attachments,
+      now
+    );
+    return result(
+      command,
+      {
+        sessionId: command.sessionId,
+        commentId,
+        sequence: event.sequence,
+        mentionedUserIds,
+        attachmentCount: attachments.length,
+      },
+      [event]
+    );
+  }
+
+  /** Parse `@userId` tokens, keep those that are active Participants, dedupe, bound. */
+  private recordCommentMentions(
+    sessionId: string,
+    commentId: string,
+    commentSequence: number,
+    authorUserId: string,
+    body: string,
+    now: number
+  ): string[] {
+    const tokens = parseMentionTokens(body);
+    if (tokens.length === 0) return [];
+    const activeParticipants = new Set(
+      (
+        this.db
+          .prepare(
+            `SELECT user_id FROM session_participants
+              WHERE session_id = ? AND status = 'active'`
+          )
+          .all(sessionId) as SqlRow[]
+      ).map((row) => row.user_id as string)
+    );
+    const resolved: string[] = [];
+    const seen = new Set<string>();
+    for (const token of tokens) {
+      if (resolved.length >= MAX_COMMENT_MENTIONS) break;
+      if (seen.has(token) || !activeParticipants.has(token)) continue;
+      seen.add(token);
+      resolved.push(token);
+    }
+    const insert = this.db.prepare(
+      `INSERT INTO comment_mentions
+         (id, session_id, comment_id, comment_sequence, mentioned_user_id,
+          author_user_id, created_at_ms)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
+    );
+    for (const userId of resolved) {
+      insert.run(
+        this.nextId("mention"),
+        sessionId,
+        commentId,
+        commentSequence,
+        userId,
+        authorUserId,
+        now
+      );
+    }
+    return resolved;
+  }
+
+  private recordCommentAttachments(
+    sessionId: string,
+    commentId: string,
+    commentSequence: number,
+    authorUserId: string,
+    attachments: ReadonlyArray<{ artifactRef: string; mediaType: string; byteSize: number }>,
+    now: number
+  ): void {
+    if (attachments.length === 0) return;
+    const insert = this.db.prepare(
+      `INSERT INTO comment_attachments
+         (id, session_id, comment_id, comment_sequence, attachment_index,
+          artifact_ref, media_type, byte_size, author_user_id, created_at_ms)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    );
+    attachments.forEach((attachment, index) => {
+      insert.run(
+        this.nextId("attachment"),
+        sessionId,
+        commentId,
+        commentSequence,
+        index,
+        attachment.artifactRef,
+        attachment.mediaType,
+        attachment.byteSize,
+        authorUserId,
+        now
+      );
+    });
   }
 
   private addSuggestion(
@@ -10319,6 +10435,65 @@ function requiredConversationBody(value: unknown, label: string): string {
     throw new TeamSessionError("invalid-command", `${label} is invalid`);
   }
   return value;
+}
+
+/** Extract candidate `@userId` mention tokens from a comment body, in order. */
+function parseMentionTokens(body: string): string[] {
+  const tokens: string[] = [];
+  for (const match of body.matchAll(MENTION_TOKEN_PATTERN)) {
+    const token = match[1];
+    if (token) tokens.push(token);
+  }
+  return tokens;
+}
+
+/** Validate and bound optional comment attachments; returns a frozen, safe copy. */
+function validateCommentAttachments(
+  value: unknown
+): ReadonlyArray<{ artifactRef: string; mediaType: string; byteSize: number }> {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) {
+    throw new TeamSessionError("invalid-command", "Comment attachments are invalid");
+  }
+  if (value.length > MAX_COMMENT_ATTACHMENTS) {
+    throw new TeamSessionError("invalid-command", "Too many comment attachments");
+  }
+  return value.map((entry) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new TeamSessionError("invalid-command", "Comment attachment is invalid");
+    }
+    const record = entry as Record<string, unknown>;
+    const allowed = new Set(["artifactRef", "mediaType", "byteSize"]);
+    if (Object.keys(record).some((key) => !allowed.has(key))) {
+      throw new TeamSessionError("invalid-command", "Comment attachment has an unknown field");
+    }
+    const { artifactRef, mediaType, byteSize } = record;
+    if (
+      typeof artifactRef !== "string" ||
+      artifactRef.trim().length === 0 ||
+      artifactRef.length > MAX_COMMENT_ARTIFACT_REF_LENGTH ||
+      /[\u0000-\u001f\u007f]/.test(artifactRef)
+    ) {
+      throw new TeamSessionError("invalid-command", "Comment attachment reference is invalid");
+    }
+    if (
+      typeof mediaType !== "string" ||
+      mediaType.trim().length === 0 ||
+      mediaType.length > MAX_COMMENT_MEDIA_TYPE_LENGTH ||
+      /[\u0000-\u001f\u007f]/.test(mediaType)
+    ) {
+      throw new TeamSessionError("invalid-command", "Comment attachment media type is invalid");
+    }
+    if (
+      typeof byteSize !== "number" ||
+      !Number.isSafeInteger(byteSize) ||
+      byteSize < 0 ||
+      byteSize > MAX_COMMENT_ATTACHMENT_BYTES
+    ) {
+      throw new TeamSessionError("invalid-command", "Comment attachment size is invalid");
+    }
+    return Object.freeze({ artifactRef, mediaType, byteSize });
+  });
 }
 
 function requiredRunDirective(
