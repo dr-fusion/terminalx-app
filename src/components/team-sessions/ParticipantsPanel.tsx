@@ -33,7 +33,7 @@ import type {
   TeamSessionShare,
 } from "@/types/team-session";
 import { cn } from "@/lib/utils";
-import { OfferHandoffDialog } from "./OfferHandoffDialog";
+import { OfferHandoffDialog, type HandoffBriefingInput } from "./OfferHandoffDialog";
 
 export type GovernanceAction =
   | { type: "transfer-control"; participant: TeamSessionParticipant }
@@ -46,7 +46,7 @@ export type GovernanceAction =
   | {
       type: "offer-handoff";
       participant: TeamSessionParticipant;
-      summary: string;
+      briefing: HandoffBriefingInput;
       expiresAtMs: number;
     }
   | { type: "accept-handoff"; handoff: TeamSessionOpenHandoff }
@@ -460,50 +460,115 @@ export function ParticipantsPanel({
                 Open handoffs
               </h3>
               <ul className="mt-2 space-y-2">
-                {session.openHandoffs.map((handoff) => (
-                  <li key={handoff.handoffId} className="rounded-lg border border-border p-3">
-                    <p className="text-sm leading-5">{handoff.briefing.summary}</p>
-                    <p className="mt-1 text-xs text-muted-foreground">
-                      Offered to{" "}
-                      {session.participants.find(
-                        (participant) => participant.userId === handoff.recipientUserId
-                      )?.displayName ?? handoff.recipientUserId}
-                      {" · expires "}
-                      {new Date(handoff.expiresAtMs).toLocaleString()}
-                    </p>
-                    {handoff.briefing.blockers.length > 0 ? (
-                      <p className="mt-2 text-xs leading-5 text-muted-foreground">
-                        Blockers: {handoff.briefing.blockers.join(" · ")}
+                {session.openHandoffs.map((handoff) => {
+                  const isRecipient = handoff.recipientUserId === session.viewer.userId;
+                  return (
+                    <li key={handoff.handoffId} className="rounded-lg border border-border p-3">
+                      <p className="text-sm leading-5">{handoff.briefing.summary}</p>
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        Offered to{" "}
+                        {session.participants.find(
+                          (participant) => participant.userId === handoff.recipientUserId
+                        )?.displayName ?? handoff.recipientUserId}
+                        {" · expires "}
+                        {new Date(handoff.expiresAtMs).toLocaleString()}
                       </p>
-                    ) : null}
-                    <div className="mt-3 flex flex-wrap gap-2">
-                      {capabilities.acceptHandoff &&
-                      handoff.recipientUserId === session.viewer.userId ? (
-                        <Button
-                          type="button"
-                          size="sm"
-                          className="min-h-10"
-                          disabled={isMutating}
-                          onClick={() => setPendingAction({ type: "accept-handoff", handoff })}
-                        >
-                          Accept handoff
-                        </Button>
+                      {handoff.briefing.currentState ? (
+                        <div className="mt-2">
+                          <p className="text-xs font-medium text-muted-foreground">Current state</p>
+                          <p className="mt-0.5 whitespace-pre-wrap break-words text-xs leading-5 text-foreground">
+                            {handoff.briefing.currentState}
+                          </p>
+                        </div>
                       ) : null}
-                      {capabilities.cancelHandoff ? (
-                        <Button
-                          type="button"
-                          size="sm"
-                          variant="outline"
-                          className="min-h-10"
-                          disabled={isMutating}
-                          onClick={() => setPendingAction({ type: "cancel-handoff", handoff })}
-                        >
-                          Cancel offer
-                        </Button>
+                      {handoff.briefing.blockers.length > 0 ? (
+                        <div className="mt-2 rounded-md border border-[color:var(--amber-dim)] bg-[var(--amber-ghost)] p-2">
+                          <p className="text-xs font-semibold uppercase tracking-wide text-[var(--amber)]">
+                            {handoff.briefing.blockers.length}{" "}
+                            {handoff.briefing.blockers.length === 1 ? "blocker" : "blockers"}
+                          </p>
+                          <ul className="mt-1 space-y-0.5">
+                            {handoff.briefing.blockers.map((blocker, index) => (
+                              <li
+                                key={index}
+                                className="flex gap-1.5 break-words text-xs leading-5 text-foreground"
+                              >
+                                <span aria-hidden="true" className="text-[var(--amber)]">
+                                  •
+                                </span>
+                                <span>{blocker}</span>
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
                       ) : null}
-                    </div>
-                  </li>
-                ))}
+                      {handoff.briefing.nextSteps.length > 0 ? (
+                        <div className="mt-2">
+                          <p className="text-xs font-medium text-muted-foreground">Next steps</p>
+                          <ol className="mt-0.5 list-decimal space-y-0.5 pl-4">
+                            {handoff.briefing.nextSteps.map((step, index) => (
+                              <li
+                                key={index}
+                                className="break-words text-xs leading-5 text-foreground"
+                              >
+                                {step}
+                              </li>
+                            ))}
+                          </ol>
+                        </div>
+                      ) : null}
+                      {handoff.briefing.artifactRefs.length > 0 ? (
+                        <div className="mt-2">
+                          <p className="text-xs font-medium text-muted-foreground">
+                            Evidence / Runs
+                          </p>
+                          <ul className="mt-0.5 space-y-0.5">
+                            {handoff.briefing.artifactRefs.map((ref, index) => (
+                              <li
+                                key={index}
+                                className="break-all font-mono text-xs leading-5 text-[var(--cyan)]"
+                              >
+                                {ref}
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      ) : null}
+                      {isRecipient && handoff.briefing.blockers.length > 0 ? (
+                        <p className="mt-2 text-xs leading-5 text-muted-foreground">
+                          Accepting the handoff makes you the Assignee; resolve these blockers as
+                          you carry the work forward.
+                        </p>
+                      ) : null}
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        {capabilities.acceptHandoff &&
+                        handoff.recipientUserId === session.viewer.userId ? (
+                          <Button
+                            type="button"
+                            size="sm"
+                            className="min-h-10"
+                            disabled={isMutating}
+                            onClick={() => setPendingAction({ type: "accept-handoff", handoff })}
+                          >
+                            Accept handoff
+                          </Button>
+                        ) : null}
+                        {capabilities.cancelHandoff ? (
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="outline"
+                            className="min-h-10"
+                            disabled={isMutating}
+                            onClick={() => setPendingAction({ type: "cancel-handoff", handoff })}
+                          >
+                            Cancel offer
+                          </Button>
+                        ) : null}
+                      </div>
+                    </li>
+                  );
+                })}
               </ul>
             </section>
           ) : null}
@@ -712,11 +777,11 @@ export function ParticipantsPanel({
           isSubmitting={isMutating}
           error={error}
           onOpenChange={setHandoffOpen}
-          onOffer={async (participant, summary, expiresAtMs) => {
+          onOffer={async (participant, briefing, expiresAtMs) => {
             await onAction({
               type: "offer-handoff",
               participant,
-              summary,
+              briefing,
               expiresAtMs,
             });
             setHandoffOpen(false);

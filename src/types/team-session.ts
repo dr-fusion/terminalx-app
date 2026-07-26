@@ -125,11 +125,29 @@ export interface TeamSessionOpenHandoff {
   contextSequence: number;
   expiresAtMs: number;
   createdAtMs: number;
-  briefing: {
-    summary: string;
-    blockers: string[];
-    artifactRefs: string[];
-  };
+  briefing: TeamSessionHandoffBriefing;
+}
+
+export interface TeamSessionHandoffBriefing {
+  summary: string;
+  currentState: string;
+  blockers: string[];
+  nextSteps: string[];
+  artifactRefs: string[];
+}
+
+export interface TeamSessionConversationSearchMatch {
+  eventId: string;
+  sequence: number;
+  occurredAtMs: number;
+  actor: { userId: string; displayName: string };
+  body: string;
+}
+
+export interface TeamSessionConversationSearchResult {
+  sessionId: string;
+  matches: TeamSessionConversationSearchMatch[];
+  nextAfterSequence: number | null;
 }
 
 export interface TeamSessionDetail extends TeamSessionInboxItem {
@@ -642,7 +660,9 @@ export type TeamSessionCommandBody = TeamSessionCommandBase &
         expiresAtMs?: number;
         briefing?: {
           summary: string;
+          currentState?: string;
           blockers?: string[];
+          nextSteps?: string[];
           artifactRefs?: string[];
         };
       }

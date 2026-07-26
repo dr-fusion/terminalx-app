@@ -168,9 +168,14 @@ Complete the externally usable application around the closed gates. Phase 11 is
 delivered in three sub-slices: 11A (product messaging), 11B (mobile/a11y/
 handoff), 11C (operations/deploy).
 
-Status: **11A landed; 11B and 11C pending.** The attention inbox authority,
+Status: **11A and 11B landed; 11C pending.** The attention inbox authority,
 durable cursors, escalation, delivery, and chat completion are recorded in
-[ADR 0008](../adr/0008-attention-inbox-delivery-cursors-and-escalation.md).
+[ADR 0008](../adr/0008-attention-inbox-delivery-cursors-and-escalation.md). 11B
+added mobile navigation, an accessibility pass, structured handoff
+artifacts/blockers, operator error states, and the carried server-side
+conversation search; it needed no durable schema or authority change (the
+handoff briefing extends its existing JSON blob and search reuses the
+`session_events` visibility fence), so it adds no ADR.
 
 - Add the global attention inbox, durable read/delivery cursors, deadlines, escalation, and
   Slack/Telegram notification delivery for unavailable steerers. — **11A done**: schema v18
@@ -185,9 +190,19 @@ durable cursors, escalation, delivery, and chat completion are recorded in
   virtualization. — **11A done** for pagination (sequence-ordered `session.events`), unread/read
   state (attention read cursor), `@mention` parsing/resolution feeding the inbox, bounded artifact
   attachments, mention rendering, and client windowing/virtualization in `ConversationTimeline`.
-  **Pending:** server-side bounded conversation search.
+  Server-side bounded conversation search — **11B done**: the visibility-fenced, sequence-paginated
+  `session.conversation-search` kernel query over comment bodies, wired into the conversation surface.
 - Complete mobile navigation, accessibility, structured handoff artifacts/blockers, and operator
-  error states. — **11B pending.**
+  error states. — **11B done**: an off-canvas mobile nav plus responsive `(app)` layouts; an
+  accessibility pass (landmarks, skip link, labelled controls, `aria-live`, keyboard-operable
+  dialogs); structured handoff briefings (summary, current state, first-class blockers, next steps,
+  evidence/Run links) captured on offer and shown to the accepting Participant and in the attention
+  inbox; and App Router error boundaries (`error`, `global-error`, `not-found`) with a single
+  non-leaking operator error surface for auth-expired, permission-denied, session-gone,
+  runtime-unavailable, offline, and server states. Blockers are captured, bounded, and surfaced
+  first-class as an immutable part of the accountable briefing; durable per-blocker _resolution_
+  state (mutating individual blockers after the offer) is intentionally deferred because it conflicts
+  with the append-only briefing model — a handoff resolves atomically on accept/cancel/expire.
 - Add live/readiness probes, structured telemetry, metrics, SLOs, alerts, and incident runbooks.
 - Add online backup/restore, pre-migration snapshots, restore drills, retention, and capacity
   controls.

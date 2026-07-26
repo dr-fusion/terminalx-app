@@ -48,6 +48,13 @@ _Avoid_: Editor, driver
 The single active Steerer whose control epoch admits live terminal input at a given moment.
 _Avoid_: Session owner, assignee
 
+**Handoff Briefing**:
+The immutable, structured, server-bounded context a Participant records when offering a responsibility
+Handoff — a summary, the current state, first-class blockers, next steps, and links to evidence or
+Runs. It travels with the Handoff and is shown to the accepting Participant; it is accountable
+context, not itself a grant of authority.
+_Avoid_: Note, description, comment
+
 ## Attention and delivery
 
 **Attention Item**:

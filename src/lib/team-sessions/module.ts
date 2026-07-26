@@ -102,6 +102,10 @@ import {
   type SessionDetailView,
   type SessionEvent,
   type SessionEventsQuery,
+  type ConversationSearchQuery,
+  type ConversationSearchResultView,
+  type ConversationSearchMatch,
+  type HandoffBriefing,
   type SessionGetQuery,
   type SessionInboxItemView,
   type SessionInboxQuery,
@@ -658,6 +662,7 @@ class SqliteTeamSessions implements TeamSessions {
   inspect(query: SessionDetailQuery): Promise<SessionDetailView | null>;
   inspect(query: PublicSessionRunStateQuery): Promise<PublicSessionRunStateView | null>;
   inspect(query: SessionEventsQuery): Promise<SessionEvent[]>;
+  inspect(query: ConversationSearchQuery): Promise<ConversationSearchResultView>;
   inspect(query: SessionTerminalAuthorizationQuery): Promise<TerminalAuthorization>;
   inspect(query: SessionAdmissionQuery): Promise<SessionAdmissionView>;
   inspect(query: TeamAccessQuery): Promise<TeamAccessView>;
@@ -672,6 +677,7 @@ class SqliteTeamSessions implements TeamSessions {
       | SessionDetailQuery
       | PublicSessionRunStateQuery
       | SessionEventsQuery
+      | ConversationSearchQuery
       | SessionTerminalAuthorizationQuery
       | SessionAdmissionQuery
       | TeamAccessQuery
@@ -686,6 +692,7 @@ class SqliteTeamSessions implements TeamSessions {
     | SessionDetailView
     | PublicSessionRunStateView
     | SessionEvent[]
+    | ConversationSearchResultView
     | TerminalAuthorization
     | SessionAdmissionView
     | TeamAccessView
@@ -745,6 +752,19 @@ class SqliteTeamSessions implements TeamSessions {
             query.sessionId,
             Math.max(0, query.afterSequence ?? 0),
             clamp(query.limit ?? 200, 1, 1000)
+          );
+        case "session.conversation-search":
+          // Fail closed: an actor who cannot see the Session gets an empty,
+          // cursor-terminal result — never any comment content or existence
+          // signal from a Session outside their visibility.
+          if (!this.hasSessionAccess(query.sessionId, query.actor.userId)) {
+            return { sessionId: query.sessionId, matches: [], nextAfterSequence: null };
+          }
+          return this.searchConversation(
+            query.sessionId,
+            query.text,
+            Math.max(0, query.afterSequence ?? 0),
+            clamp(query.limit ?? 25, 1, 50)
           );
         case "session.terminal-authorization":
           return this.terminalAuthorization(query);
@@ -7464,7 +7484,7 @@ class SqliteTeamSessions implements TeamSessions {
         contextSequence: handoff.context_sequence as number,
         expiresAtMs: handoff.expires_at_ms as number,
         createdAtMs: handoff.created_at_ms as number,
-        briefing: JSON.parse(handoff.briefing_json as string) as PublicOpenHandoffView["briefing"],
+        briefing: parseStoredBriefing(handoff.briefing_json as string),
       }));
     return { ...inbox, participants, shares, openHandoffs };
   }
@@ -8046,9 +8066,7 @@ class SqliteTeamSessions implements TeamSessions {
         contextSequence: row.context_sequence as number,
         expiresAtMs: row.expires_at_ms as number,
         createdAtMs: row.created_at_ms as number,
-        briefing: JSON.parse(
-          row.briefing_json as string
-        ) as SessionView["handoffs"][number]["briefing"],
+        briefing: parseStoredBriefing(row.briefing_json as string),
         ...(row.resolved_at_ms === null ? {} : { resolvedAtMs: row.resolved_at_ms as number }),
         ...(row.resolved_by_user_id === null
           ? {}
@@ -8105,6 +8123,54 @@ class SqliteTeamSessions implements TeamSessions {
       source: { scope: row.source_scope as string, key: row.source_key as string },
       payload: JSON.parse(row.payload_json as string) as Record<string, unknown>,
     }));
+  }
+
+  /**
+   * Bounded, sequence-paginated search over comment bodies in one Session. The
+   * caller has already been visibility-fenced. Matching is a literal
+   * case-insensitive substring (LIKE wildcards escaped) against the comment
+   * `body` payload; only comment events are searched, so suggestions/directives
+   * and system events never surface. We over-read one row to compute a stable
+   * next cursor without leaking a total count.
+   */
+  private searchConversation(
+    sessionId: string,
+    text: string,
+    afterSequence: number,
+    limit: number
+  ): ConversationSearchResultView {
+    const needle = escapeLikePattern(text.trim().toLowerCase());
+    const rows = this.db
+      .prepare(
+        `SELECT event_id, sequence, occurred_at_ms, actor_user_id, actor_display_name, payload_json
+         FROM session_events
+         WHERE session_id = ?
+           AND type = 'comment.added'
+           AND sequence > ?
+           AND lower(json_extract(payload_json, '$.body')) LIKE ? ESCAPE '\\'
+         ORDER BY sequence ASC
+         LIMIT ?`
+      )
+      .all(sessionId, afterSequence, `%${needle}%`, limit + 1) as SqlRow[];
+    const hasMore = rows.length > limit;
+    const page = hasMore ? rows.slice(0, limit) : rows;
+    const matches: ConversationSearchMatch[] = page.map((row) => {
+      const payload = JSON.parse(row.payload_json as string) as Record<string, unknown>;
+      const body = typeof payload.body === "string" ? payload.body : "";
+      return {
+        eventId: row.event_id as string,
+        sequence: row.sequence as number,
+        occurredAtMs: row.occurred_at_ms as number,
+        actor: {
+          userId: row.actor_user_id as string,
+          displayName: row.actor_display_name as string,
+        },
+        body,
+      };
+    });
+    const lastMatch = matches[matches.length - 1];
+    const nextAfterSequence = hasMore && lastMatch ? lastMatch.sequence : null;
+    return { sessionId, matches, nextAfterSequence };
   }
 
   private hasSessionAccess(sessionId: string, userId: string): boolean {
@@ -10331,6 +10397,7 @@ function validateQuery(
     | SessionDetailQuery
     | PublicSessionRunStateQuery
     | SessionEventsQuery
+    | ConversationSearchQuery
     | SessionTerminalAuthorizationQuery
     | SessionAdmissionQuery
     | TeamAccessQuery
@@ -10368,6 +10435,24 @@ function validateQuery(
         (!Number.isSafeInteger(query.limit) || query.limit < 1 || query.limit > 1_000)
       ) {
         throw new TeamSessionError("invalid-command", "Invalid event limit");
+      }
+      return;
+    case "session.conversation-search":
+      requiredIdentifier(query.sessionId, "Session id");
+      // A bounded, non-empty needle. The trimmed length cap keeps the LIKE scan
+      // predictable and rejects degenerate queries.
+      requiredText(query.text, "Search text", 200);
+      if (
+        query.afterSequence !== undefined &&
+        (!Number.isSafeInteger(query.afterSequence) || query.afterSequence < 0)
+      ) {
+        throw new TeamSessionError("invalid-command", "Invalid event sequence");
+      }
+      if (
+        query.limit !== undefined &&
+        (!Number.isSafeInteger(query.limit) || query.limit < 1 || query.limit > 50)
+      ) {
+        throw new TeamSessionError("invalid-command", "Invalid search limit");
       }
       return;
     case "session.terminal-authorization":
@@ -10931,22 +11016,28 @@ function normalizeHandoffBriefing(
   briefing:
     | {
         summary: string;
+        currentState?: string;
         blockers?: string[];
+        nextSteps?: string[];
         artifactRefs?: string[];
       }
     | undefined,
   contextSequence: number
-): { summary: string; blockers: string[]; artifactRefs: string[] } {
+): HandoffBriefing {
   if (!briefing) {
     return {
       summary: `Review the Session through canonical event ${contextSequence} before accepting responsibility.`,
+      currentState: "",
       blockers: [],
+      nextSteps: [],
       artifactRefs: [],
     };
   }
   return {
     summary: requiredText(briefing.summary, "Handoff summary", 1_000),
+    currentState: optionalText(briefing.currentState, 2_000) ?? "",
     blockers: normalizedTextList(briefing.blockers, "Handoff blocker", 20, 500),
+    nextSteps: normalizedTextList(briefing.nextSteps, "Handoff next step", 20, 500),
     artifactRefs: normalizedTextList(
       briefing.artifactRefs,
       "Handoff artifact reference",
@@ -10954,6 +11045,32 @@ function normalizeHandoffBriefing(
       1_000
     ),
   };
+}
+
+/**
+ * Read a stored briefing JSON back into the canonical shape. Handoffs offered
+ * before structured `currentState`/`nextSteps` shipped only persisted
+ * `summary`/`blockers`/`artifactRefs`, so we default the newer fields rather
+ * than trust the stored blob to be complete.
+ */
+function parseStoredBriefing(briefingJson: string): HandoffBriefing {
+  const raw = JSON.parse(briefingJson) as Partial<HandoffBriefing>;
+  return {
+    summary: typeof raw.summary === "string" ? raw.summary : "",
+    currentState: typeof raw.currentState === "string" ? raw.currentState : "",
+    blockers: Array.isArray(raw.blockers) ? raw.blockers.filter((b) => typeof b === "string") : [],
+    nextSteps: Array.isArray(raw.nextSteps)
+      ? raw.nextSteps.filter((s) => typeof s === "string")
+      : [],
+    artifactRefs: Array.isArray(raw.artifactRefs)
+      ? raw.artifactRefs.filter((a) => typeof a === "string")
+      : [],
+  };
+}
+
+/** Escape LIKE metacharacters so search needles match literally (ESCAPE '\'). */
+function escapeLikePattern(value: string): string {
+  return value.replace(/[\\%_]/g, (match) => `\\${match}`);
 }
 
 function normalizedTextList(

@@ -155,7 +155,10 @@ export function AttentionInboxView() {
           Loading your inbox…
         </div>
       ) : error ? (
-        <p className="rounded-md border border-destructive/40 bg-destructive/10 p-4 text-sm text-destructive">
+        <p
+          role="alert"
+          className="rounded-md border border-destructive/40 bg-destructive/10 p-4 text-sm text-destructive"
+        >
           {error}
         </p>
       ) : !page || page.items.length === 0 ? (
@@ -165,7 +168,7 @@ export function AttentionInboxView() {
           <p className="text-sm text-muted-foreground">Nothing needs your attention right now.</p>
         </div>
       ) : (
-        <ol className="space-y-2">
+        <ol className="space-y-2" aria-live="polite" aria-label="Attention items">
           {page.items.map((item) => {
             const Icon = KIND_ICON[item.kind];
             const overdue = isOverdue(item, now);
