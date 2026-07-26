@@ -69,6 +69,24 @@ An expiring, revocable authorization for a bounded class of effects within one e
 Runtime Assignment, and Sandbox generation.
 _Avoid_: Approval, permission bypass
 
+**Approval Provenance**:
+The signed, immutable snapshot recorded when an approval is resolved into an Action Grant, binding
+the resolving actor, the approved capability, the policy, the budget, the Sandbox identity, and the
+grant state at approval time. It is evidence of what was granted, not itself an authorization.
+_Avoid_: Audit log entry, approval record
+
+**Reservation**:
+A durable, receipt-keyed hold placed on a Run's authoritative limits before an effect, later
+settled from the effect's Runtime receipt or released on failure. It is the unit of authoritative
+limit accounting, not a prediction or an estimate.
+_Avoid_: Quota, budget, estimate
+
+**YOLO Challenge**:
+A server-issued, expiring, single-use proof bound to one exact actor, Team Session, run policy, and
+Sandbox identity that gates minting the first autonomous ("yolo") Action Grant, consumed atomically
+with that grant.
+_Avoid_: Confirmation dialog, override, bypass token
+
 ## Connections and channels
 
 **Identity Connection**:
