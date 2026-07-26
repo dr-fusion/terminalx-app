@@ -338,6 +338,106 @@ export function verifySessionEventChain(
   return { ok: true, headSequence: records[records.length - 1].sequence, headHash: previous };
 }
 
+/** Export format version for a self-verifying chain bundle. */
+export const SESSION_EVENT_CHAIN_EXPORT_SCHEMA = 1 as const;
+
+/**
+ * A self-verifying, externally-retainable bundle: the ordered event chain plus
+ * every signed checkpoint. This is the externally-retainable release evidence
+ * that Phase 8's internal ledger explicitly was not — a holder can re-derive the
+ * chain and check the checkpoint signatures without any TerminalX state.
+ */
+export interface SessionEventChainExport {
+  readonly schema: typeof SESSION_EVENT_CHAIN_EXPORT_SCHEMA;
+  readonly sessionId: string;
+  readonly genesisRoot: string;
+  readonly events: readonly SessionEventChainRecord[];
+  readonly checkpoints: readonly SessionEventCheckpointProof[];
+}
+
+export type ChainImportResult =
+  | {
+      readonly ok: true;
+      readonly sessionId: string;
+      readonly headSequence: number;
+      readonly headHash: string;
+      readonly verifiedCheckpoints: number;
+    }
+  | {
+      readonly ok: false;
+      readonly reason:
+        | "malformed-bundle"
+        | "chain-invalid"
+        | "checkpoint-unverified"
+        | "checkpoint-head-mismatch"
+        | "checkpoint-session-mismatch";
+      readonly detail?: ChainVerificationFailure;
+    };
+
+/**
+ * Verify an exported bundle end to end: re-derive the event chain, then confirm
+ * every checkpoint is signed by a trusted key and pins a head hash/sequence that
+ * matches the re-derived chain. Fails closed — an unverifiable checkpoint or a
+ * head that does not match the chain rejects the whole bundle. Pure: usable by
+ * an external retainer holding only the bundle and the trusted public keys.
+ */
+export function verifyExportedSessionEventChain(
+  bundle: unknown,
+  verificationKeys: ReadonlyMap<string, KeyObject>
+): ChainImportResult {
+  if (typeof bundle !== "object" || bundle === null || Array.isArray(bundle)) {
+    return { ok: false, reason: "malformed-bundle" };
+  }
+  const record = bundle as Record<string, unknown>;
+  if (
+    record.schema !== SESSION_EVENT_CHAIN_EXPORT_SCHEMA ||
+    typeof record.sessionId !== "string" ||
+    typeof record.genesisRoot !== "string" ||
+    !SHA256.test(record.genesisRoot) ||
+    !Array.isArray(record.events) ||
+    !Array.isArray(record.checkpoints)
+  ) {
+    return { ok: false, reason: "malformed-bundle" };
+  }
+  const events = record.events as SessionEventChainRecord[];
+  if (events.some((event) => !isChainRecord(event) || event.sessionId !== record.sessionId)) {
+    return { ok: false, reason: "malformed-bundle" };
+  }
+  const chain = verifySessionEventChain(events, record.genesisRoot);
+  if (!chain.ok) return { ok: false, reason: "chain-invalid", detail: chain.failure };
+  const bySequence = new Map(events.map((event) => [event.sequence, event.hash] as const));
+  let verifiedCheckpoints = 0;
+  for (const rawCheckpoint of record.checkpoints as unknown[]) {
+    const checkpointRecord =
+      typeof rawCheckpoint === "object" && rawCheckpoint !== null
+        ? (rawCheckpoint as Record<string, unknown>)
+        : undefined;
+    const payloadRecord =
+      checkpointRecord && typeof checkpointRecord.payload === "object"
+        ? (checkpointRecord.payload as Record<string, unknown>)
+        : undefined;
+    const keyId = payloadRecord?.signingKeyId;
+    const key = typeof keyId === "string" ? verificationKeys.get(keyId) : undefined;
+    if (!key) return { ok: false, reason: "checkpoint-unverified" };
+    const payload = verifySessionEventCheckpoint(rawCheckpoint, key);
+    if (!payload) return { ok: false, reason: "checkpoint-unverified" };
+    if (payload.sessionId !== record.sessionId || payload.genesisRoot !== record.genesisRoot) {
+      return { ok: false, reason: "checkpoint-session-mismatch" };
+    }
+    if (bySequence.get(payload.headSequence) !== payload.headHash) {
+      return { ok: false, reason: "checkpoint-head-mismatch" };
+    }
+    verifiedCheckpoints += 1;
+  }
+  return {
+    ok: true,
+    sessionId: record.sessionId,
+    headSequence: chain.headSequence,
+    headHash: chain.headHash,
+    verifiedCheckpoints,
+  };
+}
+
 function isChainRecord(value: unknown): value is SessionEventChainRecord {
   if (typeof value !== "object" || value === null) return false;
   const record = value as Record<string, unknown>;

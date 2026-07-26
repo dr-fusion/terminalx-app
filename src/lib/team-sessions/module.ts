@@ -5009,6 +5009,22 @@ class SqliteTeamSessions implements TeamSessions {
         disposition: command.disposition,
       });
     }
+    // Immutable evidence-review history: who reviewed exactly which evidence, at
+    // which Goal version, with what disposition. Keyed by the reviewed version so
+    // a given (Goal, version) review is recorded exactly once.
+    this.recordEvidenceReviewHistory({
+      sessionId: command.sessionId,
+      agentRunId: command.agentRunId,
+      goalSetId: current.goalSetId,
+      goalSetRevision: current.revision,
+      goalId: command.goalId,
+      goalVersion: command.expectedGoalVersion,
+      disposition: command.disposition,
+      evidenceDigests: evidence.map((row) => row.evidence_digest as string),
+      reviewer: command.actor,
+      directiveId: directive?.payload.directiveId,
+      now,
+    });
     return this.commitGoalSetMutation(command, run, current, goals, now, directive, {
       change: "goal-evidence-reviewed",
       goalId: command.goalId,
@@ -8412,6 +8428,25 @@ class SqliteTeamSessions implements TeamSessions {
       | undefined;
     if (!updated) throw new TeamSessionError("stale-revision", "Goal Set changed concurrently");
     const runStateRevision = this.advanceRunStateRevision(command.sessionId);
+    // Immutable Goal version lineage: when a specific Goal's version advanced,
+    // record the new version, its predecessor, and the command that produced it.
+    if (typeof change.goalId === "string") {
+      const touched = goals.find((goal) => goal.goalId === change.goalId);
+      if (touched) {
+        this.recordGoalVersionLineage({
+          sessionId: command.sessionId,
+          agentRunId: command.agentRunId,
+          goalSetId: current.goalSetId,
+          goalSetRevision: revision,
+          goalId: touched.goalId,
+          version: touched.version,
+          producingCommandType: command.type,
+          changeKind: String(change.change),
+          actor: command.actor,
+          now,
+        });
+      }
+    }
     const event = this.appendEvent(command.sessionId, command, now, "goal-set.revised", {
       agentRunId: command.agentRunId,
       previousGoalSetRevision: current.revision,
@@ -8437,6 +8472,84 @@ class SqliteTeamSessions implements TeamSessions {
       },
       events
     );
+  }
+
+  private recordGoalVersionLineage(input: {
+    sessionId: string;
+    agentRunId: string;
+    goalSetId: string;
+    goalSetRevision: number;
+    goalId: string;
+    version: number;
+    producingCommandType: string;
+    changeKind: string;
+    actor: ActorContext;
+    now: number;
+  }): void {
+    this.db
+      .prepare(
+        `INSERT INTO goal_version_lineage (
+           id, session_id, agent_run_id, goal_set_id, goal_set_revision, goal_id,
+           version, previous_version, producing_command_type, change_kind,
+           actor_kind, actor_ref, created_at_ms
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        this.nextId("goal-lineage"),
+        input.sessionId,
+        input.agentRunId,
+        input.goalSetId,
+        input.goalSetRevision,
+        input.goalId,
+        input.version,
+        input.version === 1 ? null : input.version - 1,
+        input.producingCommandType,
+        input.changeKind,
+        input.actor.kind,
+        input.actor.userId,
+        input.now
+      );
+  }
+
+  private recordEvidenceReviewHistory(input: {
+    sessionId: string;
+    agentRunId: string;
+    goalSetId: string;
+    goalSetRevision: number;
+    goalId: string;
+    goalVersion: number;
+    disposition: "validate" | "request-more-work";
+    evidenceDigests: string[];
+    reviewer: ActorContext;
+    directiveId: string | undefined;
+    now: number;
+  }): void {
+    const reviewedEvidenceDigest = sha256(canonicalRuntimeJson(input.evidenceDigests));
+    this.db
+      .prepare(
+        `INSERT INTO evidence_review_history (
+           id, session_id, agent_run_id, goal_set_id, goal_set_revision, goal_id,
+           goal_version, disposition, reviewed_evidence_count, reviewed_evidence_digest,
+           reviewer_kind, reviewer_ref, directive_id, reviewed_at_ms, created_at_ms
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        this.nextId("evidence-review"),
+        input.sessionId,
+        input.agentRunId,
+        input.goalSetId,
+        input.goalSetRevision,
+        input.goalId,
+        input.goalVersion,
+        input.disposition,
+        input.evidenceDigests.length,
+        reviewedEvidenceDigest,
+        input.reviewer.kind,
+        input.reviewer.userId,
+        input.directiveId ?? null,
+        input.now,
+        input.now
+      );
   }
 
   private requestRuntimeLifecycleTransition(

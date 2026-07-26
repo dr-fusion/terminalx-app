@@ -646,6 +646,122 @@ describe("Team Session Agent Runs", () => {
     });
   });
 
+  it("records immutable Goal version lineage and evidence-review history", async () => {
+    const started = await startRun();
+    const agentRunId = started.data.agentRunId as string;
+    await dispatch({
+      type: "goal.add",
+      sessionId: SESSION_ID,
+      agentRunId,
+      expectedGoalSetRevision: 1,
+      goal: {
+        goalId: "goal:fix",
+        position: 2,
+        title: "Apply the bounded fix",
+        acceptanceCriteria: ["Focused tests pass"],
+        dependencyGoalIds: [],
+      },
+      directive: { format: "plain-text", body: "Add the fix goal." },
+    });
+    await dispatch({
+      type: "goal.criteria.strengthen",
+      sessionId: SESSION_ID,
+      agentRunId,
+      goalId: "goal:fix",
+      expectedGoalSetRevision: 2,
+      addedCriteria: ["The regression test fails first"],
+      directive: { format: "plain-text", body: "Strengthen the fix goal." },
+    });
+
+    const db = new Database(filename);
+    try {
+      const lineage = db
+        .prepare(
+          `SELECT goal_id, version, previous_version, producing_command_type, change_kind
+           FROM goal_version_lineage WHERE agent_run_id = ?
+           ORDER BY created_at_ms ASC, id ASC`
+        )
+        .all(agentRunId);
+      expect(lineage).toEqual([
+        {
+          goal_id: "goal:fix",
+          version: 1,
+          previous_version: null,
+          producing_command_type: "goal.add",
+          change_kind: "goal-added",
+        },
+        {
+          goal_id: "goal:fix",
+          version: 2,
+          previous_version: 1,
+          producing_command_type: "goal.criteria.strengthen",
+          change_kind: "goal-criteria-strengthened",
+        },
+      ]);
+
+      // Goal version lineage is append-only.
+      expect(() =>
+        db.prepare(`UPDATE goal_version_lineage SET version = 9 WHERE goal_id = 'goal:fix'`).run()
+      ).toThrow(/append-only/);
+      expect(() =>
+        db.prepare(`DELETE FROM goal_version_lineage WHERE goal_id = 'goal:fix'`).run()
+      ).toThrow(/append-only/);
+
+      const goalSet = db
+        .prepare(`SELECT goal_set_id FROM goal_sets WHERE agent_run_id = ? AND revision = 3`)
+        .get(agentRunId) as { goal_set_id: string };
+      db.prepare(
+        `INSERT INTO goal_evidence
+           (id, agent_run_id, goal_set_id, goal_set_revision, goal_id, goal_version,
+            evidence_ref, evidence_digest, status, created_at_ms, reviewed_at_ms)
+         VALUES ('evidence:diagnose-1', ?, ?, 3, 'goal:diagnose', 1,
+                 'artifact:diagnose-1', ?, 'proposed', ?, NULL)`
+      ).run(agentRunId, goalSet.goal_set_id, "d".repeat(64), now);
+    } finally {
+      db.close();
+    }
+
+    await dispatch({
+      type: "goal.evidence.review",
+      sessionId: SESSION_ID,
+      agentRunId,
+      goalId: "goal:diagnose",
+      expectedGoalVersion: 1,
+      disposition: "validate",
+    });
+
+    const audit = new Database(filename);
+    try {
+      const history = audit
+        .prepare(
+          `SELECT goal_id, goal_version, disposition, reviewed_evidence_count,
+                  reviewer_kind, reviewer_ref
+           FROM evidence_review_history WHERE agent_run_id = ?`
+        )
+        .all(agentRunId);
+      expect(history).toEqual([
+        {
+          goal_id: "goal:diagnose",
+          goal_version: 1,
+          disposition: "validate",
+          reviewed_evidence_count: 1,
+          reviewer_kind: "human",
+          reviewer_ref: ALICE.userId,
+        },
+      ]);
+
+      // Evidence-review history is append-only.
+      expect(() =>
+        audit.prepare(`UPDATE evidence_review_history SET disposition = 'request-more-work'`).run()
+      ).toThrow(/append-only/);
+      expect(() => audit.prepare(`DELETE FROM evidence_review_history`).run()).toThrow(
+        /append-only/
+      );
+    } finally {
+      audit.close();
+    }
+  });
+
   it("uses fenced lifecycle versions for pause, resume, and stop", async () => {
     const started = await startRun();
     const agentRunId = started.data.agentRunId as string;
