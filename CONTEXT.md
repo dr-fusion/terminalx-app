@@ -48,6 +48,32 @@ _Avoid_: Editor, driver
 The single active Steerer whose control epoch admits live terminal input at a given moment.
 _Avoid_: Session owner, assignee
 
+## Attention and delivery
+
+**Attention Item**:
+One attention or steering ask directed at a single User — a mention, a Handoff offer awaiting their
+acceptance, or an assignee-required ask a Supervisor must resolve — projected across every Team
+Session that User can currently see. It is a projection over existing durable authority, always
+fenced to an active Participant, never a new authoritative record.
+_Avoid_: Notification, task, ticket
+
+**Read Cursor**:
+The durable, per-User, per-Team-Session high-water mark of the Attention Items a User has read. It
+never regresses, and unread counts derive from it. It is a projection, not evidence.
+_Avoid_: Seen flag, last-read timestamp
+
+**Delivery Cursor**:
+The append-only, per-User, hash-chained record of which Attention Items have been delivered to a
+User's bound external channel, and with what outcome. It makes external delivery idempotent across
+retry and restart and is evidence of what was delivered, not an authorization to deliver.
+_Avoid_: Sent log, outbox
+
+**Attention Escalation**:
+The append-only, per-Team-Session, hash-chained record that a responsible Participant did not act on
+an Attention Item before its deadline, so oversight was escalated to a Supervisor. It is evidence of
+the escalation, not itself a grant of authority.
+_Avoid_: Alert, reminder
+
 ## Integrity and recovery
 
 **Session Event Chain**:
