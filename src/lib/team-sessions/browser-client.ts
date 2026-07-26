@@ -5,6 +5,8 @@ import type {
   TeamSessionAdmission,
   TeamSessionCommandBody,
   TeamSessionCommandResult,
+  TeamSessionConversationSearchMatch,
+  TeamSessionConversationSearchResult,
   TeamSessionDetail,
   TeamSessionDiscovery,
   TeamSessionEvent,
@@ -190,6 +192,89 @@ export async function fetchTeamSessionEvents(
   return requireArray(envelope.events, "Session events").map((event) =>
     parseTeamSessionEvent(event, sessionId)
   );
+}
+
+export interface TeamSessionSearchFetchOptions extends TeamSessionFetchOptions {
+  afterSequence?: number;
+  limit?: number;
+}
+
+/**
+ * Bounded, visibility-fenced server-side search over comment bodies in one
+ * Session. The server returns nothing for Sessions the actor cannot see, so a
+ * client can safely surface results without a local access check.
+ */
+export async function searchTeamSessionConversation(
+  sessionId: string,
+  text: string,
+  options: TeamSessionSearchFetchOptions = {}
+): Promise<TeamSessionConversationSearchResult> {
+  const query = new URLSearchParams();
+  query.set("q", text);
+  if (options.afterSequence !== undefined) {
+    query.set(
+      "afterSequence",
+      String(requireSafeInteger(options.afterSequence, "afterSequence", 0))
+    );
+  }
+  if (options.limit !== undefined) {
+    query.set("limit", String(requireSafeInteger(options.limit, "limit", 1, 50)));
+  }
+  const body = await requestJson(
+    `/api/team-sessions/sessions/${encodeURIComponent(requireIdentifier(sessionId, "Session id"))}/search?${query.toString()}`,
+    { method: "GET", signal: options.signal }
+  );
+  const envelope = requireRecord(body, "Session search response");
+  requireExactFields(envelope, ["search"], "Session search response");
+  return parseConversationSearchResult(envelope.search, sessionId);
+}
+
+function parseConversationSearchResult(
+  value: unknown,
+  expectedSessionId: string
+): TeamSessionConversationSearchResult {
+  const result = requireRecord(value, "Session search result");
+  requireExactFields(
+    result,
+    ["sessionId", "matches", "nextAfterSequence"],
+    "Session search result"
+  );
+  const sessionId = requireString(result.sessionId, "Search result sessionId");
+  if (sessionId !== expectedSessionId) {
+    throw new TypeError("Search result Session id mismatch");
+  }
+  const nextAfterSequence =
+    result.nextAfterSequence === null
+      ? null
+      : requireSafeInteger(result.nextAfterSequence, "Search nextAfterSequence", 1);
+  return {
+    sessionId,
+    matches: requireArray(result.matches, "Search matches").map((match) =>
+      parseConversationSearchMatch(match)
+    ),
+    nextAfterSequence,
+  };
+}
+
+function parseConversationSearchMatch(value: unknown): TeamSessionConversationSearchMatch {
+  const match = requireRecord(value, "Search match");
+  requireExactFields(
+    match,
+    ["eventId", "sequence", "occurredAtMs", "actor", "body"],
+    "Search match"
+  );
+  const actor = requireRecord(match.actor, "Search match actor");
+  requireExactFields(actor, ["userId", "displayName"], "Search match actor");
+  return {
+    eventId: requireString(match.eventId, "Search match eventId"),
+    sequence: requireSafeInteger(match.sequence, "Search match sequence", 1),
+    occurredAtMs: requireSafeInteger(match.occurredAtMs, "Search match occurredAtMs", 0),
+    actor: {
+      userId: requireString(actor.userId, "Search match actor userId"),
+      displayName: requireString(actor.displayName, "Search match actor displayName", true),
+    },
+    body: requireString(match.body, "Search match body", true),
+  };
 }
 
 export async function submitTeamSessionCommand(
@@ -1491,7 +1576,11 @@ function parseOpenHandoff(value: unknown): TeamSessionOpenHandoff {
     "Session Handoff"
   );
   const briefing = requireRecord(handoff.briefing, "Handoff briefing");
-  requireExactFields(briefing, ["summary", "blockers", "artifactRefs"], "Handoff briefing");
+  requireExactFields(
+    briefing,
+    ["summary", "currentState", "blockers", "nextSteps", "artifactRefs"],
+    "Handoff briefing"
+  );
   return {
     handoffId: requireString(handoff.handoffId, "Handoff id"),
     offererUserId: requireString(handoff.offererUserId, "Handoff offerer user id"),
@@ -1511,7 +1600,9 @@ function parseOpenHandoff(value: unknown): TeamSessionOpenHandoff {
     createdAtMs: requireSafeInteger(handoff.createdAtMs, "Handoff createdAtMs", 0),
     briefing: {
       summary: requireString(briefing.summary, "Handoff summary", true),
+      currentState: requireString(briefing.currentState, "Handoff current state", true),
       blockers: parseStringArray(briefing.blockers, "Handoff blockers"),
+      nextSteps: parseStringArray(briefing.nextSteps, "Handoff next steps"),
       artifactRefs: parseStringArray(briefing.artifactRefs, "Handoff artifact refs"),
     },
   };

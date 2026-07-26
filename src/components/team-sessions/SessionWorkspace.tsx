@@ -340,7 +340,7 @@ export function SessionWorkspace({ sessionId, transportEnabled }: SessionWorkspa
         expectedRecipientParticipantVersion: action.participant.version,
         expectedOffererResponsibilityVersion: offererResponsibilityVersion,
         expiresAtMs: action.expiresAtMs,
-        briefing: { summary: action.summary },
+        briefing: action.briefing,
       };
     } else if (action.type === "accept-handoff") {
       command = {

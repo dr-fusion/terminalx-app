@@ -212,7 +212,9 @@ export type SessionCommand =
       expiresAtMs?: number;
       briefing?: {
         summary: string;
+        currentState?: string;
         blockers?: string[];
+        nextSteps?: string[];
         artifactRefs?: string[];
       };
     })
@@ -367,6 +369,37 @@ export interface SessionEventsQuery extends QueryBase {
   limit?: number;
 }
 
+/**
+ * Bounded server-side search over comment bodies within one Team Session. It is
+ * visibility-fenced: the kernel resolves the same Participant access predicate as
+ * `session.events` and returns nothing when the actor cannot see the Session, so
+ * search never crosses a Session-visibility boundary. Results page by sequence.
+ */
+export interface ConversationSearchQuery extends QueryBase {
+  type: "session.conversation-search";
+  sessionId: string;
+  /** Free-text needle; matched literally (LIKE-escaped) against comment bodies. */
+  text: string;
+  /** Return only matches strictly after this sequence (cursor pagination). */
+  afterSequence?: number;
+  limit?: number;
+}
+
+export interface ConversationSearchMatch {
+  eventId: string;
+  sequence: number;
+  occurredAtMs: number;
+  actor: { userId: string; displayName: string };
+  body: string;
+}
+
+export interface ConversationSearchResultView {
+  sessionId: string;
+  matches: ConversationSearchMatch[];
+  /** Cursor for the next page, or null when the last page has been returned. */
+  nextAfterSequence: number | null;
+}
+
 export interface SessionTerminalAuthorizationQuery extends QueryBase {
   type: "session.terminal-authorization";
   sessionId: string;
@@ -398,6 +431,7 @@ export type SessionQuery =
   | SessionDetailQuery
   | PublicSessionRunStateQuery
   | SessionEventsQuery
+  | ConversationSearchQuery
   | SessionTerminalAuthorizationQuery
   | SessionAdmissionQuery
   | TeamAccessQuery
@@ -498,11 +532,22 @@ export interface SessionHandoffView {
   resolvedAtMs?: number;
   resolvedByUserId?: string;
   cancellationReason?: string;
-  briefing: {
-    summary: string;
-    blockers: string[];
-    artifactRefs: string[];
-  };
+  briefing: HandoffBriefing;
+}
+
+/**
+ * Durable, structured handoff briefing. `summary`, `currentState`, and
+ * `nextSteps` capture the accountable transfer context; `blockers` are
+ * first-class so the accepting Participant can triage them; `artifactRefs`
+ * link to evidence or Runs. All fields are bounded and validated server-side
+ * and stored as an immutable JSON briefing on the Handoff.
+ */
+export interface HandoffBriefing {
+  summary: string;
+  currentState: string;
+  blockers: string[];
+  nextSteps: string[];
+  artifactRefs: string[];
 }
 
 export type RuntimeOutboxKind =
@@ -834,11 +879,7 @@ export interface PublicOpenHandoffView {
   contextSequence: number;
   expiresAtMs: number;
   createdAtMs: number;
-  briefing: {
-    summary: string;
-    blockers: string[];
-    artifactRefs: string[];
-  };
+  briefing: HandoffBriefing;
 }
 
 export interface SessionDetailView extends SessionInboxItemView {
@@ -1142,6 +1183,7 @@ export interface TeamSessions {
   inspect(query: SessionDetailQuery): Promise<SessionDetailView | null>;
   inspect(query: PublicSessionRunStateQuery): Promise<PublicSessionRunStateView | null>;
   inspect(query: SessionEventsQuery): Promise<SessionEvent[]>;
+  inspect(query: ConversationSearchQuery): Promise<ConversationSearchResultView>;
   inspect(query: SessionTerminalAuthorizationQuery): Promise<TerminalAuthorization>;
   inspect(query: SessionAdmissionQuery): Promise<SessionAdmissionView>;
   inspect(query: TeamAccessQuery): Promise<TeamAccessView>;

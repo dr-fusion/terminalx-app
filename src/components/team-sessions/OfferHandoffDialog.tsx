@@ -14,6 +14,14 @@ import {
 } from "@/components/ui/dialog";
 import type { TeamSessionParticipant } from "@/types/team-session";
 
+export interface HandoffBriefingInput {
+  summary: string;
+  currentState: string;
+  blockers: string[];
+  nextSteps: string[];
+  artifactRefs: string[];
+}
+
 interface OfferHandoffDialogProps {
   open: boolean;
   participants: TeamSessionParticipant[];
@@ -22,7 +30,7 @@ interface OfferHandoffDialogProps {
   onOpenChange: (open: boolean) => void;
   onOffer: (
     participant: TeamSessionParticipant,
-    summary: string,
+    briefing: HandoffBriefingInput,
     expiresAtMs: number
   ) => Promise<void>;
 }
@@ -32,6 +40,14 @@ const EXPIRATIONS = [
   { value: "24h", label: "24 hours", durationMs: 24 * 60 * 60 * 1_000 },
   { value: "7d", label: "7 days", durationMs: 7 * 24 * 60 * 60 * 1_000 },
 ] as const;
+
+/** Split a textarea (one item per line) into a bounded, trimmed, non-empty list. */
+export function linesToList(value: string): string[] {
+  return value
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+}
 
 export function OfferHandoffDialog({
   open,
@@ -43,6 +59,10 @@ export function OfferHandoffDialog({
 }: OfferHandoffDialogProps) {
   const [participantId, setParticipantId] = useState(participants[0]?.participantId ?? "");
   const [summary, setSummary] = useState("");
+  const [currentState, setCurrentState] = useState("");
+  const [blockers, setBlockers] = useState("");
+  const [nextSteps, setNextSteps] = useState("");
+  const [artifactRefs, setArtifactRefs] = useState("");
   const [expiration, setExpiration] = useState<(typeof EXPIRATIONS)[number]["value"]>("24h");
   const intentRef = useRef<{
     fingerprint: string;
@@ -50,11 +70,19 @@ export function OfferHandoffDialog({
   } | null>(null);
   const participantInputId = useId();
   const summaryInputId = useId();
+  const currentStateInputId = useId();
+  const blockersInputId = useId();
+  const nextStepsInputId = useId();
+  const artifactsInputId = useId();
   const expirationInputId = useId();
   const selectedParticipant = participants.find(
     (participant) => participant.participantId === participantId
   );
   const normalizedSummary = summary.trim();
+
+  const resetIntent = () => {
+    intentRef.current = null;
+  };
 
   return (
     <Dialog
@@ -64,16 +92,23 @@ export function OfferHandoffDialog({
         onOpenChange(nextOpen);
       }}
     >
-      <DialogContent className="sm:max-w-lg" showCloseButton={false}>
+      <DialogContent className="max-h-[90dvh] overflow-y-auto sm:max-w-lg" showCloseButton={false}>
         <form
           onSubmit={(event) => {
             event.preventDefault();
             if (!selectedParticipant || !normalizedSummary || isSubmitting) return;
             const selectedExpiration = EXPIRATIONS.find((option) => option.value === expiration);
             if (!selectedExpiration) return;
+            const briefing: HandoffBriefingInput = {
+              summary: normalizedSummary,
+              currentState: currentState.trim(),
+              blockers: linesToList(blockers),
+              nextSteps: linesToList(nextSteps),
+              artifactRefs: linesToList(artifactRefs),
+            };
             const fingerprint = JSON.stringify({
               participantId: selectedParticipant.participantId,
-              summary: normalizedSummary,
+              briefing,
               expiration,
             });
             const previous = intentRef.current;
@@ -85,9 +120,7 @@ export function OfferHandoffDialog({
                     expiresAtMs: Date.now() + selectedExpiration.durationMs,
                   };
             intentRef.current = intent;
-            void onOffer(selectedParticipant, normalizedSummary, intent.expiresAtMs).catch(
-              () => undefined
-            );
+            void onOffer(selectedParticipant, briefing, intent.expiresAtMs).catch(() => undefined);
           }}
         >
           <DialogHeader>
@@ -112,7 +145,7 @@ export function OfferHandoffDialog({
                 disabled={isSubmitting || participants.length === 0}
                 className="min-h-10 w-full rounded-md border border-input bg-background px-3 text-sm focus-visible:ring-2 focus-visible:ring-ring"
                 onChange={(event) => {
-                  intentRef.current = null;
+                  resetIntent();
                   setParticipantId(event.target.value);
                 }}
               >
@@ -131,15 +164,92 @@ export function OfferHandoffDialog({
               <textarea
                 id={summaryInputId}
                 value={summary}
-                rows={4}
+                rows={3}
                 required
                 maxLength={1_000}
                 disabled={isSubmitting}
-                className="max-h-48 min-h-24 w-full resize-y rounded-md border border-input bg-background p-3 text-sm leading-6 focus-visible:ring-2 focus-visible:ring-ring"
+                className="max-h-48 min-h-20 w-full resize-y rounded-md border border-input bg-background p-3 text-sm leading-6 focus-visible:ring-2 focus-visible:ring-ring"
                 placeholder="What is done, what remains, and what needs attention?"
                 onChange={(event) => {
-                  intentRef.current = null;
+                  resetIntent();
                   setSummary(event.target.value);
+                }}
+              />
+            </div>
+
+            <div className="space-y-1.5">
+              <label htmlFor={currentStateInputId} className="text-xs font-medium">
+                Current state <span className="text-muted-foreground">(optional)</span>
+              </label>
+              <textarea
+                id={currentStateInputId}
+                value={currentState}
+                rows={2}
+                maxLength={2_000}
+                disabled={isSubmitting}
+                className="max-h-48 min-h-16 w-full resize-y rounded-md border border-input bg-background p-3 text-sm leading-6 focus-visible:ring-2 focus-visible:ring-ring"
+                placeholder="Where the work stands right now (branch, running processes, decisions in flight)."
+                onChange={(event) => {
+                  resetIntent();
+                  setCurrentState(event.target.value);
+                }}
+              />
+            </div>
+
+            <div className="space-y-1.5">
+              <label htmlFor={blockersInputId} className="text-xs font-medium">
+                Blockers <span className="text-muted-foreground">(one per line)</span>
+              </label>
+              <textarea
+                id={blockersInputId}
+                value={blockers}
+                rows={2}
+                disabled={isSubmitting}
+                aria-describedby={`${blockersInputId}-hint`}
+                className="max-h-48 min-h-16 w-full resize-y rounded-md border border-input bg-background p-3 text-sm leading-6 focus-visible:ring-2 focus-visible:ring-ring"
+                placeholder={"Waiting on prod deploy approval\nFlaky integration test in CI"}
+                onChange={(event) => {
+                  resetIntent();
+                  setBlockers(event.target.value);
+                }}
+              />
+              <p id={`${blockersInputId}-hint`} className="text-xs text-muted-foreground">
+                Each blocker is listed for the recipient to triage.
+              </p>
+            </div>
+
+            <div className="space-y-1.5">
+              <label htmlFor={nextStepsInputId} className="text-xs font-medium">
+                Next steps <span className="text-muted-foreground">(one per line)</span>
+              </label>
+              <textarea
+                id={nextStepsInputId}
+                value={nextSteps}
+                rows={2}
+                disabled={isSubmitting}
+                className="max-h-48 min-h-16 w-full resize-y rounded-md border border-input bg-background p-3 text-sm leading-6 focus-visible:ring-2 focus-visible:ring-ring"
+                placeholder={"Re-run the migration on staging\nAsk @dana to review the auth change"}
+                onChange={(event) => {
+                  resetIntent();
+                  setNextSteps(event.target.value);
+                }}
+              />
+            </div>
+
+            <div className="space-y-1.5">
+              <label htmlFor={artifactsInputId} className="text-xs font-medium">
+                Evidence / Run links <span className="text-muted-foreground">(one per line)</span>
+              </label>
+              <textarea
+                id={artifactsInputId}
+                value={artifactRefs}
+                rows={2}
+                disabled={isSubmitting}
+                className="max-h-48 min-h-16 w-full resize-y rounded-md border border-input bg-background p-3 text-sm leading-6 focus-visible:ring-2 focus-visible:ring-ring"
+                placeholder={"run:agent-run-42\nhttps://example.test/evidence/123"}
+                onChange={(event) => {
+                  resetIntent();
+                  setArtifactRefs(event.target.value);
                 }}
               />
             </div>
@@ -154,7 +264,7 @@ export function OfferHandoffDialog({
                 disabled={isSubmitting}
                 className="min-h-10 w-full rounded-md border border-input bg-background px-3 text-sm focus-visible:ring-2 focus-visible:ring-ring"
                 onChange={(event) => {
-                  intentRef.current = null;
+                  resetIntent();
                   setExpiration(event.target.value as (typeof EXPIRATIONS)[number]["value"]);
                 }}
               >

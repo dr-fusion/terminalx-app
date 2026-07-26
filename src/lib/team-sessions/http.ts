@@ -15,6 +15,7 @@ import {
   type SessionDetailView,
   type SessionCommand,
   type SessionEvent,
+  type ConversationSearchResultView,
   type SessionInboxItemView,
   type TeamAccessView,
   type TeamSessions,
@@ -659,14 +660,24 @@ function assertHandoffBriefingShape(value: unknown): void {
   if (!isJsonRecord(value)) {
     throw new HttpProblem(400, "invalid-briefing", "Handoff briefing is invalid");
   }
-  const allowedFields = new Set(["summary", "blockers", "artifactRefs"]);
+  const allowedFields = new Set([
+    "summary",
+    "currentState",
+    "blockers",
+    "nextSteps",
+    "artifactRefs",
+  ]);
   if (Object.keys(value).some((field) => !allowedFields.has(field))) {
     throw new HttpProblem(400, "unknown-briefing-field", "Handoff briefing has an unknown field");
   }
   if (typeof value.summary !== "string") {
     throw new HttpProblem(400, "invalid-briefing", "Handoff briefing is invalid");
   }
+  if (value.currentState !== undefined && typeof value.currentState !== "string") {
+    throw new HttpProblem(400, "invalid-briefing", "Handoff briefing is invalid");
+  }
   assertOptionalStringArray(value.blockers);
+  assertOptionalStringArray(value.nextSteps);
   assertOptionalStringArray(value.artifactRefs);
 }
 
@@ -918,6 +929,41 @@ export async function handleSessionEvents(
       limit,
     });
     return jsonResponse({ events: events.map(projectPublicSessionEvent) });
+  });
+}
+
+export async function handleConversationSearch(
+  request: Request,
+  sessionId: string,
+  dependencies: TeamSessionHttpDependencies = {}
+): Promise<Response> {
+  return withHttpErrors(dependencies, async () => {
+    const actor = await requireActor(request, dependencies);
+    const text = singleSearchParam(request, "q");
+    if (text === undefined || text.trim().length === 0) {
+      throw new HttpProblem(400, "invalid-query", "q is required");
+    }
+    if (text.length > 200) {
+      throw new HttpProblem(400, "invalid-query", "q is too long");
+    }
+    const afterSequence = optionalNonNegativeInteger(request, "afterSequence");
+    const limit = optionalNonNegativeInteger(request, "limit", 50);
+    if (limit === 0) {
+      throw new HttpProblem(400, "invalid-query", "limit is invalid");
+    }
+    // The kernel is the visibility fence: an actor without Session access gets an
+    // empty result, so no comment content or existence signal ever crosses a
+    // Session-visibility boundary here.
+    const result: ConversationSearchResultView = await sessions(dependencies).inspect({
+      schemaVersion: TEAM_SESSION_SCHEMA_VERSION,
+      type: "session.conversation-search",
+      actor,
+      sessionId: requireIdentifier(sessionId, "Session id"),
+      text,
+      afterSequence,
+      limit,
+    });
+    return jsonResponse({ search: result });
   });
 }
 
