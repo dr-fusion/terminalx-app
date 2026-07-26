@@ -16,7 +16,7 @@ describe("canonical identity schema", () => {
   it("creates the versioned User and authentication identity authority", () => {
     database = openTeamSessionDatabase({ filename: ":memory:" });
 
-    expect(database.db.pragma("user_version", { simple: true })).toBe(15);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(16);
     expect(
       database.db
         .prepare(
@@ -309,6 +309,13 @@ describe("canonical identity schema", () => {
         DROP TABLE auth_identities;
         DROP TABLE users;
         DROP TABLE identity_migrations;
+        DROP TABLE IF EXISTS yolo_challenges;
+        DROP TABLE IF EXISTS circuit_breaker_state;
+        DROP TABLE IF EXISTS limit_settlements;
+        DROP TABLE IF EXISTS limit_reservations;
+        DROP TABLE IF EXISTS grant_consumptions;
+        DROP TABLE IF EXISTS grant_lineage;
+        DROP TABLE IF EXISTS approval_provenance;
         PRAGMA user_version = 10;
       `);
       database.close();
@@ -316,7 +323,7 @@ describe("canonical identity schema", () => {
 
       database = openTeamSessionDatabase({ filename });
 
-      expect(database.db.pragma("user_version", { simple: true })).toBe(15);
+      expect(database.db.pragma("user_version", { simple: true })).toBe(16);
       expect(database.db.prepare("SELECT id, name FROM teams").all()).toEqual([
         { id: "team-1", name: "Team" },
       ]);
@@ -397,6 +404,13 @@ describe("canonical identity schema", () => {
         DROP TABLE channel_installations;
         DROP TABLE credential_handles;
         DROP TABLE legacy_google_identity_bridges;
+        DROP TABLE IF EXISTS yolo_challenges;
+        DROP TABLE IF EXISTS circuit_breaker_state;
+        DROP TABLE IF EXISTS limit_settlements;
+        DROP TABLE IF EXISTS limit_reservations;
+        DROP TABLE IF EXISTS grant_consumptions;
+        DROP TABLE IF EXISTS grant_lineage;
+        DROP TABLE IF EXISTS approval_provenance;
         PRAGMA user_version = 11;
       `);
       database.close();
@@ -404,7 +418,7 @@ describe("canonical identity schema", () => {
 
       database = openTeamSessionDatabase({ filename });
 
-      expect(database.db.pragma("user_version", { simple: true })).toBe(15);
+      expect(database.db.pragma("user_version", { simple: true })).toBe(16);
       expect(database.db.prepare("SELECT * FROM legacy_google_identity_bridges").all()).toEqual([
         {
           google_subject: "compatible-subject",
@@ -452,6 +466,13 @@ describe("canonical identity schema", () => {
         DROP TABLE channel_installations;
         DROP TABLE credential_handles;
         DROP TABLE legacy_google_identity_bridges;
+        DROP TABLE IF EXISTS yolo_challenges;
+        DROP TABLE IF EXISTS circuit_breaker_state;
+        DROP TABLE IF EXISTS limit_settlements;
+        DROP TABLE IF EXISTS limit_reservations;
+        DROP TABLE IF EXISTS grant_consumptions;
+        DROP TABLE IF EXISTS grant_lineage;
+        DROP TABLE IF EXISTS approval_provenance;
         PRAGMA user_version = 11;
       `);
       database.close();

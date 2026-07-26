@@ -299,4 +299,57 @@ describe("Runtime circuit breaker", () => {
       reason: "proposal_unchanged",
     });
   });
+
+  describe("durable snapshot and restore", () => {
+    it("rehydrates an open circuit and denied proposals across a fresh process", () => {
+      const first = createRuntimeCircuitBreaker({ ttlMs: 100_000 });
+      const proposal = { type: "deploy", payload: { environment: "production" } };
+      for (let i = 0; i < RUNTIME_CIRCUIT_BREAKER_FAILURE_THRESHOLD; i += 1) {
+        first.recordFailure("session:one", TIMEOUT_FAILURE, 1_000);
+      }
+      first.recordDeniedProposal("session:one", proposal, 1_000);
+      expect(first.status("session:one", 1_000).state).toBe("open");
+
+      const snapshot = first.snapshotScope("session:one", 1_000);
+      expect(snapshot?.open?.expiresAtMs).toBe(101_000);
+      expect(snapshot?.deniedProposals).toHaveLength(1);
+
+      const revived = createRuntimeCircuitBreaker({ ttlMs: 100_000 });
+      revived.loadScope(snapshot!, 2_000);
+      expect(revived.status("session:one", 2_000).state).toBe("open");
+      expect(revived.evaluateProposal("session:one", proposal, 2_000)).toMatchObject({
+        allowed: false,
+      });
+    });
+
+    it("drops entries that expired while the process was down and returns null when empty", () => {
+      const first = createRuntimeCircuitBreaker({ ttlMs: 5_000 });
+      first.recordFailure("session:one", TIMEOUT_FAILURE, 1_000);
+      const snapshot = first.snapshotScope("session:one", 1_000);
+      expect(snapshot).not.toBeNull();
+
+      const revived = createRuntimeCircuitBreaker({ ttlMs: 5_000 });
+      revived.loadScope(snapshot!, 1_000_000);
+      expect(revived.snapshotScope("session:one", 1_000_001)).toBeNull();
+      expect(first.snapshotScope("session:two", 1_000)).toBeNull();
+    });
+
+    it("refuses to load over live state and rejects malformed snapshots", () => {
+      const breaker = createRuntimeCircuitBreaker({ ttlMs: 5_000 });
+      breaker.recordFailure("session:one", TIMEOUT_FAILURE, 1_000);
+      const snapshot = breaker.snapshotScope("session:one", 1_000)!;
+      expect(() => breaker.loadScope(snapshot, 1_000)).toThrow(RuntimeCircuitBreakerInputError);
+
+      const fresh = createRuntimeCircuitBreaker({ ttlMs: 5_000 });
+      expect(() =>
+        fresh.loadScope(
+          {
+            ...snapshot,
+            failures: [{ fingerprint: "not-a-fingerprint", count: 1, expiresAtMs: 9_000 }],
+          },
+          1_000
+        )
+      ).toThrow(RuntimeCircuitBreakerInputError);
+    });
+  });
 });

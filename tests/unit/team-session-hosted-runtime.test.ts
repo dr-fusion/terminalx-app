@@ -150,7 +150,7 @@ describe("hosted Team Session Runtime", () => {
     expect(projected?.runtime).not.toHaveProperty("tmuxName");
 
     const database = new Database(filename, { readonly: true });
-    expect(database.pragma("user_version", { simple: true })).toBe(15);
+    expect(database.pragma("user_version", { simple: true })).toBe(16);
     expect(
       database
         .prepare(
@@ -380,6 +380,13 @@ describe("hosted Team Session Runtime", () => {
 
     const v8 = new Database(filename);
     v8.exec(`
+      DROP TABLE IF EXISTS yolo_challenges;
+      DROP TABLE IF EXISTS circuit_breaker_state;
+      DROP TABLE IF EXISTS limit_settlements;
+      DROP TABLE IF EXISTS limit_reservations;
+      DROP TABLE IF EXISTS grant_consumptions;
+      DROP TABLE IF EXISTS grant_lineage;
+      DROP TABLE IF EXISTS approval_provenance;
       DROP TABLE installation_webhook_auth_digests;
       DROP TABLE provider_webhook_deliveries;
       DROP TABLE mobile_auth_migrations;
@@ -475,6 +482,13 @@ describe("hosted Team Session Runtime", () => {
       CREATE INDEX migration_probe_sessions_status ON sessions(status);
       CREATE TRIGGER migration_probe_assignment_insert
       AFTER INSERT ON runtime_assignments BEGIN SELECT 1; END;
+      DROP TABLE IF EXISTS yolo_challenges;
+      DROP TABLE IF EXISTS circuit_breaker_state;
+      DROP TABLE IF EXISTS limit_settlements;
+      DROP TABLE IF EXISTS limit_reservations;
+      DROP TABLE IF EXISTS grant_consumptions;
+      DROP TABLE IF EXISTS grant_lineage;
+      DROP TABLE IF EXISTS approval_provenance;
       PRAGMA user_version = 8;
     `);
     v8.close();
@@ -483,7 +497,7 @@ describe("hosted Team Session Runtime", () => {
     createTeamSessionKernel({ filename: artifactFilename }).teamSessions.close();
     const migrated = new Database(artifactFilename, { readonly: true });
     try {
-      expect(migrated.pragma("user_version", { simple: true })).toBe(15);
+      expect(migrated.pragma("user_version", { simple: true })).toBe(16);
       expect(migrated.pragma("foreign_key_check")).toEqual([]);
       expect(migrated.pragma("quick_check", { simple: true })).toBe("ok");
       expect(
@@ -528,6 +542,13 @@ describe("hosted Team Session Runtime", () => {
     poisoned.exec(`
       DROP TABLE hosted_runtime_assignment_plans;
       DROP TRIGGER runtime_outbox_immutable_update;
+      DROP TABLE IF EXISTS yolo_challenges;
+      DROP TABLE IF EXISTS circuit_breaker_state;
+      DROP TABLE IF EXISTS limit_settlements;
+      DROP TABLE IF EXISTS limit_reservations;
+      DROP TABLE IF EXISTS grant_consumptions;
+      DROP TABLE IF EXISTS grant_lineage;
+      DROP TABLE IF EXISTS approval_provenance;
       PRAGMA user_version = 8;
     `);
     poisoned.prepare(`UPDATE runtime_outbox SET payload_json = ? WHERE session_id = ?`).run(

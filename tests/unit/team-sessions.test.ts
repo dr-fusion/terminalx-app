@@ -590,6 +590,13 @@ describe("Team Session kernel", () => {
     try {
       database.exec(`
         PRAGMA foreign_keys = OFF;
+        DROP TABLE yolo_challenges;
+        DROP TABLE circuit_breaker_state;
+        DROP TABLE limit_settlements;
+        DROP TABLE limit_reservations;
+        DROP TABLE grant_consumptions;
+        DROP TABLE grant_lineage;
+        DROP TABLE approval_provenance;
         DROP TABLE installation_webhook_auth_digests;
         DROP TABLE provider_webhook_deliveries;
         DROP TABLE mobile_auth_migrations;
@@ -2825,7 +2832,7 @@ describe("Team Session kernel", () => {
 
     const database = new Database(filename, { readonly: true });
     try {
-      expect(database.pragma("user_version", { simple: true })).toBe(15);
+      expect(database.pragma("user_version", { simple: true })).toBe(16);
       expect(database.pragma("foreign_key_check")).toEqual([]);
       expect(
         database

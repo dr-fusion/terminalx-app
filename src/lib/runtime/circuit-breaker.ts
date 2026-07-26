@@ -76,6 +76,31 @@ export interface RuntimeCircuitBreakerStatus {
   deniedProposalFingerprints: number;
 }
 
+/**
+ * A durable, transport-safe projection of one scope's live state. It carries
+ * only fingerprints (already opaque digests), counters, and absolute expiry
+ * instants, so it can be persisted verbatim and rehydrated after a restart
+ * without re-deriving anything from raw failures or proposals.
+ */
+export interface RuntimeCircuitBreakerScopeSnapshot {
+  readonly scope: string;
+  readonly failures: ReadonlyArray<{
+    readonly fingerprint: string;
+    readonly count: number;
+    readonly expiresAtMs: number;
+  }>;
+  readonly deniedProposals: ReadonlyArray<{
+    readonly fingerprint: string;
+    readonly expiresAtMs: number;
+  }>;
+  readonly open?: {
+    readonly failureFingerprint: string;
+    readonly expiresAtMs: number;
+  };
+}
+
+const FINGERPRINT = /^runtime-(failure|proposal):v1:[0-9a-f]{64}$/;
+
 interface FailureCounter {
   count: number;
   expiresAtMs: number;
@@ -387,6 +412,94 @@ export class RuntimeCircuitBreaker {
   reset(scope: string): boolean {
     validateScope(scope);
     return this.entries.delete(scope);
+  }
+
+  /**
+   * Durable projection of one scope after pruning expiry at `nowMs`. Returns
+   * `null` when the scope holds no live state, so a persistence layer can
+   * delete the durable row instead of storing an empty entry.
+   */
+  snapshotScope(scope: string, nowMs: number): RuntimeCircuitBreakerScopeSnapshot | null {
+    validateScope(scope);
+    this.validateTimeAndExpiry(nowMs);
+    this.pruneExpired(nowMs);
+    const entry = this.entries.get(scope);
+    if (!entry) return null;
+    return Object.freeze({
+      scope,
+      failures: Object.freeze(
+        [...entry.failures.entries()].map(([fingerprint, counter]) =>
+          Object.freeze({ fingerprint, count: counter.count, expiresAtMs: counter.expiresAtMs })
+        )
+      ),
+      deniedProposals: Object.freeze(
+        [...entry.deniedProposals.entries()].map(([fingerprint, expiresAtMs]) =>
+          Object.freeze({ fingerprint, expiresAtMs })
+        )
+      ),
+      ...(entry.open ? { open: Object.freeze({ ...entry.open }) } : {}),
+    });
+  }
+
+  /**
+   * Rehydrate one scope from a durable snapshot. Any counter, denial, or open
+   * circuit already expired at `nowMs` is dropped. The scope must be empty
+   * (fresh process) or the load fails closed to avoid silently discarding
+   * live in-process state. Malformed snapshots throw rather than admit a
+   * corrupt guard.
+   */
+  loadScope(snapshot: RuntimeCircuitBreakerScopeSnapshot, nowMs: number): void {
+    const scope = validateSnapshotScope(snapshot);
+    this.validateTimeAndExpiry(nowMs);
+    if (this.entries.has(scope)) {
+      throw new RuntimeCircuitBreakerInputError(
+        `Cannot load a durable snapshot over live scope ${scope}`
+      );
+    }
+    this.pruneExpired(nowMs);
+    const failures = new Map<string, FailureCounter>();
+    for (const failure of snapshot.failures) {
+      validateFingerprint(failure.fingerprint, "failure");
+      if (
+        !Number.isSafeInteger(failure.count) ||
+        failure.count < 1 ||
+        failure.count >= RUNTIME_CIRCUIT_BREAKER_FAILURE_THRESHOLD ||
+        failures.has(failure.fingerprint)
+      ) {
+        throw new RuntimeCircuitBreakerInputError("Invalid persisted failure counter");
+      }
+      const expiresAtMs = validateSnapshotExpiry(failure.expiresAtMs);
+      if (expiresAtMs <= nowMs) continue;
+      failures.set(failure.fingerprint, { count: failure.count, expiresAtMs });
+    }
+    const deniedProposals = new Map<string, number>();
+    for (const denial of snapshot.deniedProposals) {
+      validateFingerprint(denial.fingerprint, "proposal");
+      if (deniedProposals.has(denial.fingerprint)) {
+        throw new RuntimeCircuitBreakerInputError("Invalid persisted proposal denial");
+      }
+      const expiresAtMs = validateSnapshotExpiry(denial.expiresAtMs);
+      if (expiresAtMs <= nowMs) continue;
+      deniedProposals.set(denial.fingerprint, expiresAtMs);
+    }
+    let open: OpenCircuit | undefined;
+    if (snapshot.open) {
+      validateFingerprint(snapshot.open.failureFingerprint, "failure");
+      const expiresAtMs = validateSnapshotExpiry(snapshot.open.expiresAtMs);
+      if (expiresAtMs > nowMs) {
+        open = { failureFingerprint: snapshot.open.failureFingerprint, expiresAtMs };
+      }
+    }
+    if (failures.size === 0 && deniedProposals.size === 0 && !open) return;
+    if (
+      failures.size + deniedProposals.size > this.maxFingerprintsPerEntry ||
+      this.entries.size >= this.maxEntries
+    ) {
+      throw new RuntimeCircuitBreakerCapacityError(
+        `Cannot load durable snapshot for scope ${scope}: capacity exceeded`
+      );
+    }
+    this.entries.set(scope, { failures, deniedProposals, ...(open ? { open } : {}) });
   }
 
   private validateTimeAndExpiry(nowMs: number): number {
@@ -737,6 +850,34 @@ function validateText(name: string, value: unknown, maxLength: number): string {
     throw new RuntimeCircuitBreakerInputError(`${name} must be a bounded string without NUL bytes`);
   }
   return value;
+}
+
+function validateSnapshotScope(snapshot: RuntimeCircuitBreakerScopeSnapshot): string {
+  if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) {
+    throw new RuntimeCircuitBreakerInputError("Circuit-breaker snapshot must be an object");
+  }
+  validateScope(snapshot.scope);
+  if (!Array.isArray(snapshot.failures) || !Array.isArray(snapshot.deniedProposals)) {
+    throw new RuntimeCircuitBreakerInputError("Circuit-breaker snapshot is malformed");
+  }
+  return snapshot.scope;
+}
+
+function validateFingerprint(value: unknown, mode: FingerprintMode): void {
+  if (
+    typeof value !== "string" ||
+    !FINGERPRINT.test(value) ||
+    !value.startsWith(`runtime-${mode === "failure" ? "failure" : "proposal"}:v1:`)
+  ) {
+    throw new RuntimeCircuitBreakerInputError("Persisted fingerprint is malformed");
+  }
+}
+
+function validateSnapshotExpiry(value: unknown): number {
+  if (!Number.isSafeInteger(value) || (value as number) < 0) {
+    throw new RuntimeCircuitBreakerInputError("Persisted expiry must be a non-negative integer");
+  }
+  return value as number;
 }
 
 function validateScope(scope: unknown): asserts scope is string {

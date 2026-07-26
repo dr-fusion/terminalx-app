@@ -19,7 +19,7 @@ describe("connection authority schema", () => {
   it("creates an additive v13 authority without secret-bearing columns", () => {
     database = openTeamSessionDatabase({ filename: ":memory:" });
 
-    expect(database.db.pragma("user_version", { simple: true })).toBe(15);
+    expect(database.db.pragma("user_version", { simple: true })).toBe(16);
     const tables = [
       "credential_handles",
       "channel_installations",
@@ -70,6 +70,13 @@ describe("connection authority schema", () => {
         DROP TABLE link_challenges;
         DROP TABLE channel_installations;
         DROP TABLE credential_handles;
+        DROP TABLE IF EXISTS yolo_challenges;
+        DROP TABLE IF EXISTS circuit_breaker_state;
+        DROP TABLE IF EXISTS limit_settlements;
+        DROP TABLE IF EXISTS limit_reservations;
+        DROP TABLE IF EXISTS grant_consumptions;
+        DROP TABLE IF EXISTS grant_lineage;
+        DROP TABLE IF EXISTS approval_provenance;
         PRAGMA user_version = 12;
       `);
       database.close();
@@ -81,7 +88,7 @@ describe("connection authority schema", () => {
       );
       database = openTeamSessionDatabase({ filename });
 
-      expect(database.db.pragma("user_version", { simple: true })).toBe(15);
+      expect(database.db.pragma("user_version", { simple: true })).toBe(16);
       expect(database.db.prepare("SELECT id, name FROM teams").all()).toEqual([
         { id: "team-1", name: "Team" },
       ]);
@@ -124,6 +131,13 @@ describe("connection authority schema", () => {
         DROP TABLE channel_installations;
         DROP TABLE credential_handles;
         CREATE TABLE link_challenges (injected_failure_marker TEXT) STRICT;
+        DROP TABLE IF EXISTS yolo_challenges;
+        DROP TABLE IF EXISTS circuit_breaker_state;
+        DROP TABLE IF EXISTS limit_settlements;
+        DROP TABLE IF EXISTS limit_reservations;
+        DROP TABLE IF EXISTS grant_consumptions;
+        DROP TABLE IF EXISTS grant_lineage;
+        DROP TABLE IF EXISTS approval_provenance;
         PRAGMA user_version = 12;
       `);
       database.close();

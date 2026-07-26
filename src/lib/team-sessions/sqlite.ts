@@ -15,7 +15,7 @@ import { digestRuntimeCompensationIncident } from "../runtime/runtime-compensati
 import { RUNTIME_RECEIPT_OBSERVATION_MAX_CURSOR_CODE_POINTS } from "../runtime/runtime-receipt-observation-contract";
 import { isValidTmuxSessionName } from "../tmux";
 
-const SCHEMA_VERSION = 15;
+const SCHEMA_VERSION = 16;
 const PRE_RUNTIME_START_SCHEMA_VERSION = 4;
 const RUNTIME_START_SCHEMA_VERSION = 5;
 const RUNTIME_RECEIPT_FOLLOW_SCHEMA_VERSION = 6;
@@ -28,6 +28,7 @@ const GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION = 12;
 const CONNECTION_AUTHORITY_SCHEMA_VERSION = 13;
 const WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION = 14;
 const WEBHOOK_AUTH_SCHEMA_VERSION = 15;
+const PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION = 16;
 const APPLICATION_ID = 0x54585331; // "TXS1"
 
 const CANONICAL_IDENTITY_SCHEMA_V11 = `
@@ -1676,6 +1677,260 @@ CREATE TRIGGER installation_webhook_auth_digests_immutable_delete
 BEFORE DELETE ON installation_webhook_auth_digests
 BEGIN
   SELECT RAISE(ABORT, 'Installation webhook authentication digests are immutable');
+END;
+`;
+
+/**
+ * Schema v16 (Phase 9): approval provenance (Gate 4), authoritative limits
+ * (Gate 5), and the YOLO challenge (Gate 6). Every evidence table is
+ * digest-only where it could carry sensitive data and immutable by trigger; the
+ * durable limit ledger is idempotent by Runtime-receipt identity; the YOLO
+ * challenge is a single-use, digest-only row consumed atomically with the
+ * initial Action Grant. `circuit_breaker_state` is the one operational
+ * (upsertable) projection — it is a live durable mirror of the in-process
+ * guard, not an audit record.
+ */
+const PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_V16 = `
+CREATE TABLE approval_provenance (
+  grant_id TEXT PRIMARY KEY REFERENCES action_grants(id) ON DELETE RESTRICT,
+  signing_key_id TEXT NOT NULL CHECK (length(signing_key_id) BETWEEN 1 AND 300),
+  provenance_digest TEXT NOT NULL UNIQUE CHECK (
+    length(provenance_digest) = 64 AND provenance_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  approval_request_id TEXT NOT NULL,
+  approval_request_version INTEGER NOT NULL CHECK (approval_request_version >= 1),
+  grant_state_version INTEGER NOT NULL CHECK (grant_state_version >= 1),
+  actor_kind TEXT NOT NULL CHECK (actor_kind IN ('human', 'system')),
+  actor_ref TEXT NOT NULL CHECK (length(actor_ref) BETWEEN 1 AND 300),
+  action_class TEXT NOT NULL CHECK (action_class IN ('scoped-external', 'protected')),
+  capability_digest TEXT NOT NULL CHECK (
+    length(capability_digest) = 64 AND capability_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  policy_digest TEXT NOT NULL CHECK (
+    length(policy_digest) = 64 AND policy_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  budget_digest TEXT NOT NULL CHECK (
+    length(budget_digest) = 64 AND budget_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  runtime_authorization_generation INTEGER NOT NULL
+    CHECK (runtime_authorization_generation >= 1),
+  signature TEXT NOT NULL CHECK (length(signature) BETWEEN 1 AND 4000),
+  issued_at_ms INTEGER NOT NULL CHECK (issued_at_ms >= 0),
+  expires_at_ms INTEGER NOT NULL CHECK (expires_at_ms > issued_at_ms),
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  FOREIGN KEY (approval_request_id, approval_request_version)
+    REFERENCES approval_requests(id, version) ON DELETE RESTRICT
+) STRICT;
+
+CREATE TRIGGER approval_provenance_immutable_update
+BEFORE UPDATE ON approval_provenance
+BEGIN
+  SELECT RAISE(ABORT, 'Approval provenance is immutable');
+END;
+
+CREATE TRIGGER approval_provenance_immutable_delete
+BEFORE DELETE ON approval_provenance
+BEGIN
+  SELECT RAISE(ABORT, 'Approval provenance is immutable');
+END;
+
+CREATE TABLE grant_lineage (
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  agent_run_id TEXT NOT NULL,
+  successor_grant_id TEXT NOT NULL REFERENCES action_grants(id) ON DELETE RESTRICT,
+  predecessor_grant_id TEXT NOT NULL REFERENCES action_grants(id) ON DELETE RESTRICT,
+  relation TEXT NOT NULL CHECK (relation IN ('reissues', 'supersedes')),
+  grant_review_id TEXT NOT NULL,
+  grant_review_version INTEGER NOT NULL CHECK (grant_review_version >= 1),
+  actor_ref TEXT NOT NULL CHECK (length(actor_ref) BETWEEN 1 AND 300),
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  CHECK (successor_grant_id <> predecessor_grant_id),
+  UNIQUE (successor_grant_id, predecessor_grant_id, relation),
+  FOREIGN KEY (agent_run_id, session_id)
+    REFERENCES agent_runs(id, session_id) ON DELETE RESTRICT,
+  FOREIGN KEY (grant_review_id, grant_review_version)
+    REFERENCES grant_reviews(id, version) ON DELETE RESTRICT
+) STRICT;
+
+CREATE INDEX grant_lineage_by_predecessor ON grant_lineage(predecessor_grant_id);
+CREATE INDEX grant_lineage_by_successor ON grant_lineage(successor_grant_id);
+
+CREATE TRIGGER grant_lineage_immutable_update
+BEFORE UPDATE ON grant_lineage
+BEGIN
+  SELECT RAISE(ABORT, 'Grant lineage is append-only');
+END;
+
+CREATE TRIGGER grant_lineage_immutable_delete
+BEFORE DELETE ON grant_lineage
+BEGIN
+  SELECT RAISE(ABORT, 'Grant lineage is append-only');
+END;
+
+CREATE TABLE grant_consumptions (
+  grant_id TEXT PRIMARY KEY REFERENCES action_grants(id) ON DELETE RESTRICT,
+  effect_idempotency_key TEXT NOT NULL CHECK (length(effect_idempotency_key) BETWEEN 1 AND 500),
+  canonical_effect_input_digest TEXT NOT NULL CHECK (
+    length(canonical_effect_input_digest) = 64
+    AND canonical_effect_input_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  consumption_receipt_digest TEXT NOT NULL UNIQUE CHECK (
+    length(consumption_receipt_digest) = 64
+    AND consumption_receipt_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  actor_ref TEXT NOT NULL CHECK (length(actor_ref) BETWEEN 1 AND 300),
+  consumed_at_ms INTEGER NOT NULL CHECK (consumed_at_ms >= 0)
+) STRICT;
+
+CREATE TRIGGER grant_consumptions_immutable_update
+BEFORE UPDATE ON grant_consumptions
+BEGIN
+  SELECT RAISE(ABORT, 'Grant consumption is recorded exactly once');
+END;
+
+CREATE TRIGGER grant_consumptions_immutable_delete
+BEFORE DELETE ON grant_consumptions
+BEGIN
+  SELECT RAISE(ABORT, 'Grant consumption is recorded exactly once');
+END;
+
+CREATE TABLE limit_reservations (
+  reservation_id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  agent_run_id TEXT NOT NULL,
+  reserve_receipt_digest TEXT NOT NULL UNIQUE CHECK (
+    length(reserve_receipt_digest) = 64 AND reserve_receipt_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  currency TEXT NOT NULL CHECK (currency GLOB '[A-Z][A-Z][A-Z]'),
+  wall_clock_ms INTEGER NOT NULL CHECK (wall_clock_ms >= 0),
+  model_tokens INTEGER NOT NULL CHECK (model_tokens >= 0),
+  model_spend_minor INTEGER NOT NULL CHECK (model_spend_minor >= 0),
+  outbound_bytes INTEGER NOT NULL CHECK (outbound_bytes >= 0),
+  action_local INTEGER NOT NULL CHECK (action_local >= 0),
+  action_scoped_external INTEGER NOT NULL CHECK (action_scoped_external >= 0),
+  action_protected INTEGER NOT NULL CHECK (action_protected >= 0),
+  action_forbidden INTEGER NOT NULL CHECK (action_forbidden >= 0),
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  FOREIGN KEY (agent_run_id, session_id)
+    REFERENCES agent_runs(id, session_id) ON DELETE RESTRICT
+) STRICT;
+
+CREATE INDEX limit_reservations_by_run ON limit_reservations(agent_run_id);
+
+CREATE TRIGGER limit_reservations_immutable_update
+BEFORE UPDATE ON limit_reservations
+BEGIN
+  SELECT RAISE(ABORT, 'Limit reservations are immutable');
+END;
+
+CREATE TRIGGER limit_reservations_immutable_delete
+BEFORE DELETE ON limit_reservations
+BEGIN
+  SELECT RAISE(ABORT, 'Limit reservations are immutable');
+END;
+
+CREATE TABLE limit_settlements (
+  reservation_id TEXT PRIMARY KEY
+    REFERENCES limit_reservations(reservation_id) ON DELETE RESTRICT,
+  disposition TEXT NOT NULL CHECK (disposition IN ('settled', 'released')),
+  settle_receipt_digest TEXT NOT NULL UNIQUE CHECK (
+    length(settle_receipt_digest) = 64 AND settle_receipt_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  currency TEXT NOT NULL CHECK (currency GLOB '[A-Z][A-Z][A-Z]'),
+  wall_clock_ms INTEGER NOT NULL CHECK (wall_clock_ms >= 0),
+  model_tokens INTEGER NOT NULL CHECK (model_tokens >= 0),
+  model_spend_minor INTEGER NOT NULL CHECK (model_spend_minor >= 0),
+  outbound_bytes INTEGER NOT NULL CHECK (outbound_bytes >= 0),
+  action_local INTEGER NOT NULL CHECK (action_local >= 0),
+  action_scoped_external INTEGER NOT NULL CHECK (action_scoped_external >= 0),
+  action_protected INTEGER NOT NULL CHECK (action_protected >= 0),
+  action_forbidden INTEGER NOT NULL CHECK (action_forbidden >= 0),
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  CHECK (
+    disposition = 'settled' OR (
+      wall_clock_ms = 0 AND model_tokens = 0 AND model_spend_minor = 0
+      AND outbound_bytes = 0 AND action_local = 0 AND action_scoped_external = 0
+      AND action_protected = 0 AND action_forbidden = 0
+    )
+  )
+) STRICT;
+
+CREATE TRIGGER limit_settlements_immutable_update
+BEFORE UPDATE ON limit_settlements
+BEGIN
+  SELECT RAISE(ABORT, 'Limit settlements are immutable');
+END;
+
+CREATE TRIGGER limit_settlements_immutable_delete
+BEFORE DELETE ON limit_settlements
+BEGIN
+  SELECT RAISE(ABORT, 'Limit settlements are immutable');
+END;
+
+CREATE TABLE circuit_breaker_state (
+  scope TEXT PRIMARY KEY CHECK (length(scope) BETWEEN 1 AND 256),
+  snapshot_json TEXT NOT NULL CHECK (
+    json_valid(snapshot_json) AND json_type(snapshot_json) = 'object'
+  ),
+  updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= 0)
+) STRICT;
+
+CREATE TABLE yolo_challenges (
+  id TEXT PRIMARY KEY,
+  challenge_digest TEXT NOT NULL UNIQUE CHECK (
+    length(challenge_digest) = 64 AND challenge_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  binding_digest TEXT NOT NULL CHECK (
+    length(binding_digest) = 64 AND binding_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  user_id TEXT NOT NULL CHECK (length(user_id) BETWEEN 1 AND 300),
+  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE RESTRICT,
+  run_policy_digest TEXT NOT NULL CHECK (
+    length(run_policy_digest) = 64 AND run_policy_digest NOT GLOB '*[^0-9a-f]*'
+  ),
+  runtime_assignment_id TEXT NOT NULL,
+  runtime_assignment_generation INTEGER NOT NULL CHECK (runtime_assignment_generation >= 1),
+  sandbox_id TEXT NOT NULL,
+  sandbox_generation INTEGER NOT NULL CHECK (sandbox_generation >= 1),
+  runtime_principal_id TEXT NOT NULL,
+  runtime_authorization_generation INTEGER NOT NULL
+    CHECK (runtime_authorization_generation >= 1),
+  status TEXT NOT NULL CHECK (status IN ('active', 'consumed', 'expired', 'invalidated')),
+  consumed_grant_id TEXT REFERENCES action_grants(id) ON DELETE RESTRICT,
+  issued_at_ms INTEGER NOT NULL CHECK (issued_at_ms >= 0),
+  expires_at_ms INTEGER NOT NULL CHECK (expires_at_ms > issued_at_ms),
+  resolved_at_ms INTEGER,
+  CHECK (
+    (status = 'active' AND consumed_grant_id IS NULL AND resolved_at_ms IS NULL) OR
+    (status = 'consumed' AND consumed_grant_id IS NOT NULL AND resolved_at_ms IS NOT NULL) OR
+    (status IN ('expired', 'invalidated') AND consumed_grant_id IS NULL
+      AND resolved_at_ms IS NOT NULL)
+  )
+) STRICT;
+
+CREATE INDEX yolo_challenges_by_actor_session
+  ON yolo_challenges(user_id, session_id, issued_at_ms);
+CREATE INDEX yolo_challenges_by_boundary
+  ON yolo_challenges(session_id, runtime_assignment_id, runtime_assignment_generation);
+
+CREATE TRIGGER yolo_challenges_immutable_delete
+BEFORE DELETE ON yolo_challenges
+BEGIN
+  SELECT RAISE(ABORT, 'YOLO challenges are single-use and never deleted');
+END;
+
+CREATE TRIGGER yolo_challenges_valid_transition
+BEFORE UPDATE ON yolo_challenges
+WHEN NOT (
+  OLD.status = 'active' AND NEW.status IN ('consumed', 'expired', 'invalidated')
+  AND NEW.id = OLD.id AND NEW.challenge_digest = OLD.challenge_digest
+  AND NEW.binding_digest = OLD.binding_digest AND NEW.user_id = OLD.user_id
+  AND NEW.session_id = OLD.session_id AND NEW.run_policy_digest = OLD.run_policy_digest
+  AND NEW.issued_at_ms = OLD.issued_at_ms AND NEW.expires_at_ms = OLD.expires_at_ms
+)
+BEGIN
+  SELECT RAISE(ABORT, 'Invalid YOLO challenge transition');
 END;
 `;
 
@@ -8700,7 +8955,8 @@ export function openTeamSessionDatabase(
         migratedVersion !== GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION &&
         migratedVersion !== CONNECTION_AUTHORITY_SCHEMA_VERSION &&
         migratedVersion !== WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION &&
-        migratedVersion !== WEBHOOK_AUTH_SCHEMA_VERSION
+        migratedVersion !== WEBHOOK_AUTH_SCHEMA_VERSION &&
+        migratedVersion !== PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION
       ) {
         throw new Error(
           `Unsupported Team Session database schema ${currentVersion}; expected ${SCHEMA_VERSION}`
@@ -8764,6 +9020,10 @@ export function openTeamSessionDatabase(
     const webhookAuthPreparedVersion = db.pragma("user_version", { simple: true }) as number;
     if (webhookAuthPreparedVersion === WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION) {
       migrateWebhookAuthSchemaV15(db);
+    }
+    const phase9PreparedVersion = db.pragma("user_version", { simple: true }) as number;
+    if (phase9PreparedVersion === WEBHOOK_AUTH_SCHEMA_VERSION) {
+      migratePhase9ProvenanceLimitsYoloSchemaV16(db);
     }
 
     const applicationId = db.pragma("application_id", { simple: true }) as number;
@@ -8853,7 +9113,8 @@ function migrateRuntimeStartSchemaV5(db: Database.Database): void {
         currentVersion === GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION ||
         currentVersion === CONNECTION_AUTHORITY_SCHEMA_VERSION ||
         currentVersion === WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION ||
-        currentVersion === WEBHOOK_AUTH_SCHEMA_VERSION
+        currentVersion === WEBHOOK_AUTH_SCHEMA_VERSION ||
+        currentVersion === PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION
       ) {
         return;
       }
@@ -8897,7 +9158,8 @@ function migrateRuntimeReceiptFollowSchemaV6(db: Database.Database): void {
       currentVersion === GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION ||
       currentVersion === CONNECTION_AUTHORITY_SCHEMA_VERSION ||
       currentVersion === WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION ||
-      currentVersion === WEBHOOK_AUTH_SCHEMA_VERSION
+      currentVersion === WEBHOOK_AUTH_SCHEMA_VERSION ||
+      currentVersion === PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION
     ) {
       return;
     }
@@ -8934,7 +9196,8 @@ function migrateRuntimeCompensationSchemaV7(db: Database.Database): void {
       currentVersion === GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION ||
       currentVersion === CONNECTION_AUTHORITY_SCHEMA_VERSION ||
       currentVersion === WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION ||
-      currentVersion === WEBHOOK_AUTH_SCHEMA_VERSION
+      currentVersion === WEBHOOK_AUTH_SCHEMA_VERSION ||
+      currentVersion === PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION
     ) {
       return;
     }
@@ -8974,7 +9237,8 @@ function migrateRuntimeAssignmentOutboxInterlockSchemaV8(db: Database.Database):
       currentVersion === GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION ||
       currentVersion === CONNECTION_AUTHORITY_SCHEMA_VERSION ||
       currentVersion === WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION ||
-      currentVersion === WEBHOOK_AUTH_SCHEMA_VERSION
+      currentVersion === WEBHOOK_AUTH_SCHEMA_VERSION ||
+      currentVersion === PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION
     )
       return;
     if (currentVersion !== RUNTIME_COMPENSATION_SCHEMA_VERSION) {
@@ -9020,7 +9284,8 @@ function migrateHostedRuntimeAssignmentSchemaV9(db: Database.Database): void {
         currentVersion === GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION ||
         currentVersion === CONNECTION_AUTHORITY_SCHEMA_VERSION ||
         currentVersion === WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION ||
-        currentVersion === WEBHOOK_AUTH_SCHEMA_VERSION
+        currentVersion === WEBHOOK_AUTH_SCHEMA_VERSION ||
+        currentVersion === PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION
       )
         return;
       if (currentVersion !== RUNTIME_ASSIGNMENT_OUTBOX_INTERLOCK_SCHEMA_VERSION) {
@@ -9118,7 +9383,8 @@ function migrateProviderBoundEffectActivationSchemaV10(db: Database.Database): v
       currentVersion === GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION ||
       currentVersion === CONNECTION_AUTHORITY_SCHEMA_VERSION ||
       currentVersion === WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION ||
-      currentVersion === WEBHOOK_AUTH_SCHEMA_VERSION
+      currentVersion === WEBHOOK_AUTH_SCHEMA_VERSION ||
+      currentVersion === PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION
     ) {
       return;
     }
@@ -9354,7 +9620,8 @@ function migrateCanonicalIdentitySchemaV11(db: Database.Database): void {
       currentVersion === GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION ||
       currentVersion === CONNECTION_AUTHORITY_SCHEMA_VERSION ||
       currentVersion === WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION ||
-      currentVersion === WEBHOOK_AUTH_SCHEMA_VERSION
+      currentVersion === WEBHOOK_AUTH_SCHEMA_VERSION ||
+      currentVersion === PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION
     )
       return;
     if (currentVersion !== PROVIDER_BOUND_EFFECT_ACTIVATION_SCHEMA_VERSION) {
@@ -9386,7 +9653,8 @@ function migrateGoogleIdentityContinuitySchemaV12(db: Database.Database): void {
       currentVersion === GOOGLE_IDENTITY_CONTINUITY_SCHEMA_VERSION ||
       currentVersion === CONNECTION_AUTHORITY_SCHEMA_VERSION ||
       currentVersion === WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION ||
-      currentVersion === WEBHOOK_AUTH_SCHEMA_VERSION
+      currentVersion === WEBHOOK_AUTH_SCHEMA_VERSION ||
+      currentVersion === PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION
     )
       return;
     if (currentVersion !== CANONICAL_IDENTITY_SCHEMA_VERSION) {
@@ -9448,7 +9716,8 @@ function migrateConnectionAuthoritySchemaV13(db: Database.Database): void {
     if (
       currentVersion === CONNECTION_AUTHORITY_SCHEMA_VERSION ||
       currentVersion === WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION ||
-      currentVersion === WEBHOOK_AUTH_SCHEMA_VERSION
+      currentVersion === WEBHOOK_AUTH_SCHEMA_VERSION ||
+      currentVersion === PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION
     ) {
       return;
     }
@@ -9477,7 +9746,8 @@ function migrateWebhookReplayDedupSchemaV14(db: Database.Database): void {
     const currentVersion = db.pragma("user_version", { simple: true }) as number;
     if (
       currentVersion === WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION ||
-      currentVersion === WEBHOOK_AUTH_SCHEMA_VERSION
+      currentVersion === WEBHOOK_AUTH_SCHEMA_VERSION ||
+      currentVersion === PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION
     ) {
       return;
     }
@@ -9501,7 +9771,11 @@ function migrateWebhookReplayDedupSchemaV14(db: Database.Database): void {
 function migrateWebhookAuthSchemaV15(db: Database.Database): void {
   const migrate = db.transaction(() => {
     const currentVersion = db.pragma("user_version", { simple: true }) as number;
-    if (currentVersion === WEBHOOK_AUTH_SCHEMA_VERSION) return;
+    if (
+      currentVersion === WEBHOOK_AUTH_SCHEMA_VERSION ||
+      currentVersion === PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION
+    )
+      return;
     if (currentVersion !== WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION) {
       throw new Error(
         `Unsupported Team Session database schema ${currentVersion}; expected ${WEBHOOK_REPLAY_DEDUP_SCHEMA_VERSION}`
@@ -9515,6 +9789,28 @@ function migrateWebhookAuthSchemaV15(db: Database.Database): void {
       throw new Error("Team Session v15 migration failed its foreign key check");
     }
     db.pragma(`user_version = ${WEBHOOK_AUTH_SCHEMA_VERSION}`);
+  });
+  migrate.exclusive();
+}
+
+function migratePhase9ProvenanceLimitsYoloSchemaV16(db: Database.Database): void {
+  const migrate = db.transaction(() => {
+    const currentVersion = db.pragma("user_version", { simple: true }) as number;
+    if (currentVersion === PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION) return;
+    if (currentVersion !== WEBHOOK_AUTH_SCHEMA_VERSION) {
+      throw new Error(
+        `Unsupported Team Session database schema ${currentVersion}; expected ${WEBHOOK_AUTH_SCHEMA_VERSION}`
+      );
+    }
+    // Additive Phase 9 evidence + ledger tables. Every new table is empty at
+    // migration time and either immutable-by-trigger or an operational
+    // projection, so no backfill is required.
+    db.exec(PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_V16);
+    const violations = db.pragma("foreign_key_check") as unknown[];
+    if (violations.length > 0) {
+      throw new Error("Team Session v16 migration failed its foreign key check");
+    }
+    db.pragma(`user_version = ${PHASE9_PROVENANCE_LIMITS_YOLO_SCHEMA_VERSION}`);
   });
   migrate.exclusive();
 }

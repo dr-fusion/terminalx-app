@@ -97,16 +97,35 @@ Secret Broker, provider adapter, or closure of Gate 3.
 
 ### Phase 9 — Approval provenance, authoritative limits, and YOLO
 
-Close release Gates 4, 5, and 6.
+Advance release Gates 4, 5, and 6.
 
-- Sign immutable actor, capability, policy, budget, Sandbox, and state snapshots.
-- Model explicit reissue/review lineage and atomic grant usage.
+Status: **mechanism + hermetic evidence complete; real-runtime receipt volume pending Phase 12.**
+The mechanisms and their verification run against the real modules and the hermetic hosted-runtime
+harness and the receipt sources that exist today (the 8D proxy accounting and command receipts).
+The scope and key management are recorded in
+[ADR 0006](../adr/0006-approval-provenance-authoritative-limits-and-yolo-challenge.md).
+
+- Sign immutable actor, capability, policy, budget, Sandbox, and state snapshots — done:
+  Ed25519 approval-provenance snapshots under a dedicated approval key, persisted digest-only and
+  immutable (`approval_provenance`).
+- Model explicit reissue/review lineage and atomic grant usage — done: append-only `grant_lineage`
+  to the authorizing Grant Review version, and exactly-once `grant_consumptions` consumed
+  transactionally with the `consumed` grant-state transition.
 - Reserve and account wall time, tokens/spend, outbound bytes, and action counts from Runtime
-  receipts; fail closed when accounting is unavailable.
-- Persist circuit-breaker state and optional limits, with unlimited as the explicit default.
+  receipts; fail closed when accounting is unavailable — done: the durable
+  `limit_reservations`/`limit_settlements` ledger, idempotent by receipt identity, replaces the
+  `accounting-unavailable` read model with real enforcement that fails closed.
+- Persist circuit-breaker state and optional limits, with unlimited as the explicit default — done:
+  durable `circuit_breaker_state` with snapshot/restore, and canonical `RunLimit` unlimited-default
+  semantics.
 - Implement a server-issued, expiring, one-use, actor/session/policy/Sandbox-bound YOLO challenge
-  consumed atomically with the initial Action Grant.
-- Support revoking all approvals for a changed Sandbox or changed execution boundary.
+  consumed atomically with the initial Action Grant — done, and kept **unexposed** (no browser
+  route) per Gate 6's "Open and unexposed" state; product exposure is a Phase 11 decision.
+- Support revoking all approvals for a changed Sandbox or changed execution boundary — done:
+  generation-fenced invalidation of all outstanding grants and outstanding YOLO challenges.
+
+Gates 4/5/6 CLOSE when Phase 12's real hosted Daytona Runtime drives reservations, provenance, and
+YOLO consumption through this exact machinery at real receipt volume.
 
 ### Phase 10 — Recovery, evidence, and lifecycle completion
 
@@ -153,9 +172,9 @@ Complete the externally usable application around the closed gates.
 | 1. Runtime truth            | 5–7           | Gate 1a complete; Gate 1 open                                                  |
 | 2. Hosted isolation         | 7             | Open                                                                           |
 | 3. Brokered secrets         | 8             | Mechanism + hermetic evidence complete; real-runtime evidence pending Phase 12 |
-| 4. Approval provenance      | 9             | Open                                                                           |
-| 5. Authoritative limits     | 9             | Open                                                                           |
-| 6. YOLO challenge           | 9             | Open and unexposed                                                             |
+| 4. Approval provenance      | 9             | Mechanism + hermetic evidence complete; real-runtime evidence pending Phase 12 |
+| 5. Authoritative limits     | 9             | Mechanism + hermetic evidence complete; real-runtime evidence pending Phase 12 |
+| 6. YOLO challenge           | 9             | Mechanism complete and unexposed; real-runtime evidence pending Phase 12       |
 | 7. Emergency recovery       | 10            | Partial foundation; open                                                       |
 | 8. Event/evidence integrity | 10            | Open                                                                           |
 
