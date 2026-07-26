@@ -168,14 +168,23 @@ Complete the externally usable application around the closed gates. Phase 11 is
 delivered in three sub-slices: 11A (product messaging), 11B (mobile/a11y/
 handoff), 11C (operations/deploy).
 
-Status: **11A and 11B landed; 11C pending.** The attention inbox authority,
-durable cursors, escalation, delivery, and chat completion are recorded in
+Status: **11A, 11B, and 11C landed; Phase 11 complete.** The attention inbox
+authority, durable cursors, escalation, delivery, and chat completion are
+recorded in
 [ADR 0008](../adr/0008-attention-inbox-delivery-cursors-and-escalation.md). 11B
 added mobile navigation, an accessibility pass, structured handoff
 artifacts/blockers, operator error states, and the carried server-side
 conversation search; it needed no durable schema or authority change (the
 handoff briefing extends its existing JSON blob and search reuses the
-`session_events` visibility fence), so it adds no ADR.
+`session_events` visibility fence), so it adds no ADR. 11C added the
+liveness/readiness probes, structured redaction-guarded telemetry, the
+access-controlled Prometheus metrics surface, SLOs/alerts/runbooks, online
+backup/restore with fail-closed pre-migration snapshots and a restore drill, the
+periodic maintenance tick wiring the 11A escalation/delivery adapter, and the
+systemd/PM2/container deployment profiles with canary + migration-aware rollback;
+it added no durable authority (backups, telemetry, and metrics are projections
+over existing durable state, and the maintenance tick only schedules existing
+capabilities), so it adds no ADR.
 
 - Add the global attention inbox, durable read/delivery cursors, deadlines, escalation, and
   Slack/Telegram notification delivery for unavailable steerers. — **11A done**: schema v18
@@ -203,11 +212,30 @@ handoff briefing extends its existing JSON blob and search reuses the
   first-class as an immutable part of the accountable briefing; durable per-blocker _resolution_
   state (mutating individual blockers after the offer) is intentionally deferred because it conflicts
   with the append-only briefing model — a handoff resolves atomically on accept/cancel/expire.
-- Add live/readiness probes, structured telemetry, metrics, SLOs, alerts, and incident runbooks.
+- Add live/readiness probes, structured telemetry, metrics, SLOs, alerts, and incident runbooks. —
+  **11C done**: `/health` (liveness, minimal, non-leaking) and `/api/health/ready` (readiness —
+  SQLite reachable + expected schema + integrity, and the Secret Broker when configured; fails
+  closed with a bare non-leaking status); a structured JSON telemetry logger with levels,
+  request/trace correlation ids, and a redaction guard that drops secret-named fields and scrubs
+  bearer/JWT values (the audit log now routes through it); an access-controlled Prometheus
+  `/api/metrics` (token-or-admin, 404 otherwise) covering request rate/latency/errors, PTY session
+  counts, outbox/worker lag, session counts, and the Gate-5/Gate-8 counters; and SLOs, alert rules,
+  and incident runbooks in `docs/production-readiness/` (`slos.md`, `alerts.md`, `runbooks.md`).
 - Add online backup/restore, pre-migration snapshots, restore drills, retention, and capacity
-  controls.
+  controls. — **11C done**: online backup via SQLite's Online Backup API (never a live-WAL copy),
+  verified restore, an automatic fail-closed pre-migration snapshot hooked into the migration
+  dispatcher (`VACUUM INTO` before any migration mutates the database), a restore drill that backs
+  up → restores → verifies integrity + the Phase 10 event chain over every session, rotation/
+  retention of backups/snapshots/recordings, and documented capacity limits
+  (`docs/production-readiness/backup-restore.md`).
 - Ship production PM2/systemd/container profiles, safe restart behavior, canary rollout, and
-  migration-aware rollback.
+  migration-aware rollback. — **11C done**: `deploy/terminalx.service` (systemd, `KillMode=process`
+  so a restart never kills live tmux/pty), `deploy/ecosystem.config.js` (PM2 fork mode), a hardened
+  container (readiness healthcheck, resource ceilings, Secret Broker sibling template), the periodic
+  maintenance tick driving 11A escalation/delivery through the concrete production adapter plus
+  rotated backups, graceful drain consistent with `graceful-shutdown`, and a canary +
+  migration-aware rollback procedure with a startup rollback guard that refuses an older binary
+  against a newer schema (`docs/production-readiness/deployment.md`, `canary-rollback.md`).
 
 ### Phase 12 — Adversarial verification and release
 

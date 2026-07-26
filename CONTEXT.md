@@ -205,3 +205,31 @@ A single-use, Secret Broker-signed proof that binds one exact Credential Handle 
 expectation to a newly prepared handle. The main process verifies it locally to admit the
 registration; it is never itself persisted, and TerminalX stores only its digest.
 _Avoid_: Token, session, capability
+
+## Operations
+
+**Readiness Probe**:
+The dependency-aware health check that reports whether the node can actually serve — SQLite reachable
+and migrated to the expected schema, integrity-clean, and the Secret Broker ready when configured. It
+fails closed with a bare, non-leaking status so a load balancer holds traffic and no probe discloses
+which dependency is degraded. It is distinct from the minimal liveness check.
+_Avoid_: Health check, ping, status page
+
+**Pre-migration Snapshot**:
+The automatic, fail-closed, transactionally-consistent copy of the database taken by the migration
+dispatcher before any schema migration mutates it, using SQLite's `VACUUM INTO` (never a live-WAL
+copy). It is the recovery point a migration-aware rollback restores from; if it cannot be written,
+the migration is refused.
+_Avoid_: Backup, dump, checkpoint
+
+**Restore Drill**:
+The verification that a backup is recoverable, not merely present: it backs up the live database,
+restores the backup into a throwaway location, and verifies integrity, schema, and the Session Event
+Chain over every session. It only reads the live database through the online backup API.
+_Avoid_: Backup test, dry run
+
+**Maintenance Tick**:
+The periodic server loop that drives existing durable capabilities on a schedule — Attention
+escalation and notification delivery, rotated online backups, and recording pruning. It holds no
+authority of its own; every step is idempotent and fail-closed.
+_Avoid_: Cron job, background task, scheduler

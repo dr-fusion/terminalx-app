@@ -20,8 +20,14 @@ import {
   SESSION_EVENT_CHAIN_SCHEMA,
 } from "./session-event-chain";
 import { isValidTmuxSessionName } from "../tmux";
+import {
+  takePreMigrationSnapshot,
+  type PreMigrationSnapshotInput,
+} from "../ops/pre-migration-snapshot";
 
 const SCHEMA_VERSION = 18;
+/** The schema version this binary understands; the rollback guard compares against it. */
+export const TEAM_SESSION_SCHEMA_VERSION = SCHEMA_VERSION;
 const PRE_RUNTIME_START_SCHEMA_VERSION = 4;
 const RUNTIME_START_SCHEMA_VERSION = 5;
 const RUNTIME_RECEIPT_FOLLOW_SCHEMA_VERSION = 6;
@@ -9260,6 +9266,13 @@ ${RUNTIME_RUN_COMMAND_SCHEMA}
 
 export interface OpenTeamSessionDatabaseOptions {
   filename: string;
+  /**
+   * Called once, before any schema migration mutates an existing on-disk
+   * database, with the source connection and the version transition. It defaults
+   * to a fail-closed pre-migration snapshot (VACUUM INTO). It is never called for
+   * a fresh initialization or a `:memory:` database. Injectable for tests.
+   */
+  onBeforeMigrate?: (input: PreMigrationSnapshotInput) => void;
 }
 
 export interface TeamSessionDatabase {
@@ -9291,6 +9304,35 @@ export function openTeamSessionDatabase(
     db.pragma("foreign_keys = ON");
     db.pragma("recursive_triggers = ON");
     db.pragma("trusted_schema = OFF");
+
+    // Take a fail-closed, transactionally-consistent pre-migration snapshot
+    // before any migration mutates an existing database. A fresh (user_version
+    // 0) or unrecognized file is not snapshotted here — the initializer below
+    // rejects unrecognized files, and a fresh database has nothing to recover.
+    if (resolved !== ":memory:") {
+      // Read the pre-flight version/application id via prepared PRAGMA statements
+      // rather than db.pragma(): this snapshot pre-check must not perturb the
+      // pragma-call sequencing that the concurrent-migration tests rely on.
+      const onDiskVersion = (db.prepare("PRAGMA user_version").get() as { user_version: number })
+        .user_version;
+      const onDiskApplicationId = (
+        db.prepare("PRAGMA application_id").get() as { application_id: number }
+      ).application_id;
+      if (
+        onDiskApplicationId === APPLICATION_ID &&
+        Number.isSafeInteger(onDiskVersion) &&
+        onDiskVersion >= 1 &&
+        onDiskVersion < SCHEMA_VERSION
+      ) {
+        const snapshot = options.onBeforeMigrate ?? takePreMigrationSnapshot;
+        snapshot({
+          db,
+          filename: resolved,
+          fromVersion: onDiskVersion,
+          toVersion: SCHEMA_VERSION,
+        });
+      }
+    }
 
     // Version discovery and first initialization share the same write lock so
     // the Next route bundle and custom server can open a fresh database at the

@@ -52,8 +52,11 @@ USER terminus
 
 EXPOSE 3000
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-  CMD curl -fsS http://localhost:${PORT}/health || exit 1
+# Use the readiness probe: it fails (503) until SQLite is migrated to the expected
+# schema and the Secret Broker (when configured) is ready, so an orchestrator
+# holds traffic until the node can actually serve. Liveness stays at /health.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=25s --retries=3 \
+  CMD curl -fsS http://localhost:${PORT}/api/health/ready || exit 1
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/app/docker-entrypoint.sh"]
 CMD ["./node_modules/.bin/tsx", "server/index.ts"]

@@ -1,7 +1,12 @@
 /**
  * Structured security audit logging for TerminalX.
  * Logs security-sensitive events with timestamp, user, and action context.
+ *
+ * Every context field is passed through the ops redaction guard before it is
+ * serialized, so no secret material, token, credential value, or authorization
+ * header can ever reach the audit stream even if a caller passes one in `detail`.
  */
+import { redactFields } from "./ops/redaction";
 
 export type AuditEvent =
   | "login_success"
@@ -60,7 +65,7 @@ export function audit(event: AuditEvent, context?: Omit<AuditEntry, "timestamp" 
   const entry: AuditEntry = {
     timestamp: new Date().toISOString(),
     event,
-    ...context,
+    ...(context ? redactFields(context) : {}),
   };
   // Structured JSON log to stdout for easy parsing by log aggregators
   console.log(`[audit] ${JSON.stringify(entry)}`);
