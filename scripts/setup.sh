@@ -124,7 +124,14 @@ if [ "$USE_PM2" -eq 1 ]; then
     echo "pm2 is not installed. Install it with: npm install -g pm2" >&2
     exit 1
   fi
-  pm2 start server/index.ts --name terminalx --interpreter ./node_modules/.bin/tsx --update-env
+  # NODE_ENV must be production here. `npm run build` above emits a production
+  # bundle, but the server reads NODE_ENV at startup — without it Next.js boots
+  # in development mode (HMR, eval, source maps) and ignores that build, which
+  # is both slower and unsafe to expose. `npm run start` sets this; pm2 did not.
+  # --update-env carries it into the pm2 process and into the `pm2 save` dump,
+  # so `pm2 resurrect` after a reboot also comes back in production mode.
+  NODE_ENV=production pm2 start server/index.ts --name terminalx \
+    --interpreter ./node_modules/.bin/tsx --update-env
   pm2 save
   echo "TerminalX is running under pm2 as 'terminalx'."
 else
