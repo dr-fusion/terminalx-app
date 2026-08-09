@@ -55,85 +55,85 @@
 
 :root {
   /* Surfaces — near-black, layered */
-  --bg-void:      #05060a;
-  --bg-base:      #0a0b10;
-  --bg-surface:   #0f1117;
-  --bg-raised:    #14161e;
-  --bg-sunken:    #07080c;
+  --bg-void: #05060a;
+  --bg-base: #0a0b10;
+  --bg-surface: #0f1117;
+  --bg-raised: #14161e;
+  --bg-sunken: #07080c;
 
   /* Foregrounds — slightly phosphor-tinted, never pure white */
-  --fg-1:         #e6f0e4;
-  --fg-2:         #a8b3a6;
-  --fg-3:         #6b7569;
-  --fg-4:         #3f4742;
-  --fg-inverse:   #05060a;
+  --fg-1: #e6f0e4;
+  --fg-2: #a8b3a6;
+  --fg-3: #6b7569;
+  --fg-4: #3f4742;
+  --fg-inverse: #05060a;
 
   /* Lines */
-  --line-1:       #1a1d24;
-  --line-2:       #252933;
-  --line-3:       #363b47;
+  --line-1: #1a1d24;
+  --line-2: #252933;
+  --line-3: #363b47;
 
   /* Phosphor — P1 CRT green. The signal. Use sparingly. */
-  --phosphor:          #00ff88;
-  --phosphor-bright:   #4dffa8;
-  --phosphor-dim:      #00cc6e;
-  --phosphor-deep:     #006b3a;
-  --phosphor-ghost:    #002a17;
-  --phosphor-glow:     0 0 12px rgba(0, 255, 136, 0.45);
-  --phosphor-glow-sm:  0 0 6px  rgba(0, 255, 136, 0.35);
+  --phosphor: #00ff88;
+  --phosphor-bright: #4dffa8;
+  --phosphor-dim: #00cc6e;
+  --phosphor-deep: #006b3a;
+  --phosphor-ghost: #002a17;
+  --phosphor-glow: 0 0 12px rgba(0, 255, 136, 0.45);
+  --phosphor-glow-sm: 0 0 6px rgba(0, 255, 136, 0.35);
 
   /* Amber — warn/pending */
-  --amber:        #ffb454;
-  --amber-dim:    #c98a2a;
-  --amber-ghost:  #2a1d0a;
+  --amber: #ffb454;
+  --amber-dim: #c98a2a;
+  --amber-ghost: #2a1d0a;
 
   /* Red — destructive/dead */
-  --red:          #ff5c5c;
-  --red-dim:      #c94444;
-  --red-ghost:    #2a0e0e;
+  --red: #ff5c5c;
+  --red-dim: #c94444;
+  --red-ghost: #2a0e0e;
 
   /* Cyan — info/links */
-  --cyan:         #5ccfe6;
-  --cyan-dim:     #3ca5ba;
-  --cyan-ghost:   #0d2730;
+  --cyan: #5ccfe6;
+  --cyan-dim: #3ca5ba;
+  --cyan-ghost: #0d2730;
 
   /* Magenta — identity / you-are-here */
-  --magenta:      #d58fff;
-  --magenta-dim:  #a76fd0;
-  --magenta-ghost:#1f1328;
+  --magenta: #d58fff;
+  --magenta-dim: #a76fd0;
+  --magenta-ghost: #1f1328;
 
   /* ANSI — real terminal output colors */
-  --ansi-black:      #0a0b10;
-  --ansi-red:        #ff5c5c;
-  --ansi-green:      #00cc6e;
-  --ansi-yellow:     #ffb454;
-  --ansi-blue:       #7aa2ff;
-  --ansi-magenta:    #d58fff;
-  --ansi-cyan:       #5ccfe6;
-  --ansi-white:      #c8d0c6;
-  --ansi-br-black:   #3f4742;
-  --ansi-br-red:     #ff8080;
-  --ansi-br-green:   #4dffa8;
-  --ansi-br-yellow:  #ffd080;
-  --ansi-br-blue:    #a8c0ff;
+  --ansi-black: #0a0b10;
+  --ansi-red: #ff5c5c;
+  --ansi-green: #00cc6e;
+  --ansi-yellow: #ffb454;
+  --ansi-blue: #7aa2ff;
+  --ansi-magenta: #d58fff;
+  --ansi-cyan: #5ccfe6;
+  --ansi-white: #c8d0c6;
+  --ansi-br-black: #3f4742;
+  --ansi-br-red: #ff8080;
+  --ansi-br-green: #4dffa8;
+  --ansi-br-yellow: #ffd080;
+  --ansi-br-blue: #a8c0ff;
   --ansi-br-magenta: #e6b3ff;
-  --ansi-br-cyan:    #8fdff0;
-  --ansi-br-white:   #e6f0e4;
+  --ansi-br-cyan: #8fdff0;
+  --ansi-br-white: #e6f0e4;
 
   /* Glows */
-  --glow-sm:    0 0 6px  rgba(0, 255, 136, 0.35);
-  --glow-md:    0 0 12px rgba(0, 255, 136, 0.45);
-  --glow-lg:    0 0 24px rgba(0, 255, 136, 0.55), 0 0 4px rgba(0, 255, 136, 0.8);
+  --glow-sm: 0 0 6px rgba(0, 255, 136, 0.35);
+  --glow-md: 0 0 12px rgba(0, 255, 136, 0.45);
+  --glow-lg: 0 0 24px rgba(0, 255, 136, 0.55), 0 0 4px rgba(0, 255, 136, 0.8);
   --glow-amber: 0 0 10px rgba(255, 180, 84, 0.4);
-  --glow-red:   0 0 10px rgba(255, 92, 92, 0.45);
+  --glow-red: 0 0 10px rgba(255, 92, 92, 0.45);
 
   /* Motion */
-  --dur-fast:    80ms;
-  --dur-base:    140ms;
-  --dur-slow:    240ms;
-  --ease-out:    cubic-bezier(0.2, 0.7, 0.3, 1);
-  --ease-in:     cubic-bezier(0.7, 0, 0.8, 0.3);
-  --ease-inout:  cubic-bezier(0.5, 0, 0.3, 1);
+  --dur-fast: 80ms;
+  --dur-base: 140ms;
+  --dur-slow: 240ms;
+  --ease-out: cubic-bezier(0.2, 0.7, 0.3, 1);
+  --ease-in: cubic-bezier(0.7, 0, 0.8, 0.3);
+  --ease-inout: cubic-bezier(0.5, 0, 0.3, 1);
 
   /* shadcn aliases — map to the phosphor palette so built-in ui/* inherits */
   --background: var(--bg-base);
@@ -210,7 +210,12 @@
   }
   body {
     @apply bg-background text-foreground;
-    font-feature-settings: "calt" 1, "liga" 1, "ss01" 1, "ss02" 1, "zero" 1;
+    font-feature-settings:
+      "calt" 1,
+      "liga" 1,
+      "ss01" 1,
+      "ss02" 1,
+      "zero" 1;
   }
   html {
     font-family: var(--font-jetbrains-mono), ui-monospace, "SF Mono", Menlo, Consolas, monospace;
@@ -239,22 +244,42 @@
   margin-left: 2px;
   animation: stx-cursor-blink 1.05s steps(2, end) infinite;
 }
-.stx-cursor.bar { width: 2px; height: 1em; }
-.stx-cursor.underscore { width: 0.55em; height: 2px; align-self: flex-end; }
+.stx-cursor.bar {
+  width: 2px;
+  height: 1em;
+}
+.stx-cursor.underscore {
+  width: 0.55em;
+  height: 2px;
+  align-self: flex-end;
+}
 
 @keyframes stx-cursor-blink {
-  0%, 50% { opacity: 1; }
-  50.01%, 100% { opacity: 0; }
+  0%,
+  50% {
+    opacity: 1;
+  }
+  50.01%,
+  100% {
+    opacity: 0;
+  }
 }
 
 /* Phosphor text + glow utilities */
-.text-phosphor { color: var(--phosphor); text-shadow: var(--phosphor-glow-sm); }
-.text-phosphor-dim { color: var(--phosphor-dim); }
+.text-phosphor {
+  color: var(--phosphor);
+  text-shadow: var(--phosphor-glow-sm);
+}
+.text-phosphor-dim {
+  color: var(--phosphor-dim);
+}
 
 /* Subtle scanlines overlay — CRT feel. Pair with position: relative parent. */
-.crt-scanlines { position: relative; }
+.crt-scanlines {
+  position: relative;
+}
 .crt-scanlines::after {
-  content: '';
+  content: "";
   position: absolute;
   inset: 0;
   background: repeating-linear-gradient(
@@ -292,23 +317,36 @@
   padding: 4px;
   background: var(--bg-sunken);
 }
-.xterm-viewport::-webkit-scrollbar { width: 8px; }
-.xterm-viewport::-webkit-scrollbar-track { background: var(--bg-sunken); }
+.xterm-viewport::-webkit-scrollbar {
+  width: 8px;
+}
+.xterm-viewport::-webkit-scrollbar-track {
+  background: var(--bg-sunken);
+}
 .xterm-viewport::-webkit-scrollbar-thumb {
   background: var(--line-2);
   border-radius: 999px;
 }
-.xterm-viewport::-webkit-scrollbar-thumb:hover { background: var(--phosphor-dim); }
+.xterm-viewport::-webkit-scrollbar-thumb:hover {
+  background: var(--phosphor-dim);
+}
 
 /* Slim phosphor scrollbar globally */
 * {
   scrollbar-width: thin;
   scrollbar-color: var(--line-2) transparent;
 }
-*::-webkit-scrollbar { width: 8px; height: 8px; }
-*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
 *::-webkit-scrollbar-thumb {
   background: var(--line-2);
   border-radius: 999px;
 }
-*::-webkit-scrollbar-thumb:hover { background: var(--line-3); }
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--line-3);
+}

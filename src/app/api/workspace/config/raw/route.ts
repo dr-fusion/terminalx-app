@@ -1,11 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
 import * as fs from "fs";
 import * as path from "path";
-import { getUserScoping, canAccessSession } from "@/lib/session-scope";
+import { canAccessSession } from "@/lib/session-scope";
 import { assertNotSensitivePath, resolveSafePath } from "@/lib/file-service";
 import { audit } from "@/lib/audit-log";
 import { parseToml, repoConfigPath, settingsTomlTemplate } from "@/lib/workspace-config";
 import { resolveSessionWorkspace } from "@/lib/workspace-resolve";
+import { resolveRequestActor } from "@/lib/request-actor";
 
 /** Resolve the committed settings.toml path for a session or explicit repoRoot. */
 function resolveTargetPath(session: string | null, repoRootParam: string | null): string | null {
@@ -27,14 +28,14 @@ function resolveTargetPath(session: string | null, repoRootParam: string | null)
  * Returns the raw committed settings.toml (or a seed template when missing).
  */
 export async function GET(req: NextRequest) {
-  const { hasIdentity, username, role } = getUserScoping(req.headers);
-  if (!hasIdentity) {
+  const actor = await resolveRequestActor(req.headers);
+  if (!actor) {
     return NextResponse.json({ error: "Access denied" }, { status: 403 });
   }
   const session = req.nextUrl.searchParams.get("session");
   const repoRootParam = req.nextUrl.searchParams.get("repoRoot");
 
-  if (session && !canAccessSession(username, role, session)) {
+  if (session && !canAccessSession(actor.username, actor.legacyRole, session)) {
     return NextResponse.json({ error: "Access denied" }, { status: 403 });
   }
 
@@ -46,7 +47,7 @@ export async function GET(req: NextRequest) {
     let content = "";
     let exists = false;
     try {
-      content = fs.readFileSync(target, "utf-8");
+      content = fs.readFileSync(/* turbopackIgnore: true */ target, "utf-8");
       exists = true;
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
@@ -74,8 +75,8 @@ export async function PUT(req: NextRequest) {
       { status: 403 }
     );
   }
-  const { hasIdentity, username, role } = getUserScoping(req.headers);
-  if (!hasIdentity) {
+  const actor = await resolveRequestActor(req.headers);
+  if (!actor) {
     return NextResponse.json({ error: "Access denied" }, { status: 403 });
   }
 
@@ -88,7 +89,7 @@ export async function PUT(req: NextRequest) {
   if (typeof body.content !== "string") {
     return NextResponse.json({ error: "content must be a string" }, { status: 400 });
   }
-  if (body.session && !canAccessSession(username, role, body.session)) {
+  if (body.session && !canAccessSession(actor.username, actor.legacyRole, body.session)) {
     return NextResponse.json({ error: "Access denied" }, { status: 403 });
   }
 
@@ -107,10 +108,15 @@ export async function PUT(req: NextRequest) {
     if (!target) {
       return NextResponse.json({ error: "session or repoRoot is required" }, { status: 400 });
     }
-    fs.mkdirSync(path.dirname(target), { recursive: true });
-    fs.writeFileSync(target, body.content, { encoding: "utf-8", mode: 0o644 });
+    const targetDirectory = path.dirname(/* turbopackIgnore: true */ target);
+    fs.mkdirSync(/* turbopackIgnore: true */ targetDirectory, { recursive: true });
+    fs.writeFileSync(/* turbopackIgnore: true */ target, body.content, {
+      encoding: "utf-8",
+      mode: 0o644,
+    });
     audit("workspace_config_edited", {
-      username: username || undefined,
+      username: actor.username,
+      userId: actor.userId,
       detail: target,
     });
     return NextResponse.json({ success: true, path: target });

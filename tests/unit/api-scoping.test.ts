@@ -36,6 +36,12 @@ async function loadLogsRoute() {
   return await import("@/app/api/logs/route");
 }
 
+async function authenticatedRequest(username: string, role: string) {
+  const { signJwt } = await import("@/lib/auth");
+  const token = await signJwt({ userId: "single-user", username, role });
+  return mockRequest({ cookie: `terminalx-session=${token}` });
+}
+
 async function loadFilesRoute() {
   return await import("@/app/api/files/route");
 }
@@ -98,23 +104,30 @@ describe("logs GET admin gate", () => {
     delete process.env.TERMINALX_AUTH_MODE;
   });
 
-  it("returns empty list for non-admin in local mode", async () => {
+  it("returns empty list for an authenticated non-admin in local mode", async () => {
     process.env.TERMINALX_AUTH_MODE = "local";
     const { GET } = await loadLogsRoute();
-    const res = await GET(mockRequest({ "x-username": "alice", "x-user-role": "user" }));
+    const res = await GET(await authenticatedRequest("alice", "user"));
     const body = await res.json();
     expect(body.files).toEqual([]);
   });
 
-  it("returns files for admin in local mode", async () => {
+  it("returns files for a freshly verified admin in local mode", async () => {
     process.env.TERMINALX_AUTH_MODE = "local";
     const { GET } = await loadLogsRoute();
-    const res = await GET(mockRequest({ "x-username": "root", "x-user-role": "admin" }));
+    const res = await GET(await authenticatedRequest("root", "admin"));
     // We don't assert contents (depends on TERMINUS_LOG_PATHS on this host),
     // only that the guard doesn't short-circuit for admins.
     const body = await res.json();
     expect(body).toHaveProperty("files");
     expect(Array.isArray(body.files)).toBe(true);
+  });
+
+  it("rejects spoofed identity headers", async () => {
+    process.env.TERMINALX_AUTH_MODE = "local";
+    const { GET } = await loadLogsRoute();
+    const res = await GET(mockRequest({ "x-username": "root", "x-user-role": "admin" }));
+    expect(res.status).toBe(401);
   });
 });
 

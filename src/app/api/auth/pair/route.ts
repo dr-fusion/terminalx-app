@@ -4,6 +4,7 @@ import { consumePairingCode } from "@/lib/pairing";
 import { registerDevice } from "@/lib/devices";
 import { audit } from "@/lib/audit-log";
 import { isRateLimited } from "@/lib/rate-limit";
+import { trustProxyHeaders } from "@/lib/security-config";
 
 // POST /api/auth/pair
 // Public endpoint. Body: { code, deviceName }. Exchanges a one-time pairing
@@ -14,10 +15,11 @@ import { isRateLimited } from "@/lib/rate-limit";
 export async function POST(req: NextRequest) {
   // Rate-limit pair attempts per source IP to slow brute force of the code
   // space (even though codes are 24 bytes of randomness, this is cheap insurance).
-  const ip =
-    req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ||
-    req.headers.get("x-real-ip") ||
-    "unknown";
+  const ip = trustProxyHeaders()
+    ? req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ||
+      req.headers.get("x-real-ip") ||
+      "unknown"
+    : "direct-client";
   if (isRateLimited(`pair:${ip}`)) {
     audit("rate_limited", { detail: `pair from ${ip}` });
     return NextResponse.json({ error: "Too many attempts. Try again later." }, { status: 429 });
@@ -62,10 +64,13 @@ export async function POST(req: NextRequest) {
   const expiresAt = Date.now() + 24 * 60 * 60 * 1000;
   audit("pair_success", { username: consumed.username, detail: device.id });
 
-  return NextResponse.json({
-    token,
-    expiresAt,
-    deviceId: device.id,
-    user: { id: consumed.userId, name: consumed.username },
-  });
+  return NextResponse.json(
+    {
+      token,
+      expiresAt,
+      deviceId: device.id,
+      user: { id: consumed.userId, name: consumed.username },
+    },
+    { headers: { "Cache-Control": "no-store, max-age=0" } }
+  );
 }

@@ -36,6 +36,8 @@ On a brand-new Linux host with nothing pre-installed, install the system prerequ
 # 1. System packages: git, tmux, and node-pty build tools
 sudo apt-get update
 sudo apt-get install -y git tmux build-essential python3 curl ca-certificates
+# Also install CMake when enabling optional Telegram voice transcription:
+sudo apt-get install -y cmake
 
 # 2. Node.js 20+ (NodeSource); skip if Node 20+ is already present
 curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
@@ -50,7 +52,7 @@ cd terminalx-app-mono
 npm run setup            # add --pm2 to run under PM2, --with-whisper for voice notes
 ```
 
-On macOS, install the equivalents with Homebrew (`brew install git tmux node`) plus the Xcode command-line tools (`xcode-select --install`), then run steps 3–4.
+On macOS, install the equivalents with Homebrew (`brew install git tmux node cmake`) plus the Xcode command-line tools (`xcode-select --install`), then run steps 3–4. CMake is only required for optional Telegram voice transcription.
 
 > AI-CLI session kinds also need the `claude` and/or `codex` CLI installed on the host `PATH` **and logged in** — that login is shared across all TerminalX users on the machine. Install and authenticate them separately from this app.
 
@@ -135,6 +137,19 @@ LocalTmux is still trusted, single-host execution—not a Sandbox or a tenant-is
 
 Tmux preserves already-running processes across application upgrades. After upgrading from a version that launched Claude with `--dangerously-skip-permissions` or Codex with `--yolo`, stop and recreate those managed AI sessions; changing the launcher cannot alter an existing process's arguments.
 
+### Collaborative Team Sessions
+
+Set `TERMINALX_MULTIPLAYER_ENABLED=true` and use the custom `npm run dev` or `npm start` server to activate the canonical Team Session Runtime and WebSocket transports. Canonical clients address the Session UUID—not a tmux name—at `/ws/team-sessions/:sessionId/terminal` and `/ws/team-sessions/:sessionId/events`. The HTTP API is under `/api/team-sessions`.
+
+Enabling this mode disables the legacy direct `/ws/terminal/:tmuxName` upgrade path. Browser connections require same-origin cookie authentication; non-browser clients may use a Bearer header. Credentials are re-verified throughout long-lived connections, and every terminal mutation is checked against the current Control epoch and Runtime authorization generation. Each canonical Session runs on its own derived tmux server socket, so a tmux client cannot navigate into another Team Session. LocalTmux remains a trusted shared-host Runtime, not a Sandbox boundary: processes still run as the same host user and therefore require mutually trusted collaborators.
+
+Agent Run contracts and safe read state are being introduced behind additional release gates.
+See [Phase 4 Agent Run release gates](docs/multiplayer/phase-4-release-gates.md) for the Runtime
+truth, Daytona isolation, secret-broker, approval, limit-accounting, YOLO, and emergency-recovery
+work required before those mutations can be exposed.
+
+The public API exposes actor-scoped discovery at `/api/team-sessions/discovery`, a minimized Session inbox at `/api/team-sessions`, and Session detail and ordered event catch-up under `/api/team-sessions/sessions/:sessionId`. Conversation mutations are explicit Comments, Suggestions, Suggestion resolutions, or queued Directives; arbitrary chat text is never inferred to be executable. Shared Steering serializes Directives by canonical Session sequence while raw terminal input remains Controller-only. Pending queues are operationally bounded to 64 Directives per author and 256 per Session so access revocation remains finite and atomic. These queue safety ceilings are separate from user-configured Agent Run limits, which are not implemented by the LocalTmux Runtime.
+
 ## Configuration
 
 All settings via environment variables. See [`.env.example`](.env.example) for the full list.
@@ -151,6 +166,9 @@ All settings via environment variables. See [`.env.example`](.env.example) for t
 | `TERMINUS_SCROLLBACK`                | `10000`                               | tmux scrollback history lines                                                                                        |
 | `TERMINUS_LOG_PATHS`                 | `/var/log,~/.pm2/logs`                | Log directories to scan                                                                                              |
 | `TERMINUS_RECORD_SESSIONS`           | `false`                               | Record every PTY session to `data/recordings/*.jsonl` for replay (⚠ captures everything you type, including secrets) |
+| `TERMINALX_MULTIPLAYER_ENABLED`      | `false`                               | Enable canonical Team Sessions/Runtime and disable the legacy direct terminal WebSocket                              |
+| `TERMINALX_TEAM_SESSION_DB_PATH`     | `data/team-sessions.sqlite`           | Private SQLite state for Teams, Projects, Sessions, access, events, and Runtime outbox                               |
+| `TERMINALX_TMUX_SOCKET_NAME`         | `terminalx-multiplayer`               | Namespace used to derive one isolated tmux server socket per canonical Team Session                                  |
 | `TERMINALX_AUTH_MODE`                | `local`                               | Auth mode: `local`, `password`, or `google`. `none` is refused at startup                                            |
 | `TERMINALX_PUBLIC_URL`               | —                                     | Canonical external URL for OAuth and redirects behind a proxy                                                        |
 | `TERMINALX_TRUST_PROXY_HEADERS`      | `false`                               | Trust `X-Forwarded-*` headers only when a trusted proxy overwrites them                                              |
@@ -205,11 +223,22 @@ Authenticated admins can inspect it through `GET /api/telegram/messages`. Result
 /api/telegram/messages?routingStatus=mismatch&includeContent=true&limit=50
 ```
 
-Voice notes sent inside a session topic are downloaded by the bot, converted with the bundled ffmpeg binary, transcribed locally with whisper.cpp, and sent to the bound tmux session as normal text input. Install the default small native model with:
+Voice notes sent inside a session topic are downloaded by the bot, converted with ffmpeg, transcribed locally with whisper.cpp, and sent to the bound tmux session as normal text input. The setup command clones the official upstream into a fresh staging directory at exact commit `23ee03506a91ac3d3f0071b40e66a430eebdfa1d` (v1.8.6), builds a static CLI, and installs it under the ignored `data/tools/whisper.cpp` development tool root. Models come from immutable Hugging Face revision `5359861c739e955e79d9a303bcbc70fb988958b1`; every supported model has an exact size and SHA-256 pin in [`config/whisper-artifacts.json`](config/whisper-artifacts.json). Downloads use a same-directory temporary file and become active only after verification. Install the default model with:
 
 ```bash
 npm run setup:whisper -- tiny.en
 ```
+
+Development verifies the generated runtime manifest plus the binary and model bytes before every first use. Production fails closed unless the server is non-root and the trust root, manifest, binary, model, their directories, and all directory ancestors are root-owned without group/world write access. ffmpeg receives the same production ownership/ancestry checks. Promote the verified development artifacts into one protected tree (all explicit paths must remain descendants of `TERMINALX_WHISPER_CPP_ROOT`):
+
+```bash
+sudo install -d -o root -g root -m 0755 /opt/terminalx-whisper/bin /opt/terminalx-whisper/models
+sudo install -o root -g root -m 0555 data/tools/whisper.cpp/bin/whisper-cli /opt/terminalx-whisper/bin/whisper-cli
+sudo install -o root -g root -m 0444 data/tools/whisper.cpp/models/ggml-tiny.en.bin /opt/terminalx-whisper/models/ggml-tiny.en.bin
+sudo install -o root -g root -m 0444 data/tools/whisper.cpp/runtime-manifest.json /opt/terminalx-whisper/runtime-manifest.json
+```
+
+Set `TERMINALX_WHISPER_CPP_ROOT=/opt/terminalx-whisper` and `TERMINALX_FFMPEG_PATH=/usr/bin/ffmpeg`; production deliberately has no bundled ffmpeg fallback, so this explicit root-owned system decoder must be kept on the operating system's security-patch cadence. The default binary, model, and manifest locations then resolve inside the Whisper root. If explicit paths are used, keep all three beneath the same canonical root. Native children receive a small OS-only environment allowlist rather than server secrets, audio is capped at 50 MiB/10 minutes, command output and time are bounded, and the process-wide concurrency limit defaults to one (`TERMINALX_TELEGRAM_TRANSCRIBE_MAX_CONCURRENCY`, maximum four).
 
 ## How It Compares
 

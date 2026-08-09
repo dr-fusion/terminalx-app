@@ -10,3 +10,12 @@ data/
 .env*
 .claude/
 .gstack/
+.conductor/
+.github/
+.husky/
+coverage/
+playwright-report/
+test-results/
+tests/
+*.log
+*.tsbuildinfo

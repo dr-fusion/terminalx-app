@@ -23,10 +23,11 @@ import {
   removeOpenCodeProviderConfig,
   writeOpenCodeProviderConfig,
 } from "@/lib/harnesses/settings-toml";
-import { canAccessSession, getUserScoping } from "@/lib/session-scope";
+import { canAccessSession } from "@/lib/session-scope";
 import { assertNotSensitivePath, resolveSafePath } from "@/lib/file-service";
 import { resolveSessionWorkspace } from "@/lib/workspace-resolve";
 import { audit } from "@/lib/audit-log";
+import { resolveRequestActor } from "@/lib/request-actor";
 
 type Scope = "user" | "repo";
 
@@ -96,8 +97,8 @@ export async function GET(req: NextRequest) {
     // ?configured=1 → the user/repo-scoped configured providers + counts that
     // back the OpenCode panel's "N configured" / "N selected" labels.
     if (configured) {
-      const { hasIdentity, username, role } = getUserScoping(req.headers);
-      if (!hasIdentity) {
+      const actor = await resolveRequestActor(req.headers);
+      if (!actor) {
         return NextResponse.json({ error: "Access denied" }, { status: 403 });
       }
       const scope: Scope = isScope(params.get("scope")) ? (params.get("scope") as Scope) : "repo";
@@ -106,7 +107,7 @@ export async function GET(req: NextRequest) {
         repoRoot = resolveRepoRoot(
           scope,
           { repoRoot: params.get("repoRoot"), session: params.get("session") },
-          { username, role }
+          { username: actor.username, role: actor.legacyRole }
         );
       } catch {
         // No resolvable repo (e.g. no worktree-backed session yet) → empty, not an error.
@@ -150,8 +151,8 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  const { hasIdentity, username, role } = getUserScoping(req.headers);
-  if (!hasIdentity) {
+  const actor = await resolveRequestActor(req.headers);
+  if (!actor) {
     return NextResponse.json({ error: "Access denied" }, { status: 403 });
   }
 
@@ -192,13 +193,17 @@ export async function POST(req: NextRequest) {
   }
 
   try {
-    const repoRoot = resolveRepoRoot(scope, body, { username, role });
+    const repoRoot = resolveRepoRoot(scope, body, {
+      username: actor.username,
+      role: actor.legacyRole,
+    });
     // NB: apiKey/token/etc are intentionally NOT read off the body — TerminalX
     // persists no secret (AC-7/AC-10); only the non-secret instance is written.
     writeOpenCodeProviderConfig({ providerId, endpoint, models, scope }, repoRoot);
     const config = readOpenCodeProviderConfig(repoRoot, scope);
     audit("opencode_provider_configured", {
-      username: username || undefined,
+      username: actor.username,
+      userId: actor.userId,
       detail: `${providerId} (${scope})`,
     });
     return NextResponse.json({
@@ -231,8 +236,8 @@ export async function DELETE(req: NextRequest) {
     );
   }
 
-  const { hasIdentity, username, role } = getUserScoping(req.headers);
-  if (!hasIdentity) {
+  const actor = await resolveRequestActor(req.headers);
+  if (!actor) {
     return NextResponse.json({ error: "Access denied" }, { status: 403 });
   }
 
@@ -248,12 +253,13 @@ export async function DELETE(req: NextRequest) {
     const repoRoot = resolveRepoRoot(
       scope,
       { repoRoot: params.get("repoRoot"), session: params.get("session") },
-      { username, role }
+      { username: actor.username, role: actor.legacyRole }
     );
     removeOpenCodeProviderConfig(providerId, repoRoot, scope);
     const config = readOpenCodeProviderConfig(repoRoot, scope);
     audit("opencode_provider_removed", {
-      username: username || undefined,
+      username: actor.username,
+      userId: actor.userId,
       detail: `${providerId} (${scope})`,
     });
     return NextResponse.json({

@@ -41,7 +41,9 @@ export function resolveSessionModelSettings(
   repoRoot: string | null | undefined
 ): SessionModelSettings {
   const user = safe(() => readUserSettings()?.models, undefined);
-  const repo = repoRoot ? safe(() => readRepoSettings(repoRoot).settings.models, undefined) : undefined;
+  const repo = repoRoot
+    ? safe(() => readRepoSettings(repoRoot).settings.models, undefined)
+    : undefined;
 
   const resolved = resolveModelSettings(user, repo);
   return {

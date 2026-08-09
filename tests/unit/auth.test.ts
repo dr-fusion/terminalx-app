@@ -173,4 +173,24 @@ describe("/api/auth/me", () => {
     const res = await GET(req);
     expect(res.status).toBe(401);
   });
+
+  it("returns the canonical user id needed for attributed collaboration", async () => {
+    process.env.TERMINALX_AUTH_MODE = "local";
+    const token = await signJwt({ userId: "single-user", username: "alice", role: "user" });
+    const { GET } = await import("@/app/api/auth/me/route");
+    const req = {
+      headers: {
+        get: (name: string) =>
+          name.toLowerCase() === "cookie" ? `terminalx-session=${token}` : null,
+      },
+    } as never;
+
+    const res = await GET(req);
+    await expect(res.json()).resolves.toMatchObject({
+      userId: "single-user",
+      username: "alice",
+      displayName: "alice",
+      role: "user",
+    });
+  });
 });

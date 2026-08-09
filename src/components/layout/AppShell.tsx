@@ -4,7 +4,15 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { useParams, usePathname } from "next/navigation";
 import { useRouter } from "next/navigation";
-import { ChevronRight, History, Plus, RotateCcw, Settings, Terminal } from "lucide-react";
+import {
+  ChevronRight,
+  History,
+  Plus,
+  RotateCcw,
+  Settings,
+  Terminal,
+  UsersRound,
+} from "lucide-react";
 import { TopNav } from "./TopNav";
 import { StatusBar } from "./StatusBar";
 // Project sidebar (#12): the left rail groups workspaces under their project
@@ -19,6 +27,7 @@ import { useOpenTabs } from "@/hooks/useOpenTabs";
 import { useSessions } from "@/hooks/useSessions";
 
 const SIDEBAR_LINKS = [
+  { href: "/team-sessions", label: "Team sessions", icon: UsersRound },
   { href: "/playground", label: "Playground", icon: Terminal },
   { href: "/replay", label: "Replays", icon: RotateCcw },
   { href: "/settings", label: "Settings", icon: Settings },
@@ -135,6 +144,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const [hostname, setHostname] = useState("…");
   const params = useParams();
   const path = usePathname();
+  const isTeamSessionsPath = path === "/team-sessions" || path.startsWith("/team-sessions/");
   const { tabs, reconcileTabs } = useOpenTabs();
   const { sessionNames, hasLoadedSuccessfully } = useSessions();
 
@@ -176,13 +186,17 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const activeSession =
     typeof params?.session === "string"
       ? params.session
-      : path.startsWith("/workspace/")
-        ? decodeURIComponent(path.split("/")[2] ?? "")
-        : null;
+      : isTeamSessionsPath && typeof params?.sessionId === "string"
+        ? params.sessionId
+        : path.startsWith("/workspace/")
+          ? decodeURIComponent(path.split("/")[2] ?? "")
+          : null;
 
   return (
     <div className="flex h-dvh w-screen overflow-hidden bg-[#05060a] text-[#e6f0e4]">
-      <LeftSidebar activeSession={activeSession} onOpenPalette={() => setPaletteOpen(true)} />
+      {isTeamSessionsPath ? null : (
+        <LeftSidebar activeSession={activeSession} onOpenPalette={() => setPaletteOpen(true)} />
+      )}
       <section className="flex min-w-0 flex-1 flex-col border-r border-[#1a1d24] bg-[#0a0b10]">
         <TopNav
           hostname={hostname}
@@ -192,14 +206,16 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         <main className="min-h-0 flex-1 overflow-hidden">{children}</main>
         <StatusBar hostname={hostname} session={activeSession} tabCount={tabs.length} />
       </section>
-      <aside className="hidden h-full w-[360px] shrink-0 flex-col bg-[#0a0b10] xl:flex 2xl:w-[400px]">
-        <div className="min-h-0 flex-1">
-          {/* feature #2: ReviewPanel (All files / Changes / Checks / Review),
-              scoped to the active session. The Changes tab is the diff viewer. */}
-          <ReviewPanel session={activeSession} />
-        </div>
-        <InspectorTerminal activeSession={activeSession} />
-      </aside>
+      {isTeamSessionsPath ? null : (
+        <aside className="hidden h-full w-[360px] shrink-0 flex-col bg-[#0a0b10] xl:flex 2xl:w-[400px]">
+          <div className="min-h-0 flex-1">
+            {/* feature #2: ReviewPanel (All files / Changes / Checks / Review),
+                scoped to the active session. The Changes tab is the diff viewer. */}
+            <ReviewPanel session={activeSession} />
+          </div>
+          <InspectorTerminal activeSession={activeSession} />
+        </aside>
+      )}
       <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} />
     </div>
   );

@@ -133,7 +133,7 @@ export async function runSetup(opts: {
   try {
     createSession(setupName, wrapped, opts.cwd);
     ({ timedOut } = await waitForSessionExit(setupName, opts.timeoutSeconds));
-  } catch (err) {
+  } catch {
     await patchSetupStatus(opts.sessionName, {
       status: "failed",
       finishedAt: now(),

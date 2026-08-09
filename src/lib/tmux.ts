@@ -11,6 +11,8 @@ export interface TmuxSession {
 
 const TMUX_BIN = "tmux";
 const TERMINALX_MANAGED_OPTION = "@terminalx_managed";
+export const TMUX_SESSION_NAME_MAX_LENGTH = 128;
+const TMUX_SESSION_NAME_PATTERN = /^[a-zA-Z0-9_.-]+$/;
 
 /**
  * Capture the last N lines of a session's scrollback as a single chunk,
@@ -120,13 +122,22 @@ export function applyGlobalOptions(historyLimit = 50000): void {
   }
 }
 
+export function isValidTmuxSessionName(name: unknown): name is string {
+  return (
+    typeof name === "string" &&
+    name.length > 0 &&
+    name.length <= TMUX_SESSION_NAME_MAX_LENGTH &&
+    TMUX_SESSION_NAME_PATTERN.test(name)
+  );
+}
+
 function sanitizeSessionName(name: string): string {
   // tmux session names: alphanumeric, underscore, hyphen, dot
-  if (!/^[a-zA-Z0-9_.\-]+$/.test(name)) {
+  if (!TMUX_SESSION_NAME_PATTERN.test(name)) {
     throw new Error("Invalid session name: only alphanumeric, underscore, hyphen, and dot allowed");
   }
-  if (name.length > 128) {
-    throw new Error("Session name too long (max 128 characters)");
+  if (name.length > TMUX_SESSION_NAME_MAX_LENGTH) {
+    throw new Error(`Session name too long (max ${TMUX_SESSION_NAME_MAX_LENGTH} characters)`);
   }
   return name;
 }

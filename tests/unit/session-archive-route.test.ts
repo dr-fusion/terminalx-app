@@ -40,9 +40,7 @@ describe("patchMeta + PATCH /api/sessions/[name] (feature #12)", () => {
     prevCwd = process.cwd();
     cwd = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "tx-archive-")));
     process.chdir(cwd);
-    writeSessionsJson(cwd, [
-      { name: "feat-x", kind: "bash", createdAt: new Date().toISOString() },
-    ]);
+    writeSessionsJson(cwd, [{ name: "feat-x", kind: "bash", createdAt: new Date().toISOString() }]);
   });
 
   afterEach(() => {
